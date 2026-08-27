@@ -1,0 +1,39 @@
+{
+  "source": "Test-Pico-1",
+  "config_schema_version": 4,
+  "read_loop_sec": 20,
+  "device_initialization_attempts": 3,
+  "device_initialization_retry_delay_ms": 250,
+  "device_read_failure_threshold": 3,
+  "mqtt_broker_ip_address": "10.10.10.64",
+  "mqtt_keepalive_sec": 30,
+  "mqtt_command_poll_ms": 100,
+  "mqtt_broker_response_timeout_sec": 4,
+  "datetime_sync_interval_min": 60,
+  "network_snapshot_interval_sec": 5,
+  "max_outbound_queue_entries": 16,
+  "max_intercore_event_entries": 4,
+  "mqtt_topic_telemetry": "iot/v3/telemetry",
+  "mqtt_topic_log": "iot/v3/log",
+  "mqtt_topic_command": "iot/v3/command",
+  "mqtt_topic_command_response": "iot/v3/command-response",
+  "mqtt_topic_info_request": "iot/v3/info-request",
+  "mqtt_topic_info_response": "iot/v3/info-response",
+  "wifi_reconnect_delays_sec": [ 5, 5, 5, 5, 10, 10, 20, 20, 40, 40 ],
+  "mqtt_reconnect_delays_sec": [ 3, 3, 3, 5, 5, 5, 10, 10, 20, 20, 40, 40 ],
+  "devices": [
+    {
+      "id": "p5h3DLqmWjCkLcXUtaFRq8yBsucEuY4A",
+      "device_type": "system-information",
+      "name": "System Information Sensor",
+      "sensor_type": "system-info",
+      "config": {
+        "include": [
+          "network",
+          "runtime",
+          "device_status"
+        ]
+      }
+    }
+  ]
+}
