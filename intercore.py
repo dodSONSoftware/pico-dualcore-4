@@ -7,6 +7,7 @@ import _thread
 
 KIND_TELEMETRY = "telemetry"
 KIND_COMMAND_RESPONSE = "command_response"
+KIND_HEALTH = "health"
 
 # Lower numeric values are more important and are retained preferentially.
 RETENTION_PRIORITY_CRITICAL = 10
@@ -54,6 +55,8 @@ class OutboundQueue:
             return "iot/v3/telemetry"
         if kind == KIND_COMMAND_RESPONSE:
             return "iot/v3/command-response"
+        if kind == KIND_HEALTH:
+            return "iot/v3/health"
         raise ValueError("Unsupported outbound message kind: {}".format(kind))
 
     def _evict_oldest_by_priority_locked(self, retention_priority):
@@ -85,7 +88,7 @@ class OutboundQueue:
         The in-flight QoS 1 entry counts toward max_entries but cannot be
         evicted. If no queued entry is available for eviction, admission fails.
         """
-        if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE):
+        if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(message, dict):
             raise ValueError("outbound message must be a dictionary")
@@ -150,6 +153,58 @@ class OutboundQueue:
                 self._high_watermark = depth
             return True
 
+    def put_with_kind(self, kind, payload_bytes, retention_priority):
+        """Admit one MQTT-bound message with a specific kind (e.g., health).
+
+        Args:
+            kind: Message kind (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH)
+            payload_bytes: Pre-serialized, UTF-8 encoded payload
+            retention_priority: Priority level for retention management
+
+        Returns:
+            bool: True if message was admitted, False otherwise
+        """
+        if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH):
+            raise ValueError("Unsupported outbound message kind: {}".format(kind))
+        if not isinstance(payload_bytes, (bytes, bytearray)):
+            raise ValueError("payload_bytes must be bytes")
+        if isinstance(retention_priority, bool) or not isinstance(retention_priority, int):
+            raise ValueError("retention_priority must be an integer")
+        if not RETENTION_PRIORITY_MIN <= retention_priority <= RETENTION_PRIORITY_MAX:
+            raise ValueError(
+                "retention_priority must be between {} and {}".format(
+                    RETENTION_PRIORITY_MIN, RETENTION_PRIORITY_MAX
+                )
+            )
+
+        with self._lock:
+            occupied = len(self._queue) + (1 if self._in_flight is not None else 0)
+            if occupied >= self._max_entries:
+                if not self._queue:
+                    self._messages_rejected += 1
+                    return False
+
+                worst_priority = max(entry["retention_priority"] for entry in self._queue)
+                if retention_priority > worst_priority:
+                    self._messages_rejected += 1
+                    return False
+
+                if not self._evict_oldest_by_priority_locked(worst_priority):
+                    self._messages_rejected += 1
+                    return False
+
+            entry = {
+                "kind": kind,
+                "retention_priority": retention_priority,
+                "payload_bytes": payload_bytes,
+            }
+            self._queue.append(entry)
+
+            depth = len(self._queue)
+            if depth > self._high_watermark:
+                self._high_watermark = depth
+            return True
+
     def take(self):
         """Return the current in-flight entry or move one queued entry into it."""
         with self._lock:
@@ -184,6 +239,17 @@ class OutboundQueue:
                 "serialization_rejected": self._serialization_rejected,
                 "oversized_rejected": self._oversized_rejected,
             }
+
+    def get_depth(self):
+        """Return current queue depth (queued + in-flight entries)."""
+        with self._lock:
+            return len(self._queue) + (1 if self._in_flight is not None else 0)
+
+    def get_depth_with_capacity(self):
+        """Return queue depth and capacity tuple for health reporting."""
+        with self._lock:
+            depth = len(self._queue) + (1 if self._in_flight is not None else 0)
+            return depth, self._max_entries
 
 
 class InterCoreEventQueue:
@@ -244,6 +310,8 @@ class StateMailboxes:
         self._lock = _thread.allocate_lock()
         self._network_snapshot = None
         self._utc_snapshot = None
+        self._core_1_activity_ms = None
+        self._hardware = None
 
     def set_network_snapshot(self, snapshot):
         if not isinstance(snapshot, dict):
@@ -260,6 +328,28 @@ class StateMailboxes:
             raise ValueError("UTC snapshot must be a dictionary")
         with self._lock:
             self._utc_snapshot = snapshot
+
+    def set_core_1_activity_ms(self, activity_ms):
+        """Record Core 1 activity timestamp in milliseconds."""
+        if isinstance(activity_ms, bool) or not isinstance(activity_ms, int):
+            raise ValueError("activity_ms must be an integer")
+        with self._lock:
+            self._core_1_activity_ms = activity_ms
+
+    def get_core_1_activity_ms(self):
+        with self._lock:
+            return self._core_1_activity_ms
+
+    def set_hardware(self, hardware):
+        """Set hardware detection result."""
+        if not isinstance(hardware, dict):
+            raise ValueError("hardware must be a dictionary")
+        with self._lock:
+            self._hardware = hardware
+
+    def get_hardware(self):
+        with self._lock:
+            return self._hardware
 
     def get_utc_snapshot(self):
         with self._lock:

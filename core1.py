@@ -19,9 +19,11 @@ from device_manager import (
 from intercore import (
     KIND_TELEMETRY,
     KIND_COMMAND_RESPONSE,
+    KIND_HEALTH,
     RETENTION_PRIORITY_CRITICAL,
     RETENTION_PRIORITY_TELEMETRY,
     RETENTION_PRIORITY_INFO,
+    RETENTION_PRIORITY_HEALTH,
 )
 
 # Core 1 uses the same MQTT log topic as Core 0
@@ -299,6 +301,227 @@ def _handle_device_result(intercore, config, boot_ticks_ms, result):
         ))
 
 
+def _build_health_payload(intercore, boot_ticks_ms, source, config, runtime_id, system_information):
+    """Build the health payload from shared state snapshots.
+
+    Args:
+        intercore: InterCore bus instance
+        boot_ticks_ms: Monotonic timestamp at firmware boot
+        source: Device source identifier (from network snapshot)
+        config: Core 1 configuration
+        runtime_id: Unique runtime identifier
+        system_information: SystemInformation instance for device status
+
+    Returns:
+        dict: Health message payload with status and diagnostic fields
+    """
+    now_ms = time.ticks_ms()
+    uptime_ms = time.ticks_diff(now_ms, boot_ticks_ms)
+
+    # Get network snapshot (from Core 0)
+    network_snapshot = intercore.state_mailboxes.get_network_snapshot()
+    if network_snapshot is None:
+        # No network snapshot available yet
+        return None
+
+    # Get UTC snapshot (from Core 0)
+    utc_snapshot = intercore.state_mailboxes.get_utc_snapshot()
+    utc_valid = utc_snapshot is not None
+
+    # Get Core 1 activity timestamp
+    core_1_activity_ms = intercore.state_mailboxes.get_core_1_activity_ms()
+    # Calculate Core 1 activity age
+    core_1_inactive_ms = time.ticks_diff(now_ms, core_1_activity_ms) if core_1_activity_ms is not None else None
+    # Calculate threshold: 3x the read loop interval (with reasonable minimum)
+    core_1_activity_threshold_ms = max(config["read_loop_sec"] * 3 * 1000, 60000)  # 60 seconds min
+    core_1_active = core_1_inactive_ms is not None and core_1_inactive_ms <= core_1_activity_threshold_ms
+
+    # Get device status from SystemInformation (which uses DeviceManager)
+    devices = system_information.get_devices() if system_information else {"configured": 0, "active": 0}
+    devices_configured = devices["configured"]
+    devices_active = devices["active"]
+
+    # Get queue status
+    outbound_queue = intercore.outbound_queue
+    queue_depth, queue_capacity = outbound_queue.get_depth_with_capacity()
+
+    # Determine queue pressure (75% threshold)
+    queue_pressure = queue_capacity > 0 and (queue_depth / queue_capacity) >= 0.75
+
+    # Get memory info
+    try:
+        free_heap = gc.mem_free()
+    except Exception:
+        free_heap = 0
+
+    # Get hardware info from state mailboxes
+    try:
+        hardware = intercore.state_mailboxes.get_hardware()
+        minimum_free_heap = hardware.get("minimum_free_heap_bytes") if hardware else 65536
+        hardware_type = hardware.get("hardware_type", "unknown")
+        machine = hardware.get("machine", "unknown")
+    except Exception:
+        minimum_free_heap = 65536
+        hardware_type = "unknown"
+        machine = "unknown"
+
+    # Get RSSI from network snapshot
+    wifi_rssi_dbm = network_snapshot.get("rssi")
+
+    # Calculate heap headroom
+    heap_headroom_bytes = free_heap - minimum_free_heap
+
+    # Calculate Core 1 activity age in milliseconds
+    core_1_activity_age_ms = time.ticks_diff(now_ms, core_1_activity_ms) if core_1_activity_ms is not None else None
+
+    # Calculate UTC sync age in seconds
+    utc_sync_age_sec = None
+    if utc_snapshot is not None:
+        elapsed_ms = time.ticks_diff(now_ms, utc_snapshot["ticks_ms"])
+        utc_sync_age_sec = elapsed_ms // 1000  # Integer division for seconds
+
+    # Calculate device failures from DeviceManager state
+    device_failures = devices_configured - devices_active
+
+    # Calculate queue utilization percentage
+    queue_utilization_percent = 0
+    if queue_capacity > 0:
+        queue_utilization_percent = (queue_depth * 100) // queue_capacity
+
+    # Determine queue pressure (75% threshold)
+    queue_pressure = queue_capacity > 0 and queue_utilization_percent >= 75
+
+    # Evaluate health status and build degraded reasons
+    degraded_reasons = []
+    network_stack_ready = bool(network_snapshot.get("network_stack_ready"))
+    wifi_connected = bool(network_snapshot.get("wifi_connected"))
+    mqtt_connected = bool(network_snapshot.get("mqtt_connected"))
+
+    if not network_stack_ready:
+        degraded_reasons.append("network_stack_not_ready")
+    if not wifi_connected:
+        degraded_reasons.append("wifi_not_connected")
+    if not mqtt_connected:
+        degraded_reasons.append("mqtt_not_connected")
+    if not core_1_active:
+        degraded_reasons.append("core_1_inactive")
+    if free_heap < minimum_free_heap:
+        degraded_reasons.append("low_free_heap")
+    if devices_active != devices_configured:
+        degraded_reasons.append("device_count_mismatch")
+    if queue_pressure:
+        degraded_reasons.append("outbound_queue_pressure")
+    if not utc_valid:
+        degraded_reasons.append("utc_not_valid")
+
+    # Determine status
+    status = "healthy" if not degraded_reasons else "degraded"
+
+    # Build health payload
+    payload = {
+        "message_schema_version": MESSAGE_SCHEMA_VERSION,
+        "runtime_id": runtime_id,
+        "uptime_ms": uptime_ms,
+        "timestamp": None,  # Will be filled by Core 0
+        "source": source,
+        "message_type": "health",
+        "firmware_version": FIRMWARE_VERSION,
+        "payload": {
+            "status": status,
+            "degraded_reasons": degraded_reasons,
+            "hardware_type": hardware_type,
+            "machine": machine,
+            "network_stack_ready": network_stack_ready,
+            "wifi_connected": wifi_connected,
+            "wifi_rssi_dbm": wifi_rssi_dbm,
+            "mqtt_connected": mqtt_connected,
+            "core_1_active": core_1_active,
+            "core_1_activity_age_ms": core_1_activity_age_ms,
+            "free_heap_bytes": free_heap,
+            "minimum_free_heap_bytes": minimum_free_heap,
+            "heap_headroom_bytes": heap_headroom_bytes,
+            "devices_configured": devices_configured,
+            "devices_active": devices_active,
+            "device_failures": device_failures,
+            "outbound_queue_depth": queue_depth,
+            "outbound_queue_capacity": queue_capacity,
+            "outbound_queue_utilization_percent": queue_utilization_percent,
+            "utc_valid": utc_valid,
+            "utc_sync_age_sec": utc_sync_age_sec,
+        },
+    }
+
+    return payload
+
+
+def _try_queue_health_message(intercore, message, runtime_id):
+    """Attempt to queue a health message.
+
+    Args:
+        intercore: InterCore bus instance
+        message: Health message payload dict
+        runtime_id: Runtime identifier for logging
+
+    Returns:
+        bool: True if message was admitted, False otherwise
+    """
+    try:
+        payload_bytes = serialize_and_validate_message(message)
+    except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
+        if DEBUG:
+            print("[DEBUG] Health message validation failed: {}".format(err))
+        return False
+    except MessageTooLargeError as err:
+        print("[WARNING] Health message too large: {}".format(err))
+        return False
+    except Exception as err:
+        print("[WARNING] Health message serialization failed: {}".format(err))
+        return False
+
+    # Queue the pre-serialized message with health kind
+    return intercore.outbound_queue.put_with_kind(
+        KIND_HEALTH,
+        payload_bytes,
+        RETENTION_PRIORITY_HEALTH,
+    )
+
+
+def _try_queue_health_message_intercore(intercore, boot_ticks_ms, source, config, runtime_id, system_information):
+    """Build health payload and attempt to queue it.
+
+    Only generates health message if network stack is ready.
+    This prevents health messages from accumulating during MQTT outages.
+
+    Args:
+        intercore: InterCore bus instance
+        boot_ticks_ms: Monotonic timestamp at firmware boot
+        source: Device source identifier
+        config: Core 1 configuration
+        runtime_id: Unique runtime identifier
+        system_information: SystemInformation instance for device status
+    """
+    # Check if network stack is ready before generating health
+    network_snapshot = intercore.state_mailboxes.get_network_snapshot()
+    if network_snapshot is None:
+        return
+
+    # Only generate health if network is ready and MQTT is connected
+    # This prevents stale health messages from accumulating during outages
+    network_stack_ready = network_snapshot.get("network_stack_ready", False)
+    mqtt_connected = network_snapshot.get("mqtt_connected", False)
+
+    if not network_stack_ready or not mqtt_connected:
+        return
+
+    # Build health payload
+    health_payload = _build_health_payload(intercore, boot_ticks_ms, source, config, runtime_id, system_information)
+    if health_payload is None:
+        return
+
+    # Queue the health message
+    _try_queue_health_message(intercore, health_payload, runtime_id)
+
+
 def core1_main(intercore, config, boot_ticks_ms, runtime_id):
     """Core 1 entry point. This core never imports or touches network/MQTT.
 
@@ -356,9 +579,29 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         print("[INFO] Startup log admitted to outbound queue")
 
-        # Now that startup log is queued, telemetry can begin
+        # Store hardware info in state mailboxes (from system_information)
+        try:
+            hardware = system_information.get_machine()
+            intercore.state_mailboxes.set_hardware(hardware)
+        except Exception as err:
+            if DEBUG:
+                print("[DEBUG] Hardware storage failed: {}".format(err))
+
+        # Register initial Core 1 activity
+        intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
+
+        # Queue immediate health message after startup completed
+        # This ensures health message arrives before first telemetry (which runs on read_loop_sec)
+        _try_queue_health_message_intercore(intercore, boot_ticks_ms, source, config, runtime_id, system_information)
+
+        # Health scheduler for periodic health messages
+        health_interval_ms = config["health_interval_sec"] * 1000
+        next_health_ms = time.ticks_add(time.ticks_ms(), health_interval_ms)
+
+        # Now that startup log and health are queued, telemetry can begin
         read_loop_ms = config["read_loop_sec"] * 1000
         next_read_ms = time.ticks_add(time.ticks_ms(), read_loop_ms)
+
         pending_command_response = None
 
         while True:
@@ -379,6 +622,18 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
                 next_read_ms = time.ticks_add(now_ms, read_loop_ms)
                 gc.collect()
+
+            # Register Core 1 activity periodically (every 5 seconds)
+            if time.ticks_diff(now_ms, next_read_ms) < 0 and time.ticks_diff(now_ms, next_health_ms) < 0:
+                # Not time for read or health yet - update activity once per 5 seconds
+                if now_ms % 5000 < 20:
+                    intercore.state_mailboxes.set_core_1_activity_ms(now_ms)
+
+            # Check for health message generation
+            if time.ticks_diff(now_ms, next_health_ms) >= 0:
+                # Try to generate and queue health message
+                _try_queue_health_message_intercore(intercore, boot_ticks_ms, source, config, runtime_id, system_information)
+                next_health_ms = time.ticks_add(now_ms, health_interval_ms)
 
             time.sleep_ms(20)
 

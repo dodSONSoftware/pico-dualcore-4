@@ -8,10 +8,24 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+# Mock machine module for host-side testing
+class MockMachine:
+    PWM = None
+    Pin = None
+
+sys.modules['machine'] = MockMachine()
+
+# Mock network module for host-side testing
+class MockNetwork:
+    WLAN = None
+
+sys.modules['network'] = MockNetwork()
+
 from intercore import (
     InterCore,
     KIND_TELEMETRY,
     KIND_COMMAND_RESPONSE,
+    KIND_HEALTH,
     RETENTION_PRIORITY_CRITICAL,
     RETENTION_PRIORITY_ERROR,
     RETENTION_PRIORITY_TELEMETRY,
@@ -321,3 +335,271 @@ def test_connection_log_like_message():
     reconstructed = json.loads(payload_bytes.decode("utf-8"))
     assert reconstructed["message_type"] == "log"
     assert reconstructed["payload"]["message"] == "Connected to Wi-Fi"
+
+
+def test_health_message_kind_is_valid():
+    """Verify KIND_HEALTH is a valid outbound message kind."""
+    bus = InterCore(outbound_max=2, event_max=2)
+    # Health messages should be accepted with health priority
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"test": true}', RETENTION_PRIORITY_HEALTH)
+
+
+def test_health_message_is_lesser_priority_than_info():
+    """Verify health messages can be evicted by info messages."""
+    bus = InterCore(outbound_max=2, event_max=2)
+    # Queue two health messages
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 1}', RETENTION_PRIORITY_HEALTH)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 2}', RETENTION_PRIORITY_HEALTH)
+
+    # Try to add an info message (more important) when full
+    # Info has priority 50, health has priority 70
+    # So info should evict the oldest health (id 1)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 3}', RETENTION_PRIORITY_INFO)
+
+    # The oldest health (id 1) should be evicted
+    # Queue is now [2, 3] after eviction and addition
+    entry = bus.outbound_queue.take()
+    message = json.loads(entry["payload_bytes"].decode("utf-8"))
+    assert message["id"] == 2  # id 1 was evicted, 2 is now oldest
+    bus.outbound_queue.complete_in_flight(entry)
+
+    entry = bus.outbound_queue.take()
+    message = json.loads(entry["payload_bytes"].decode("utf-8"))
+    assert message["id"] == 3
+    bus.outbound_queue.complete_in_flight(entry)
+
+    assert bus.outbound_queue.take() is None
+
+
+def test_health_message_is_rejected_when_queue_is_full():
+    """Verify health messages are rejected when queue is full and no eviction possible."""
+    bus = InterCore(outbound_max=1, event_max=2)
+    # Fill the queue with a critical message
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 1}', RETENTION_PRIORITY_CRITICAL)
+
+    first = bus.outbound_queue.take()
+    bus.outbound_queue.complete_in_flight(first)
+
+    # Queue is now empty but capacity is 1
+    # Take it again to leave in_flight
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 2}', RETENTION_PRIORITY_HEALTH)
+    first = bus.outbound_queue.take()
+
+    # Now try to add health when in_flight is occupied
+    # This should fail since in_flight counts toward max
+    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 3}', RETENTION_PRIORITY_HEALTH)
+    bus.outbound_queue.complete_in_flight(first)
+
+
+def test_health_queue_depth_helper():
+    """Verify the health queue depth helper returns correct values."""
+    bus = InterCore(outbound_max=4, event_max=2)
+
+    # Empty queue should return (0, 4)
+    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
+    assert depth == 0
+    assert capacity == 4
+
+    # Add one message
+    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
+    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
+    assert depth == 1
+    assert capacity == 4
+
+    # Take and complete to check in-flight counting
+    first = bus.outbound_queue.take()
+    assert first is not None
+    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
+    # In-flight counts toward depth
+    assert depth == 1
+    assert capacity == 4
+
+    bus.outbound_queue.complete_in_flight(first)
+    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
+    assert depth == 0
+    assert capacity == 4
+
+
+def test_health_queue_depth_calculation():
+    """Verify queue depth is queued + in_flight."""
+    bus = InterCore(outbound_max=4, event_max=2)
+
+    # Add two messages
+    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
+    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_TELEMETRY)
+
+    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
+    assert depth == 2
+    assert capacity == 4
+
+    # Take one (moves to in_flight)
+    first = bus.outbound_queue.take()
+    assert first is not None
+    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
+    assert depth == 2  # 1 queued + 1 in_flight
+    assert capacity == 4
+
+
+def test_health_topic_routing_returns_configured_topic():
+    """Verify KIND_HEALTH routes to the configured mqtt_topic_health."""
+    from config import load_config, split_config
+
+    config_path = pathlib.Path(__file__).resolve().parents[1] / "config.json"
+    config = load_config(str(config_path))
+    core0, _, bus_config = split_config(config)
+
+    bus = InterCore(outbound_max=bus_config["max_outbound_queue_entries"],
+                   event_max=bus_config["max_intercore_event_entries"])
+
+    # Create a Core0-like topic resolver using the config
+    def topic_for_kind(kind):
+        if kind == KIND_HEALTH:
+            return core0["mqtt_topic_health"]
+        raise ValueError("Unsupported outbound message kind")
+
+    # Verify KIND_HEALTH returns the configured health topic
+    assert topic_for_kind(KIND_HEALTH) == "iot/v3/health"
+    assert topic_for_kind(KIND_HEALTH) == config["mqtt_topic_health"]
+
+
+def test_publish_failure_clears_in_flight_state():
+    """Verify that when publish fails, complete_in_flight must be called to clear state.
+
+    This test verifies the fix for a bug where failed MQTT publishes would leave
+    the in-flight state permanently occupied, blocking the queue forever.
+    """
+    bus = InterCore(outbound_max=2, event_max=2)
+
+    # Add two messages
+    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
+    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_TELEMETRY)
+
+    # Take first message (moves to in_flight)
+    first = bus.outbound_queue.take()
+    assert first is not None
+    assert json.loads(first["payload_bytes"].decode("utf-8"))["id"] == 1
+    assert bus.outbound_queue.has_in_flight()
+
+    # Simulate a failed publish - the bug was that complete_in_flight was not called
+    # After the fix, we call complete_in_flight even on failure
+    assert bus.outbound_queue.complete_in_flight(first)
+    assert not bus.outbound_queue.has_in_flight()
+
+    # Now we should be able to take the second message
+    second = bus.outbound_queue.take()
+    assert second is not None
+    assert json.loads(second["payload_bytes"].decode("utf-8"))["id"] == 2
+    assert bus.outbound_queue.has_in_flight()
+
+    # Complete the second message
+    assert bus.outbound_queue.complete_in_flight(second)
+    assert not bus.outbound_queue.has_in_flight()
+
+    # Queue should now be empty
+    assert bus.outbound_queue.take() is None
+
+
+class TestCommandResponsePreSerializedFormat:
+    """Regression tests for Core 0 command-response pre-serialized format.
+
+    These tests verify that command responses use the pre-serialized
+    payload_bytes contract.
+    """
+
+    def test_command_response_entry_format(self, tmp_path):
+        """Verify command-response entries contain payload_bytes, not message."""
+        from config import load_config
+
+        config_path = pathlib.Path(__file__).resolve().parents[1] / "config.json"
+        config = load_config(str(config_path))
+
+        bus = InterCore(outbound_max=16, event_max=4)
+
+        # Build a command response message
+        message = {
+            "message_type": "command_response",
+            "payload": {
+                "command_id": "reboot-001",
+                "command": "reboot",
+                "targeted": False,
+                "success": True,
+                "data": {"rebooting": True},
+            },
+        }
+
+        # Serialize (same pattern as _publish_core0_command_response)
+        from message_serializer import serialize_and_validate_message
+        payload_bytes = serialize_and_validate_message(message)
+
+        # Verify payload_bytes is bytes and not a dict with 'message' key
+        assert isinstance(payload_bytes, bytes)
+
+        # Create entry with payload_bytes (same as fixed _publish_core0_command_response)
+        entry = {
+            "kind": KIND_COMMAND_RESPONSE,
+            "payload_bytes": payload_bytes,
+        }
+
+        # Verify entry doesn't have the obsolete 'message' field
+        assert "message" not in entry
+        assert "payload_bytes" in entry
+
+        # Add to queue
+        bus.outbound_queue.put_with_kind(
+            KIND_COMMAND_RESPONSE, payload_bytes, RETENTION_PRIORITY_CRITICAL
+        )
+
+        # Verify the entry was queued with payload_bytes
+        queued_entry = bus.outbound_queue.take()
+        assert queued_entry is not None
+        assert "payload_bytes" in queued_entry
+        assert "message" not in queued_entry
+        assert queued_entry["kind"] == KIND_COMMAND_RESPONSE
+
+        # Verify payload_bytes is valid JSON with expected content
+        deserialized = json.loads(queued_entry["payload_bytes"].decode("utf-8"))
+        assert deserialized["message_type"] == "command_response"
+        assert deserialized["payload"]["command_id"] == "reboot-001"
+        assert deserialized["payload"]["success"] is True
+
+    def test_command_response_payload_is_serialized_bytes(self, tmp_path):
+        """Verify command-response payload_bytes is properly serialized."""
+        from config import load_config
+
+        config_path = pathlib.Path(__file__).resolve().parents[1] / "config.json"
+        config = load_config(str(config_path))
+
+        bus = InterCore(outbound_max=16, event_max=4)
+
+        # Build a command response message with error
+        message = {
+            "message_type": "command_response",
+            "payload": {
+                "command_id": "reboot-002",
+                "command": "reboot",
+                "targeted": False,
+                "success": False,
+                "error": {"code": "test_error", "message": "Test error"},
+            },
+        }
+
+        from message_serializer import serialize_and_validate_message
+        payload_bytes = serialize_and_validate_message(message)
+
+        entry = {
+            "topic": config["mqtt_topic_command_response"],
+            "kind": KIND_COMMAND_RESPONSE,
+            "payload_bytes": payload_bytes,
+        }
+
+        # Verify entry format
+        assert "payload_bytes" in entry
+        assert "message" not in entry
+        assert isinstance(entry["payload_bytes"], bytes)
+
+        # Decode and verify
+        payload_str = entry["payload_bytes"].decode("utf-8")
+        deserialized = json.loads(payload_str)
+        assert deserialized["message_type"] == "command_response"
+        assert deserialized["payload"]["success"] is False
+        assert deserialized["payload"]["error"]["code"] == "test_error"

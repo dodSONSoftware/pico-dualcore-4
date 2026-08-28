@@ -4,6 +4,44 @@
 
 This is a dual-core MicroPython firmware for Raspberry Pi Pico W/Pico 2 W. Core 0 handles network operations (Wi-Fi, MQTT, UTC sync, reboot), while Core 1 handles sensors and devices. Communication occurs over a three-lane inter-core bus.
 
+### Health Message Fields
+
+Core 1 periodically publishes health messages to `iot/v3/health` containing diagnostic information:
+
+**Core Fields:**
+- `status`: "healthy" or "degraded"
+- `degraded_reasons`: Array of degradation reasons (e.g., "wifi_not_connected", "outbound_queue_pressure")
+
+**Hardware Fields:**
+- `hardware_type`: Canonical hardware type ("pico_w" or "pico_2_w")
+- `machine`: Human-readable machine identifier
+
+**Network Fields:**
+- `wifi_rssi_dbm`: Current Wi-Fi signal strength (dBm)
+
+**Memory Fields:**
+- `free_heap_bytes`: Current free heap
+- `minimum_free_heap_bytes`: Configured heap reserve
+- `heap_headroom_bytes`: free_heap - minimum_free_heap (may be negative)
+
+**Core Activity Fields:**
+- `core_1_active`: Boolean indicating Core 1 liveness
+- `core_1_activity_age_ms`: Time since last Core 1 activity report
+
+**Device Fields:**
+- `devices_configured`: Number of configured devices
+- `devices_active`: Number of active/ready devices
+- `device_failures`: devices_configured - devices_active
+
+**Queue Fields:**
+- `outbound_queue_depth`: Current queued + in-flight entries
+- `outbound_queue_capacity`: Maximum queue entries
+- `outbound_queue_utilization_percent`: (depth * 100) // capacity
+
+**UTC Fields:**
+- `utc_valid`: Boolean indicating UTC time is valid
+- `utc_sync_age_sec`: Seconds since last successful UTC sync
+
 ## Key Architectural Principles
 
 1. **Strict Ownership**: Core 0 owns the network stack; Core 1 owns devices/sensors. No overlap.
@@ -18,10 +56,13 @@ This is a dual-core MicroPython firmware for Raspberry Pi Pico W/Pico 2 W. Core 
 |------|---------|
 | `main.py` | Entry point, orchestrates startup sequence |
 | `core0.py` | Network stack (Wi-Fi, MQTT, UTC, reboot) |
-| `core1.py` | Device lifecycle, sensor reads, telemetry |
+| `core1.py` | Device lifecycle, sensor reads, telemetry, health messages |
 | `intercore.py` | Three-lane message bus implementation |
 | `device_manager.py` | Device lifecycle management |
 | `config.py` | Configuration loading and validation |
+| `hardware.py` | Hardware detection (Pico W/Pico 2 W) |
+| `system_information.py` | System state snapshots |
+| `message_serializer.py` | JSON-safe message validation and serialization |
 
 ## Development Guidelines
 
@@ -61,6 +102,13 @@ This is a dual-core MicroPython firmware for Raspberry Pi Pico W/Pico 2 W. Core 
 2. Update `intercore.py` with new message format
 3. Update `message_protocol.py` helpers
 4. Test both cores handle the change
+
+### Adding Health Message Fields
+
+1. Update `_build_health_payload()` in `core1.py` to include new fields
+2. Update `_build_health_payload_test()` in `tests/test_health.py`
+3. Add tests for new fields
+4. Update `ARCHITECTURE.md` health section with new field descriptions
 
 ### MQTT Topic Changes
 
@@ -106,5 +154,13 @@ Check for:
 - Never call `machine.reset()` from Core 1
 
 ## Version History
+
+- **0.4.0**: Extended health messages with 8 additional operational fields: hardware_type, machine, wifi_rssi_dbm, heap_headroom_bytes, core_1_activity_age_ms, utc_sync_age_sec, device_failures, outbound_queue_utilization_percent. Added health message queueing support.
+
+- **0.3.0**: Pre-serialized outbound MQTT queue with QoS 1
+
+- **0.2.0**: Hardware detection for Pico W and Pico 2 W
+
+- **0.1.0**: QoS 1 network probes and deterministic startup contract
 
 - **0.0.0**: Baseline dual-core rebuild with system-information sensor only

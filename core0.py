@@ -7,11 +7,13 @@ import machine
 import time
 
 from debug import DEBUG
-from intercore import KIND_COMMAND_RESPONSE, KIND_TELEMETRY
+from intercore import KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_TELEMETRY
 from message_protocol import format_utc_epoch_ms
 from mqtt import Mqtt
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 from wifi import Wifi
+
+from message_serializer import serialize_and_validate_message, MessageTooLargeError
 
 
 _MAX_PENDING_CORE0_RESPONSES = 4
@@ -312,6 +314,8 @@ class Core0:
             return self._config["mqtt_topic_telemetry"]
         if kind == KIND_COMMAND_RESPONSE:
             return self._config["mqtt_topic_command_response"]
+        if kind == KIND_HEALTH:
+            return self._config["mqtt_topic_health"]
         raise ValueError("Unsupported outbound message kind: {}".format(kind))
 
     def _make_envelope(self, entry, sequence):
@@ -370,6 +374,11 @@ class Core0:
     def _publish_core0_command_response(
         self, command_id, command, success, targeted=True, data=None, error=None
     ):
+        """Build and publish a Core 0 command response.
+
+        The command response is serialized before publishing to honor the
+        pre-serialized outbound-message contract.
+        """
         payload = {
             "command_id": command_id,
             "command": command,
@@ -381,12 +390,24 @@ class Core0:
         else:
             payload["error"] = error
 
+        # Build the logical message first
+        message = {
+            "message_type": "command_response",
+            "payload": payload,
+        }
+
+        # Serialize and encode the message for the pre-serialized queue
+        try:
+            payload_bytes = serialize_and_validate_message(message)
+        except (MessageTooLargeError, Exception) as err:
+            if DEBUG:
+                print("[DEBUG] Command response serialization failed: {}".format(err))
+            return
+
         entry = {
             "topic": self._config["mqtt_topic_command_response"],
-            "message": {
-                "message_type": "command_response",
-                "payload": payload,
-            },
+            "kind": KIND_COMMAND_RESPONSE,
+            "payload_bytes": payload_bytes,
         }
         self._publish_entry(entry)
 
@@ -764,12 +785,13 @@ class Core0:
                 if entry is not None:
                     try:
                         self._publish_entry(entry)
-                        self._intercore.outbound_queue.complete_in_flight(entry)
                     except MemoryError:
                         raise
                     except Exception as err:
                         if DEBUG:
-                            print("[DEBUG] MQTT publish failed; in-flight message retained: {}".format(err))
+                            print("[DEBUG] MQTT publish failed: {}".format(err))
+                    finally:
+                        self._intercore.outbound_queue.complete_in_flight(entry)
 
             self._publish_network_snapshot()
 

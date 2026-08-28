@@ -24,6 +24,7 @@ REQUIRED_FILES = {
     "led_manager.py",
     "debug.py",
     "version.py",
+    "hardware.py",
 }
 
 # Optional files (config files, user-provided)

@@ -34,6 +34,7 @@ def test_config_loads_and_splits_ownership(tmp_path):
     assert "source" not in core1  # Core 1 doesn't need source (it uses IP from network snapshot)
     assert core0["mqtt_topic_telemetry"] == config["mqtt_topic_telemetry"]
     assert core0["mqtt_topic_log"] == config["mqtt_topic_log"]
+    assert core0["mqtt_topic_health"] == config["mqtt_topic_health"]
     assert bus["max_outbound_queue_entries"] == config["max_outbound_queue_entries"]
 
 

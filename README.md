@@ -1,4 +1,4 @@
-# Sensor Firmware v4 — Dual-Core Embedded System
+# Sensor Firmware — Refit 4 — Dual-Core Embedded System
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-1.20+-00897B?logo=micropython&logoColor=white)](https://micropython.org)
@@ -134,21 +134,87 @@ Core 0 forwards MQTT commands to Core 1 via discrete events.
 Latest-value snapshots:
 - `network_snapshot`: Wi-Fi status, IP, RSSI, connection counts
 - `utc_snapshot`: Current UTC time, ticks base, runtime start
+- `hardware`: Detected hardware type and heap reserve
+- `core_1_activity_ms`: Timestamp of last Core 1 activity
+
+## Health Messages
+
+Core 1 periodically publishes health messages to `iot/v3/health` with the following fields:
+
+### Status
+- `status`: "healthy" or "degraded"
+- `degraded_reasons`: Array of degradation reasons (e.g., "wifi_not_connected", "outbound_queue_pressure")
+
+### Hardware
+- `hardware_type`: Canonical hardware type ("pico_w" or "pico_2_w")
+- `machine`: Human-readable machine identifier
+
+### Network
+- `wifi_rssi_dbm`: Current Wi-Fi signal strength (dBm)
+- `network_stack_ready`: Core 0 network stack initialization status
+- `wifi_connected`: Wi-Fi connection status
+- `mqtt_connected`: MQTT broker connection status
+
+### Memory
+- `free_heap_bytes`: Current free heap
+- `minimum_free_heap_bytes`: Configured heap reserve (64KB Pico W, 128KB Pico 2 W)
+- `heap_headroom_bytes`: free_heap - minimum_free_heap (may be negative)
+
+### Core Activity
+- `core_1_active`: Boolean indicating Core 1 liveness
+- `core_1_activity_age_ms`: Milliseconds since last Core 1 activity report
+
+### Devices
+- `devices_configured`: Number of configured devices
+- `devices_active`: Number of active/ready devices
+- `device_failures`: devices_configured - devices_active
+
+### Queue
+- `outbound_queue_depth`: Current queued + in-flight entries
+- `outbound_queue_capacity`: Maximum queue entries
+- `outbound_queue_utilization_percent`: (depth * 100) // capacity
+
+### UTC
+- `utc_valid`: Boolean indicating UTC time is valid
+- `utc_sync_age_sec`: Seconds since last successful UTC sync
+
+### Degradation Triggers
+
+The health status is "degraded" when any of these conditions are true:
+- `network_stack_not_ready`: Core 0 network not fully initialized
+- `wifi_not_connected`: Wi-Fi disconnected
+- `mqtt_not_connected`: MQTT broker connection lost
+- `core_1_inactive`: Core 1 activity exceeds threshold (3x read_loop_sec, min 60s)
+- `low_free_heap`: free_heap < minimum_free_heap
+- `device_count_mismatch`: devices_active != devices_configured
+- `outbound_queue_pressure`: utilization >= 75%
+- `utc_not_valid`: UTC snapshot unavailable
+
+Health messages are only generated when MQTT is connected to prevent stale messages during outages.
+
+### Configuration
+
+Health messages are controlled by:
+- `mqtt_topic_health`: MQTT topic for health messages (default: `iot/v3/health`)
+- `health_interval_sec`: Interval between health messages (default: 60 seconds)
 
 ## Features
 
 - **QoS 1 MQTT**: Synchronous PUBLISH → PUBACK, one in-flight message
+- **Health Messages**: Periodic diagnostic messages with status and 17+ fields
 - **UTC Synchronization**: Requests time from server on boot and periodically
 - **LED Status**: Flashing during connection, pulse on telemetry send
 - **Reboot Command**: JSON command triggers clean reboot with acknowledgment
 - **Device Lifecycle**: Auto-retry initialization and read failures
+- **Pre-serialized Queue**: Outbound messages validated and serialized before admission
+- **Hardware Detection**: Automatic Pico W vs Pico 2 W detection
 - **Memory-Efficient**: Designed for 256KB RAM constraint
 
 ## Configuration
 
 ### Schema Version
 
-The firmware expects `config_schema_version: 4`. Unknown top-level keys are rejected.
+The firmware expects `config_schema_version: 5`. Unknown top-level keys are rejected.
 
 ### Key Settings
 
@@ -159,6 +225,10 @@ The firmware expects `config_schema_version: 4`. Unknown top-level keys are reje
 | `device_read_failure_threshold` | Consecutive failures before reinit |
 | `mqtt_keepalive_sec` | MQTT keepalive interval |
 | `datetime_sync_interval_min` | UTC sync interval (minutes) |
+| `health_interval_sec` | Health message interval (seconds) |
+| `mqtt_topic_health` | MQTT topic for health messages |
+| `max_outbound_queue_entries` | Maximum queued messages |
+| `network_snapshot_interval_sec` | Network snapshot update interval |
 
 See [`config.json`](config.json) for complete example.
 
@@ -197,6 +267,9 @@ The device responds with a command response, waits 6 seconds, then reboots.
 ├── wifi.py          # Wi-Fi connection management
 ├── mqtt.py          # MQTT client wrapper
 ├── message_protocol.py # Message formatting helpers
+├── message_serializer.py # Message validation and pre-serialization
+├── hardware.py      # Hardware detection (Pico W/Pico 2 W)
+├── system_information.py # System state snapshots
 └── version.py       # Version constants
 ```
 

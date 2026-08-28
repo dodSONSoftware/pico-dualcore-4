@@ -39,6 +39,8 @@ _REQUIRED_KEYS = (
     "mqtt_topic_info_request",
     "mqtt_topic_info_response",
     "mqtt_topic_network_probe",
+    "mqtt_topic_health",
+    "health_interval_sec",
     "wifi_reconnect_delays_sec",
     "mqtt_reconnect_delays_sec",
 )
@@ -153,6 +155,7 @@ def load_config(path="config.json"):
         "mqtt_topic_info_request",
         "mqtt_topic_info_response",
         "mqtt_topic_network_probe",
+        "mqtt_topic_health",
     ):
         _require_non_empty_string(config, key)
 
@@ -168,6 +171,7 @@ def load_config(path="config.json"):
         "network_probe_timeout_sec",
         "max_outbound_queue_entries",
         "max_intercore_event_entries",
+        "health_interval_sec",
     ):
         _require_positive_integer(config, key)
 
@@ -217,6 +221,7 @@ def split_config(config):
         "network_snapshot_interval_sec": config["network_snapshot_interval_sec"],
         "network_probe_timeout_sec": config["network_probe_timeout_sec"],
         "mqtt_topic_network_probe": config["mqtt_topic_network_probe"],
+        "mqtt_topic_health": config["mqtt_topic_health"],
     }
 
     core1 = {
@@ -224,6 +229,7 @@ def split_config(config):
         "device_initialization_attempts": config["device_initialization_attempts"],
         "device_initialization_retry_delay_ms": config["device_initialization_retry_delay_ms"],
         "device_read_failure_threshold": config["device_read_failure_threshold"],
+        "health_interval_sec": config["health_interval_sec"],
         "devices": config["devices"],
     }
 

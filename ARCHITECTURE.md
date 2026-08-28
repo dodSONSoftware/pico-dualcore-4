@@ -1,5 +1,108 @@
 # Rebuilt Dual-Core Architecture
 
+## Health Message Protocol
+
+### Message Type: `health`
+
+Core 1 publishes health messages to `iot/v3/health` with the following payload structure:
+
+```json
+{
+  "message_schema_version": 4,
+  "runtime_id": "<runtime-uuid>",
+  "uptime_ms": <milliseconds>,
+  "timestamp": "<utc-iso8601>",
+  "source": "<device-source>",
+  "message_type": "health",
+  "firmware_version": "0.4.0",
+  "payload": {
+    "status": "healthy|degraded",
+    "degraded_reasons": ["<reason1>", "<reason2>"],
+    "hardware_type": "pico_w|pico_2_w",
+    "machine": "Raspberry Pi Pico W with RP2040",
+    "wifi_rssi_dbm": -45,
+    "core_1_active": true,
+    "core_1_activity_age_ms": 42,
+    "free_heap_bytes": 95728,
+    "minimum_free_heap_bytes": 65536,
+    "heap_headroom_bytes": 30192,
+    "devices_configured": 1,
+    "devices_active": 1,
+    "device_failures": 0,
+    "outbound_queue_depth": 0,
+    "outbound_queue_capacity": 16,
+    "outbound_queue_utilization_percent": 0,
+    "utc_valid": true,
+    "utc_sync_age_sec": 52
+  }
+}
+```
+
+### Status Fields
+
+- `status`: "healthy" when no degradation reasons, "degraded" otherwise
+- `degraded_reasons`: Array of active degradation reasons
+
+### Hardware Fields
+
+- `hardware_type`: Canonical hardware type from `detect_hardware()`
+- `machine`: Raw machine string from `os.uname().machine`
+
+### Network Fields
+
+- `wifi_rssi_dbm`: Current Wi-Fi RSSI from Core 0 network snapshot (may be null)
+
+### Memory Fields
+
+- `free_heap_bytes`: Current `gc.mem_free()` value
+- `minimum_free_heap_bytes`: Board-specific heap reserve (64KB Pico W, 128KB Pico 2 W)
+- `heap_headroom_bytes`: free_heap - minimum_free_heap (negative when below reserve)
+
+### Core Activity Fields
+
+- `core_1_active`: True if `core_1_activity_age_ms <= threshold`
+- `core_1_activity_age_ms`: Monotonic elapsed time since last activity report
+
+### Device Fields
+
+- `devices_configured`: From `DeviceManager.get_status_snapshot()`
+- `devices_active`: From `DeviceManager.get_status_snapshot()`
+- `device_failures`: devices_configured - devices_active
+
+### Queue Fields
+
+- `outbound_queue_depth`: Queued + in-flight entries
+- `outbound_queue_capacity`: Queue capacity from `OutboundQueue`
+- `outbound_queue_utilization_percent`: (depth * 100) // capacity (integer)
+
+### UTC Fields
+
+- `utc_valid`: True if UTC snapshot is available
+- `utc_sync_age_sec`: Seconds since last UTC sync (integer, null if never synchronized)
+
+### Degradation Reasons
+
+- `network_stack_not_ready`: Core 0 network not fully initialized
+- `wifi_not_connected`: Wi-Fi disconnected
+- `mqtt_not_connected`: MQTT broker connection lost
+- `core_1_inactive`: Core 1 activity exceeds threshold (3x read_loop_sec, min 60s)
+- `low_free_heap`: free_heap < minimum_free_heap
+- `device_count_mismatch`: devices_active != devices_configured
+- `outbound_queue_pressure`: utilization >= 75%
+- `utc_not_valid`: UTC snapshot unavailable
+
+### Queue Priority
+
+Health messages use `RETENTION_PRIORITY_HEALTH = 70`, the lowest priority class.
+
+### Outage Behavior
+
+Health messages are only generated when:
+1. Network snapshot is available (`network_stack_ready = True`)
+2. MQTT is connected (`mqtt_connected = True`)
+
+This prevents health messages from accumulating during MQTT outages.
+
 ## Hardware detection
 
 The firmware explicitly identifies the hardware at startup using `os.uname().machine`.
@@ -37,7 +140,7 @@ Core 1 -> Core 0. Contains only data intended for MQTT.
 - Retention priority is explicit: lower numeric values are more important.
 - Priority classes are: CRITICAL 10, ERROR 20, WARN 30, TELEMETRY 40, INFO 50, HEALTH 70.
 - When full, the queue finds the least-important queued class (highest numeric priority). If the incoming message is more important, or equally important, the oldest entry in that least-important class is evicted. If the incoming message is less important, it is rejected.
-- The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40.
+- The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40; health messages use HEALTH 70.
 - An in-flight QoS 1 entry counts toward the configured capacity but is never evicted.
 
 #### Pre-serialized message storage
@@ -67,7 +170,7 @@ After this change, any message present in the outbound queue is guaranteed to be
 - Within the configured application payload limit
 
 The queue entry stores:
-- `kind`: message kind (TELEMETRY, COMMAND_RESPONSE)
+- `kind`: message kind (TELEMETRY, COMMAND_RESPONSE, HEALTH)
 - `retention_priority`: numeric priority for eviction
 - `payload_bytes`: pre-serialized, UTF-8 encoded JSON payload
 
@@ -88,8 +191,10 @@ Core 0 -> Core 1. Contains private discrete commands/events.
 
 Core 0 -> Core 1 latest-value state.
 
-- `network_snapshot`
-- `utc_snapshot`
+- `network_snapshot`: Wi-Fi status, IP, RSSI, connection counts, `network_stack_ready` flag
+- `utc_snapshot`: Current UTC time, ticks base, runtime start
+- `hardware`: Detected hardware type, machine string, heap reserve
+- `core_1_activity_ms`: Timestamp of last Core 1 activity report (in milliseconds)
 
 State is replaced, not accumulated. Core 1 keeps the latest immutable snapshot until Core 0 replaces it.
 
@@ -152,6 +257,45 @@ Core 1 starts only after Core 0 has completed the deterministic startup contract
 
 The `network_stack_ready` flag in the network snapshot indicates the complete startup contract has been verified.
 
+## Periodic Health Messages
+
+Core 1 generates health messages periodically (every `health_interval_sec`) and immediately after startup completes. The health message contains current-state diagnostic fields without turning the payload into a full system information report.
+
+### Generation Rules
+
+1. **Network ready required**: Health messages are only generated when `network_stack_ready = True` and `mqtt_connected = True`. This prevents accumulation during MQTT outages.
+
+2. **Authoritative data sources**:
+   - Hardware: `StateMailboxes.get_hardware()` (canonical detected state)
+   - RSSI: `StateMailboxes.get_network_snapshot().get("rssi")`
+   - Core 1 activity: `StateMailboxes.get_core_1_activity_ms()`
+   - Heap: `gc.mem_free()` (current measurement)
+   - Devices: `DeviceManager.get_status_snapshot()`
+   - Queue: `OutboundQueue.get_depth_with_capacity()`
+   - UTC: `StateMailboxes.get_utc_snapshot()`
+
+3. **Monotonic time calculations**:
+   - All age calculations use `time.ticks_diff()` for monotonic elapsed time
+   - UTC sync age: integer division of milliseconds by 1000
+
+4. **Queue pressure threshold**: 75% utilization (`outbound_queue_utilization_percent >= 75`)
+
+5. **Low-priority retention**: Uses `RETENTION_PRIORITY_HEALTH = 70`, the lowest priority class
+
+### Degradation Triggers
+
+Health status is "degraded" when any of these conditions are true:
+- `network_stack_not_ready`: Core 0 network not initialized
+- `wifi_not_connected`: Wi-Fi disconnected
+- `mqtt_not_connected`: MQTT broker connection lost
+- `core_1_inactive`: Activity age exceeds threshold (3x read_loop_sec, minimum 60 seconds)
+- `low_free_heap`: Free heap below configured reserve
+- `device_count_mismatch`: Active devices don't match configured count
+- `outbound_queue_pressure`: Queue utilization >= 75%
+- `utc_not_valid`: UTC snapshot unavailable
+
+If no degradation reasons exist, status is "healthy".
+
 ## Deterministic startup sequence
 
 Core 0 performs the following sequence during `start()` before returning and allowing Core 1 to start:
@@ -176,7 +320,6 @@ These should be added individually only after the baseline passes:
 
 - advanced reboot-delivery state machines;
 - advanced network recovery generations/state machines;
-- health publishing;
 - dynamic configuration;
 - watchdog/cross-core recovery;
 - additional Core 1 commands;
