@@ -8,6 +8,12 @@ import os
 import sys
 import time
 
+from hardware import (
+    HARDWARE_TYPE_PICO_W,
+    HARDWARE_TYPE_PICO_2_W,
+    _PICO_W_MACHINE_PATTERNS,
+    _PICO_2_W_MACHINE_PATTERNS,
+)
 from message_protocol import format_utc_epoch_ms
 
 SYSTEM_INFORMATION_SECTIONS = (
@@ -98,6 +104,19 @@ class SystemInformation:
             frequency_hz = None
         return {"frequency_hz": frequency_hz}
 
+    def _classify_hardware(self, machine_name):
+        """
+        Classify hardware from machine string.
+
+        Returns (hardware_type, minimum_free_heap_bytes) or ("unknown", None).
+        """
+        if machine_name in _PICO_W_MACHINE_PATTERNS:
+            return (HARDWARE_TYPE_PICO_W, 64 * 1024)  # 65,536 bytes
+        elif machine_name in _PICO_2_W_MACHINE_PATTERNS:
+            return (HARDWARE_TYPE_PICO_2_W, 128 * 1024)  # 131,072 bytes
+        else:
+            return ("unknown", None)
+
     def get_machine(self):
         try:
             uname = os.uname()
@@ -108,10 +127,15 @@ class SystemInformation:
         except Exception:
             machine_name = "unknown"
             version = "unknown"
+
+        hardware_type, minimum_free_heap_bytes = self._classify_hardware(machine_name)
+
         return {
+            "hardware_type": hardware_type,
             "machine": machine_name,
             "version": version,
             "implementation": sys.implementation.name,
+            "minimum_free_heap_bytes": minimum_free_heap_bytes,
         }
 
     def get_communications(self):

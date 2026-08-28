@@ -7,6 +7,7 @@ import machine
 import os
 import time
 
+from hardware import detect_hardware, HARDWARE_TYPE_PICO_W, HARDWARE_TYPE_PICO_2_W
 from led_manager import LEDManager
 
 
@@ -33,6 +34,13 @@ def _runtime_id():
 def main():
     boot_ticks_ms = time.ticks_ms()
     gc.collect()
+
+    # Detect hardware early to validate the board and select heap reserve.
+    hardware = detect_hardware()
+    print("[INFO] Hardware detected: {} (heap reserve: {} bytes)".format(
+        hardware["hardware_type"],
+        hardware["minimum_free_heap_bytes"],
+    ))
 
     # Start the boot/connection indication before loading the rest of the firmware.
     led_manager = LEDManager()

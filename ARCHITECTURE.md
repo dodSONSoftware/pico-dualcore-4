@@ -1,5 +1,20 @@
 # Rebuilt Dual-Core Architecture
 
+## Hardware detection
+
+The firmware explicitly identifies the hardware at startup using `os.uname().machine`.
+
+- Raspberry Pi Pico W: `RPI_PICO_W with RP2040` → canonical type `pico_w`, heap reserve 64 KiB
+- Raspberry Pi Pico 2 W: `RPI_PICO2_W with RP2350` → canonical type `pico_2_w`, heap reserve 128 KiB
+- Unsupported hardware raises a clear `RuntimeError` during startup
+
+The hardware module provides:
+- Canonical hardware type identifiers (`HARDWARE_TYPE_PICO_W`, `HARDWARE_TYPE_PICO_2_W`)
+- Board-specific minimum free-heap reserves (`PICO_W_MIN_FREE_HEAP_BYTES`, `PICO_2_W_MIN_FREE_HEAP_BYTES`)
+- Detection function `detect_hardware()` returning immutable result dict
+
+See `hardware.py` for implementation details.
+
 ## Ownership invariants
 
 1. Core 0 exclusively owns the complete network stack: `network.WLAN`, CYW43 networking, IP/DNS, sockets, MQTT, QoS 1, subscriptions, reconnect, UTC acquisition, reboot, and QoS 1 network probes for startup verification.
