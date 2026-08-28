@@ -83,7 +83,7 @@ def main():
     import _thread
     from core1 import core1_main
 
-    _thread.start_new_thread(core1_main, (intercore, core1_config, boot_ticks_ms))
+    _thread.start_new_thread(core1_main, (intercore, core1_config, boot_ticks_ms, _runtime_id()))
     core1_config = None
     print("[INFO] Core 1 started after Wi-Fi + MQTT")
 

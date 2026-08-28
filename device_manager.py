@@ -104,6 +104,10 @@ class ManagedDevice:
         if self.state == DEVICE_STATE_READY:
             snapshot["sensor_type"] = self.sensor_type
 
+        # Add optional fields if present
+        if self.name is not None:
+            snapshot["name"] = self.name
+
         # Add age fields if now_ms is provided
         if now_ms is not None:
             snapshot["last_read_age_ms"] = None

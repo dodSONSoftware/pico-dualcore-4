@@ -337,7 +337,7 @@ class Core0:
         envelope["runtime_id"] = self._runtime_id
         if "uptime_ms" not in envelope:
             envelope["uptime_ms"] = self._uptime_ms()
-        if "timestamp" not in envelope:
+        if "timestamp" not in envelope or envelope["timestamp"] is None:
             envelope["timestamp"] = self._current_utc_timestamp()
         envelope["firmware_version"] = FIRMWARE_VERSION
         envelope["message_schema_version"] = MESSAGE_SCHEMA_VERSION

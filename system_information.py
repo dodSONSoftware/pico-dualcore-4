@@ -80,7 +80,7 @@ class SystemInformation:
         if utc is not None:
             start_time = format_utc_epoch_ms(utc.get("runtime_start_epoch_ms"))
         return {
-            "read_loop_sec": self._config["read_loop_sec"],
+            "read_loop_sec": self._config["read_loop_sec"] if self._config is not None else None,
             "start_time": start_time,
         }
 

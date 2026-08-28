@@ -48,12 +48,23 @@ class OutboundQueue:
         self._serialization_rejected = 0
         self._oversized_rejected = 0
 
+    def _topic_for_kind(self, kind):
+        """Return the MQTT topic for a given kind."""
+        if kind == KIND_TELEMETRY:
+            return "iot/v3/telemetry"
+        if kind == KIND_COMMAND_RESPONSE:
+            return "iot/v3/command-response"
+        raise ValueError("Unsupported outbound message kind: {}".format(kind))
+
     def _evict_oldest_by_priority_locked(self, retention_priority):
         for index, entry in enumerate(self._queue):
             if entry["retention_priority"] == retention_priority:
                 evicted = self._queue.pop(index)
                 self._messages_evicted += 1
-                if evicted["kind"] == KIND_TELEMETRY:
+                # Check if evicted message is telemetry based on kind or topic
+                is_telemetry = (evicted.get("kind") == KIND_TELEMETRY) or \
+                               (evicted.get("topic") == self._topic_for_kind(KIND_TELEMETRY))
+                if is_telemetry:
                     self._telemetry_evicted += 1
                 return True
         return False
