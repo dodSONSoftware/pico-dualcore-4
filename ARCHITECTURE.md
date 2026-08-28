@@ -40,6 +40,41 @@ Core 1 -> Core 0. Contains only data intended for MQTT.
 - The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40.
 - An in-flight QoS 1 entry counts toward the configured capacity but is never evicted.
 
+#### Pre-serialized message storage
+
+Messages are fully validated, serialized to JSON, UTF-8 encoded, and size-checked before admission:
+
+```
+message created
+    ↓
+validate JSON-safe values (dict, list, tuple, str, int, float, bool, None)
+    ↓
+serialize to JSON
+    ↓
+encode UTF-8
+    ↓
+validate maximum payload size (MAX_OUTBOUND_MESSAGE_BYTES = 128KB)
+    ↓
+admit serialized bytes to outbound queue
+    ↓
+later MQTT publish uses stored bytes for envelope construction
+```
+
+After this change, any message present in the outbound queue is guaranteed to be:
+- JSON-safe (only supported value types)
+- Valid JSON-serializable
+- UTF-8 encoded
+- Within the configured application payload limit
+
+The queue entry stores:
+- `kind`: message kind (TELEMETRY, COMMAND_RESPONSE)
+- `retention_priority`: numeric priority for eviction
+- `payload_bytes`: pre-serialized, UTF-8 encoded JSON payload
+
+The original message dictionary is not retained after queue admission. Any mutations to the original message after `put()` returns `True` have no effect on the queued payload.
+
+Validation failures (unsupported value types, non-string keys, non-finite floats) raise a `ValueError` immediately. Oversized messages are silently rejected without affecting queue state.
+
 ### 2. `event_queue`
 
 Core 0 -> Core 1. Contains private discrete commands/events.

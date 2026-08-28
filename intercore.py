@@ -24,8 +24,8 @@ class OutboundQueue:
     """Core 1 -> Core 0 queue for MQTT-bound messages only.
 
     Hard ownership rule:
-    Once put() succeeds, the message object and everything reachable from it
-    are immutable. The producer must never mutate it again.
+    Once put() succeeds, the message bytes are immutable. The queue stores
+    pre-serialized, UTF-8 encoded payload bytes.
 
     Retention rule:
     Lower numeric retention priorities are more important. When capacity is
@@ -45,6 +45,8 @@ class OutboundQueue:
         self._messages_evicted = 0
         self._telemetry_evicted = 0
         self._messages_rejected = 0
+        self._serialization_rejected = 0
+        self._oversized_rejected = 0
 
     def _evict_oldest_by_priority_locked(self, retention_priority):
         for index, entry in enumerate(self._queue):
@@ -57,7 +59,11 @@ class OutboundQueue:
         return False
 
     def put(self, kind, message, retention_priority):
-        """Admit one immutable MQTT-bound message.
+        """Admit one MQTT-bound message after validation, serialization, and encoding.
+
+        The message is validated, serialized to JSON, UTF-8 encoded, and size-checked
+        before admission. The queue stores the final payload bytes, not the original
+        dictionary.
 
         When full, compare the incoming priority with the least-important
         queued priority (highest numeric value):
@@ -81,6 +87,30 @@ class OutboundQueue:
                 )
             )
 
+        # Validate, serialize, and encode before queue admission
+        from message_serializer import (
+            serialize_and_validate_message,
+            MessageTooLargeError,
+            UnsupportedValueError,
+            NonStringKeyError,
+            NonFiniteFloatError,
+            SerializationError,
+        )
+        try:
+            payload_bytes = serialize_and_validate_message(message)
+        except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
+            # Validation errors are raised immediately
+            raise ValueError("Message validation failed: {}".format(err))
+        except MessageTooLargeError as err:
+            # Oversized messages are rejected (do not affect queue state)
+            self._oversized_rejected += 1
+            return False
+        except SerializationError as err:
+            # Other serialization errors (e.g., JSON encoding issues)
+            # are rejected without affecting queue state
+            self._serialization_rejected += 1
+            return False
+
         with self._lock:
             occupied = len(self._queue) + (1 if self._in_flight is not None else 0)
             if occupied >= self._max_entries:
@@ -100,7 +130,7 @@ class OutboundQueue:
             entry = {
                 "kind": kind,
                 "retention_priority": retention_priority,
-                "message": message,
+                "payload_bytes": payload_bytes,
             }
             self._queue.append(entry)
 
@@ -140,6 +170,8 @@ class OutboundQueue:
                 "messages_evicted": self._messages_evicted,
                 "telemetry_evicted": self._telemetry_evicted,
                 "messages_rejected": self._messages_rejected,
+                "serialization_rejected": self._serialization_rejected,
+                "oversized_rejected": self._oversized_rejected,
             }
 
 

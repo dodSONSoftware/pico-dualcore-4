@@ -88,12 +88,24 @@ class Core0:
         if not self._pending_connection_logs:
             return
 
-        entry = {
-            "topic": self._config["mqtt_topic_log"],
-            "message": self._pending_connection_logs[0],
-        }
-        self._publish_entry(entry)
-        self._pending_connection_logs.pop(0)
+        # For connection logs, we use the pre-serialized message approach
+        from message_serializer import serialize_and_validate_message, MessageTooLargeError
+        message = self._pending_connection_logs[0]
+        try:
+            payload_bytes = serialize_and_validate_message(message)
+            entry = {
+                "topic": self._config["mqtt_topic_log"],
+                "payload_bytes": payload_bytes,
+                "kind": KIND_TELEMETRY,  # Use telemetry kind for topic lookup
+            }
+            self._publish_entry(entry)
+        except Exception as err:
+            # Log serialization failures but still remove the log from the queue
+            # to prevent infinite retry loop
+            print("[DEBUG] Connection log failed: {}".format(err))
+        finally:
+            # Always remove the log from the queue to prevent infinite retry
+            self._pending_connection_logs.pop(0)
 
     def _on_mqtt_message(self, topic, payload):
         """Handle subscribed MQTT traffic on Core 0."""
@@ -303,7 +315,20 @@ class Core0:
         raise ValueError("Unsupported outbound message kind: {}".format(kind))
 
     def _make_envelope(self, entry, sequence):
-        source = entry["message"]
+        """Build envelope from pre-serialized message bytes.
+
+        The queue stores the message as pre-serialized bytes. This method
+        deserializes the bytes to build the envelope, then returns the envelope
+        dict which will be serialized for MQTT publication.
+
+        Handles both MicroPython (bytes require decode) and CPython (bytes work directly).
+        """
+        payload = entry["payload_bytes"]
+        if isinstance(payload, bytes):
+            payload_str = payload.decode("utf-8")
+        else:
+            payload_str = payload
+        source = json.loads(payload_str)
         envelope = {}
         for key, value in source.items():
             envelope[key] = value
@@ -320,8 +345,18 @@ class Core0:
         return envelope
 
     def _publish_entry(self, entry):
+        """Publish one MQTT entry using pre-serialized message bytes.
+
+        The queue stores the message as pre-serialized bytes. At publish time,
+        we build the envelope from the message and serialize the envelope.
+        The pre-serialized message is validated, JSON-safe, and UTF-8 encoded
+        at queue admission time.
+        """
         sequence = self._next_sequence
-        encoded = json.dumps(self._make_envelope(entry, sequence))
+        # Build envelope from the pre-serialized message bytes
+        envelope = self._make_envelope(entry, sequence)
+        # Serialize the envelope for MQTT publication
+        encoded = json.dumps(envelope)
         topic = entry.get("topic")
         if topic is None:
             topic = self._topic_for_kind(entry["kind"])
