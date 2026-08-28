@@ -70,7 +70,7 @@ def _collect_system_information_full(system_information):
     return system_info
 
 
-def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_manager, startup_duration_ms):
+def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_manager, config, startup_duration_ms, system_information=None):
     """Build the system_startup_completed log message.
 
     The payload must include all envelope fields since Core 0's _make_envelope
@@ -85,17 +85,30 @@ def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_mana
         boot_ticks_ms: Monotonic timestamp at firmware boot
         runtime_id: Unique runtime identifier
         device_manager: DeviceManager instance
+        config: Core 1 configuration for MQTT topics
         startup_duration_ms: Duration of startup in milliseconds
+        system_information: Optional SystemInformation instance with device_manager set
     """
     # Use provided source
 
+    # Get MQTT topics from config for subscriptions
+    mqtt_topics = []
+    if config is not None:
+        mqtt_topics = [
+            config.get("mqtt_topic_command", "iot/v3/command"),
+            config.get("mqtt_topic_info_response", "iot/v3/info-response"),
+        ]
+
     # Build startup summary
     startup_summary = {
-        "duration_ms": startup_duration_ms,
+        "uptime": startup_duration_ms,
         "hardware": {"status": "ready"},
         "wifi": {"status": "ready"},
         "mqtt": {"status": "ready"},
-        "subscriptions": {"status": "ready"},
+        "subscriptions": {
+            "status": "ready",
+            "topics": mqtt_topics,
+        },
         "utc": {"status": "synchronized"},
         "core_0": {"status": "running"},
         "core_1": {"status": "running"},
@@ -125,7 +138,11 @@ def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_mana
     startup_summary["failed_devices"] = failed_devices
 
     # Collect full system information
-    system_info = _collect_system_information_full(SystemInformation(intercore, None))
+    # Use provided system_information if available (with device_manager set),
+    # otherwise create a new one for host-side testing
+    if system_information is None:
+        system_information = SystemInformation(intercore, config)
+    system_info = _collect_system_information_full(system_information)
 
     # Build the complete message with envelope fields
     # Note: Core 0 will add sequence and may add timestamp/uptime_ms if missing
@@ -557,7 +574,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         # Build and queue the one-time startup log
         startup_log_message = _build_startup_log(
-            intercore, source, boot_ticks_ms, runtime_id, device_manager, startup_duration_ms
+            intercore, source, boot_ticks_ms, runtime_id, device_manager, config, startup_duration_ms, system_information
         )
 
         # Attempt to queue the startup log with INFO priority

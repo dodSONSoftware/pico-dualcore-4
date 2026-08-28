@@ -177,11 +177,17 @@ def test_build_startup_log_structure():
             "message": "System startup completed",
             "data": {
                 "startup": {
-                    "duration_ms": 5000,
+                    "uptime": 5000,
                     "hardware": {"status": "ready"},
                     "wifi": {"status": "ready"},
                     "mqtt": {"status": "ready"},
-                    "subscriptions": {"status": "ready"},
+                    "subscriptions": {
+                        "status": "ready",
+                        "topics": [
+                            "iot/v3/command",
+                            "iot/v3/info-response",
+                        ],
+                    },
                     "utc": {"status": "synchronized"},
                     "core_0": {"status": "running"},
                     "core_1": {"status": "running"},
