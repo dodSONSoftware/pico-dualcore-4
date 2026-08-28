@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "micropython": {
+      "command": "node",
+      "args": [
+        "/home/worker/Documents/code/sensor-services/sensors-services-and-webapps/sensor-code/wikis/micropython-mcp/src/server.js"
+      ],
+      "cwd": "/home/worker/Documents/code/sensor-services/sensors-services-and-webapps/sensor-code/wikis/micropython-mcp"
+    }
+  }
+}

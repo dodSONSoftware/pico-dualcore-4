@@ -123,6 +123,45 @@ class Mqtt:
             self.mark_disconnected()
             raise
 
+    def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):
+        """Publish one QoS 1 message with a specific packet ID and wait for matching PUBACK.
+
+        Args:
+            topic: MQTT topic
+            message: Message body
+            packet_id: Specific packet ID to use
+            timeout_ms: Optional timeout in milliseconds
+
+        Returns True if PUBACK received with matching ID, False on timeout/error.
+        """
+        if not self.is_connected():
+            raise OSError("MQTT is not connected")
+
+        try:
+            # Pass timeout to mqtt_client's publish method
+            self._client.publish(topic, message, qos=1, packet_id=packet_id, timeout_ms=timeout_ms)
+            return True
+        except MemoryError:
+            raise
+        except Exception as err:
+            if DEBUG:
+                print("[DEBUG] QoS 1 publish with packet_id {} failed: {}".format(packet_id, err))
+            self.mark_disconnected()
+            return False
+
+    def get_next_packet_id(self):
+        """Get the next packet ID to use for QoS 1 messages.
+
+        Uses the client's current PID and increments it.
+        """
+        if self._client is None:
+            return 1
+        # Increment and wrap at 65535
+        pid = self._client.pid + 1
+        if pid > 65535:
+            pid = 1
+        return pid
+
     def status(self):
         return {
             "connected": self.is_connected(),

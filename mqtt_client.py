@@ -114,7 +114,17 @@ class MQTTClient:
     def ping(self):
         self.sock.write(b"\xc0\0")
 
-    def publish(self, topic, msg, retain=False, qos=0):
+    def publish(self, topic, msg, retain=False, qos=0, packet_id=None, timeout_ms=None):
+        """Publish one or more application messages.
+
+        Args:
+            topic: Topic string
+            msg: Message bytes or string
+            retain: Retain flag
+            qos: Quality of Service (0, 1, or 2)
+            packet_id: Optional packet ID for QoS 1/2. If None, auto-increment.
+            timeout_ms: Optional timeout in milliseconds for QoS 1 PUBACK wait.
+        """
         pkt = bytearray(b"\x30\0\0\0")
         pkt[0] |= qos << 1 | retain
         sz = 2 + len(topic) + len(msg)
@@ -131,12 +141,25 @@ class MQTTClient:
         self.sock.write(pkt, i + 1)
         self._send_str(topic)
         if qos > 0:
-            self.pid += 1
-            pid = self.pid
+            # Use provided packet_id or auto-increment
+            if packet_id is None:
+                self.pid += 1
+                pid = self.pid
+            else:
+                pid = packet_id
             struct.pack_into("!H", pkt, 0, pid)
             self.sock.write(pkt, 2)
         self.sock.write(msg)
         if qos == 1:
+            # Set timeout if specified
+            if timeout_ms is not None:
+                try:
+                    timeout_sec = timeout_ms / 1000.0
+                    self.sock.settimeout(timeout_sec)
+                except MemoryError:
+                    raise
+                except Exception:
+                    pass
             while 1:
                 op = self.wait_msg()
                 if op == 0x40:
@@ -145,6 +168,9 @@ class MQTTClient:
                     rcv_pid = self.sock.read(2)
                     rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
                     if pid == rcv_pid:
+                        # Update pid for next auto-increment
+                        if packet_id is None:
+                            self.pid = pid
                         return
         elif qos == 2:
             assert 0

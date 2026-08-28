@@ -11,6 +11,7 @@
   "mqtt_broker_response_timeout_sec": 4,
   "datetime_sync_interval_min": 60,
   "network_snapshot_interval_sec": 5,
+  "network_probe_timeout_sec": 5,
   "max_outbound_queue_entries": 16,
   "max_intercore_event_entries": 4,
   "mqtt_topic_telemetry": "iot/v3/telemetry",
@@ -19,6 +20,7 @@
   "mqtt_topic_command_response": "iot/v3/command-response",
   "mqtt_topic_info_request": "iot/v3/info-request",
   "mqtt_topic_info_response": "iot/v3/info-response",
+  "mqtt_topic_network_probe": "iot/v3/network_probe",
   "wifi_reconnect_delays_sec": [ 5, 5, 5, 5, 10, 10, 20, 20, 40, 40 ],
   "mqtt_reconnect_delays_sec": [ 3, 3, 3, 5, 5, 5, 10, 10, 20, 20, 40, 40 ],
   "devices": [

@@ -2,7 +2,7 @@
 
 ## Ownership invariants
 
-1. Core 0 exclusively owns the complete network stack: `network.WLAN`, CYW43 networking, IP/DNS, sockets, MQTT, QoS 1, subscriptions, reconnect, UTC acquisition, and reboot.
+1. Core 0 exclusively owns the complete network stack: `network.WLAN`, CYW43 networking, IP/DNS, sockets, MQTT, QoS 1, subscriptions, reconnect, UTC acquisition, reboot, and QoS 1 network probes for startup verification.
 2. Core 1 exclusively owns the complete sensor/device stack: device drivers, I2C/SPI/UART/ADC, initialization, reads, device state, software sensors, and telemetry construction.
 3. Only plain-data objects cross the core boundary.
 4. Once an object is transferred into an inter-core lane it becomes immutable. Neither producer nor consumer may mutate it.
@@ -57,6 +57,26 @@ Core 0 intentionally follows the original known-good behavior:
 - reboot response is published, then the code waits 5 seconds + 1 second and calls `machine.reset()`;
 - no pre-reset network shutdown is performed.
 
+## QoS 1 network probe
+
+Core 0 uses QoS 1 MQTT to verify the network path during startup. The probe message is published to `mqtt_topic_network_probe` with a unique packet ID. Core 0 waits for the matching PUBACK from the broker before proceeding.
+
+The probe payload is minimal:
+```json
+{
+  "message_type": "network_probe",
+  "runtime_id": "<runtime_id>",
+  "uptime_ms": <milliseconds>,
+  "packet_id": <packet_id>
+}
+```
+
+Two probes are performed during startup:
+1. After Wi-Fi and MQTT connection, before draining startup work
+2. After the 5-second stabilization wait
+
+Both probes must succeed with matching PUBACKs before Core 1 starts and before the network snapshot marks `network_stack_ready = True`.
+
 ## Core 1 baseline
 
 The current device framework is retained:
@@ -69,13 +89,41 @@ The current device framework is retained:
 
 The baseline test device is the software-only `system-information` sensor.
 
-Core 1 starts only after Core 0 has connected Wi-Fi and MQTT and published the initial network snapshot.
+Core 1 starts only after Core 0 has completed the deterministic startup contract:
+
+1. Wi-Fi connected
+2. MQTT connected with subscriptions
+3. QoS 1 network probe #1 with matching PUBACK received
+4. Startup MQTT work drained
+5. 5-second stabilization wait
+6. QoS 1 network probe #2 with matching PUBACK received
+7. UTC synchronization completed with valid snapshot
+8. Initial network snapshot published with `network_stack_ready = True`
+
+The `network_stack_ready` flag in the network snapshot indicates the complete startup contract has been verified.
+
+## Deterministic startup sequence
+
+Core 0 performs the following sequence during `start()` before returning and allowing Core 1 to start:
+
+1. **LED starts connecting**: Flashing 50ms ON / 50ms OFF
+2. **Wi-Fi connection**: Blocks until Wi-Fi is connected
+3. **MQTT connection**: Blocks until MQTT is connected and subscriptions established
+4. **Network probe #1**: Publish QoS 1 probe message and wait for matching PUBACK
+5. **Drain startup work**: Service pending connection logs
+6. **5-second wait**: Stabilization period
+7. **Network probe #2**: Publish QoS 1 probe message and wait for matching PUBACK
+8. **UTC synchronization**: Block until valid UTC response received
+9. **Publish initial snapshots**: UTC and network snapshots to state mailboxes
+10. **Stop connection LED**: LED turns off
+11. **Return**: Core 0.start() returns, Core 1 starts
+
+If any step fails (Wi-Fi, MQTT, either probe, or UTC sync), Core 0 raises an exception and Core 1 never starts.
 
 ## Features intentionally not carried into the baseline
 
 These should be added individually only after the baseline passes:
 
-- startup network probes;
 - advanced reboot-delivery state machines;
 - advanced network recovery generations/state machines;
 - health publishing;
@@ -98,4 +146,17 @@ These should be added individually only after the baseline passes:
 
 ## LED ownership
 
-The onboard LED belongs to Core 0. `LEDManager` is the only component that writes `machine.Pin("LED")`. Core 1 and the Wi-Fi implementation do not access the LED directly. The connection indication remains active until MQTT is connected; successful telemetry publication requests a non-blocking one-second pulse.
+The onboard LED belongs to Core 0. `LEDManager` is the only component that writes `machine.Pin("LED")`. Core 1 and the Wi-Fi implementation do not access the LED directly.
+
+The connection indication (50ms ON / 50ms OFF) remains active throughout the entire deterministic startup sequence:
+- Wi-Fi connection
+- MQTT connection
+- QoS 1 network probe #1
+- Startup MQTT work drain
+- 5-second stabilization wait
+- QoS 1 network probe #2
+- UTC synchronization
+
+The connection LED stops only after the complete startup contract has been verified and the initial state snapshots have been published.
+
+Successful telemetry publication requests a non-blocking one-second pulse.

@@ -29,6 +29,7 @@ _REQUIRED_KEYS = (
     "mqtt_broker_response_timeout_sec",
     "datetime_sync_interval_min",
     "network_snapshot_interval_sec",
+    "network_probe_timeout_sec",
     "max_outbound_queue_entries",
     "max_intercore_event_entries",
     "mqtt_topic_telemetry",
@@ -37,6 +38,7 @@ _REQUIRED_KEYS = (
     "mqtt_topic_command_response",
     "mqtt_topic_info_request",
     "mqtt_topic_info_response",
+    "mqtt_topic_network_probe",
     "wifi_reconnect_delays_sec",
     "mqtt_reconnect_delays_sec",
 )
@@ -150,6 +152,7 @@ def load_config(path="config.json"):
         "mqtt_topic_command_response",
         "mqtt_topic_info_request",
         "mqtt_topic_info_response",
+        "mqtt_topic_network_probe",
     ):
         _require_non_empty_string(config, key)
 
@@ -162,6 +165,7 @@ def load_config(path="config.json"):
         "mqtt_broker_response_timeout_sec",
         "datetime_sync_interval_min",
         "network_snapshot_interval_sec",
+        "network_probe_timeout_sec",
         "max_outbound_queue_entries",
         "max_intercore_event_entries",
     ):
@@ -211,6 +215,8 @@ def split_config(config):
         "mqtt_broker_response_timeout_sec": config["mqtt_broker_response_timeout_sec"],
         "datetime_sync_interval_min": config["datetime_sync_interval_min"],
         "network_snapshot_interval_sec": config["network_snapshot_interval_sec"],
+        "network_probe_timeout_sec": config["network_probe_timeout_sec"],
+        "mqtt_topic_network_probe": config["mqtt_topic_network_probe"],
     }
 
     core1 = {
