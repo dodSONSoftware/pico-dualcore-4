@@ -139,14 +139,19 @@ def _reload_core1_under_fakes():
     module already cached (possibly imported under host or other-test
     stand-ins) is reloaded in dependency order before core1 itself.
     """
+    # Reload order follows the import dependency chain (a module must be
+    # reloaded before the module that binds from it, or the binder keeps a
+    # stale reference -- e.g. device_manager would keep an old create_device
+    # and instances would be built from a stale driver class).
     names = (
         "hardware",
         "system_information",
-        "device_manager",
-        "device_factory",
         "devices",
         "devices.system_information",
         "devices.system_information.system_information_device",
+        "device_factory",
+        "device_manager",
+        "uptime",
         "core1",
     )
     for name in names[:-1]:

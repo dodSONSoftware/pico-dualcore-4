@@ -187,7 +187,7 @@ def test_build_startup_log_structure():
             "message": "System startup completed",
             "data": {
                 "startup": {
-                    "uptime": 5000,
+                    "duration_ms": 5000,
                     "hardware": {"status": "ready"},
                     "wifi": {"status": "ready"},
                     "mqtt": {"status": "ready"},
@@ -228,6 +228,59 @@ def test_build_startup_log_structure():
     assert entry["kind"] == KIND_LOG, "Queue entry should use the log kind"
     assert "topic" not in entry, "Queue entry must not carry a hardcoded topic"
     assert entry["retention_priority"] == RETENTION_PRIORITY_INFO, "Queue entry should have INFO priority"
+
+
+def test_startup_summary_uses_explicit_duration_ms():
+    """The startup summary names its duration explicitly (duration_ms).
+
+    Drives the real _build_startup_log and verifies the ambiguous 'uptime' key
+    is gone from the startup summary, while the envelope keeps device uptime as
+    'uptime_ms'.
+    """
+    sys.modules['machine'] = MagicMock()
+    sys.modules['gc'] = MagicMock()
+    sys.modules['os'] = MagicMock()
+    sys.modules['sys'] = MagicMock()
+    sys.modules['debug'] = MagicMock()
+    sys.modules['debug'].DEBUG = False
+
+    import core1
+
+    class MockDeviceManager:
+        def get_status_snapshot(self, now_ms=None):
+            return {
+                "devices": {"configured": 1, "active": 1, "initialization_failed": 0},
+                "device_status": [],
+            }
+
+    class MockInterCore:
+        def __init__(self):
+            self.state_mailboxes = MagicMock()
+            self.outbound_queue = MagicMock()
+
+    # core1 may already be imported under a host time lacking MicroPython
+    # ticks_*; point its time at a MicroPython-style fake for the call only.
+    saved_time = core1.time
+    core1.time = MagicMock(ticks_ms=lambda: 6000)
+    try:
+        payload = core1._build_startup_log(
+            MockInterCore(),
+            "192.168.1.100",
+            boot_ticks_ms=1000,
+            runtime_id="rt-test",
+            device_manager=MockDeviceManager(),
+            config=_base_config(),
+            startup_duration_ms=12782,
+            system_information=MagicMock(),
+        )
+    finally:
+        core1.time = saved_time
+
+    startup = payload["payload"]["data"]["startup"]
+    assert startup["duration_ms"] == 12782
+    assert "uptime" not in startup
+    # The envelope still carries device uptime under its explicit key.
+    assert payload["uptime_ms"] == 12782
 
 
 def test_split_config_core1_does_not_include_source():

@@ -7,6 +7,7 @@ import os
 # Canonical hardware type identifiers
 HARDWARE_TYPE_PICO_W = "pico_w"
 HARDWARE_TYPE_PICO_2_W = "pico_2_w"
+HARDWARE_TYPE_UNKNOWN = "unknown"
 
 # Board-specific minimum free-heap reserves (bytes)
 PICO_W_MIN_FREE_HEAP_BYTES = 64 * 1024   # 65,536 bytes
@@ -23,6 +24,33 @@ _PICO_2_W_MACHINE_PATTERNS = (
     "Raspberry Pi Pico 2 W with RP2350",
     "RPI_PICO2_W with RP2350",
 )
+
+
+def classify_machine(machine_name):
+    """
+    Classify a machine string into its canonical board result.
+
+    This is the single source of truth for mapping a machine string to a
+    hardware type and the board-specific minimum free-heap reserve.
+
+    Returns a dict with:
+        hardware_type: canonical type ("pico_w", "pico_2_w", or "unknown")
+        minimum_free_heap_bytes: board reserve, or None when unknown
+    """
+    if machine_name in _PICO_W_MACHINE_PATTERNS:
+        return {
+            "hardware_type": HARDWARE_TYPE_PICO_W,
+            "minimum_free_heap_bytes": PICO_W_MIN_FREE_HEAP_BYTES,
+        }
+    if machine_name in _PICO_2_W_MACHINE_PATTERNS:
+        return {
+            "hardware_type": HARDWARE_TYPE_PICO_2_W,
+            "minimum_free_heap_bytes": PICO_2_W_MIN_FREE_HEAP_BYTES,
+        }
+    return {
+        "hardware_type": HARDWARE_TYPE_UNKNOWN,
+        "minimum_free_heap_bytes": None,
+    }
 
 
 def detect_hardware():
@@ -44,23 +72,16 @@ def detect_hardware():
     except Exception:
         raise RuntimeError("Unable to read machine identifier")
 
-    # Classify the hardware based on the machine string
-    if machine_name in _PICO_W_MACHINE_PATTERNS:
-        return {
-            "hardware_type": HARDWARE_TYPE_PICO_W,
-            "machine": machine_name,
-            "minimum_free_heap_bytes": PICO_W_MIN_FREE_HEAP_BYTES,
-        }
+    # Classify via the shared policy, then fail startup on unknown hardware.
+    result = classify_machine(machine_name)
+    if result["hardware_type"] == HARDWARE_TYPE_UNKNOWN:
+        raise RuntimeError("Unsupported hardware: {}".format(machine_name))
 
-    if machine_name in _PICO_2_W_MACHINE_PATTERNS:
-        return {
-            "hardware_type": HARDWARE_TYPE_PICO_2_W,
-            "machine": machine_name,
-            "minimum_free_heap_bytes": PICO_2_W_MIN_FREE_HEAP_BYTES,
-        }
-
-    # Unsupported hardware - fail startup explicitly
-    raise RuntimeError("Unsupported hardware: {}".format(machine_name))
+    return {
+        "hardware_type": result["hardware_type"],
+        "machine": machine_name,
+        "minimum_free_heap_bytes": result["minimum_free_heap_bytes"],
+    }
 
 
 def is_supported_hardware():

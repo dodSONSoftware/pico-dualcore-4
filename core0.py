@@ -10,6 +10,7 @@ from debug import DEBUG
 from intercore import KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG, KIND_TELEMETRY
 from message_protocol import format_utc_epoch_ms
 from mqtt import Mqtt
+from uptime import create_uptime_state, current_uptime_ms
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 from wifi import Wifi
 
@@ -30,7 +31,7 @@ class Core0:
         self._intercore = intercore
         self._config = config
         self._runtime_id = runtime_id
-        self._boot_ticks_ms = boot_ticks_ms
+        self._uptime_state = create_uptime_state(boot_ticks_ms)
         self._led_manager = led_manager
 
         self._wifi = Wifi(
@@ -54,7 +55,7 @@ class Core0:
         self._network_stack_ready = False
 
     def _uptime_ms(self):
-        return time.ticks_diff(time.ticks_ms(), self._boot_ticks_ms)
+        return current_uptime_ms(self._uptime_state)
 
     def _current_utc_timestamp(self):
         snapshot = self._utc_snapshot

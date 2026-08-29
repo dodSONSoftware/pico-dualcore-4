@@ -27,6 +27,7 @@ from intercore import (
 )
 from message_protocol import format_utc_epoch_ms, is_json_safe
 from system_information import SystemInformation, SYSTEM_INFORMATION_SECTIONS
+from uptime import create_uptime_state, current_uptime_ms
 
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 from message_serializer import (
@@ -77,8 +78,10 @@ def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_mana
 
     # Build startup summary. Subscription readiness is reported without topic
     # names: topic ownership belongs to Core 0 (message kind only crosses cores).
+    # The startup duration is named explicitly (duration_ms) so it carries its
+    # units and is not confused with the envelope's device-uptime (uptime_ms).
     startup_summary = {
-        "uptime": startup_duration_ms,
+        "duration_ms": startup_duration_ms,
         "hardware": {"status": "ready"},
         "wifi": {"status": "ready"},
         "mqtt": {"status": "ready"},
@@ -168,9 +171,9 @@ def _try_queue_startup_log(intercore, source, message, retention_priority):
     )
 
 
-def _message_time(intercore, boot_ticks_ms):
+def _message_time(intercore, uptime_state):
     now_ticks = time.ticks_ms()
-    uptime_ms = time.ticks_diff(now_ticks, boot_ticks_ms)
+    uptime_ms = current_uptime_ms(uptime_state)
 
     snapshot = intercore.state_mailboxes.get_utc_snapshot()
     if snapshot is None:
@@ -181,7 +184,7 @@ def _message_time(intercore, boot_ticks_ms):
     return uptime_ms, timestamp
 
 
-def _build_command_response(intercore, boot_ticks_ms, event, success, data=None, error=None):
+def _build_command_response(intercore, uptime_state, event, success, data=None, error=None):
     payload = {
         "command_id": event.get("command_id"),
         "command": event.get("command"),
@@ -193,7 +196,7 @@ def _build_command_response(intercore, boot_ticks_ms, event, success, data=None,
     else:
         payload["error"] = error
 
-    uptime_ms, timestamp = _message_time(intercore, boot_ticks_ms)
+    uptime_ms, timestamp = _message_time(intercore, uptime_state)
     return {
         "kind": KIND_COMMAND_RESPONSE,
         "message": {
@@ -213,7 +216,7 @@ def _try_queue_response(intercore, response):
     )
 
 
-def _process_intercore_event(intercore, boot_ticks_ms):
+def _process_intercore_event(intercore, uptime_state):
     event = intercore.event_queue.take()
     if event is None:
         return None
@@ -221,7 +224,7 @@ def _process_intercore_event(intercore, boot_ticks_ms):
     # Baseline rebuild intentionally implements no Core 1 commands yet.
     return _build_command_response(
         intercore,
-        boot_ticks_ms,
+        uptime_state,
         event,
         False,
         error={
@@ -231,11 +234,11 @@ def _process_intercore_event(intercore, boot_ticks_ms):
     )
 
 
-def _handle_device_result(intercore, config, boot_ticks_ms, result):
+def _handle_device_result(intercore, config, uptime_state, result):
     status = result["status"]
 
     if status == DEVICE_RESULT_TELEMETRY:
-        uptime_ms, timestamp = _message_time(intercore, boot_ticks_ms)
+        uptime_ms, timestamp = _message_time(intercore, uptime_state)
         message = {
             "message_type": "telemetry",
             "uptime_ms": uptime_ms,
@@ -268,17 +271,21 @@ def _handle_device_result(intercore, config, boot_ticks_ms, result):
         return
 
     if status == DEVICE_RESULT_REINITIALIZATION_FAILED:
-        print("[WARNING] Core 1 device reinitialization failed: {}: {}".format(
-            result["device_id"], result.get("error")
-        ))
+        # device_manager flags which reinitialization failures should warn: the
+        # first for a device, not the repeats. Default to logging so a missing
+        # field never silences a genuine failure.
+        if result.get("log_failure_warning", True):
+            print("[WARNING] Core 1 device reinitialization failed: {}: {}".format(
+                result["device_id"], result.get("error")
+            ))
 
 
-def _build_health_payload(intercore, boot_ticks_ms, source, config, runtime_id, system_information):
+def _build_health_payload(intercore, uptime_state, source, config, runtime_id, system_information):
     """Build the health payload from shared state snapshots.
 
     Args:
         intercore: InterCore bus instance
-        boot_ticks_ms: Monotonic timestamp at firmware boot
+        uptime_state: Accumulated uptime state (see uptime.py)
         source: Device source identifier (from network snapshot)
         config: Core 1 configuration
         runtime_id: Unique runtime identifier
@@ -288,7 +295,7 @@ def _build_health_payload(intercore, boot_ticks_ms, source, config, runtime_id, 
         dict: Health message payload with status and diagnostic fields
     """
     now_ms = time.ticks_ms()
-    uptime_ms = time.ticks_diff(now_ms, boot_ticks_ms)
+    uptime_ms = current_uptime_ms(uptime_state)
 
     # Get network snapshot (from Core 0)
     network_snapshot = intercore.state_mailboxes.get_network_snapshot()
@@ -452,7 +459,7 @@ def _try_queue_health_message(intercore, message, runtime_id):
     )
 
 
-def _try_queue_health_message_intercore(intercore, boot_ticks_ms, source, config, runtime_id, system_information):
+def _try_queue_health_message_intercore(intercore, uptime_state, source, config, runtime_id, system_information):
     """Build health payload and attempt to queue it.
 
     Only generates health message if network stack is ready.
@@ -460,7 +467,7 @@ def _try_queue_health_message_intercore(intercore, boot_ticks_ms, source, config
 
     Args:
         intercore: InterCore bus instance
-        boot_ticks_ms: Monotonic timestamp at firmware boot
+        uptime_state: Accumulated uptime state (see uptime.py)
         source: Device source identifier
         config: Core 1 configuration
         runtime_id: Unique runtime identifier
@@ -480,7 +487,7 @@ def _try_queue_health_message_intercore(intercore, boot_ticks_ms, source, config
         return
 
     # Build health payload
-    health_payload = _build_health_payload(intercore, boot_ticks_ms, source, config, runtime_id, system_information)
+    health_payload = _build_health_payload(intercore, uptime_state, source, config, runtime_id, system_information)
     if health_payload is None:
         return
 
@@ -500,6 +507,13 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
     try:
         print("[INFO] Core 1 starting")
 
+        # Accumulated uptime: every ticks_diff compares recent samples, so
+        # uptime stays correct across a tick-counter wrap on long runs.
+        # boot_ticks_ms anchors this boot-lifetime uptime only; periodic
+        # scheduling anchors to normal_runtime_start_ticks_ms (captured
+        # after startup-log admission, below).
+        uptime_state = create_uptime_state(boot_ticks_ms)
+
         system_information = SystemInformation(intercore, config)
         device_manager = DeviceManager(config, system_information=system_information)
         system_information.set_device_manager(device_manager)
@@ -515,7 +529,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 print("[DEBUG] Core 1 init attempt: {}".format(item))
 
         # Calculate startup duration
-        startup_duration_ms = time.ticks_diff(time.ticks_ms(), boot_ticks_ms)
+        startup_duration_ms = current_uptime_ms(uptime_state)
 
         # Get source from network snapshot
         network_snapshot = intercore.state_mailboxes.get_network_snapshot()
@@ -545,6 +559,17 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         print("[INFO] Startup log admitted to outbound queue")
 
+        # The single normal-runtime scheduling anchor, captured exactly once,
+        # immediately after system_startup_completed is admitted. All
+        # periodic Core 1 work (telemetry and health) derives its fixed
+        # boundaries from this moment -- not from boot_ticks_ms (which
+        # remains the boot-lifetime reference for uptime and startup-duration
+        # measurement) and not from when startup merely completed. A Wi-Fi or
+        # MQTT reconnect, a UTC resynchronization, a device reinitialization,
+        # or a queue drain must never re-capture this anchor; only a true
+        # reboot -- a new runtime with a new runtime_id -- creates a new one.
+        normal_runtime_start_ticks_ms = time.ticks_ms()
+
         # Store hardware info in state mailboxes (from system_information)
         try:
             hardware = system_information.get_machine()
@@ -556,18 +581,21 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # Register initial Core 1 activity
         intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
 
-        # Health scheduler anchored to boot_ticks_ms: fixed uptime-based
-        # boundaries every health_interval_sec from boot (e.g. a 60s interval
-        # means 60, 120, 180 seconds of uptime), independent of when startup
-        # completed. No immediate health message is emitted at startup.
+        # Health scheduler anchored to the shared normal-runtime anchor:
+        # fixed boundaries every health_interval_sec from normal-runtime
+        # start (a 60s interval means +60s, +120s, +180s relative to the
+        # anchor). Independent of the telemetry scheduler: the two share
+        # the epoch, not an execution dependency. No immediate health
+        # message is emitted at startup.
         health_interval_ms = config["health_interval_sec"] * 1000
-        next_health_ms = time.ticks_add(boot_ticks_ms, health_interval_ms)
+        next_health_ms = time.ticks_add(normal_runtime_start_ticks_ms, health_interval_ms)
 
         now_ms = time.ticks_ms()
 
-        # Boundaries already passed while startup was running are skipped,
-        # never replayed: health is current-state data, not historical
-        # telemetry. Advance to the next future boundary.
+        # Boundaries already passed (only possible if scheduler initialization
+        # was delayed by more than a full interval) are skipped, never
+        # replayed: health is current-state data, not historical telemetry.
+        # Advance to the next future boundary.
         while time.ticks_diff(now_ms, next_health_ms) >= 0:
             next_health_ms = time.ticks_add(next_health_ms, health_interval_ms)
 
@@ -575,9 +603,11 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         activity_interval_ms = 5000
         next_activity_ms = time.ticks_add(now_ms, activity_interval_ms)
 
-        # Now that the startup log is admitted, telemetry can begin
+        # Now that the startup log is admitted, telemetry can begin. The
+        # telemetry scheduler shares the same normal-runtime anchor as the
+        # health scheduler but keeps its own independent deadline.
         read_loop_ms = config["read_loop_sec"] * 1000
-        next_read_ms = time.ticks_add(now_ms, read_loop_ms)
+        next_read_ms = time.ticks_add(normal_runtime_start_ticks_ms, read_loop_ms)
 
         pending_command_response = None
 
@@ -586,7 +616,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 if _try_queue_response(intercore, pending_command_response):
                     pending_command_response = None
             else:
-                pending_command_response = _process_intercore_event(intercore, boot_ticks_ms)
+                pending_command_response = _process_intercore_event(intercore, uptime_state)
                 if pending_command_response is not None:
                     if _try_queue_response(intercore, pending_command_response):
                         pending_command_response = None
@@ -595,9 +625,13 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             if time.ticks_diff(now_ms, next_read_ms) >= 0:
                 for managed_device in device_manager.get_active_devices():
                     result = device_manager.process_device(managed_device)
-                    _handle_device_result(intercore, config, boot_ticks_ms, result)
+                    _handle_device_result(intercore, config, uptime_state, result)
 
-                next_read_ms = time.ticks_add(now_ms, read_loop_ms)
+                # Advance from the previous scheduled deadline -- not from
+                # the actual execution time -- so per-iteration processing
+                # delay cannot accumulate into drift: boundaries stay fixed
+                # at anchor + n * read_loop_ms.
+                next_read_ms = time.ticks_add(next_read_ms, read_loop_ms)
                 gc.collect()
 
             # Register Core 1 activity periodically (every 5 seconds)
@@ -607,12 +641,13 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
             # Health boundary reached: emit at most one current health
             # report (skipped entirely during a network outage), then advance
-            # to the next boot-relative boundary. Advancing from the old
-            # deadline -- not from now -- keeps the cadence aligned to the
-            # boot-based boundaries and avoids cumulative drift; missed
-            # boundaries are skipped, never replayed as catch-up reports.
+            # to the next normal-runtime-relative boundary. Advancing from
+            # the old deadline -- not from now -- keeps the cadence aligned
+            # to the anchor-based boundaries and avoids cumulative drift;
+            # missed boundaries are skipped, never replayed as catch-up
+            # reports.
             if time.ticks_diff(now_ms, next_health_ms) >= 0:
-                _try_queue_health_message_intercore(intercore, boot_ticks_ms, source, config, runtime_id, system_information)
+                _try_queue_health_message_intercore(intercore, uptime_state, source, config, runtime_id, system_information)
                 while time.ticks_diff(now_ms, next_health_ms) >= 0:
                     next_health_ms = time.ticks_add(next_health_ms, health_interval_ms)
 

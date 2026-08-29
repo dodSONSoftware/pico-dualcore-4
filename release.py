@@ -22,6 +22,7 @@ REQUIRED_FILES = {
     "mqtt.py",
     "mqtt_client.py",
     "system_information.py",
+    "uptime.py",
     "device_manager.py",
     "device_factory.py",
     "led_manager.py",

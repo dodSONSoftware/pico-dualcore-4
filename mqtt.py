@@ -205,17 +205,15 @@ class Mqtt:
         self._touch()
 
     def get_next_packet_id(self):
-        """Get the next packet ID to use for QoS 1 messages.
+        """Advance and return the next packet ID to use for a QoS 1 message.
 
-        Uses the client's current PID and increments it.
+        Delegates to the client's single increment helper so the 1..65535 wrap
+        is defined in exactly one place. Advancing (not peeking) means the ID
+        is consumed, so the next auto-increment cannot reuse it.
         """
         if self._client is None:
             return 1
-        # Increment and wrap at 65535
-        pid = self._client.pid + 1
-        if pid > 65535:
-            pid = 1
-        return pid
+        return self._client.next_packet_id()
 
     def status(self):
         return {

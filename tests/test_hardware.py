@@ -181,55 +181,109 @@ class TestMachinePatterns:
         assert "RPI_PICO2_W with RP2350" in hardware._PICO_2_W_MACHINE_PATTERNS
 
 
-class TestSystemInformationHardware:
-    """Test system_information.py hardware classification._classify_hardware helper."""
+class TestClassifyMachine:
+    """Test the shared machine-string -> board classification policy in hardware.py."""
 
-    def test_classify_hardware_pico_w(self):
-        """Verify _classify_hardware classifies Pico W correctly."""
-        intercore = MockInterCore()
-        config = MockConfig()
-        sys_info = SystemInformation(intercore, config)
+    def test_classify_machine_pico_w(self):
+        """Pico W machine string classifies to pico_w with its 64 KiB reserve."""
+        result = hardware.classify_machine("Raspberry Pi Pico W with RP2040")
 
-        result = sys_info._classify_hardware("Raspberry Pi Pico W with RP2040")
+        assert result == {
+            "hardware_type": "pico_w",
+            "minimum_free_heap_bytes": 65536,
+        }
 
-        assert result == ("pico_w", 65536)
+    def test_classify_machine_pico_2_w(self):
+        """Pico 2 W machine string classifies to pico_2_w with its 128 KiB reserve."""
+        result = hardware.classify_machine("Raspberry Pi Pico 2 W with RP2350")
 
-    def test_classify_hardware_pico_2_w(self):
-        """Verify _classify_hardware classifies Pico 2 W correctly."""
-        intercore = MockInterCore()
-        config = MockConfig()
-        sys_info = SystemInformation(intercore, config)
+        assert result == {
+            "hardware_type": "pico_2_w",
+            "minimum_free_heap_bytes": 131072,
+        }
 
-        result = sys_info._classify_hardware("Raspberry Pi Pico 2 W with RP2350")
+    def test_classify_machine_unknown(self):
+        """An unrecognized machine string classifies to unknown with no reserve."""
+        result = hardware.classify_machine("UNKNOWN_BOARD")
 
-        assert result == ("pico_2_w", 131072)
+        assert result == {
+            "hardware_type": "unknown",
+            "minimum_free_heap_bytes": None,
+        }
 
-    def test_classify_hardware_unknown(self):
-        """Verify _classify_hardware handles unknown hardware."""
-        intercore = MockInterCore()
-        config = MockConfig()
-        sys_info = SystemInformation(intercore, config)
+    def test_classify_machine_pico_w_old_format(self):
+        """Pico W old-format machine string classifies correctly."""
+        result = hardware.classify_machine("RPI_PICO_W with RP2040")
 
-        result = sys_info._classify_hardware("UNKNOWN_BOARD")
+        assert result == {
+            "hardware_type": "pico_w",
+            "minimum_free_heap_bytes": 65536,
+        }
 
-        assert result == ("unknown", None)
+    def test_classify_machine_pico_2_w_old_format(self):
+        """Pico 2 W old-format machine string classifies correctly."""
+        result = hardware.classify_machine("RPI_PICO2_W with RP2350")
 
-    def test_classify_hardware_pico_w_old_format(self):
-        """Verify _classify_hardware classifies Pico W with old format string."""
-        intercore = MockInterCore()
-        config = MockConfig()
-        sys_info = SystemInformation(intercore, config)
+        assert result == {
+            "hardware_type": "pico_2_w",
+            "minimum_free_heap_bytes": 131072,
+        }
 
-        result = sys_info._classify_hardware("RPI_PICO_W with RP2040")
 
-        assert result == ("pico_w", 65536)
+class TestGetMachineConsumesSharedClassifier:
+    """system_information.get_machine() must report the shared classifier's result."""
 
-    def test_classify_hardware_pico_2_w_old_format(self):
-        """Verify _classify_hardware classifies Pico 2 W with old format string."""
-        intercore = MockInterCore()
-        config = MockConfig()
-        sys_info = SystemInformation(intercore, config)
+    def _system_information(self):
+        return SystemInformation(MockInterCore(), MockConfig())
 
-        result = sys_info._classify_hardware("RPI_PICO2_W with RP2350")
+    def test_get_machine_pico_2_w(self, monkeypatch):
+        import system_information
 
-        assert result == ("pico_2_w", 131072)
+        monkeypatch.setattr(
+            system_information.os,
+            "uname",
+            lambda: type("Uname", (), {
+                "machine": "Raspberry Pi Pico 2 W with RP2350",
+                "version": "v1.23.0",
+            })(),
+        )
+
+        result = self._system_information().get_machine()
+
+        assert result["hardware_type"] == "pico_2_w"
+        assert result["minimum_free_heap_bytes"] == 131072
+        assert result["machine"] == "Raspberry Pi Pico 2 W with RP2350"
+
+    def test_get_machine_pico_w(self, monkeypatch):
+        import system_information
+
+        monkeypatch.setattr(
+            system_information.os,
+            "uname",
+            lambda: type("Uname", (), {
+                "machine": "Raspberry Pi Pico W with RP2040",
+                "version": "v1.23.0",
+            })(),
+        )
+
+        result = self._system_information().get_machine()
+
+        assert result["hardware_type"] == "pico_w"
+        assert result["minimum_free_heap_bytes"] == 65536
+
+    def test_get_machine_unknown(self, monkeypatch):
+        import system_information
+
+        monkeypatch.setattr(
+            system_information.os,
+            "uname",
+            lambda: type("Uname", (), {
+                "machine": "UNKNOWN_BOARD",
+                "version": "v1.23.0",
+            })(),
+        )
+
+        result = self._system_information().get_machine()
+
+        assert result["hardware_type"] == "unknown"
+        assert result["minimum_free_heap_bytes"] is None

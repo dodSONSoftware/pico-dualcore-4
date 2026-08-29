@@ -219,6 +219,8 @@ def make_core0():
     def _make():
         _FAKE_TIME.now_ms = 0
         _install_mocks()
+        # core0 imports uptime; rebind its time to the fake before reloading core0.
+        importlib.reload(importlib.import_module("uptime"))
         core0_mod = importlib.import_module("core0")
         importlib.reload(core0_mod)
 

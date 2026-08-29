@@ -473,7 +473,14 @@ class DeviceManager:
         # All reinitialization attempts exhausted
         # The device remains in reinitialize_pending state for retry on next cycle
         # Do NOT mark for removal - transient failures should be retried
-        # Return failure with flag=False; caller will log and set flag if needed
+        #
+        # A device that keeps failing reinit warns on every cycle. Log the first
+        # failure and suppress the repeats: the flag lives on the ManagedDevice
+        # and is cleared by a successful reinit (clear_reinitialize_pending), so
+        # an independent later failure logs again.
+        log_failure_warning = not managed_device.should_suppress_reinit_failure()
+        if log_failure_warning:
+            managed_device.set_reinit_failure_logged()
 
         return {
             "status": DEVICE_RESULT_REINITIALIZATION_FAILED,
@@ -483,7 +490,7 @@ class DeviceManager:
             "consecutive_read_failures": managed_device.consecutive_read_failures,
             "total_read_failures": managed_device.total_read_failures,
             "reinitialization_attempts_used": attempts_used,
-            "reinit_failure_logged": False,  # Flag not yet set; caller handles logging
+            "log_failure_warning": log_failure_warning,
             "remove": False,
         }
 

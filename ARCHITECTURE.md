@@ -14,7 +14,7 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
   "timestamp": "<utc-iso8601>",
   "source": "<device-source>",
   "message_type": "health",
-  "firmware_version": "0.4.4",
+  "firmware_version": "0.4.6",
   "payload": {
     "status": "healthy|degraded",
     "degraded_reasons": ["<reason1>", "<reason2>"],
@@ -107,7 +107,7 @@ Health messages are only generated when:
 1. Network snapshot is available (`network_stack_ready = True`)
 2. MQTT is connected (`mqtt_connected = True`)
 
-This prevents health messages from accumulating during MQTT outages. A boundary skipped during an outage is never replayed after recovery: the scheduler waits for the next boot-relative boundary.
+This prevents health messages from accumulating during MQTT outages. A boundary skipped during an outage is never replayed after recovery: the scheduler waits for the next normal-runtime-relative boundary.
 
 ## Hardware detection
 
@@ -118,9 +118,10 @@ The firmware explicitly identifies the hardware at startup using `os.uname().mac
 - Unsupported hardware raises a clear `RuntimeError` during startup
 
 The hardware module provides:
-- Canonical hardware type identifiers (`HARDWARE_TYPE_PICO_W`, `HARDWARE_TYPE_PICO_2_W`)
+- Canonical hardware type identifiers (`HARDWARE_TYPE_PICO_W`, `HARDWARE_TYPE_PICO_2_W`, `HARDWARE_TYPE_UNKNOWN`)
 - Board-specific minimum free-heap reserves (`PICO_W_MIN_FREE_HEAP_BYTES`, `PICO_2_W_MIN_FREE_HEAP_BYTES`)
-- Detection function `detect_hardware()` returning immutable result dict
+- `classify_machine()` — the single source of truth mapping a machine string to canonical type and board heap reserve. Both `detect_hardware()` (startup) and `SystemInformation.get_machine()` (telemetry/health) classify through it, so they can never disagree.
+- Detection function `detect_hardware()` returning an immutable result dict, failing fast on unknown hardware
 
 See `hardware.py` for implementation details.
 
@@ -253,6 +254,13 @@ The CONNPACK advertises `mqtt_keepalive_sec` (30 s default), so the broker disco
 - `ping()` waits for PINGRESP with a bounded timeout (capped at 10 s) so a dead link surfaces as a disconnect within one interval instead of blocking the run loop.
 - A failed PINGREQ marks the connection disconnected; `_recover_network_if_needed` reconnects.
 
+## MQTT wire client
+
+Two invariants in `mqtt_client.py` keep the bounded-wait contract sound (every blocking broker wait must be deadline-limited, so a dead link surfaces as a failure instead of stalling the run loop):
+
+- **One packet ID helper**: `next_packet_id()` advances the counter and wraps 65535 back to 1 (0 is reserved). QoS 1 publish, subscribe, and `Mqtt.get_next_packet_id()` (the network-probe path) all draw IDs from this single helper, so every message takes the next of 1, 2, ..., 65535, 1, 2, ... and the wrap is defined in exactly one place.
+- **Socket mode is the caller's contract**: `wait_msg()` reads in whatever socket mode it finds and never changes it. Blocking callers (publish, ping, subscribe) bound their waits with their own timeout, so a link that stalls after the first frame byte surfaces as a timeout instead of blocking forever. `check_msg()` is the poller: it switches the socket non-blocking and restores blocking mode on the way out — in MicroPython `setblocking(True)` is identical to `settimeout(None)`, so a poll that left the socket non-blocking, or a wait that forced blocking mid-read, would silently clear the next operation's timeout.
+
 ## Network recovery
 
 When the run loop detects a lost link (Wi-Fi down, or MQTT down with Wi-Fi up), `_recover_network_if_needed` re-establishes it before any further processing. A blackholed broker (TCP up, but no PINGRESP or PUBACK ever arrives) is detected the same way: every blocking broker wait is bounded, so a dead link surfaces as a failed ping or publish, marks the connection disconnected, and recovery fires on the next loop iteration.
@@ -286,6 +294,7 @@ The current device framework is retained:
 - `SystemInformationDevice`
 - initialization retry behavior
 - read-failure/reinitialization behavior
+- reinitialization failure logging: the first reinit failure for a device is warned once; repeats while the same device stays in pending-reinit are suppressed until a successful reinit clears the flag, so a stuck device warns once instead of every cycle (a later independent failure warns again)
 
 The baseline test device is the software-only `system-information` sensor.
 
@@ -309,6 +318,7 @@ Core 1's first action, before the first telemetry, is a one-time `system_startup
 The payload carries:
 
 - Startup status per subsystem (hardware, Wi-Fi, MQTT, subscriptions, UTC, Core 0, Core 1). Subscription readiness is reported without topic names — topic ownership stays in Core 0.
+- Startup duration as `duration_ms` — explicitly named so it is not confused with the envelope's device uptime (`uptime_ms`).
 - Device counts (configured / ready / initialization-failed) plus per-device ready and failed lists (device, name, sensor type).
 - A full `system_information` snapshot (all sections collected through `SystemInformation`).
 
@@ -320,14 +330,32 @@ Core 1 refreshes the `core_1_activity_ms` state mailbox on a 5-second deadline, 
 
 Health messages report `core_1_active` as true while the stamp age is within threshold (`3 × read_loop_sec`, minimum 60 seconds), and add `core_1_inactive` to the degradation reasons when it is exceeded.
 
+## Normal-runtime scheduling anchor
+
+All periodic Core 1 runtime work — telemetry and health — is scheduled from one shared epoch, `normal_runtime_start_ticks_ms`, captured exactly once, immediately after `system_startup_completed` has been successfully admitted to the outbound queue. No periodic work begins before that admission.
+
+- `boot_ticks_ms` remains the boot-lifetime reference: firmware uptime (`uptime_ms`), startup duration, and lifecycle diagnostics are all measured from boot. It is no longer the scheduling origin for periodic work.
+- `normal_runtime_start_ticks_ms` anchors periodic operational work: telemetry boundaries at `anchor + n × read_loop_sec`, health boundaries at `anchor + n × health_interval_sec`. With a 13-second startup, `read_loop_sec = 20`, and `health_interval_sec = 60`, telemetry falls at 33/53/73/93... seconds of uptime and health at 73/133/193/253... seconds of uptime.
+- The two schedulers share the epoch but stay independent: each keeps its own deadline, neither derives its deadline from the other, and neither may fire the other. When both are due (health interval is a multiple of the read loop), both process normally through the existing outbound queue at their existing priorities (TELEMETRY = 40, HEALTH = 70).
+- The anchor is captured once per runtime. A Wi-Fi reconnect, MQTT reconnect, UTC resynchronization, device reinitialization, or queue drain must never re-capture it. Only a true reboot — a new `runtime_id` and new `boot_ticks_ms` — creates a new anchor.
+- Deadlines advance from the previous scheduled deadline (deadline + interval), never from the moment a message was actually generated, so per-iteration processing delay cannot accumulate into drift.
+
+## Uptime accounting
+
+Every message envelope carries `uptime_ms`, and both cores compute it from `uptime.py`: each core seeds a small state from `boot_ticks_ms` and advances it by the delta between consecutive recent samples (`create_uptime_state` / `current_uptime_ms`). No code diffs the original boot tick against the current tick in one step — `time.ticks_diff()` is only guaranteed correct within half a tick period, so the one-shot form wraps on a long-running device while the accumulated form stays monotonic and correct across a wrap.
+
+## Periodic Telemetry
+
+Telemetry cadence is anchored to the normal-runtime anchor: `read_loop_sec` defines fixed boundaries at `anchor + n × read_loop_sec` (a 20-second read loop produces boundaries at +20s, +40s, +60s relative to normal-runtime start). Telemetry remains historical sensor/runtime data: during an MQTT outage it may continue to enter the bounded outbound queue under the existing retention/eviction rules. Telemetry generation is gated on startup-log admission — no telemetry before `system_startup_completed` is admitted.
+
 ## Periodic Health Messages
 
-Core 1 generates health messages on a boot-anchored cadence: `health_interval_sec` defines fixed uptime-based boundaries counted from firmware boot (a 60-second interval produces boundaries at 60, 120, 180, 240 seconds of uptime, ...), independent of when startup completes. No immediate health message is generated after `system_startup_completed`. The health message contains current-state diagnostic fields without turning the payload into a full system information report.
+Core 1 generates health messages on a normal-runtime-anchored cadence: `health_interval_sec` defines fixed boundaries counted from `normal_runtime_start_ticks_ms` (a 60-second interval produces boundaries at +60s, +120s, +180s, +240s relative to normal-runtime start), independent of when startup merely completed and independent of the telemetry scheduler. No immediate health message is generated after `system_startup_completed`. The health message contains current-state diagnostic fields without turning the payload into a full system information report.
 
 ### Scheduling
 
-- **Boot-anchored**: the first deadline is `boot_ticks_ms + health_interval_sec`, never derived from the moment startup completed.
-- **Missed boundaries are skipped, never replayed**: boundaries that elapsed during startup (or any bounded delay) are not emitted as catch-up reports; the scheduler advances directly to the next future boundary.
+- **Normal-runtime-anchored**: the first deadline is `normal_runtime_start_ticks_ms + health_interval_sec`, where the anchor is captured once, immediately after successful `system_startup_completed` admission.
+- **Missed boundaries are skipped, never replayed**: boundaries that elapsed during any bounded delay (e.g. a stalled loop) are not emitted as catch-up reports; the scheduler advances directly to the next future boundary.
 - **No cumulative drift**: after a boundary the deadline advances from the previous deadline (deadline + interval), not from the moment the message was actually generated, so per-iteration processing delay cannot accumulate.
 - **At most one message per boundary**: when a boundary is due, at most one current-state health report is emitted (subject to the generation rules below), then the deadline advances past any elapsed boundaries.
 
@@ -346,6 +374,7 @@ Core 1 generates health messages on a boot-anchored cadence: `health_interval_se
 
 3. **Monotonic time calculations**:
    - All age calculations use `time.ticks_diff()` for monotonic elapsed time
+   - Uptime since boot is accumulated from deltas between recent samples (`uptime.py`), never as a single `ticks_diff(now, boot)` — that one-shot form is only guaranteed within half a tick period and wraps on long-running devices
    - UTC sync age: integer division of milliseconds by 1000
 
 4. **Queue pressure threshold**: 75% utilization (`outbound_queue_utilization_percent >= 75`)

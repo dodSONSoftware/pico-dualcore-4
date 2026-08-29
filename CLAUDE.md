@@ -67,6 +67,7 @@ Core 1 periodically publishes health messages to `iot/v3/health` containing diag
 | `config.py` | Configuration loading and validation |
 | `hardware.py` | Hardware detection (Pico W/Pico 2 W) |
 | `system_information.py` | System state snapshots (Core 1 data source) |
+| `uptime.py` | Accumulated boot-relative uptime (tick-wrap-safe; both cores) |
 | `message_serializer.py` | JSON-safe message validation and serialization |
 | `mqtt.py` | Core 0 MQTT lifecycle (QoS 1, keepalive PINGREQ, subscriptions) |
 | `mqtt_client.py` | Low-level MQTT wire protocol client |
@@ -163,7 +164,7 @@ Check for:
 
 - `tests/` contains host-side unit tests
 - Run with: `python -m pytest tests/`
-- The suite covers core-ownership boundaries (AST checks), config validation, inter-core bus semantics, health payloads, boot-anchored health scheduling, MQTT keepalive, UTC synchronization, network recovery, and the Core 1 liveness heartbeat
+- The suite covers core-ownership boundaries (AST checks), config validation, inter-core bus semantics, health payloads, normal-runtime-anchored telemetry/health scheduling, MQTT keepalive, UTC synchronization, network recovery, and the Core 1 liveness heartbeat
 - Hardware testing requires an actual Pico device
 
 ## Hardware Notes
@@ -174,6 +175,8 @@ Check for:
 - Never call `machine.reset()` from Core 1
 
 ## Version History
+
+- **0.4.6**: One shared normal-runtime scheduling epoch for all periodic Core 1 work. `normal_runtime_start_ticks_ms` is captured exactly once, immediately after `system_startup_completed` is admitted to the outbound queue; both the telemetry deadline (`anchor + n × read_loop_sec`) and the health deadline (`anchor + n × health_interval_sec`) derive their fixed boundaries from that anchor. Telemetry and health remain independent schedulers (shared epoch, no execution dependency); neither deadline derives from the other. `boot_ticks_ms` remains the boot-lifetime reference for uptime (`uptime_ms`) and startup-duration measurement only. Reconnects, UTC resyncs, and device reinitialization never reset the anchor; only a reboot creates a new one. Health outage policy is unchanged (missed intervals skipped, never replayed); telemetry outage buffering is unchanged.
 
 - **0.4.5**: Health scheduling anchored to boot time: `health_interval_sec` now defines fixed uptime-based boundaries from firmware boot (60s interval → first health at ~60s uptime, then 120s, 180s, ...). The immediate post-startup health message is removed; boundaries missed during startup or an MQTT outage are skipped, never replayed; deadlines advance from the previous boundary so processing delay cannot accumulate drift.
 

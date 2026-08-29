@@ -205,12 +205,16 @@ Health messages are controlled by:
 - `mqtt_topic_health`: MQTT topic for health messages (default: `iot/v3/health`)
 - `health_interval_sec`: Interval between health messages (default: 60 seconds)
 
+The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` from a single runtime anchor captured once, after the startup log is admitted. Telemetry shares the same anchor (`anchor + n × read_loop_sec`) but keeps its own independent scheduler. Boundaries missed during startup or an outage are skipped, never replayed, and deadlines advance from the previous deadline so processing delay cannot accumulate drift. See the scheduling sections in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ## Features
 
 - **QoS 1 MQTT**: Synchronous PUBLISH → PUBACK, one in-flight message
 - **MQTT Keepalive**: Explicit PINGREQ at keepalive/2 keeps the broker session alive
 - **Network Recovery**: Mid-run Wi-Fi/MQTT loss — including blackholed links — is detected and re-established automatically
 - **Health Messages**: Periodic diagnostic messages with status and 17+ fields
+- **Anchored Scheduling**: Telemetry and health boundaries are fixed to one shared runtime anchor captured at startup; missed boundaries are skipped, never replayed
+- **Tick-Wrap-Safe Uptime**: Uptime is accumulated from recent sample deltas, staying correct on long-running devices
 - **UTC Synchronization**: Mandatory at startup; non-blocking steady-state re-sync with deadline and retry throttling
 - **Core 1 Liveness**: Deadline-based heartbeat drives the `core_1_active` health field
 - **Startup Log**: One-time full system startup log published before telemetry
@@ -332,6 +336,7 @@ Example:
 ├── message_protocol.py # Message formatting helpers
 ├── message_serializer.py # Message validation and pre-serialization
 ├── system_information.py # System state snapshots (Core 1 data source)
+├── uptime.py            # Accumulated boot-relative uptime (tick-wrap-safe)
 ├── hardware.py        # Hardware detection (Pico W/Pico 2 W)
 ├── debug.py           # Debug print switch
 ├── release.py         # Release artifact builder
@@ -357,11 +362,11 @@ Host-side validation runs before hardware deployment:
 python -m pytest tests/
 ```
 
-See tests in [`tests/`](tests/) — covering core-ownership boundaries, configuration, inter-core bus semantics, health payloads, MQTT keepalive, UTC synchronization, network recovery, and Core 1 liveness.
+See tests in [`tests/`](tests/) — covering core-ownership boundaries, configuration, inter-core bus semantics, health payloads, normal-runtime-anchored telemetry/health scheduling, tick-wrap-safe uptime, MQTT keepalive, UTC synchronization, network recovery, and Core 1 liveness.
 
 ## Hardware Status
 
-Firmware 0.4.4 is software-tested and passes the full host-side test suite. Hardware validation on Pico W/Pico 2 W with the system-information sensor is pending.
+Firmware 0.4.6 is software-tested and passes the full host-side test suite (178 tests). Hardware validation on Pico W/Pico 2 W with the system-information sensor is pending.
 
 ## License
 

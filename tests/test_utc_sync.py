@@ -119,6 +119,8 @@ def make_core0():
         _MQTT_INSTANCE.reset_mock()
         _MQTT_INSTANCE.is_connected.return_value = True
         _install_mocks()
+        # core0 imports uptime; rebind its time to the fake before reloading core0.
+        importlib.reload(importlib.import_module("uptime"))
         importlib.reload(core0_module)
         return core0_module.Core0(
             MockInterCore(),

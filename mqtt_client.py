@@ -53,6 +53,20 @@ class MQTTClient:
                 return n
             sh += 7
 
+    def next_packet_id(self):
+        """Advance the packet ID and return it, wrapping 65535 back to 1.
+
+        MQTT packet IDs are 1..65535 (0 is reserved), so the counter wraps
+        from 65535 to 1 instead of growing unbounded. QoS 1 publish,
+        subscribe, and the network-probe path all draw from this one helper so
+        every message takes the next of 1, 2, ..., 65535, 1, 2, ... and never
+        0 or a value above 65535.
+        """
+        self.pid += 1
+        if self.pid > 65535:
+            self.pid = 1
+        return self.pid
+
     def set_callback(self, f):
         self.cb = f
 
@@ -121,15 +135,16 @@ class MQTTClient:
         Args:
             timeout_sec: Optional timeout in seconds for the PINGRESP wait.
                 When the link is dead, a bounded wait surfaces the failure
-                instead of blocking until the next publish.
+                instead of blocking until the next publish. If the timeout
+                cannot be installed, that failure propagates into the
+                recovery path rather than falling through to an unbounded
+                PINGRESP wait.
         """
         if timeout_sec is not None:
-            try:
-                self.sock.settimeout(timeout_sec)
-            except MemoryError:
-                raise
-            except Exception:
-                pass
+            # The bounded wait depends on this timeout being active, so a
+            # failed installation must not be swallowed: let it propagate
+            # into Core 0's network recovery instead of entering the wait.
+            self.sock.settimeout(timeout_sec)
         try:
             self.sock.write(b"\xc0\0")
             while 1:
@@ -174,8 +189,7 @@ class MQTTClient:
         if qos > 0:
             # Use provided packet_id or auto-increment
             if packet_id is None:
-                self.pid += 1
-                pid = self.pid
+                pid = self.next_packet_id()
             else:
                 pid = packet_id
             struct.pack_into("!H", pkt, 0, pid)
@@ -188,13 +202,10 @@ class MQTTClient:
             # the run loop indefinitely.
             timed = timeout_ms is not None
             if timed:
-                try:
-                    timeout_sec = timeout_ms / 1000.0
-                    self.sock.settimeout(timeout_sec)
-                except MemoryError:
-                    raise
-                except Exception:
-                    pass
+                # The bounded wait depends on this timeout being active, so a
+                # failed installation must not be swallowed: let it propagate
+                # into Core 0's network recovery instead of entering the wait.
+                self.sock.settimeout(timeout_ms / 1000.0)
             try:
                 while 1:
                     op = self.wait_msg()
@@ -204,9 +215,6 @@ class MQTTClient:
                         rcv_pid = self.sock.read(2)
                         rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
                         if pid == rcv_pid:
-                            # Update pid for next auto-increment
-                            if packet_id is None:
-                                self.pid = pid
                             return
             finally:
                 if timed:
@@ -222,8 +230,8 @@ class MQTTClient:
     def subscribe(self, topic, qos=0):
         assert self.cb is not None, "Subscribe callback is not set"
         pkt = bytearray(b"\x82\0\0\0")
-        self.pid += 1
-        struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, self.pid)
+        pid = self.next_packet_id()
+        struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, pid)
         # print(hex(len(pkt)), hexlify(pkt, ":"))
         self.sock.write(pkt)
         self._send_str(topic)
@@ -243,8 +251,14 @@ class MQTTClient:
     # set by .set_callback() method. Other (internal) MQTT
     # messages processed internally.
     def wait_msg(self):
+        # Read in the caller's socket mode. publish/ping/subscribe run in
+        # blocking-with-timeout mode, so every read here is bounded by their
+        # timeout and a link that stalls after the first frame byte surfaces
+        # as a timeout instead of blocking forever. check_msg() runs in
+        # non-blocking mode and restores blocking itself. wait_msg must not
+        # change the mode: setblocking(True) == settimeout(None) in
+        # MicroPython, which would silently clear the caller's timeout.
         res = self.sock.read(1)
-        self.sock.setblocking(True)
         if res is None:
             return None
         if res == b"":
@@ -280,4 +294,10 @@ class MQTTClient:
     # the same processing as wait_msg.
     def check_msg(self):
         self.sock.setblocking(False)
-        return self.wait_msg()
+        try:
+            return self.wait_msg()
+        finally:
+            # Polling must not leave the socket non-blocking: restore the
+            # blocking mode so the next operation's reads block (bounded by
+            # their own timeout) instead of returning empty immediately.
+            self.sock.setblocking(True)
