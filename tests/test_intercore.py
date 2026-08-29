@@ -23,6 +23,8 @@ sys.modules['network'] = MockNetwork()
 
 from intercore import (
     InterCore,
+    OutboundQueue,
+    DEFAULT_MAX_OUTBOUND_QUEUED_BYTES,
     KIND_TELEMETRY,
     KIND_COMMAND_RESPONSE,
     KIND_HEALTH,
@@ -37,6 +39,11 @@ from intercore import (
 
 def put(bus, kind, message, priority):
     return bus.outbound_queue.put(kind, message, priority)
+
+
+def _bytes_of(n):
+    """A payload of exactly n bytes (JSON-ish, avoids serializer overhead)."""
+    return b"{" + b"x" * (n - 2) + b"}"
 
 
 def drain(bus):
@@ -269,18 +276,44 @@ def test_nested_invalid_rejected():
         }, RETENTION_PRIORITY_TELEMETRY)
 
 
+def _message_serializing_to(total_bytes):
+    """A message whose JSON/UTF-8 serialization is exactly total_bytes long.
+
+    Measures the wrapper overhead by serializing the same shape with an empty
+    payload, then sizes the ASCII payload to hit the target exactly.
+    """
+    overhead = len(json.dumps({"id": "test", "data": ""}).encode("utf-8"))
+    assert overhead <= total_bytes
+    return {"id": "test", "data": "x" * (total_bytes - overhead)}
+
+
 def test_exact_max_size_admitted():
     """Verify a message at exactly the max size is admitted."""
-    bus = InterCore(outbound_max=2, event_max=2)
     from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
-    # Create a message that serializes to exactly MAX_OUTBOUND_MESSAGE_BYTES
-    payload = "x" * (MAX_OUTBOUND_MESSAGE_BYTES - 100)  # Adjust for JSON overhead
-    message = {"id": "test", "data": payload}
-    # This may need adjustment based on actual serialization
-    # The test is to verify the serialization and size check work together
+    message = _message_serializing_to(MAX_OUTBOUND_MESSAGE_BYTES)
+    bus = InterCore(outbound_max=2, event_max=2)
+
     admitted = put(bus, KIND_TELEMETRY, message, RETENTION_PRIORITY_TELEMETRY)
-    # We just verify the function runs without raising an exception
-    # The exact size calculation depends on JSON serialization
+    assert admitted is True
+
+    entry = bus.outbound_queue.take()
+    assert entry is not None
+    assert len(entry["payload_bytes"]) == MAX_OUTBOUND_MESSAGE_BYTES
+    assert bus.outbound_queue.complete_in_flight(entry)
+
+
+def test_one_byte_over_max_rejected():
+    """Verify a message one byte over the max size is rejected, not admitted."""
+    from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
+    message = _message_serializing_to(MAX_OUTBOUND_MESSAGE_BYTES + 1)
+    bus = InterCore(outbound_max=2, event_max=2)
+
+    admitted = put(bus, KIND_TELEMETRY, message, RETENTION_PRIORITY_TELEMETRY)
+    assert admitted is False
+
+    assert bus.outbound_queue.take() is None
+    status = bus.outbound_queue.status()
+    assert status["oversized_rejected"] == 1
 
 
 def test_oversized_rejected():
@@ -308,6 +341,102 @@ def test_status_counters_include_serialization_rejections():
     status = bus.outbound_queue.status()
     assert "serialization_rejected" in status
     assert "oversized_rejected" in status
+
+
+# --- Aggregate queued-byte budget (memory-safety boundary) ---
+
+def test_per_message_ceiling_is_mcu_scale():
+    """The per-message ceiling is at most 16 KiB (regression guard vs 128 KiB)."""
+    from message_serializer import get_max_message_bytes
+    assert 8 * 1024 <= get_max_message_bytes() <= 16 * 1024
+
+
+def test_default_byte_budget_is_mcu_scale():
+    """The default queued-byte budget is MCU-safe and holds a realistic queue."""
+    # Well under a Pico W's heap (256 KiB).
+    assert DEFAULT_MAX_OUTBOUND_QUEUED_BYTES <= 64 * 1024
+    # Comfortably holds a full queue of 16 entries at a realistic ~2 KiB each.
+    assert DEFAULT_MAX_OUTBOUND_QUEUED_BYTES >= 16 * 2 * 1024
+
+
+def test_byte_budget_limits_admission_before_count():
+    """A high-count / low-byte queue admits only until the byte budget is hit."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    # Third 40-byte entry would push to 120 > 100; same class, so evict the oldest.
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    status = bus.outbound_queue.status()
+    assert status["queued_bytes"] <= 100
+    assert status["pending"] == 2  # bounded by bytes, not by the count budget of 10
+
+
+def test_byte_budget_respected_after_eviction():
+    """Eviction frees enough bytes for the incoming entry; the budget still holds."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_HEALTH)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    # 60 + 40 already fills the budget; the next evicts the oldest (60) -> 40 + 40.
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    status = bus.outbound_queue.status()
+    assert status["queued_bytes"] <= 100
+    assert status["pending"] == 2
+    assert status["messages_evicted"] >= 1
+
+
+def test_byte_budget_less_important_rejected_without_evicting():
+    """A less-important incoming entry is rejected, not the valid entry evicted."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    # A 60-byte CRITICAL entry fills most of the budget.
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_CRITICAL)
+    # A 50-byte HEALTH entry would exceed the budget, but HEALTH (70) is less
+    # important than CRITICAL (10): reject rather than evict the critical entry.
+    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(50), RETENTION_PRIORITY_HEALTH)
+    status = bus.outbound_queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == 60
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] >= 1
+
+
+def test_byte_budget_never_evicts_for_nothing():
+    """A valid entry is not dropped to admit one that still would not fit."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_HEALTH)
+    # 150 bytes does not fit even after evicting the 60-byte entry (150 > 100).
+    # It must be rejected; the valid 60-byte entry must survive.
+    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(150), RETENTION_PRIORITY_HEALTH)
+    status = bus.outbound_queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == 60
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] >= 1
+
+
+def test_dict_path_enforces_byte_budget():
+    """put() (dict -> serialize) also enforces the queued-byte budget."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    for _ in range(20):
+        bus.outbound_queue.put(KIND_TELEMETRY, {"id": "a", "v": 1}, RETENTION_PRIORITY_TELEMETRY)
+    assert bus.outbound_queue.status()["queued_bytes"] <= 100
+
+
+def test_status_exposes_byte_budget():
+    bus = InterCore(outbound_max=4, event_max=2, outbound_max_bytes=2048)
+    status = bus.outbound_queue.status()
+    assert status["max_queued_bytes"] == 2048
+    assert status["queued_bytes"] == 0
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(256), RETENTION_PRIORITY_HEALTH)
+    assert bus.outbound_queue.status()["queued_bytes"] == 256
+
+
+def test_outbound_queue_rejects_bad_byte_budget():
+    with pytest.raises(ValueError, match="max_queued_bytes"):
+        OutboundQueue(4, 0)
+    with pytest.raises(ValueError, match="max_queued_bytes"):
+        OutboundQueue(4, True)
+    with pytest.raises(ValueError, match="max_queued_bytes"):
+        OutboundQueue(4, -1)
 
 
 def test_connection_log_like_message():

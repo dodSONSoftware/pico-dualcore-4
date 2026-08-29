@@ -44,39 +44,33 @@ class LEDManager:
         with self._lock:
             self._telemetry_ticks_remaining = _TELEMETRY_PULSE_TICKS
 
-    def _snapshot_and_advance(self):
+    def _next_output(self):
+        """Compute and advance one LED step under the lock; return None if contended."""
         if not self._lock.acquire(False):
             return None
 
         try:
             connecting = self._connecting
-            connecting_on = self._connecting_on
-            telemetry_active = self._telemetry_ticks_remaining > 0
-
             if connecting:
+                output = 1 if self._connecting_on else 0
                 self._connecting_on = not self._connecting_on
+            elif self._telemetry_ticks_remaining > 0:
+                output = 1
+            else:
+                output = 0
 
             if self._telemetry_ticks_remaining > 0:
                 self._telemetry_ticks_remaining -= 1
 
-            return connecting, connecting_on, telemetry_active
+            return output
         finally:
             self._lock.release()
 
     def _tick(self, timer):
         """Timer callback; the only code path that writes the physical LED."""
-        state = self._snapshot_and_advance()
-        if state is None:
+        output = self._next_output()
+        if output is None:
             return
-
-        connecting, connecting_on, telemetry_active = state
-
-        if connecting:
-            output = 1 if connecting_on else 0
-        elif telemetry_active:
-            output = 1
-        else:
-            output = 0
 
         if output != self._output:
             self._output = output

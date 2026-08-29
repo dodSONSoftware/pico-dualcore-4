@@ -2,9 +2,21 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
+import select
 import socket
 import struct
 from binascii import hexlify
+
+# Maximum remaining length (bytes) for an inbound MQTT packet.
+#
+# MCU-scale ceiling for the receive path (the outbound ceiling is
+# message_serializer.MAX_OUTBOUND_MESSAGE_BYTES). The inbound topics are the
+# command and info-response topics only, so every legitimate inbound message
+# is well under this limit. A broker-side bug that publishes an oversized
+# frame must fail the connection instead of letting sock.read(sz) request an
+# allocation large enough to exhaust Pico RAM (256 KiB) — no hostile traffic
+# is required for that.
+MAX_INBOUND_PACKET_BYTES = 16 * 1024
 
 
 class MQTTException(Exception):
@@ -43,6 +55,22 @@ class MQTTClient:
         self.sock.write(struct.pack("!H", len(s)))
         self.sock.write(s)
 
+    def _abort_corrupt_inbound(self, reason):
+        """Drop the connection over a corrupt inbound stream and raise.
+
+        A protocol violation or an oversized packet leaves the byte stream
+        unreadable from here on, so the socket is closed (rather than the
+        frame being buffered or drained) and the failure propagates: Mqtt
+        marks the disconnect and Core 0's recovery path reconnects.
+        """
+        try:
+            self.sock.close()
+        except MemoryError:
+            raise
+        except Exception:
+            pass
+        raise MQTTException(reason)
+
     def _recv_len(self):
         n = 0
         sh = 0
@@ -52,6 +80,14 @@ class MQTTClient:
             if not b & 0x80:
                 return n
             sh += 7
+            if sh >= 28:
+                # MQTT allows at most four remaining-length bytes; a fifth
+                # continuation byte is a protocol violation (and, on a byte
+                # stream, an unbounded length), so fail the packet instead of
+                # looping forever on reads.
+                self._abort_corrupt_inbound(
+                    "Remaining length exceeds four bytes"
+                )
 
     def next_packet_id(self):
         """Advance the packet ID and return it, wrapping 65535 back to 1.
@@ -251,13 +287,14 @@ class MQTTClient:
     # set by .set_callback() method. Other (internal) MQTT
     # messages processed internally.
     def wait_msg(self):
-        # Read in the caller's socket mode. publish/ping/subscribe run in
-        # blocking-with-timeout mode, so every read here is bounded by their
-        # timeout and a link that stalls after the first frame byte surfaces
-        # as a timeout instead of blocking forever. check_msg() runs in
-        # non-blocking mode and restores blocking itself. wait_msg must not
-        # change the mode: setblocking(True) == settimeout(None) in
-        # MicroPython, which would silently clear the caller's timeout.
+        # Read in the caller's socket mode. publish/ping/subscribe and
+        # check_msg all run in blocking-with-timeout mode, so every read here
+        # is bounded by their timeout and a link that stalls after the first
+        # frame byte surfaces as a timeout instead of blocking forever (and,
+        # crucially, a read always returns a full length instead of a short
+        # one). wait_msg must not change the mode: setblocking(True) ==
+        # settimeout(None) in MicroPython, which would silently clear the
+        # caller's timeout.
         res = self.sock.read(1)
         if res is None:
             return None
@@ -271,6 +308,16 @@ class MQTTClient:
         if op & 0xF0 != 0x30:
             return op
         sz = self._recv_len()
+        if sz > MAX_INBOUND_PACKET_BYTES:
+            # An oversized inbound packet is a broker-side fault, not a
+            # legitimate message: sock.read(sz) below would request an
+            # allocation large enough to exhaust Pico RAM. Reject it before
+            # any payload is allocated and drop the connection.
+            self._abort_corrupt_inbound(
+                "Inbound packet remaining length {} exceeds {}".format(
+                    sz, MAX_INBOUND_PACKET_BYTES
+                )
+            )
         topic_len = self.sock.read(2)
         topic_len = (topic_len[0] << 8) | topic_len[1]
         topic = self.sock.read(topic_len)
@@ -292,12 +339,31 @@ class MQTTClient:
     # Checks whether a pending message from server is available.
     # If not, returns immediately with None. Otherwise, does
     # the same processing as wait_msg.
-    def check_msg(self):
-        self.sock.setblocking(False)
+    def check_msg(self, timeout_sec):
+        # Readiness is decided with a poll, not a non-blocking read: one
+        # readable byte only means a packet has *started* arriving, and the
+        # rest of the parse must run where read(n) is guaranteed to return n
+        # bytes. Parsing in non-blocking mode is unsafe on a byte stream —
+        # MicroPython documents that read(n) may return fewer bytes than
+        # requested there — so a PUBLISH split across TCP reads would
+        # short-read its topic or payload and deliver a corrupt frame (or
+        # raise a spurious disconnect) instead of waiting for the rest of the
+        # packet.
+        poller = select.poll()
+        poller.register(self.sock, select.POLLIN)
+        if not poller.poll(0):
+            # No packet has started: return immediately, leaving the socket in
+            # whatever mode the caller left it in (the poll consumed nothing).
+            return None
+        # A packet is in flight: finish it on a blocking-with-finite-timeout
+        # socket so every read returns a full length, and a link that stalls
+        # mid-packet surfaces as a timeout (network recovery) instead of a hang
+        # or a short read.
+        self.sock.settimeout(timeout_sec)
         try:
             return self.wait_msg()
         finally:
-            # Polling must not leave the socket non-blocking: restore the
-            # blocking mode so the next operation's reads block (bounded by
-            # their own timeout) instead of returning empty immediately.
-            self.sock.setblocking(True)
+            # Restore normal blocking mode: the run loop polls on a tight
+            # cadence, so leaving a finite timeout (or a non-blocking socket)
+            # behind would corrupt the next operation's bounded wait.
+            self.sock.settimeout(None)

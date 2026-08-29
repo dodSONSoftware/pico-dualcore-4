@@ -23,6 +23,15 @@ _UTC_STARTUP_MAX_ATTEMPTS = 3
 _UTC_RETRY_INTERVAL_MS = 30000
 _UTC_PROMPT_RETRY_DELAY_MS = 500
 
+# Core 0 watchdog timeout for the Core 1 liveness heartbeat. Core 1 refreshes
+# core_1_activity_ms on a 5-second deadline (core1.py), so a stamp already
+# this old means the Core 1 thread is dead or wedged: no legitimate loop pass
+# can miss six consecutive refreshes. Deliberately conservative -- far above
+# any live-loop processing gap, yet below the 60s core_1_inactive diagnostic
+# threshold, so a dead Core 1 resets the board instead of the health stream
+# quietly stopping. Static constant; not a config key.
+_CORE_1_HEARTBEAT_STALE_TIMEOUT_MS = 30000
+
 
 class Core0:
     """Own the complete network stack and all MQTT operations."""
@@ -99,6 +108,10 @@ class Core0:
         # For connection logs, we use the pre-serialized message approach
         from message_serializer import serialize_and_validate_message, MessageTooLargeError
         message = self._pending_connection_logs[0]
+        # The message is final at this point: uptime and timestamp are the
+        # sender's to carry, and the envelope is spliced in at publish time.
+        message["uptime_ms"] = self._uptime_ms()
+        message["timestamp"] = self._current_utc_timestamp()
         try:
             payload_bytes = serialize_and_validate_message(message)
             # KIND_LOG: _publish_entry resolves the log topic via _topic_for_kind
@@ -107,6 +120,8 @@ class Core0:
                 "kind": KIND_LOG,
             }
             self._publish_entry(entry)
+        except MemoryError:
+            raise
         except Exception as err:
             # Log serialization failures but still remove the log from the queue
             # to prevent infinite retry loop
@@ -335,46 +350,44 @@ class Core0:
             return self._config["mqtt_topic_log"]
         raise ValueError("Unsupported outbound message kind: {}".format(kind))
 
-    def _make_envelope(self, entry, sequence):
-        """Build envelope from pre-serialized message bytes.
+    def _envelope_fragment(self, sequence):
+        """Serialize the five envelope members Core 0 owns on the wire.
 
-        The queue stores the message as pre-serialized bytes. This method
-        deserializes the bytes to build the envelope, then returns the envelope
-        dict which will be serialized for MQTT publication.
-
-        Handles both MicroPython (bytes require decode) and CPython (bytes work directly).
+        Returns them as JSON members without the outer braces, ready to be
+        spliced into a queued message before its closing brace. ``json.dumps``
+        escapes the string values (runtime_id, source). Senders must not carry
+        any of these keys at the top level of their message, or the wire
+        document would repeat a name.
         """
-        payload = entry["payload_bytes"]
-        if isinstance(payload, bytes):
-            payload_str = payload.decode("utf-8")
-        else:
-            payload_str = payload
-        envelope = json.loads(payload_str)
-
-        envelope["sequence"] = sequence
-        envelope["runtime_id"] = self._runtime_id
-        if "uptime_ms" not in envelope:
-            envelope["uptime_ms"] = self._uptime_ms()
-        if "timestamp" not in envelope or envelope["timestamp"] is None:
-            envelope["timestamp"] = self._current_utc_timestamp()
-        envelope["firmware_version"] = FIRMWARE_VERSION
-        envelope["message_schema_version"] = MESSAGE_SCHEMA_VERSION
-        envelope["source"] = self._config["source"]
-        return envelope
+        fragment = json.dumps({
+            "sequence": sequence,
+            "runtime_id": self._runtime_id,
+            "source": self._config["source"],
+            "firmware_version": FIRMWARE_VERSION,
+            "message_schema_version": MESSAGE_SCHEMA_VERSION,
+        })
+        return fragment[1:-1].encode("utf-8")
 
     def _publish_entry(self, entry):
-        """Publish one MQTT entry using pre-serialized message bytes.
+        """Publish one MQTT entry from its pre-serialized message bytes.
 
-        The queue stores the message as pre-serialized bytes. At publish time,
-        we build the envelope from the message and serialize the envelope.
-        The pre-serialized message is validated, JSON-safe, and UTF-8 encoded
-        at queue admission time.
+        The queue stores the message as final, pre-serialized bytes: the wire
+        frame is that same JSON object with the five Core-0-owned envelope
+        members (sequence, runtime_id, source, firmware_version,
+        message_schema_version) spliced in before its closing brace. The
+        payload is never decoded, parsed, or re-serialized here, so publishing
+        allocates only the small envelope fragment and the assembled frame
+        instead of a full decode + dict graph + re-encode of the message.
         """
         sequence = self._next_sequence
-        # Build envelope from the pre-serialized message bytes
-        envelope = self._make_envelope(entry, sequence)
-        # Serialize the envelope for MQTT publication
-        encoded = json.dumps(envelope)
+        payload = entry["payload_bytes"]
+        if not isinstance(payload, (bytes, bytearray)) or bytes(payload[-1:]) != b"}":
+            raise ValueError("queued payload must be a serialized JSON object")
+        # The queue contract allows bytes or bytearray; normalize once so the
+        # assembled frame is plain bytes (MicroPython's bytes.join is strict
+        # about item types).
+        body = payload if isinstance(payload, bytes) else bytes(payload)
+        encoded = b"".join((body[:-1], b",", self._envelope_fragment(sequence), b"}"))
         topic = entry.get("topic")
         if topic is None:
             topic = self._topic_for_kind(entry["kind"])
@@ -404,15 +417,21 @@ class Core0:
         else:
             payload["error"] = error
 
-        # Build the logical message first
+        # Build the logical message first. Uptime and timestamp are the
+        # sender's to carry (the envelope is spliced in at publish time), so
+        # they are captured at construction time, not at publish time.
         message = {
             "message_type": "command_response",
+            "uptime_ms": self._uptime_ms(),
+            "timestamp": self._current_utc_timestamp(),
             "payload": payload,
         }
 
         # Serialize and encode the message for the pre-serialized queue
         try:
             payload_bytes = serialize_and_validate_message(message)
+        except MemoryError:
+            raise
         except (MessageTooLargeError, Exception) as err:
             if DEBUG:
                 print("[DEBUG] Command response serialization failed: {}".format(err))
@@ -643,7 +662,13 @@ class Core0:
         return True
 
     def _synchronize_utc_required(self):
-        """Synchronize UTC during startup. Must succeed for startup to complete."""
+        """Run one bounded pass of startup UTC synchronization.
+
+        Returns True once a valid snapshot is acquired. Returns False after
+        _UTC_STARTUP_MAX_ATTEMPTS attempts without one, so the caller
+        (_verify_startup_contract) can re-establish the network and retry the
+        pass. A MemoryError propagates unchanged (fail-fast).
+        """
         for attempt in range(_UTC_STARTUP_MAX_ATTEMPTS):
             self._utc_send_request()
             self._utc_wait_response()
@@ -652,7 +677,7 @@ class Core0:
             # Wait before retry
             time.sleep_ms(500)
 
-        print("[ERROR] UTC synchronization failed during startup")
+        print("[WARNING] UTC synchronization pass failed after {} attempts; will re-establish and retry".format(_UTC_STARTUP_MAX_ATTEMPTS))
         return False
 
     def establish_network(self):
@@ -713,6 +738,27 @@ class Core0:
         self._led_manager.set_connecting(False)
         self._publish_network_snapshot(force=True)
 
+    def _watch_core_1_heartbeat(self):
+        """Watch Core 1's liveness heartbeat and reset the MCU when stale.
+
+        Core 1 is the heartbeat producer; Core 0 is its independent consumer.
+        A dead or wedged Core 1 cannot report its own death -- it no longer
+        builds the health message that would carry core_1_inactive -- so Core
+        0 must detect the silence and recover the whole board.
+
+        Before the first stamp exists (Core 1 has not started yet) the check
+        is a no-op, so the unbounded startup connect loops are unaffected.
+        Once a stamp exists, age beyond _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS
+        means the thread stopped refreshing and the only recovery is a reset.
+        """
+        last_activity_ms = self._intercore.state_mailboxes.get_core_1_activity_ms()
+        if last_activity_ms is None:
+            return
+        age_ms = time.ticks_diff(time.ticks_ms(), last_activity_ms)
+        if age_ms >= _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS:
+            print("[FATAL] Core 1 heartbeat stale ({} ms) - resetting".format(age_ms))
+            machine.reset()
+
     def start(self):
         """Establish Core 0 network services before Core 1 is started.
 
@@ -729,7 +775,15 @@ class Core0:
         10. Publish initial network snapshot
         11. Stop connection LED
 
-        Returns only when the entire startup contract has succeeded.
+        The connection steps (1-2) are unbounded by design. The verification
+        steps (3-7) are self-healing: a transient failure (a dropped PUBACK, a
+        brief UTC-server outage) drops the session, re-establishes the network,
+        and retries the whole verification pass instead of halting the device.
+        A MemoryError still propagates (fail-fast), so an out-of-memory device
+        is not looped.
+
+        Returns only when a complete, clean pass of the contract has succeeded;
+        Core 1 stays gated until then.
         """
         self._led_manager.set_connecting(True)
 
@@ -738,24 +792,20 @@ class Core0:
         # logging, and LED behavior stay in one place.
         self.establish_network()
 
-        # Step 3: QoS 1 network probe #1
-        if not self._perform_network_probe():
-            raise RuntimeError("Network probe #1 failed - MQTT QoS 1 path not verified")
-
-        # Step 4: Drain startup MQTT work
-        if not self._drain_startup_mqtt_work():
-            print("[WARNING] Startup MQTT work drain did not complete")
-
-        # Step 5: Wait 5 seconds for stabilization
-        time.sleep_ms(5000)
-
-        # Step 6: QoS 1 network probe #2
-        if not self._perform_network_probe():
-            raise RuntimeError("Network probe #2 failed - MQTT QoS 1 path not verified")
-
-        # Step 7: Acquire UTC (mandatory before Core 1 starts)
-        if not self._synchronize_utc_required():
-            raise RuntimeError("UTC synchronization failed during startup")
+        # Steps 3-7: Verify the QoS 1 path (two probes) and acquire UTC.
+        # Self-healing, like the connect loops above: on any verification
+        # failure, drop the (possibly wedged) MQTT session, re-establish the
+        # network, and retry the whole pass. Core 1 stays gated because
+        # start() has not returned. A MemoryError propagates out of
+        # _verify_startup_contract and out of this loop (fail-fast on OOM).
+        while True:
+            if self._verify_startup_contract():
+                break
+            delay_sec = self._config["mqtt_reconnect_delays_sec"][-1]
+            print("[WARNING] Startup verification failed; re-establishing network and retrying in {} sec".format(delay_sec))
+            time.sleep(delay_sec)
+            self._mqtt.mark_disconnected()
+            self.establish_network()
 
         # Step 8: Publish initial UTC snapshot
         self._publish_utc_snapshot()
@@ -771,6 +821,39 @@ class Core0:
 
         print("[INFO] Core 0 startup complete - network stack verified and ready")
 
+    def _verify_startup_contract(self):
+        """Run one full pass of the startup verification contract.
+
+        Contract, in order: QoS 1 network probe #1, drain startup MQTT work,
+        a 5 s stabilization wait, QoS 1 network probe #2, then UTC
+        synchronization. Returns True only when every step succeeds; returns
+        False on any probe or UTC failure so the caller can re-establish the
+        network and retry. A MemoryError propagates unchanged (fail-fast).
+        """
+        # Step 3: QoS 1 network probe #1
+        if not self._perform_network_probe():
+            print("[WARNING] Startup verification: network probe #1 failed")
+            return False
+
+        # Step 4: Drain startup MQTT work (non-fatal, matching prior behavior)
+        if not self._drain_startup_mqtt_work():
+            print("[WARNING] Startup MQTT work drain did not complete")
+
+        # Step 5: Wait 5 seconds for stabilization
+        time.sleep_ms(5000)
+
+        # Step 6: QoS 1 network probe #2
+        if not self._perform_network_probe():
+            print("[WARNING] Startup verification: network probe #2 failed")
+            return False
+
+        # Step 7: Acquire UTC (mandatory before Core 1 starts)
+        if not self._synchronize_utc_required():
+            print("[WARNING] Startup verification: UTC synchronization failed")
+            return False
+
+        return True
+
     def _publish_utc_snapshot(self):
         """Publish the current UTC snapshot to the state mailbox."""
         if self._utc_snapshot is None:
@@ -782,6 +865,11 @@ class Core0:
         poll_ms = self._config["mqtt_command_poll_ms"]
 
         while True:
+            # First each pass: a dead Core 1 wedges the whole sensor (no
+            # telemetry, no health) and cannot report itself, so Core 0
+            # resets the board before doing any other work.
+            self._watch_core_1_heartbeat()
+
             if self._pending_reboot is not None:
                 self._perform_reboot()
 

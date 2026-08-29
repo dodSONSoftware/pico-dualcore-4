@@ -418,9 +418,11 @@ def test_telemetry_delay_does_not_move_health_deadlines():
     """A late telemetry execution leaves the health schedule untouched.
 
     The first telemetry read (due at 33s uptime) takes 35s, stalling the
-    loop until ~68s uptime. Telemetry then fires its overdue boundaries in
-    sequence. Health must still land exactly on its 73s and 133s
-    anchor-based boundaries -- one per boundary, no drift, no burst.
+    loop until ~68s uptime. The scheduler skips the elapsed 33s/53s
+    boundaries and advances directly to the next future one (73s) -- it does
+    NOT replay the missed boundaries as catch-up reads. Health must still
+    land exactly on its 73s and 133s anchor-based boundaries -- one per
+    boundary, no drift, no burst.
     """
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
@@ -438,6 +440,15 @@ def test_telemetry_delay_does_not_move_health_deadlines():
 
     # The delayed telemetry fired well past its 33s boundary...
     assert telemetry_uptimes and telemetry_uptimes[0] > 33000 + LOOP_STEP_MS
+    # ...and the slow read did NOT trigger a catch-up burst: no two samples
+    # land within a burst window (a replayed boundary would fire within one or
+    # two loop steps of the slow read), the scheduler skipped straight ahead
+    # to the next future boundary (~73s, 5s after the slow read finished).
+    for a, b in zip(telemetry_uptimes, telemetry_uptimes[1:]):
+        assert b - a > 1000, (
+            "catch-up burst after the slow read: samples at {} and {} "
+            "are nearly simultaneous".format(a, b)
+        )
     # ...but the health schedule is exactly on its anchor-based grid...
     assert len(health_uptimes) == 2
     assert 73000 <= health_uptimes[0] <= 73000 + LOOP_STEP_MS

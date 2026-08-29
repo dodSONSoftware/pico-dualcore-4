@@ -19,7 +19,11 @@ class MockMachine:
 
 sys.modules['machine'] = MockMachine()
 
-from mqtt_client import MQTTClient  # noqa: E402
+from mqtt_client import (  # noqa: E402
+    MAX_INBOUND_PACKET_BYTES,
+    MQTTClient,
+    MQTTException,
+)
 from mqtt import Mqtt  # noqa: E402
 
 
@@ -48,20 +52,29 @@ class FakeTicks:
 @pytest.fixture
 def ticks(monkeypatch):
     fake = FakeTicks()
-    for name in ("ticks_ms", "ticks_diff", "ticks_add"):
+    for name in ("ticks_ms", "ticks_diff", "ticks_add", "sleep"):
         monkeypatch.setattr(real_time, name, getattr(fake, name), raising=False)
     return fake
 
 
-class HangDetected(Exception):
+@pytest.fixture
+def mock_select(monkeypatch):
+    """Route check_msg()'s readiness poll at the readiness model (see above)."""
+    import mqtt_client
+    monkeypatch.setattr(mqtt_client, "select", MockSelect)
+
+
+class HangDetected(BaseException):
     """A read would block forever (infinite blocking, no data available).
 
     Models a MicroPython socket left in blocking mode with no timeout (the
     state ``setblocking(True)`` produces) while the peer stalls: in production
     that read never returns. The host suite cannot actually hang, so the mock
-    raises a distinctive error -- a plain ``Exception``, deliberately NOT an
-    ``OSError`` -- so a test that expects a bounded timeout fails when the
-    code under test regresses to infinite blocking.
+    raises a distinctive error, deliberately NOT an ``OSError``. It derives
+    from ``BaseException`` so the code under test's ``except Exception``
+    handlers (e.g. Mqtt.connect()'s retry loop) cannot swallow it: a test
+    that expects a bounded timeout fails hard when the code under test
+    regresses to infinite blocking, even through a retry loop.
     """
     pass
 
@@ -85,8 +98,13 @@ class MockSocket:
         # When set, settimeout() raises this instead of installing a timeout,
         # so a test can model a socket/runtime error during timeout setup.
         self.settimeout_error = None
+        self.closed = False
 
     def write(self, data, size=None):
+        # MicroPython sockets accept str writes (encoded); CPython does not,
+        # so the mock encodes before storing.
+        if isinstance(data, str):
+            data = data.encode("utf-8")
         chunk = bytes(data[:size]) if size is not None else bytes(data)
         self.written += chunk
         return len(chunk)
@@ -120,8 +138,42 @@ class MockSocket:
         else:
             self.nonblocking = True
 
-    def close(self):
+    def connect(self, addr):
+        # In-memory: no transport to stall. On the real socket this call is
+        # bounded by the timeout installed before it.
         pass
+
+    def close(self):
+        self.closed = True
+
+
+class MockPoller:
+    """Models MicroPython's select.poll(): register a stream, poll(0) non-blocking.
+
+    Readiness is modeled from the MockSocket's buffer: a stream is readable
+    exactly when it still has bytes to serve — the same "a packet has started
+    arriving" condition check_msg() tests for. (The real socket object is what
+    check_msg() registers; MockSocket has no fd, so it is modeled here.)
+    """
+
+    def __init__(self):
+        self._streams = []
+
+    def register(self, obj, eventmask=None):
+        self._streams.append(obj)
+
+    def poll(self, timeout=-1):
+        return [(obj, 1) for obj in self._streams if obj.buffer]
+
+
+class MockSelect:
+    """Stand-in for the MicroPython select module behind check_msg's readiness poll."""
+
+    POLLIN = 1
+
+    @staticmethod
+    def poll():
+        return MockPoller()
 
 
 class FakeClient:
@@ -327,23 +379,69 @@ def test_subscribe_waits_for_suback_without_clearing_timeout():
     assert sock.timeout_value == 4.0
 
 
-def test_check_msg_restores_blocking_mode_after_poll():
-    """check_msg() must not leave the socket non-blocking after polling."""
+def test_check_msg_restores_blocking_mode_after_poll(mock_select):
+    """check_msg() parses a ready packet and leaves the socket in blocking mode."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     seen = []
     client.set_callback(lambda topic, msg: seen.append((topic, msg)))
 
-    # A full PUBLISH is available; check_msg polls it non-blocking.
+    # A full PUBLISH is available; the readiness poll sees it has started.
     sock = MockSocket(incoming=b"\x30\x04\x00\x01t\x78")
     client.sock = sock
 
-    client.check_msg()
+    client.check_msg(4.0)
 
     assert seen == [(b"t", b"x")]
     assert sock.buffer == b""
-    # Polling must restore the blocking mode it temporarily cleared, so the
-    # next operation's reads block (bounded by their own timeout) instead of
-    # returning empty immediately.
+    # The parse ran under a finite timeout and was restored to normal blocking
+    # mode (not non-blocking, not infinite-blocking), so the next operation's
+    # bounded wait is intact.
+    assert sock.nonblocking is False
+    assert sock.timeout_value is None
+
+
+def test_check_msg_returns_none_when_no_packet_started(mock_select):
+    """check_msg() returns None immediately when no packet has started."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+
+    sock = MockSocket(incoming=b"")  # nothing arrived
+    client.sock = sock
+
+    assert client.check_msg(4.0) is None
+
+    # The readiness poll consumed nothing and did not perturb the socket mode,
+    # so the caller's next operation still sees its own bounded wait.
+    assert seen == []
+    assert sock.buffer == b""
+    assert sock.written == b""
+    assert sock.nonblocking is False
+    assert sock.timeout_value is None
+
+
+def test_check_msg_times_out_on_stalled_packet_instead_of_short_reading(mock_select):
+    """A packet that has started but stalled must time out, not short-read.
+
+    In non-blocking mode (the old behavior) the remaining reads return b"" and
+    a corrupt empty frame is delivered to the callback. Under a finite timeout
+    (the fix) the stalled read raises a bounded error instead, surfacing into
+    network recovery.
+    """
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+
+    # PUBLISH opcode + remaining-length + 2 topic-length bytes, then the topic
+    # body itself never arrives (a link that fragmented or stalled mid-packet).
+    sock = MockSocket(incoming=b"\x30\x05\x00\x01")
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.check_msg(4.0)
+
+    # No corrupt frame was delivered, and the socket was restored to blocking.
+    assert seen == []
     assert sock.nonblocking is False
     assert sock.timeout_value is None
 
@@ -424,6 +522,170 @@ def test_subscribe_times_out_when_suback_never_arrives():
 
     with pytest.raises(OSError):
         client.subscribe(b"t", qos=1)
+
+
+# ---------------------------------------------------------------------------
+# Inbound packet size limit: an oversized broker frame must drop the
+# connection, not request a sock.read() that could exhaust Pico RAM
+#
+# A server-side bug (no hostile traffic required) can publish an oversized
+# command/info response. Before the fix, wait_msg() handed the broker's
+# remaining-length value straight to sock.read(sz). Now the packet is
+# rejected before its payload is allocated, the socket is closed, and the
+# failure surfaces into Mqtt's disconnect + Core 0's recovery path.
+# ---------------------------------------------------------------------------
+
+def test_wait_msg_rejects_oversized_inbound_packet():
+    """A PUBLISH over the limit must fail before its payload is read."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+
+    # Remaining length 32768 (> the 16 KiB limit); the bytes that "would be"
+    # the frame follow and must never be consumed, buffered, or delivered.
+    sock = MockSocket(incoming=b"\x30\x80\x80\x02" + b"\x00\x01t" + b"x" * 32760)
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.wait_msg()
+
+    # No corrupt frame reached the callback, and the dead stream was dropped
+    # so Core 0's recovery path reconnects instead of reading the garbage.
+    assert seen == []
+    assert sock.closed
+
+
+def test_wait_msg_accepts_packet_at_inbound_limit():
+    """A packet whose remaining length equals the limit is still delivered."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+
+    # Remaining length == limit: topic "t" takes 2 + 1 bytes, leaving
+    # limit - 3 payload bytes. 16384 encodes as the 4-byte varint \x80\x80\x01.
+    payload = b"x" * (MAX_INBOUND_PACKET_BYTES - 3)
+    sock = MockSocket(incoming=b"\x30\x80\x80\x01\x00\x01t" + payload)
+    client.sock = sock
+
+    client.wait_msg()
+
+    assert seen == [(b"t", payload)]
+    assert sock.closed is False
+
+
+def test_wait_msg_rejects_remaining_length_longer_than_four_bytes():
+    """More than four remaining-length bytes is a protocol violation."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+
+    # PUBLISH opcode then five continuation-length bytes: the old unbounded
+    # loop would keep reading the stream forever; the cap must fail instead.
+    sock = MockSocket(incoming=b"\x30" + b"\xff" * 5)
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.wait_msg()
+
+    # The corrupt stream was dropped the same way as an oversized one.
+    assert sock.closed
+
+
+def test_check_msg_oversized_packet_marks_disconnected(ticks, mock_select):
+    """An oversized inbound frame must drop the connection for recovery."""
+    mqtt = _mqtt(ticks)
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    sock = MockSocket(incoming=b"\x30\x80\x80\x02" + b"\x00\x01t" + b"x" * 32760)
+    client.sock = sock
+    mqtt._client = client
+    mqtt._connected = True
+
+    with pytest.raises(MQTTException):
+        mqtt.check_msg()
+
+    # The Mqtt layer marked the disconnect (Core 0's recovery reconnects)
+    # and the socket was dropped rather than read.
+    assert mqtt.is_connected() is False
+    assert mqtt._disconnect_count == 1
+    assert sock.closed
+
+
+# ---------------------------------------------------------------------------
+# Mqtt.connect() — the whole handshake is bounded by the broker response timeout
+#
+# Regression coverage for the lifecycle bug: Mqtt.connect() used to call
+# MQTTClient.connect() with no timeout, leaving the socket in infinite-
+# blocking mode, so a broker that accepted the TCP connection and then went
+# silent wedged Core 0 forever on the CONNACK or SUBACK wait. The low-level
+# unit tests above could not catch it because they install the timeout
+# manually. These drive the real Mqtt.connect() end-to-end: a link that goes
+# silent mid-handshake must fail the attempt within
+# mqtt_broker_response_timeout_sec (OSError) — never as a hang (HangDetected,
+# a BaseException that escapes Mqtt.connect()'s except Exception).
+# ---------------------------------------------------------------------------
+
+def _mock_broker_socket(monkeypatch, sock):
+    """Route MQTTClient.connect() at the in-memory broker socket."""
+    import mqtt_client
+    monkeypatch.setattr(mqtt_client.socket, "socket", lambda *a, **k: sock)
+    monkeypatch.setattr(
+        mqtt_client.socket,
+        "getaddrinfo",
+        lambda *a, **k: [(None, None, None, ("127.0.0.1", 1883))],
+    )
+
+
+def test_mqtt_connect_times_out_when_connack_never_arrives(ticks, monkeypatch):
+    """TCP connects, the broker never sends CONNACK: fail within the timeout."""
+    sock = MockSocket(incoming=b"")  # link up, then silent
+    _mock_broker_socket(monkeypatch, sock)
+    mqtt = _mqtt(ticks)
+
+    # A regression to unbounded blocking would raise HangDetected here
+    # instead of returning False.
+    assert mqtt.connect() is False
+    assert mqtt.is_connected() is False
+    assert mqtt._connect_count == 0
+
+
+def test_mqtt_connect_times_out_when_suback_never_arrives(ticks, monkeypatch):
+    """CONNACK and the first SUBACK arrive; the second SUBACK never does."""
+    connack = b"\x20\x02\x00\x00"
+    suback_first = b"\x90\x03\x00\x01\x00"  # SUBACK for pid 1 (command topic)
+    sock = MockSocket(incoming=connack + suback_first)
+    _mock_broker_socket(monkeypatch, sock)
+    mqtt = _mqtt(ticks)
+
+    # The CONNACK wait was bounded, the first SUBACK was granted, and the
+    # second SUBACK wait timed out instead of blocking forever.
+    assert mqtt.connect() is False
+    assert mqtt.is_connected() is False
+    assert mqtt._connect_count == 0
+
+
+def test_mqtt_connect_subscribes_both_topics_and_restores_blocking(ticks, monkeypatch):
+    """A complete handshake subscribes both topics and restores normal blocking."""
+    incoming = (
+        b"\x20\x02\x00\x00"       # CONNACK
+        b"\x90\x03\x00\x01\x00"   # SUBACK pid 1 (command topic)
+        b"\x90\x03\x00\x02\x00"   # SUBACK pid 2 (info response topic)
+    )
+    sock = MockSocket(incoming=incoming)
+    _mock_broker_socket(monkeypatch, sock)
+    mqtt = _mqtt(ticks)
+
+    assert mqtt.connect() is True
+    assert mqtt.is_connected() is True
+    assert mqtt._connect_count == 1
+
+    written = bytes(sock.written)
+    assert b"iot/v3/command" in written
+    assert b"iot/v3/info_response" in written
+    assert sock.buffer == b""
+    # The handshake's finite timeout is gone: the socket is back in normal
+    # blocking mode for the run loop (each later operation bounds its own
+    # wait).
+    assert sock.timeout_value is None
 
 
 # ---------------------------------------------------------------------------

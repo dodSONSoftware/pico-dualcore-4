@@ -139,15 +139,16 @@ See `hardware.py` for implementation details.
 
 Core 1 -> Core 0. Contains only data intended for MQTT.
 
-- FIFO and bounded.
+- FIFO and bounded by BOTH entry count (`max_outbound_queue_entries`) and queued payload bytes (`DEFAULT_MAX_OUTBOUND_QUEUED_BYTES`, 32 KiB) — entry count alone is not a memory-safety boundary (see Memory safety below).
 - Core 1 supplies only a message kind plus domain data; it does not know MQTT topics.
-- Core 0 maps the kind to the authoritative MQTT topic, publishes with QoS 1, and owns the MQTT envelope sequence. Kinds: TELEMETRY → `mqtt_topic_telemetry`, COMMAND_RESPONSE → `mqtt_topic_command_response`, HEALTH → `mqtt_topic_health`, LOG → `mqtt_topic_log`.
+- Core 0 maps the kind to the authoritative MQTT topic, publishes with QoS 1, and owns the MQTT envelope (sequence, runtime_id, source, firmware_version, message_schema_version). Kinds: TELEMETRY → `mqtt_topic_telemetry`, COMMAND_RESPONSE → `mqtt_topic_command_response`, HEALTH → `mqtt_topic_health`, LOG → `mqtt_topic_log`.
 - The startup log and connection logs travel as KIND_LOG entries; no hardcoded topics cross into Core 1.
-- Core 1 captures creation-time `uptime_ms`/`timestamp`; Core 0 preserves them while adding source/runtime/firmware/schema/sequence.
+- The sender owns every message field, including `uptime_ms` and `timestamp` (the latter null when UTC is unsynchronized). A queued message must NOT carry any envelope key at the top level, or the wire document would repeat a member name.
+- Core 0 injects the envelope at publish time by splicing its five members into the stored serialized object before its closing brace: the payload bytes are never decoded, parsed, or re-serialized on the publish path, so publishing allocates only the small envelope fragment plus the assembled frame.
 - The MQTT client waits for the matching PUBACK before the next publish proceeds, naturally enforcing one application QoS 1 publish in flight. The wait is bounded by `mqtt_broker_response_timeout_sec`, so a blackholed link fails the publish (the entry stays in flight) instead of blocking the run loop.
 - Retention priority is explicit: lower numeric values are more important.
 - Priority classes are: CRITICAL 10, ERROR 20, WARN 30, TELEMETRY 40, INFO 50, HEALTH 70.
-- When full, the queue finds the least-important queued class (highest numeric priority). If the incoming message is more important, or equally important, the oldest entry in that least-important class is evicted. If the incoming message is less important, it is rejected.
+- When either budget is full, the queue finds the least-important queued class (highest numeric priority). If the incoming message is more important, or equally important, the oldest entry in that least-important class is evicted — and only if evicting it frees enough room (by count or by bytes) for the incoming entry. If the incoming message is less important, or still would not fit after eviction, it is rejected without dropping a valid entry.
 - The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40; health messages use HEALTH 70; the startup log uses INFO 50.
 - An in-flight QoS 1 entry counts toward the configured capacity but is never evicted.
 - A failed publish never discards the in-flight entry: it stays in flight and `take()` returns it again, so Core 0 retries until the broker PUBACKs (QoS 1 at-least-once delivery).
@@ -165,11 +166,12 @@ serialize to JSON
     ↓
 encode UTF-8
     ↓
-validate maximum payload size (MAX_OUTBOUND_MESSAGE_BYTES = 128KB)
+validate maximum payload size (MAX_OUTBOUND_MESSAGE_BYTES = 16 KiB)
     ↓
 admit serialized bytes to outbound queue
     ↓
-later MQTT publish uses stored bytes for envelope construction
+later MQTT publish splices Core 0's envelope members into the stored bytes
+(the message body itself is never parsed or re-serialized)
 ```
 
 After this change, any message present in the outbound queue is guaranteed to be:
@@ -187,6 +189,15 @@ The original message dictionary is not retained after queue admission. Any mutat
 
 Validation failures (unsupported value types, non-string keys, non-finite floats) raise a `ValueError` immediately. Oversized messages are silently rejected without affecting queue state.
 
+#### Memory safety
+
+Two static bounds keep the outbound path safe on MCU-scale heap (Pico W: 256 KiB SRAM, 64 KiB reserved). The size check happens after `json.dumps()` + UTF-8 `encode`, so at peak allocation the object graph, the serialized `str`, and the encoded `bytes` are all resident at once — a large payload can therefore exhaust heap before a limit is even reached. Both bounds are deliberately small:
+
+- **Per-message ceiling** — `message_serializer.MAX_OUTBOUND_MESSAGE_BYTES = 16 KiB`. Bounds a single message's transient peak (graph + str + bytes ≈ 3x the payload ≈ 48 KiB) and keeps the largest legitimate message (the one-shot startup log, the only payload that grows with device count) comfortably under the limit with margin.
+- **Aggregate queued-byte budget** — `intercore.DEFAULT_MAX_OUTBOUND_QUEUED_BYTES = 32 KiB`. Bounds total *retained* payload bytes in the FIFO, so a full queue (16 entries) cannot exhaust heap on its own during an MQTT outage. The single in-flight entry is tracked by the entry-count rule (it is in transit, not retained) and is not counted against this budget.
+
+Admission enforces both: an entry is admitted only if it fits within the entry-count budget **and** the byte budget, evicting the oldest least-important entry only when that frees enough room. Because eviction is byte-feasibility-checked, a valid queued entry is never dropped to admit one that still would not fit. `OutboundQueue.status()` reports `queued_bytes` and `max_queued_bytes` for observability.
+
 ### 2. `event_queue`
 
 Core 0 -> Core 1. Contains private discrete commands/events.
@@ -203,7 +214,7 @@ Core 0 -> Core 1 latest-value state.
 - `network_snapshot`: Wi-Fi status, IP, RSSI, connection counts, `network_stack_ready` flag
 - `utc_snapshot`: Current UTC time, ticks base, runtime start
 - `hardware`: Detected hardware type, machine string, heap reserve
-- `core_1_activity_ms`: Timestamp of last Core 1 activity report (in milliseconds)
+- `core_1_activity_ms`: Timestamp of last Core 1 activity report (in milliseconds) — written by Core 1, read by Core 1 for health reporting and by Core 0 as the input to the liveness watchdog
 
 State is replaced, not accumulated. Core 1 keeps the latest immutable snapshot until Core 0 replaces it.
 
@@ -223,7 +234,7 @@ Core 0 intentionally follows the original known-good behavior:
 
 ### Boot when the network never appears
 
-The connect loops in `establish_network()` are intentionally unbounded (a watchdog is listed under "Features intentionally not carried into the baseline"). If the configured SSID is absent, or the broker is unreachable, Core 0 retries forever: each Wi-Fi attempt observes the link for up to 20 s (200 × 100 ms), sleeps the configured backoff delays between attempts, then the whole sequence restarts. Core 1 never starts, and the flashing connection LED (50 ms on / 50 ms off) is the only visible state of this boot loop.
+The connect loops in `establish_network()` are intentionally unbounded (a watchdog is listed under "Features intentionally not carried into the baseline"). If the configured SSID is absent, or the broker is unreachable, Core 0 retries forever: each Wi-Fi attempt observes the link for up to 20 s (200 × 100 ms), sleeps the configured backoff delays between attempts, then the whole sequence restarts. Core 1 never starts, and the flashing connection LED (50 ms on / 50 ms off) is the only visible state of this boot loop. The startup verification steps behave the same way: a failed probe or a failed UTC pass drops the MQTT session, re-establishes the network, and retries the pass, so a transient failure after connection is recovered rather than fatal (see Deterministic startup sequence).
 
 ## QoS 1 network probe
 
@@ -243,7 +254,7 @@ Two probes are performed during startup:
 1. After Wi-Fi and MQTT connection, before draining startup work
 2. After the 5-second stabilization wait
 
-Both probes must succeed with matching PUBACKs before Core 1 starts and before the network snapshot marks `network_stack_ready = True`.
+Both probes must succeed with matching PUBACKs before Core 1 starts and before the network snapshot marks `network_stack_ready = True`. A failed probe is not fatal: the MQTT session is dropped, the network is re-established, and the whole verification pass retried (a `MemoryError` still fails fast).
 
 ## MQTT keepalive
 
@@ -259,7 +270,8 @@ The CONNPACK advertises `mqtt_keepalive_sec` (30 s default), so the broker disco
 Two invariants in `mqtt_client.py` keep the bounded-wait contract sound (every blocking broker wait must be deadline-limited, so a dead link surfaces as a failure instead of stalling the run loop):
 
 - **One packet ID helper**: `next_packet_id()` advances the counter and wraps 65535 back to 1 (0 is reserved). QoS 1 publish, subscribe, and `Mqtt.get_next_packet_id()` (the network-probe path) all draw IDs from this single helper, so every message takes the next of 1, 2, ..., 65535, 1, 2, ... and the wrap is defined in exactly one place.
-- **Socket mode is the caller's contract**: `wait_msg()` reads in whatever socket mode it finds and never changes it. Blocking callers (publish, ping, subscribe) bound their waits with their own timeout, so a link that stalls after the first frame byte surfaces as a timeout instead of blocking forever. `check_msg()` is the poller: it switches the socket non-blocking and restores blocking mode on the way out — in MicroPython `setblocking(True)` is identical to `settimeout(None)`, so a poll that left the socket non-blocking, or a wait that forced blocking mid-read, would silently clear the next operation's timeout.
+- **Socket mode is the caller's contract**: `wait_msg()` reads in whatever socket mode it finds and never changes it, and every caller runs it in blocking-with-timeout mode — so a read always returns a full length and a link that stalls after the first frame byte surfaces as a timeout instead of blocking forever. `publish`/`ping`/`subscribe` bound their waits with their own timeouts. `check_msg()` is the poller: it first decides *readiness* with a non-blocking `select` poll (one readable byte means a packet has started; nothing returns `None` immediately, leaving the socket mode untouched), and only then parses the packet — that parse runs under the finite `mqtt_broker_response_timeout_sec` rather than non-blocking, because a non-blocking multi-byte read can short-read a PUBLISH split across TCP reads and deliver a corrupt frame. `check_msg()` restores normal blocking mode on the way out; in MicroPython `setblocking(True)` is identical to `settimeout(None)`, so a poll that left the socket non-blocking, or a wait that forced blocking mid-read, would silently clear the next operation's timeout.
+- **The handshake is bounded the same way**: `Mqtt.connect()` calls `MQTTClient.connect(timeout=mqtt_broker_response_timeout_sec)`, which installs the finite socket timeout that the CONNACK wait runs under. `subscribe()` does not install its own timeout — it relies on the one `connect()` left in place — so that same finite timeout carries across both SUBACK waits. A broker that accepts the TCP connection and then goes silent fails the attempt within the timeout (the reconnect backoff then retries) instead of wedging Core 0. Once both subscriptions succeed, `Mqtt.connect()` restores normal blocking mode; every later operation (PUBACK, PINGRESP) installs and restores its own timeout.
 
 ## Network recovery
 
@@ -330,6 +342,8 @@ Core 1 refreshes the `core_1_activity_ms` state mailbox on a 5-second deadline, 
 
 Health messages report `core_1_active` as true while the stamp age is within threshold (`3 × read_loop_sec`, minimum 60 seconds), and add `core_1_inactive` to the degradation reasons when it is exceeded.
 
+Core 0 is the independent consumer of the heartbeat. The Core 0 run loop checks the stamp first on every pass (`_watch_core_1_heartbeat`): before any stamp exists (Core 1 has not started) the check is a no-op, so the unbounded startup connect loops are unaffected; once a stamp exists, age at or beyond `_CORE_1_HEARTBEAT_STALE_TIMEOUT_MS` (30 s, a static constant in `core0.py`, not a config key) resets the MCU via `machine.reset()`. The 30 s bound is more than six missed 5 s refreshes — far beyond any live-loop processing gap — and below the 60 s diagnostic threshold. This closes the failure mode where a dead Core 1 wedges the whole sensor (telemetry and health stopped, nothing to recover them) without Core 0 ever noticing: a dead Core 1 can no longer build the health message that would report `core_1_inactive`, so it cannot report its own death. A reboot starts clean: the mailbox is empty until the new Core 1 registers, and the check stays a no-op meanwhile.
+
 ## Normal-runtime scheduling anchor
 
 All periodic Core 1 runtime work — telemetry and health — is scheduled from one shared epoch, `normal_runtime_start_ticks_ms`, captured exactly once, immediately after `system_startup_completed` has been successfully admitted to the outbound queue. No periodic work begins before that admission.
@@ -347,6 +361,8 @@ Every message envelope carries `uptime_ms`, and both cores compute it from `upti
 ## Periodic Telemetry
 
 Telemetry cadence is anchored to the normal-runtime anchor: `read_loop_sec` defines fixed boundaries at `anchor + n × read_loop_sec` (a 20-second read loop produces boundaries at +20s, +40s, +60s relative to normal-runtime start). Telemetry remains historical sensor/runtime data: during an MQTT outage it may continue to enter the bounded outbound queue under the existing retention/eviction rules. Telemetry generation is gated on startup-log admission — no telemetry before `system_startup_completed` is admitted.
+
+- **Missed boundaries are skipped, never replayed** (same policy as health): if a device read stalls long enough to cross one or more boundaries, the scheduler performs the current sample once and advances directly to the next future boundary — it does not fire catch-up reads for the elapsed boundaries. Telemetry is a current sample, not a replayable record, so a stall cannot reconstruct the missed samples; a catch-up burst would only add near-duplicate samples, JSON work, and queue admissions immediately after an overload. This is distinct from outage buffering (above), which still applies: an MQTT outage queues telemetry rather than dropping it.
 
 ## Periodic Health Messages
 
@@ -406,18 +422,18 @@ Core 0 performs the following sequence during `start()` before returning and all
 5. **Drain startup work**: Service pending connection logs
 6. **5-second wait**: Stabilization period
 7. **Network probe #2**: Publish QoS 1 probe message and wait for matching PUBACK
-8. **UTC synchronization**: Block until a valid UTC response is received or 3 bounded attempts are exhausted (each attempt waits up to `mqtt_broker_response_timeout_sec`)
+8. **UTC synchronization**: One pass of up to 3 bounded attempts (each waiting up to `mqtt_broker_response_timeout_sec`); a failed pass is retried after re-establishing the network
 9. **Publish initial snapshots**: UTC and network snapshots to state mailboxes
 10. **Stop connection LED**: LED turns off
 11. **Return**: Core 0.start() returns, Core 1 starts
 
-If any step fails (Wi-Fi, MQTT, either probe, or UTC sync), Core 0 raises an exception and Core 1 never starts.
+Every step is self-healing: the connect steps (Wi-Fi, MQTT) retry forever, and the verification steps (each probe, the UTC sync) drop the MQTT session, re-establish the network, and retry the whole verification pass when one fails. Core 1 never starts until a complete, clean pass succeeds, so a transient blip after connection (a dropped PUBACK, a brief UTC-server outage) is recovered rather than halting the device until a reset. A `MemoryError` still propagates out of `start()` (fail-fast), so an out-of-memory device is not looped.
 
 ## UTC time synchronization
 
 Core 0 is the only UTC acquirer. Requests are published to `mqtt_topic_info_request` with a unique `request_id`; the server is expected to answer on `mqtt_topic_info_response` echoing that `request_id`.
 
-- **Startup (required, bounded)**: `_synchronize_utc_required()` makes a fixed number of attempts (3 — a constant, deliberately not derived from the timeout setting), each waiting up to `mqtt_broker_response_timeout_sec` for a valid response while pumping MQTT. If all attempts fail, startup raises and Core 1 never starts.
+- **Startup (required, self-healing)**: one pass of `_synchronize_utc_required()` makes a fixed number of attempts (3 — a constant, deliberately not derived from the timeout setting), each waiting up to `mqtt_broker_response_timeout_sec` for a valid response while pumping MQTT. A failed pass is not fatal: the network is re-established and the whole verification pass retried (see Deterministic startup sequence), so a transient UTC-server outage no longer halts startup until a reset.
 - **Steady state (non-blocking)**: when the snapshot is older than `datetime_sync_interval_min`, the run loop sends a request and records a `mqtt_broker_response_timeout_sec` deadline. The run loop keeps servicing the outbound queue, network recovery, and command responses; the answer arrives through the regular `check_msg()` pump. The run loop never blocks on a UTC request.
 - **Timeout and retry**: a pending request whose deadline passed is discarded, and re-requests are throttled to at most one per 30 seconds until a valid response arrives. An unresponsive time server therefore cannot stall the run loop or flood the broker. A malformed-but-reachable answer gets a much shorter backoff (~0.5s) since the server demonstrably answered us.
 - **Response validation**: a response is accepted only if it matches the current schema version, is targeted at this device, carries the matching `request_id`, and contains a valid `timestamp` and positive integer `utc_epoch_ms`. A malformed answer to *our own* pending request clears that request and re-keys the retry throttle to a short ~0.5s backoff (instead of the full 30s measured from the original send); a response for any other request id is ignored without disturbing pending state (our response may still be in flight).
@@ -429,7 +445,7 @@ These should be added individually only after the baseline passes:
 - advanced reboot-delivery state machines;
 - advanced network recovery generations/state machines;
 - dynamic configuration;
-- watchdog/cross-core recovery;
+- advanced watchdog/cross-core recovery (the minimal Core 0 stale-heartbeat reset is present since 0.4.9);
 - additional Core 1 commands;
 - physical sensors.
 

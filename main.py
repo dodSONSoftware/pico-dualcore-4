@@ -65,11 +65,14 @@ def main():
 
     from core0 import Core0
 
+    # One runtime ID for this boot; both cores must agree on it.
+    runtime_id = _runtime_id()
+
     core0 = Core0(
         intercore,
         core0_config,
         wifi_config,
-        _runtime_id(),
+        runtime_id,
         boot_ticks_ms,
         led_manager,
     )
@@ -83,7 +86,7 @@ def main():
     import _thread
     from core1 import core1_main
 
-    _thread.start_new_thread(core1_main, (intercore, core1_config, boot_ticks_ms, _runtime_id()))
+    _thread.start_new_thread(core1_main, (intercore, core1_config, boot_ticks_ms, runtime_id))
     core1_config = None
     print("[INFO] Core 1 started after Wi-Fi + MQTT")
 

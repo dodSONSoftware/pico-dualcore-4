@@ -29,7 +29,6 @@ from message_protocol import format_utc_epoch_ms, is_json_safe
 from system_information import SystemInformation, SYSTEM_INFORMATION_SECTIONS
 from uptime import create_uptime_state, current_uptime_ms
 
-from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 from message_serializer import (
     serialize_and_validate_message,
     MessageTooLargeError,
@@ -49,33 +48,31 @@ def _collect_system_information_full(system_information):
                 section_data = getattr(system_information, getter_name)()
                 if is_json_safe(section_data):
                     system_info[section] = section_data
+        except MemoryError:
+            raise
         except Exception as err:
             # If a section fails to collect, include error info but continue
             system_info[section] = {"error": str(err)}
     return system_info
 
 
-def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_manager, config, startup_duration_ms, system_information=None):
+def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information=None):
     """Build the system_startup_completed log message.
 
-    The payload must include all envelope fields since Core 0's _make_envelope
-    deserializes the payload and adds/overwrites fields (sequence, runtime_id,
-    firmware_version, message_schema_version, source).
-
-    For startup log, we build the complete message with all required envelope fields.
+    The message carries only Core 1's own fields (message_type, uptime_ms,
+    timestamp, payload). It must NOT carry the envelope keys (sequence,
+    runtime_id, source, firmware_version, message_schema_version): those are
+    owned by Core 0, which injects them at publish time, and repeating a name
+    in the wire document would violate the JSON object contract.
 
     Args:
         intercore: InterCore bus instance
-        source: Device source identifier (from config)
         boot_ticks_ms: Monotonic timestamp at firmware boot
-        runtime_id: Unique runtime identifier
         device_manager: DeviceManager instance
         config: Core 1 configuration
         startup_duration_ms: Duration of startup in milliseconds
         system_information: Optional SystemInformation instance with device_manager set
     """
-    # Use provided source
-
     # Build startup summary. Subscription readiness is reported without topic
     # names: topic ownership belongs to Core 0 (message kind only crosses cores).
     # The startup duration is named explicitly (duration_ms) so it carries its
@@ -123,16 +120,12 @@ def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_mana
         system_information = SystemInformation(intercore, config)
     system_info = _collect_system_information_full(system_information)
 
-    # Build the complete message with envelope fields
-    # Note: Core 0 will add sequence and may add timestamp/uptime_ms if missing
+    # Build the message. Core 0 injects the envelope (sequence, runtime_id,
+    # source, firmware_version, message_schema_version) at publish time.
     payload = {
-        "message_schema_version": MESSAGE_SCHEMA_VERSION,
-        "runtime_id": runtime_id,
         "message_type": "log",
-        "source": source,
-        "firmware_version": FIRMWARE_VERSION,
         "uptime_ms": startup_duration_ms,
-        "timestamp": None,  # Core 0 will fill from UTC snapshot
+        "timestamp": _current_utc_timestamp(intercore),
         "payload": {
             "level": "info",
             "event": "system_startup_completed",
@@ -148,7 +141,7 @@ def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_mana
     return payload
 
 
-def _try_queue_startup_log(intercore, source, message, retention_priority):
+def _try_queue_startup_log(intercore, message, retention_priority):
     """Attempt to queue the startup log message."""
     try:
         payload_bytes = serialize_and_validate_message(message)
@@ -158,6 +151,8 @@ def _try_queue_startup_log(intercore, source, message, retention_priority):
     except MessageTooLargeError as err:
         print("[ERROR] Startup log too large: {}".format(err))
         return False
+    except MemoryError:
+        raise
     except Exception as err:
         print("[ERROR] Startup log serialization failed: {}".format(err))
         return False
@@ -171,17 +166,24 @@ def _try_queue_startup_log(intercore, source, message, retention_priority):
     )
 
 
-def _message_time(intercore, uptime_state):
-    now_ticks = time.ticks_ms()
-    uptime_ms = current_uptime_ms(uptime_state)
+def _current_utc_timestamp(intercore):
+    """Current UTC timestamp from the shared snapshot, or None if unsynchronized.
 
+    Core 1 reads the snapshot Core 0 publishes to the state mailboxes and
+    advances it by the elapsed local ticks so it tracks the clock between
+    refreshes. When no snapshot exists the value is None (null on the wire),
+    which is the same value Core 0 would have published from the same
+    snapshot state.
+    """
     snapshot = intercore.state_mailboxes.get_utc_snapshot()
     if snapshot is None:
-        return uptime_ms, None
+        return None
+    elapsed_ms = time.ticks_diff(time.ticks_ms(), snapshot["ticks_ms"])
+    return format_utc_epoch_ms(snapshot["utc_epoch_ms"] + elapsed_ms)
 
-    elapsed_ms = time.ticks_diff(now_ticks, snapshot["ticks_ms"])
-    timestamp = format_utc_epoch_ms(snapshot["utc_epoch_ms"] + elapsed_ms)
-    return uptime_ms, timestamp
+
+def _message_time(intercore, uptime_state):
+    return current_uptime_ms(uptime_state), _current_utc_timestamp(intercore)
 
 
 def _build_command_response(intercore, uptime_state, event, success, data=None, error=None):
@@ -280,15 +282,19 @@ def _handle_device_result(intercore, config, uptime_state, result):
             ))
 
 
-def _build_health_payload(intercore, uptime_state, source, config, runtime_id, system_information):
+def _build_health_payload(intercore, uptime_state, config, system_information):
     """Build the health payload from shared state snapshots.
+
+    The message carries only Core 1's own fields (message_type, uptime_ms,
+    timestamp, payload). The envelope keys (sequence, runtime_id, source,
+    firmware_version, message_schema_version) are owned by Core 0, which
+    injects them at publish time; repeating them here would duplicate a name
+    in the wire document.
 
     Args:
         intercore: InterCore bus instance
         uptime_state: Accumulated uptime state (see uptime.py)
-        source: Device source identifier (from network snapshot)
         config: Core 1 configuration
-        runtime_id: Unique runtime identifier
         system_information: SystemInformation instance for device status
 
     Returns:
@@ -327,6 +333,8 @@ def _build_health_payload(intercore, uptime_state, source, config, runtime_id, s
     # Get memory info
     try:
         free_heap = gc.mem_free()
+    except MemoryError:
+        raise
     except Exception:
         free_heap = 0
 
@@ -336,6 +344,8 @@ def _build_health_payload(intercore, uptime_state, source, config, runtime_id, s
         minimum_free_heap = hardware.get("minimum_free_heap_bytes") if hardware else 65536
         hardware_type = hardware.get("hardware_type", "unknown")
         machine = hardware.get("machine", "unknown")
+    except MemoryError:
+        raise
     except Exception:
         minimum_free_heap = 65536
         hardware_type = "unknown"
@@ -390,15 +400,19 @@ def _build_health_payload(intercore, uptime_state, source, config, runtime_id, s
     # Determine status
     status = "healthy" if not degraded_reasons else "degraded"
 
-    # Build health payload
+    # Build health payload. The timestamp comes from the shared UTC snapshot
+    # (already fetched above for the utc_* fields); Core 0 injects the
+    # envelope at publish time.
+    if utc_snapshot is None:
+        timestamp = None
+    else:
+        timestamp = format_utc_epoch_ms(
+            utc_snapshot["utc_epoch_ms"] + time.ticks_diff(now_ms, utc_snapshot["ticks_ms"])
+        )
     payload = {
-        "message_schema_version": MESSAGE_SCHEMA_VERSION,
-        "runtime_id": runtime_id,
         "uptime_ms": uptime_ms,
-        "timestamp": None,  # Will be filled by Core 0
-        "source": source,
+        "timestamp": timestamp,
         "message_type": "health",
-        "firmware_version": FIRMWARE_VERSION,
         "payload": {
             "status": status,
             "degraded_reasons": degraded_reasons,
@@ -427,13 +441,12 @@ def _build_health_payload(intercore, uptime_state, source, config, runtime_id, s
     return payload
 
 
-def _try_queue_health_message(intercore, message, runtime_id):
+def _try_queue_health_message(intercore, message):
     """Attempt to queue a health message.
 
     Args:
         intercore: InterCore bus instance
         message: Health message payload dict
-        runtime_id: Runtime identifier for logging
 
     Returns:
         bool: True if message was admitted, False otherwise
@@ -447,6 +460,8 @@ def _try_queue_health_message(intercore, message, runtime_id):
     except MessageTooLargeError as err:
         print("[WARNING] Health message too large: {}".format(err))
         return False
+    except MemoryError:
+        raise
     except Exception as err:
         print("[WARNING] Health message serialization failed: {}".format(err))
         return False
@@ -459,7 +474,7 @@ def _try_queue_health_message(intercore, message, runtime_id):
     )
 
 
-def _try_queue_health_message_intercore(intercore, uptime_state, source, config, runtime_id, system_information):
+def _try_queue_health_message_intercore(intercore, uptime_state, config, system_information):
     """Build health payload and attempt to queue it.
 
     Only generates health message if network stack is ready.
@@ -468,9 +483,7 @@ def _try_queue_health_message_intercore(intercore, uptime_state, source, config,
     Args:
         intercore: InterCore bus instance
         uptime_state: Accumulated uptime state (see uptime.py)
-        source: Device source identifier
         config: Core 1 configuration
-        runtime_id: Unique runtime identifier
         system_information: SystemInformation instance for device status
     """
     # Check if network stack is ready before generating health
@@ -487,12 +500,12 @@ def _try_queue_health_message_intercore(intercore, uptime_state, source, config,
         return
 
     # Build health payload
-    health_payload = _build_health_payload(intercore, uptime_state, source, config, runtime_id, system_information)
+    health_payload = _build_health_payload(intercore, uptime_state, config, system_information)
     if health_payload is None:
         return
 
     # Queue the health message
-    _try_queue_health_message(intercore, health_payload, runtime_id)
+    _try_queue_health_message(intercore, health_payload)
 
 
 def core1_main(intercore, config, boot_ticks_ms, runtime_id):
@@ -531,18 +544,14 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # Calculate startup duration
         startup_duration_ms = current_uptime_ms(uptime_state)
 
-        # Get source from network snapshot
-        network_snapshot = intercore.state_mailboxes.get_network_snapshot()
-        source = network_snapshot.get("ip_address", "unknown") if network_snapshot else "unknown"
-
         # Build and queue the one-time startup log
         startup_log_message = _build_startup_log(
-            intercore, source, boot_ticks_ms, runtime_id, device_manager, config, startup_duration_ms, system_information
+            intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information
         )
 
         # Attempt to queue the startup log with INFO priority
         startup_log_admitted = _try_queue_startup_log(
-            intercore, source, startup_log_message, RETENTION_PRIORITY_INFO
+            intercore, startup_log_message, RETENTION_PRIORITY_INFO
         )
 
         if not startup_log_admitted:
@@ -551,7 +560,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             # Wait for queue space and retry once
             time.sleep_ms(100)
             startup_log_admitted = _try_queue_startup_log(
-                intercore, source, startup_log_message, RETENTION_PRIORITY_INFO
+                intercore, startup_log_message, RETENTION_PRIORITY_INFO
             )
             if not startup_log_admitted:
                 print("[FATAL] Startup log queue admission failed after retry - halting")
@@ -574,6 +583,8 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         try:
             hardware = system_information.get_machine()
             intercore.state_mailboxes.set_hardware(hardware)
+        except MemoryError:
+            raise
         except Exception as err:
             if DEBUG:
                 print("[DEBUG] Hardware storage failed: {}".format(err))
@@ -627,11 +638,23 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                     result = device_manager.process_device(managed_device)
                     _handle_device_result(intercore, config, uptime_state, result)
 
-                # Advance from the previous scheduled deadline -- not from
-                # the actual execution time -- so per-iteration processing
-                # delay cannot accumulate into drift: boundaries stay fixed
-                # at anchor + n * read_loop_ms.
-                next_read_ms = time.ticks_add(next_read_ms, read_loop_ms)
+                # Skip any boundaries that elapsed while the read ran, rather
+                # than replaying them as catch-up reads. Telemetry is a current
+                # sample, not historical data, so a slow read cannot reconstruct
+                # the missed samples -- emitting them as catch-up reads would
+                # only produce a burst of near-identical samples, JSON work, and
+                # queue admissions immediately after an overload. This is the
+                # same missed-boundary policy the health scheduler already uses.
+                # Advance from the previous deadline (never from execution time)
+                # so processing delay cannot accumulate into drift: boundaries
+                # stay fixed at anchor + n * read_loop_ms.
+                #
+                # Re-capture the clock here: now_ms above is stale by however
+                # long the read took, and skipping against it would
+                # under-advance and leave a catch-up read for the next pass.
+                skip_now_ms = time.ticks_ms()
+                while time.ticks_diff(skip_now_ms, next_read_ms) >= 0:
+                    next_read_ms = time.ticks_add(next_read_ms, read_loop_ms)
                 gc.collect()
 
             # Register Core 1 activity periodically (every 5 seconds)
@@ -647,7 +670,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             # missed boundaries are skipped, never replayed as catch-up
             # reports.
             if time.ticks_diff(now_ms, next_health_ms) >= 0:
-                _try_queue_health_message_intercore(intercore, uptime_state, source, config, runtime_id, system_information)
+                _try_queue_health_message_intercore(intercore, uptime_state, config, system_information)
                 while time.ticks_diff(now_ms, next_health_ms) >= 0:
                     next_health_ms = time.ticks_add(next_health_ms, health_interval_ms)
 

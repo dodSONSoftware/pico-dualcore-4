@@ -170,14 +170,11 @@ def test_build_startup_log_structure():
             self.state_mailboxes = MockStateMailboxes()
             self.outbound_queue = MockOutboundQueue()
 
-    config = _base_config()
-
+    # The message carries only Core 1's own fields: the envelope keys
+    # (sequence, runtime_id, source, firmware_version, message_schema_version)
+    # are Core 0's and are injected at publish time.
     message = {
-        "message_schema_version": 3,
-        "runtime_id": "test_runtime_12345",
         "message_type": "log",
-        "source": config["source"],
-        "firmware_version": "0.3.0",
         "uptime_ms": 5000,
         "timestamp": None,
         "payload": {
@@ -213,11 +210,10 @@ def test_build_startup_log_structure():
 
     intercore = MockInterCore()
     device_manager = MockDeviceManager()
-    source = "192.168.1.100"
 
     # Test queue admission
     admitted = _try_queue_startup_log(
-        intercore, source, message, RETENTION_PRIORITY_INFO
+        intercore, message, RETENTION_PRIORITY_INFO
     )
     assert admitted, "Startup log should be admitted to queue"
 
@@ -255,7 +251,10 @@ def test_startup_summary_uses_explicit_duration_ms():
 
     class MockInterCore:
         def __init__(self):
+            # No UTC snapshot: the builder must leave the timestamp null
+            # rather than failing on a missing snapshot.
             self.state_mailboxes = MagicMock()
+            self.state_mailboxes.get_utc_snapshot = lambda: None
             self.outbound_queue = MagicMock()
 
     # core1 may already be imported under a host time lacking MicroPython
@@ -265,9 +264,7 @@ def test_startup_summary_uses_explicit_duration_ms():
     try:
         payload = core1._build_startup_log(
             MockInterCore(),
-            "192.168.1.100",
             boot_ticks_ms=1000,
-            runtime_id="rt-test",
             device_manager=MockDeviceManager(),
             config=_base_config(),
             startup_duration_ms=12782,

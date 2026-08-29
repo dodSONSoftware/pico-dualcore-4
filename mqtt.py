@@ -79,6 +79,17 @@ class Mqtt:
         self._client = None
 
     def connect(self):
+        """Connect and subscribe, with the whole handshake time-bounded.
+
+        The CONNACK wait and both SUBACK waits run under
+        mqtt_broker_response_timeout_sec: MQTTClient.connect(timeout=...)
+        installs the finite socket timeout, and subscribe() relies on the
+        timeout connect() leaves in place. A broker that accepts the TCP
+        connection and then stops responding therefore fails the attempt
+        (retried with the reconnect backoff) instead of wedging Core 0.
+        On success the socket returns to normal blocking mode; every later
+        operation (PUBACK, PINGRESP) installs and restores its own timeout.
+        """
         for attempt_index, delay_sec in enumerate(self._reconnect_delays):
             try:
                 self._close_old_client()
@@ -87,9 +98,19 @@ class Mqtt:
                     print("[DEBUG] MQTT attempt {} to {}".format(
                         attempt_index + 1, self._broker
                     ))
-                self._client.connect()
+                # Bound the handshake: the finite timeout installed here also
+                # carries across the two SUBACK waits below.
+                self._client.connect(timeout=self._ack_timeout_ms / 1000.0)
                 self._client.subscribe(self._command_topic, qos=1)
                 self._client.subscribe(self._info_response_topic, qos=1)
+                # Handshake complete: restore normal blocking mode.
+                try:
+                    self._client.sock.settimeout(None)
+                except MemoryError:
+                    raise
+                except Exception as err:
+                    if DEBUG:
+                        print("[DEBUG] MQTT blocking-mode restore failed: {}".format(err))
                 self._connected = True
                 self._connect_count += 1
                 self._touch()
@@ -115,10 +136,17 @@ class Mqtt:
         self._connected = False
 
     def check_msg(self):
+        """Poll for one pending inbound packet and deliver it to the callback.
+
+        The parse of a ready packet runs under the broker response timeout (a
+        finite bound), so a link that stalls after the first frame byte fails
+        this poll instead of hanging the run loop or short-reading a corrupt
+        frame.
+        """
         if not self.is_connected():
             return
         try:
-            self._client.check_msg()
+            self._client.check_msg(self._ack_timeout_ms / 1000.0)
         except MemoryError:
             raise
         except Exception:

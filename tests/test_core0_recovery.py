@@ -127,8 +127,13 @@ class FakeMqtt:
         self.connected = False
         self.connect_calls = 0
         self.mark_disconnected_calls = 0
+        self.published = []
         self._last_info_request = None
         self._utc_deliver = True
+        # Number of initial startup probe publishes that fail before
+        # succeeding. 0 (default) keeps the existing always-success behavior.
+        self.fail_probes_times = 0
+        self._probe_publishes = 0
 
     def is_connected(self):
         return self.connected
@@ -153,12 +158,19 @@ class FakeMqtt:
         return 1
 
     def publish_qos1(self, topic, message):
+        self.published.append((topic, message))
         doc = json.loads(message)
         if doc.get("message_type") == "info_request":
             self._last_info_request = doc
 
     def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):
-        # Simulate a successful PUBACK for the startup probes.
+        # Simulate the startup probes: fail the first fail_probes_times
+        # publishes (dropping the session, as the real client does on a failed
+        # QoS 1 publish), then deliver a matching PUBACK.
+        self._probe_publishes += 1
+        if self._probe_publishes <= self.fail_probes_times:
+            self.mark_disconnected()
+            return False
         return True
 
     def check_msg(self):
@@ -326,6 +338,39 @@ def test_start_delegates_to_establish_network_and_stops_led(make_core0):
     assert instance._intercore.state_mailboxes.utc_snapshots
 
 
+def test_start_recovers_from_transient_probe_failure(make_core0):
+    """A transient probe failure must be re-established and retried, not fatal.
+
+    Previously a single failed probe raised and halted startup (Core 1 never
+    started until a reset). Now the network is re-established and the whole
+    verification pass retried; start() returns once a clean pass succeeds and
+    Core 1 gating (network_stack_ready, UTC snapshot) still holds.
+    """
+    instance = make_core0()
+    mqtt = instance._mqtt
+    mqtt.fail_probes_times = 1  # first probe publish fails, then succeeds
+
+    establish_calls = {"count": 0}
+    original = instance.establish_network
+
+    def spy():
+        establish_calls["count"] += 1
+        return original()
+
+    instance.establish_network = spy
+
+    # Must self-heal and complete rather than raise.
+    instance.start()
+
+    assert instance._network_stack_ready is True
+    # One establish_network() for initial connect, one more for recovery.
+    assert establish_calls["count"] == 2
+    # The failed probe dropped the session; recovery left it connected.
+    assert mqtt.connected is True
+    # Core 1 gating: the startup UTC snapshot reached the state mailboxes.
+    assert instance._intercore.state_mailboxes.utc_snapshots
+
+
 def test_publish_utc_snapshot_has_no_force_argument(make_core0):
     """_publish_utc_snapshot takes no force parameter (it has no throttle)."""
     instance = make_core0()
@@ -341,3 +386,87 @@ def test_publish_utc_snapshot_has_no_force_argument(make_core0):
     assert instance._intercore.state_mailboxes.utc_snapshots[-1] is snapshot
     with pytest.raises(TypeError):
         instance._publish_utc_snapshot(force=True)
+
+
+def _real_outbound_queue(instance):
+    """Swap the fixture's mock queue for the real bounded queue."""
+    from intercore import OutboundQueue
+
+    instance._intercore.outbound_queue = OutboundQueue(16)
+    return instance._intercore.outbound_queue
+
+
+def test_publish_entry_splices_core0_envelope_and_keeps_body_intact(make_core0):
+    """The wire frame is the queued message with Core 0's envelope spliced in.
+
+    Core 0 must not decode, parse, or re-serialize the payload: the message
+    body must appear in the published frame exactly as the sender queued it,
+    and the five envelope members must be Core 0's own values (its runtime_id
+    and configured source, not anything a sender might have embedded).
+    """
+    from intercore import KIND_HEALTH, RETENTION_PRIORITY_HEALTH
+    from message_serializer import serialize_and_validate_message
+    from version import FIRMWARE_VERSION
+
+    instance = make_core0()
+    queue = _real_outbound_queue(instance)
+    message = {
+        "message_type": "health",
+        "uptime_ms": 1234,
+        "timestamp": None,
+        "payload": {"status": "healthy", "degraded_reasons": []},
+    }
+    assert queue.put_with_kind(
+        KIND_HEALTH, serialize_and_validate_message(message), RETENTION_PRIORITY_HEALTH
+    )
+
+    instance._publish_entry(queue.take())
+
+    topic, frame = instance._mqtt.published[-1]
+    assert topic == instance._config["mqtt_topic_health"]
+    doc = json.loads(frame)
+    assert doc["sequence"] == 0
+    assert doc["runtime_id"] == "test-runtime"
+    assert doc["source"] == instance._config["source"]
+    assert doc["firmware_version"] == FIRMWARE_VERSION
+    assert doc["message_schema_version"] == MESSAGE_SCHEMA_VERSION
+    # Removing the spliced envelope restores exactly what the sender queued:
+    # proof the body was carried through, not parsed and rebuilt.
+    for key in ("sequence", "runtime_id", "source", "firmware_version",
+                "message_schema_version"):
+        del doc[key]
+    assert doc == message
+    assert instance._next_sequence == 1
+
+
+def test_publish_entry_sequence_increments_per_published_entry(make_core0):
+    from intercore import KIND_HEALTH, RETENTION_PRIORITY_HEALTH
+    from message_serializer import serialize_and_validate_message
+
+    instance = make_core0()
+    queue = _real_outbound_queue(instance)
+    for i in range(2):
+        message = {"message_type": "health", "uptime_ms": i, "timestamp": None,
+                   "payload": {"id": i}}
+        assert queue.put_with_kind(
+            KIND_HEALTH, serialize_and_validate_message(message), RETENTION_PRIORITY_HEALTH
+        )
+        instance._publish_entry(queue.take())
+
+    sequences = [json.loads(frame)["sequence"] for _topic, frame in instance._mqtt.published]
+    assert sequences == [0, 1]
+    assert instance._next_sequence == 2
+
+
+def test_publish_entry_rejects_payload_that_is_not_a_json_object(make_core0):
+    """A non-object payload cannot be spliced; the entry fails, nothing is sent."""
+    from intercore import KIND_HEALTH
+
+    instance = make_core0()
+    entry = {"payload_bytes": b"[1, 2, 3]", "kind": KIND_HEALTH}
+
+    with pytest.raises(ValueError):
+        instance._publish_entry(entry)
+
+    assert instance._mqtt.published == []
+    assert instance._next_sequence == 0

@@ -21,6 +21,17 @@ RETENTION_PRIORITY_HEALTH = 70
 RETENTION_PRIORITY_MIN = RETENTION_PRIORITY_CRITICAL
 RETENTION_PRIORITY_MAX = RETENTION_PRIORITY_HEALTH
 
+# Aggregate retained-payload budget for the outbound queue (32 KiB).
+#
+# Entry count alone is not a memory-safety boundary: 16 retained 16 KiB payloads
+# would be 256 KiB, exhausting a Pico W's heap. This budget caps total queued
+# payload bytes so the queue is bounded by BOTH entry count and bytes. Sized to
+# hold a realistic full queue (16 entries x ~2 KiB) with margin. The single
+# in-flight entry is tracked by the entry-count rule (it is in transit, not
+# retained) and is not counted here. Per-message size is bounded separately by
+# message_serializer.MAX_OUTBOUND_MESSAGE_BYTES (16 KiB).
+DEFAULT_MAX_OUTBOUND_QUEUED_BYTES = 32 * 1024
+
 
 class OutboundQueue:
     """Core 1 -> Core 0 queue for MQTT-bound messages only.
@@ -29,21 +40,44 @@ class OutboundQueue:
     Once put() succeeds, the message bytes are immutable. The queue stores
     pre-serialized, UTF-8 encoded payload bytes.
 
+    Envelope rule:
+    payload_bytes must be a serialized JSON object. The sender carries only its
+    own message fields, including uptime_ms and timestamp (the latter null when
+    UTC is unsynchronized). The envelope keys (sequence, runtime_id, source,
+    firmware_version, message_schema_version) are owned by Core 0, which
+    injects them at publish time; a queued message must not carry any of them
+    at the top level, or the wire document would repeat a member name.
+
+    Capacity rule:
+    The queue is bounded by BOTH entry count (max_entries) and queued payload
+    bytes (max_queued_bytes). Either budget being exceeded is a full condition.
+
     Retention rule:
-    Lower numeric retention priorities are more important. When capacity is
+    Lower numeric retention priorities are more important. When a budget is
     full, the oldest entry in the least-important queued priority class is
-    evicted only when the incoming entry is at least as important. An in-flight
-    QoS 1 entry consumes capacity but is never an eviction candidate.
+    evicted only when the incoming entry is at least as important AND evicting
+    it frees enough room (by count or by bytes) for the incoming entry. A valid
+    queued entry is never dropped to admit one that still would not fit. An
+    in-flight QoS 1 entry consumes entry capacity but is never an eviction
+    candidate.
     """
 
-    def __init__(self, max_entries):
+    def __init__(self, max_entries, max_queued_bytes=DEFAULT_MAX_OUTBOUND_QUEUED_BYTES):
         if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries <= 0:
             raise ValueError("max_entries must be a positive integer")
+        if (
+            isinstance(max_queued_bytes, bool)
+            or not isinstance(max_queued_bytes, int)
+            or max_queued_bytes <= 0
+        ):
+            raise ValueError("max_queued_bytes must be a positive integer")
         self._max_entries = max_entries
+        self._max_queued_bytes = max_queued_bytes
         self._queue = []
         self._in_flight = None
         self._lock = _thread.allocate_lock()
         self._high_watermark = 0
+        self._queued_bytes = 0
         self._messages_evicted = 0
         self._telemetry_evicted = 0
         self._messages_rejected = 0
@@ -54,11 +88,75 @@ class OutboundQueue:
         for index, entry in enumerate(self._queue):
             if entry["retention_priority"] == retention_priority:
                 evicted = self._queue.pop(index)
+                self._queued_bytes -= len(evicted["payload_bytes"])
                 self._messages_evicted += 1
                 if evicted["kind"] == KIND_TELEMETRY:
                     self._telemetry_evicted += 1
                 return True
         return False
+
+    def _oldest_entry_size_for_priority_locked(self, retention_priority):
+        """Return the byte size of the oldest queued entry in a priority class.
+
+        Used to feasibility-check eviction BEFORE it happens so a valid entry is
+        never dropped to admit one that still would not fit. Returns None when
+        the class is absent.
+        """
+        for entry in self._queue:
+            if entry["retention_priority"] == retention_priority:
+                return len(entry["payload_bytes"])
+        return None
+
+    def _admit_locked(self, kind, payload_bytes, retention_priority):
+        """Apply the admission decision for an entry. Lock must be held.
+
+        Enforces BOTH the entry-count budget and the queued-byte budget under the
+        retention/eviction policy. Evicts the oldest entry in the least-important
+        queued class only when the incoming entry is at least as important AND the
+        eviction frees enough room (by count or by bytes). Returns True if the
+        entry was admitted, False if it was rejected.
+        """
+        new_bytes = len(payload_bytes)
+        occupied = len(self._queue) + (1 if self._in_flight is not None else 0)
+        count_full = occupied >= self._max_entries
+        bytes_over = (self._queued_bytes + new_bytes) > self._max_queued_bytes
+
+        if count_full or bytes_over:
+            if not self._queue:
+                self._messages_rejected += 1
+                return False
+
+            worst_priority = max(entry["retention_priority"] for entry in self._queue)
+            # Incoming is less important than everything queued: do not evict.
+            if retention_priority > worst_priority:
+                self._messages_rejected += 1
+                return False
+
+            evicted_size = self._oldest_entry_size_for_priority_locked(worst_priority)
+            if evicted_size is None:
+                self._messages_rejected += 1
+                return False
+
+            # Evict only if it frees enough room for the incoming entry;
+            # otherwise reject without disturbing the valid queued entry.
+            if (self._queued_bytes - evicted_size + new_bytes) > self._max_queued_bytes:
+                self._messages_rejected += 1
+                return False
+
+            self._evict_oldest_by_priority_locked(worst_priority)
+
+        entry = {
+            "kind": kind,
+            "retention_priority": retention_priority,
+            "payload_bytes": payload_bytes,
+        }
+        self._queue.append(entry)
+        self._queued_bytes += new_bytes
+
+        depth = len(self._queue)
+        if depth > self._high_watermark:
+            self._high_watermark = depth
+        return True
 
     def put(self, kind, message, retention_priority):
         """Admit one MQTT-bound message after validation, serialization, and encoding.
@@ -114,32 +212,7 @@ class OutboundQueue:
             return False
 
         with self._lock:
-            occupied = len(self._queue) + (1 if self._in_flight is not None else 0)
-            if occupied >= self._max_entries:
-                if not self._queue:
-                    self._messages_rejected += 1
-                    return False
-
-                worst_priority = max(entry["retention_priority"] for entry in self._queue)
-                if retention_priority > worst_priority:
-                    self._messages_rejected += 1
-                    return False
-
-                if not self._evict_oldest_by_priority_locked(worst_priority):
-                    self._messages_rejected += 1
-                    return False
-
-            entry = {
-                "kind": kind,
-                "retention_priority": retention_priority,
-                "payload_bytes": payload_bytes,
-            }
-            self._queue.append(entry)
-
-            depth = len(self._queue)
-            if depth > self._high_watermark:
-                self._high_watermark = depth
-            return True
+            return self._admit_locked(kind, payload_bytes, retention_priority)
 
     def put_with_kind(self, kind, payload_bytes, retention_priority):
         """Admit one MQTT-bound message with a specific kind (e.g., health, log).
@@ -166,32 +239,7 @@ class OutboundQueue:
             )
 
         with self._lock:
-            occupied = len(self._queue) + (1 if self._in_flight is not None else 0)
-            if occupied >= self._max_entries:
-                if not self._queue:
-                    self._messages_rejected += 1
-                    return False
-
-                worst_priority = max(entry["retention_priority"] for entry in self._queue)
-                if retention_priority > worst_priority:
-                    self._messages_rejected += 1
-                    return False
-
-                if not self._evict_oldest_by_priority_locked(worst_priority):
-                    self._messages_rejected += 1
-                    return False
-
-            entry = {
-                "kind": kind,
-                "retention_priority": retention_priority,
-                "payload_bytes": payload_bytes,
-            }
-            self._queue.append(entry)
-
-            depth = len(self._queue)
-            if depth > self._high_watermark:
-                self._high_watermark = depth
-            return True
+            return self._admit_locked(kind, payload_bytes, retention_priority)
 
     def take(self):
         """Return the current in-flight entry or move one queued entry into it."""
@@ -201,6 +249,9 @@ class OutboundQueue:
             if not self._queue:
                 return None
             self._in_flight = self._queue.pop(0)
+            # The entry left the queued FIFO; it is now in-flight and no longer
+            # counted toward the queued-byte budget.
+            self._queued_bytes -= len(self._in_flight["payload_bytes"])
             return self._in_flight
 
     def complete_in_flight(self, entry):
@@ -220,6 +271,8 @@ class OutboundQueue:
                 "pending": len(self._queue),
                 "in_flight": self._in_flight is not None,
                 "max": self._max_entries,
+                "queued_bytes": self._queued_bytes,
+                "max_queued_bytes": self._max_queued_bytes,
                 "high_watermark": self._high_watermark,
                 "messages_evicted": self._messages_evicted,
                 "telemetry_evicted": self._telemetry_evicted,
@@ -347,7 +400,7 @@ class StateMailboxes:
 class InterCore:
     """Container exposing the three explicit communication lanes."""
 
-    def __init__(self, outbound_max=16, event_max=4):
-        self.outbound_queue = OutboundQueue(outbound_max)
+    def __init__(self, outbound_max=16, event_max=4, outbound_max_bytes=DEFAULT_MAX_OUTBOUND_QUEUED_BYTES):
+        self.outbound_queue = OutboundQueue(outbound_max, outbound_max_bytes)
         self.event_queue = InterCoreEventQueue(event_max)
         self.state_mailboxes = StateMailboxes()

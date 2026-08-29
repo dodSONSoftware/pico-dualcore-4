@@ -29,8 +29,8 @@ from intercore import (  # noqa: E402
     KIND_HEALTH,
     RETENTION_PRIORITY_HEALTH,
 )
+from message_protocol import format_utc_epoch_ms  # noqa: E402
 from message_serializer import serialize_and_validate_message  # noqa: E402
-from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION  # noqa: E402
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -218,16 +218,13 @@ class HealthEnv:
         self.set_clock(NOW_MS)
 
     # -- run the production builder -----------------------------------
-    def build(self, source="test-source", runtime_id="test-runtime",
-              boot_ticks_ms=BOOT_TICKS_MS):
+    def build(self, boot_ticks_ms=BOOT_TICKS_MS):
         system_information = FakeSystemInformation(self._configured, self._active)
         uptime_state = self.core1.create_uptime_state(boot_ticks_ms)
         return self.core1._build_health_payload(
             self.bus,
             uptime_state,
-            source,
             self.config,
-            runtime_id,
             system_information,
         )
 
@@ -396,19 +393,24 @@ def test_multiple_degradation_reasons(health):
 
 def test_runtime_and_uptime_values(health):
     health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
+    snapshot = _valid_utc_snapshot()
+    health.set_utc(snapshot)
     health.set_clock(NOW_MS + 25000)  # 35s of uptime
 
-    payload = health.build(source="core1", runtime_id="rt-42")
+    payload = health.build()
 
-    assert payload["source"] == "core1"
-    assert payload["runtime_id"] == "rt-42"
     assert payload["message_type"] == "health"
-    assert payload["firmware_version"] == FIRMWARE_VERSION
-    assert payload["message_schema_version"] == MESSAGE_SCHEMA_VERSION
     assert payload["uptime_ms"] == (NOW_MS + 25000) - BOOT_TICKS_MS  # 35000
-    # Core 1 leaves the timestamp for Core 0 to fill.
-    assert payload["timestamp"] is None
+    # The timestamp is Core 1's: it is computed from the shared UTC snapshot,
+    # advanced by the elapsed local ticks (the snapshot was taken 10s before
+    # the clock at set_utc time, and the clock is now 25s past "now").
+    expected_epoch_ms = snapshot["utc_epoch_ms"] + (NOW_MS + 25000) - snapshot["ticks_ms"]
+    assert payload["timestamp"] == format_utc_epoch_ms(expected_epoch_ms)
+    # The envelope keys are Core 0's: Core 1 must not carry them, or the wire
+    # document would repeat a member name when Core 0 splices them in.
+    for key in ("sequence", "runtime_id", "source", "firmware_version",
+                "message_schema_version"):
+        assert key not in payload
 
 
 def test_payload_structure_matches_spec(health):
@@ -418,11 +420,14 @@ def test_payload_structure_matches_spec(health):
 
     payload = health.build()
 
-    for field in (
-        "message_schema_version", "runtime_id", "uptime_ms", "timestamp",
-        "source", "message_type", "firmware_version", "payload",
-    ):
+    # Top level is Core 1's message fields only; the envelope
+    # (sequence, runtime_id, source, firmware_version,
+    # message_schema_version) is injected by Core 0 at publish time.
+    for field in ("message_type", "uptime_ms", "timestamp", "payload"):
         assert field in payload
+    for key in ("sequence", "runtime_id", "source", "firmware_version",
+                "message_schema_version"):
+        assert key not in payload
 
     p = payload["payload"]
     for field in (

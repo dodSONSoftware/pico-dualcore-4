@@ -19,8 +19,17 @@ Validation rules:
 import json
 
 
-# Maximum outbound MQTT payload bytes (128KB)
-MAX_OUTBOUND_MESSAGE_BYTES = 128 * 1024
+# Maximum outbound MQTT payload bytes (16 KiB).
+#
+# MCU-scale ceiling. The limit is enforced after json.dumps() + utf-8 encode, so
+# at peak allocation the object graph, the serialized str, and the encoded bytes
+# are all resident at once; a 128 KiB payload could not be admitted safely on a
+# Pico W (256 KiB SRAM, 64 KiB reserved). 16 KiB keeps a single message's transient
+# peak (graph + str + bytes, ~3x) to roughly 48 KiB and leaves ~6x headroom over the
+# largest legitimate message (the one-shot startup log, which is the only payload that
+# grows with device count). The aggregate retained footprint is separately bounded by
+# OutboundQueue's queued-byte budget (see intercore.DEFAULT_MAX_OUTBOUND_QUEUED_BYTES).
+MAX_OUTBOUND_MESSAGE_BYTES = 16 * 1024
 
 
 class SerializationError(Exception):

@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: MIT
 
 import pathlib
+import sys
 import tarfile
 from version import FIRMWARE_VERSION
 
@@ -48,8 +49,10 @@ FILES = REQUIRED_FILES | OPTIONAL_FILES | REQUIRED_PACKAGES
 
 
 def main():
-    output_dir = ROOT / "releases"
-    output_dir.mkdir(exist_ok=True)
+    if len(sys.argv) > 2:
+        raise SystemExit("Usage: python3 release.py [OUTPUT_DIR]")
+    output_dir = pathlib.Path(sys.argv[1]) if len(sys.argv) == 2 else ROOT / "releases"
+    output_dir.mkdir(parents=True, exist_ok=True)
     artifact = output_dir / "sensor-firmware-{}.tar.gz".format(FIRMWARE_VERSION)
     with tarfile.open(artifact, "w:gz") as archive:
         for name in FILES:
