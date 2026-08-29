@@ -556,21 +556,28 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # Register initial Core 1 activity
         intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
 
-        # Queue immediate health message after startup completed
-        # This ensures health message arrives before first telemetry (which runs on read_loop_sec)
-        _try_queue_health_message_intercore(intercore, boot_ticks_ms, source, config, runtime_id, system_information)
-
-        # Health scheduler for periodic health messages
+        # Health scheduler anchored to boot_ticks_ms: fixed uptime-based
+        # boundaries every health_interval_sec from boot (e.g. a 60s interval
+        # means 60, 120, 180 seconds of uptime), independent of when startup
+        # completed. No immediate health message is emitted at startup.
         health_interval_ms = config["health_interval_sec"] * 1000
-        next_health_ms = time.ticks_add(time.ticks_ms(), health_interval_ms)
+        next_health_ms = time.ticks_add(boot_ticks_ms, health_interval_ms)
+
+        now_ms = time.ticks_ms()
+
+        # Boundaries already passed while startup was running are skipped,
+        # never replayed: health is current-state data, not historical
+        # telemetry. Advance to the next future boundary.
+        while time.ticks_diff(now_ms, next_health_ms) >= 0:
+            next_health_ms = time.ticks_add(next_health_ms, health_interval_ms)
 
         # Liveness heartbeat scheduler (deadline-based, independent of loop phase)
         activity_interval_ms = 5000
-        next_activity_ms = time.ticks_add(time.ticks_ms(), activity_interval_ms)
+        next_activity_ms = time.ticks_add(now_ms, activity_interval_ms)
 
-        # Now that startup log and health are queued, telemetry can begin
+        # Now that the startup log is admitted, telemetry can begin
         read_loop_ms = config["read_loop_sec"] * 1000
-        next_read_ms = time.ticks_add(time.ticks_ms(), read_loop_ms)
+        next_read_ms = time.ticks_add(now_ms, read_loop_ms)
 
         pending_command_response = None
 
@@ -598,11 +605,16 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 intercore.state_mailboxes.set_core_1_activity_ms(now_ms)
                 next_activity_ms = time.ticks_add(now_ms, activity_interval_ms)
 
-            # Check for health message generation
+            # Health boundary reached: emit at most one current health
+            # report (skipped entirely during a network outage), then advance
+            # to the next boot-relative boundary. Advancing from the old
+            # deadline -- not from now -- keeps the cadence aligned to the
+            # boot-based boundaries and avoids cumulative drift; missed
+            # boundaries are skipped, never replayed as catch-up reports.
             if time.ticks_diff(now_ms, next_health_ms) >= 0:
-                # Try to generate and queue health message
                 _try_queue_health_message_intercore(intercore, boot_ticks_ms, source, config, runtime_id, system_information)
-                next_health_ms = time.ticks_add(now_ms, health_interval_ms)
+                while time.ticks_diff(now_ms, next_health_ms) >= 0:
+                    next_health_ms = time.ticks_add(next_health_ms, health_interval_ms)
 
             time.sleep_ms(20)
 

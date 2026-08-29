@@ -163,7 +163,7 @@ Check for:
 
 - `tests/` contains host-side unit tests
 - Run with: `python -m pytest tests/`
-- The suite covers core-ownership boundaries (AST checks), config validation, inter-core bus semantics, health payloads, MQTT keepalive, UTC synchronization, network recovery, and the Core 1 liveness heartbeat
+- The suite covers core-ownership boundaries (AST checks), config validation, inter-core bus semantics, health payloads, boot-anchored health scheduling, MQTT keepalive, UTC synchronization, network recovery, and the Core 1 liveness heartbeat
 - Hardware testing requires an actual Pico device
 
 ## Hardware Notes
@@ -174,6 +174,8 @@ Check for:
 - Never call `machine.reset()` from Core 1
 
 ## Version History
+
+- **0.4.5**: Health scheduling anchored to boot time: `health_interval_sec` now defines fixed uptime-based boundaries from firmware boot (60s interval → first health at ~60s uptime, then 120s, 180s, ...). The immediate post-startup health message is removed; boundaries missed during startup or an MQTT outage are skipped, never replayed; deadlines advance from the previous boundary so processing delay cannot accumulate drift.
 
 - **0.4.4**: Fixed UTC retry throttle blocking its own prompt retry: a malformed-but-reachable time-server answer now re-keys the retry backoff to ~0.5s (previously the 30s interval, measured from the original send, blocked the resend even though the server had just answered); a silent server still gets the full 30s throttle.
 

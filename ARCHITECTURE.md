@@ -107,7 +107,7 @@ Health messages are only generated when:
 1. Network snapshot is available (`network_stack_ready = True`)
 2. MQTT is connected (`mqtt_connected = True`)
 
-This prevents health messages from accumulating during MQTT outages.
+This prevents health messages from accumulating during MQTT outages. A boundary skipped during an outage is never replayed after recovery: the scheduler waits for the next boot-relative boundary.
 
 ## Hardware detection
 
@@ -322,7 +322,14 @@ Health messages report `core_1_active` as true while the stamp age is within thr
 
 ## Periodic Health Messages
 
-Core 1 generates health messages periodically (every `health_interval_sec`) and immediately after startup completes. The health message contains current-state diagnostic fields without turning the payload into a full system information report.
+Core 1 generates health messages on a boot-anchored cadence: `health_interval_sec` defines fixed uptime-based boundaries counted from firmware boot (a 60-second interval produces boundaries at 60, 120, 180, 240 seconds of uptime, ...), independent of when startup completes. No immediate health message is generated after `system_startup_completed`. The health message contains current-state diagnostic fields without turning the payload into a full system information report.
+
+### Scheduling
+
+- **Boot-anchored**: the first deadline is `boot_ticks_ms + health_interval_sec`, never derived from the moment startup completed.
+- **Missed boundaries are skipped, never replayed**: boundaries that elapsed during startup (or any bounded delay) are not emitted as catch-up reports; the scheduler advances directly to the next future boundary.
+- **No cumulative drift**: after a boundary the deadline advances from the previous deadline (deadline + interval), not from the moment the message was actually generated, so per-iteration processing delay cannot accumulate.
+- **At most one message per boundary**: when a boundary is due, at most one current-state health report is emitted (subject to the generation rules below), then the deadline advances past any elapsed boundaries.
 
 ### Generation Rules
 

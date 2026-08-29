@@ -210,10 +210,10 @@ def test_core1_activity_stamp_survives_hostile_loop_phase():
     finally:
         _restore()
 
-    # Health kept flowing across the whole window: initial (boot) plus the
-    # periodic messages at 60022ms and 120022ms.
+    # Health kept flowing across the whole window: the periodic boot-anchored
+    # messages at 60022ms and 120022ms (no immediate post-startup health).
     health_payloads = _drain_health_payloads(bus)
-    assert len(health_payloads) == 3
+    assert len(health_payloads) == 2
 
     # The last health message is built ~120s after boot; the old phase-gated
     # code would see a 120000ms-stale stamp and flag core_1_inactive.
