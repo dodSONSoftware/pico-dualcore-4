@@ -61,6 +61,9 @@ def ticks(monkeypatch):
 def mock_select(monkeypatch):
     """Route check_msg()'s readiness poll at the readiness model (see above)."""
     import mqtt_client
+    MockPoller.created_count = 0
+    MockPoller.poll_calls = 0
+    MockPoller.ipoll_calls = 0
     monkeypatch.setattr(mqtt_client, "select", MockSelect)
 
 
@@ -99,8 +102,25 @@ class MockSocket:
         # so a test can model a socket/runtime error during timeout setup.
         self.settimeout_error = None
         self.closed = False
+        # When set, a write attempted in infinite-blocking mode (no finite
+        # timeout installed) would stall forever on a real blackholed link;
+        # with a finite timeout installed the write is bounded and completes
+        # (in-memory). Makes "the timeout is active before byte 1 of the
+        # frame" observable: code that writes before installing its timeout
+        # raises HangDetected instead.
+        self.write_requires_timeout = False
+        # When set, every write represents a stalled send on a blackholed
+        # link: infinite-blocking -> HangDetected (the production wedge);
+        # finite timeout -> OSError (the timeout fired, a bounded failure).
+        self.write_stalls = False
 
     def write(self, data, size=None):
+        if self.write_stalls:
+            if self.timeout_value is None:
+                raise HangDetected("write would block forever (no timeout)")
+            raise OSError("write timeout (bounded by installed timeout)")
+        if self.write_requires_timeout and self.timeout_value is None:
+            raise HangDetected("write would block forever (no timeout)")
         # MicroPython sockets accept str writes (encoded); CPython does not,
         # so the mock encodes before storing.
         if isinstance(data, str):
@@ -148,22 +168,40 @@ class MockSocket:
 
 
 class MockPoller:
-    """Models MicroPython's select.poll(): register a stream, poll(0) non-blocking.
+    """Models MicroPython's select.poll(): register a stream, poll non-blocking.
 
     Readiness is modeled from the MockSocket's buffer: a stream is readable
     exactly when it still has bytes to serve — the same "a packet has started
     arriving" condition check_msg() tests for. (The real socket object is what
     check_msg() registers; MockSocket has no fd, so it is modeled here.)
+
+    Class-level counters let a test assert that check_msg() builds one poller
+    per socket and reuses it (created_count), and that it polls through the
+    allocation-free ipoll() path (ipoll_calls) rather than the list-returning
+    poll() path (poll_calls).
     """
 
+    created_count = 0
+    poll_calls = 0
+    ipoll_calls = 0
+
     def __init__(self):
+        MockPoller.created_count += 1
         self._streams = []
 
     def register(self, obj, eventmask=None):
         self._streams.append(obj)
 
     def poll(self, timeout=-1):
+        MockPoller.poll_calls += 1
         return [(obj, 1) for obj in self._streams if obj.buffer]
+
+    def ipoll(self, timeout=-1, flags=0):
+        # MicroPython's allocation-free variant: poll and return an iterator
+        # that yields one (obj, event) tuple per ready stream instead of
+        # materializing a result list (as the device's real ipoll() does).
+        MockPoller.ipoll_calls += 1
+        return iter((obj, 1) for obj in self._streams if obj.buffer)
 
 
 class MockSelect:
@@ -279,6 +317,52 @@ def test_publish_qos1_times_out_when_puback_never_arrives():
     # The PUBLISH frame went out, the bounded wait gave up, and the socket
     # is restored to the client's default (blocking) state.
     assert bytes(sock.written) == b"\x32\x06\x00\x01t\x00\x01x"
+    assert sock.timeout_value is None
+
+
+def test_publish_qos1_timeout_active_before_first_publish_byte():
+    """The QoS 1 timeout must be active before byte 1 of the PUBLISH frame.
+
+    A link that stalls on a write in infinite-blocking mode would wedge
+    Core 0 inside sock.write() forever — and with Core 0 wedged, its Core 1
+    heartbeat check never runs, so no recovery path remains. The mock stalls
+    any write attempted without a finite timeout (HangDetected, a
+    BaseException that escapes the code under test's handlers), so the
+    publish completing at all proves the timeout was installed before the
+    first write and restored after the exchange.
+    """
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"\x40\x02\x00\x01")  # PUBACK for pid 1
+    sock.write_requires_timeout = True
+    client.sock = sock
+
+    client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+
+    assert bytes(sock.written) == b"\x32\x06\x00\x01t\x00\x01x"
+    # The socket was restored to the client's default (blocking) state.
+    assert sock.timeout_value is None
+
+
+def test_publish_qos1_write_stall_surfaces_as_bounded_error():
+    """A stalled PUBLISH write must fail bounded, not wedge Core 0.
+
+    A blackholed link whose send buffer stops draining wedges Core 0 inside
+    sock.write() unless a finite timeout is active: with the timeout in place
+    the failure is a bounded OSError that propagates through
+    Mqtt.publish_qos1's disconnect into network recovery. The old code
+    (timeout installed only after the writes) surfaces this as HangDetected
+    instead.
+    """
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"")
+    sock.write_stalls = True
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+
+    # The stalled write was bounded and the socket left in its default state.
+    assert sock.written == b""
     assert sock.timeout_value is None
 
 
@@ -446,6 +530,53 @@ def test_check_msg_times_out_on_stalled_packet_instead_of_short_reading(mock_sel
     assert sock.timeout_value is None
 
 
+def test_check_msg_reuses_one_poller_and_uses_ipoll(mock_select):
+    """check_msg() builds the readiness poller once per socket and reuses it.
+
+    Rebuilding select.poll() (and a result list) on every ~100 ms call was
+    pure GC churn on the hot path — ~350,000 poll objects over a 10-hour run.
+    The fix creates the poller once and polls through the allocation-free
+    ipoll() where available (MicroPython), so a whole connection produces a
+    single poller and never the list-returning poll() path.
+    """
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    sock = MockSocket(incoming=b"")
+    client.sock = sock
+
+    for _ in range(5):
+        assert client.check_msg(4.0) is None
+
+    # One poller for all five polls (not one per call), and every poll took
+    # the allocation-free ipoll path rather than the list-returning poll path.
+    assert MockPoller.created_count == 1
+    assert MockPoller.ipoll_calls == 5
+    assert MockPoller.poll_calls == 0
+
+
+def test_check_msg_recreates_poller_when_socket_changes(mock_select):
+    """A reconnect installs a new socket object, so the poller is rebuilt.
+
+    A poller still registered on the old (closed) socket would poll the wrong
+    stream. When client.sock is replaced, check_msg() must build a fresh
+    poller bound to the new socket instead of reusing the stale one.
+    """
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+
+    old_sock = MockSocket(incoming=b"")
+    client.sock = old_sock
+    assert client.check_msg(4.0) is None
+    assert MockPoller.created_count == 1
+
+    # Reconnect: a brand-new socket object replaces the old one.
+    client.sock = MockSocket(incoming=b"")
+    assert client.check_msg(4.0) is None
+
+    # The stale poller was discarded; a fresh one was built for the new socket.
+    assert MockPoller.created_count == 2
+
+
 # ---------------------------------------------------------------------------
 # MQTTClient: a failed timeout establishment must fail the operation, not
 # swallow it into an unbounded response wait
@@ -460,7 +591,7 @@ def test_check_msg_times_out_on_stalled_packet_instead_of_short_reading(mock_sel
 # ---------------------------------------------------------------------------
 
 def test_publish_qos1_fails_immediately_when_settimeout_raises():
-    """A failed timeout install must abort publish() before the PUBACK wait."""
+    """A failed timeout install must abort publish() before byte 1 goes out."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket(incoming=b"\x40\x02\x00\x01")  # ready PUBACK: must stay queued
     sock.settimeout_error = OSError("settimeout failed")
@@ -469,9 +600,10 @@ def test_publish_qos1_fails_immediately_when_settimeout_raises():
     with pytest.raises(OSError):
         client.publish(b"t", b"x", qos=1, timeout_ms=4000)
 
-    # The PUBLISH frame went out, but the bounded wait was never entered: the
-    # ready PUBACK is still queued and no mode was left behind.
-    assert bytes(sock.written) == b"\x32\x06\x00\x01t\x00\x01x"
+    # The timeout is installed before any PUBLISH write, so a failed install
+    # aborts before byte 1 of the frame: nothing was transmitted, the ready
+    # PUBACK is still queued, and no mode was left behind.
+    assert sock.written == b""
     assert sock.buffer == b"\x40\x02\x00\x01"
     assert sock.timeout_value is None
 

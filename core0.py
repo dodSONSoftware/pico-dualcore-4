@@ -14,7 +14,7 @@ from uptime import create_uptime_state, current_uptime_ms
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 from wifi import Wifi
 
-from message_serializer import serialize_and_validate_message, MessageTooLargeError
+from message_serializer import serialize_and_validate_message
 
 
 _MAX_PENDING_CORE0_RESPONSES = 4
@@ -106,7 +106,7 @@ class Core0:
             return
 
         # For connection logs, we use the pre-serialized message approach
-        from message_serializer import serialize_and_validate_message, MessageTooLargeError
+        from message_serializer import serialize_and_validate_message
         message = self._pending_connection_logs[0]
         # The message is final at this point: uptime and timestamp are the
         # sender's to carry, and the envelope is spliced in at publish time.
@@ -270,6 +270,10 @@ class Core0:
             return
 
         response = self._pending_core0_responses[0]
+        # Claim (or, on a retry, reuse) the wire sequence on the persistent
+        # response so a re-publish after an ambiguous QoS 1 failure keeps the
+        # same (runtime_id, sequence) identity instead of shifting it.
+        wire_sequence = self._claim_wire_sequence(response)
         self._publish_core0_command_response(
             response["command_id"],
             response["command"],
@@ -277,6 +281,7 @@ class Core0:
             targeted=response.get("targeted", False),
             data=response.get("data"),
             error=response.get("error"),
+            wire_sequence=wire_sequence,
         )
         self._pending_core0_responses.pop(0)
 
@@ -368,6 +373,28 @@ class Core0:
         })
         return fragment[1:-1].encode("utf-8")
 
+    def _claim_wire_sequence(self, container):
+        """Claim the next wire sequence number and stamp it on ``container``.
+
+        QoS 1 has an ambiguous failure mode: the PUBLISH frame can reach the
+        broker while the PUBACK is lost, so a failed publish attempt may still
+        have been delivered. A number handed to such an attempt can therefore
+        never be given to a different logical message -- that is the
+        (runtime_id, sequence) collision this avoids. The claim is made before
+        the first transmission attempt, stamped on the logical object (the
+        queue entry, or the persistent response/reboot dict for Core 0's own
+        retryable messages), and never rolled back: a retry of the SAME logical
+        message finds the stamp and reuses the number (both copies identify one
+        message -- legitimate QoS 1 duplicate delivery), while a DIFFERENT
+        message always gets a fresh number.
+        """
+        sequence = container.get("_wire_sequence")
+        if sequence is None:
+            sequence = self._next_sequence
+            self._next_sequence += 1
+            container["_wire_sequence"] = sequence
+        return sequence
+
     def _publish_entry(self, entry):
         """Publish one MQTT entry from its pre-serialized message bytes.
 
@@ -378,8 +405,13 @@ class Core0:
         payload is never decoded, parsed, or re-serialized here, so publishing
         allocates only the small envelope fragment and the assembled frame
         instead of a full decode + dict graph + re-encode of the message.
+
+        Sequence: claimed once, before the first transmission attempt (see
+        _claim_wire_sequence). An attempt that fails the object check above has
+        transmitted nothing, so it consumes no number; a frame that is
+        transmitted is always bound to a number that no other logical message
+        can ever receive.
         """
-        sequence = self._next_sequence
         payload = entry["payload_bytes"]
         if not isinstance(payload, (bytes, bytearray)) or bytes(payload[-1:]) != b"}":
             raise ValueError("queued payload must be a serialized JSON object")
@@ -387,6 +419,11 @@ class Core0:
         # assembled frame is plain bytes (MicroPython's bytes.join is strict
         # about item types).
         body = payload if isinstance(payload, bytes) else bytes(payload)
+        # Claim the wire sequence now that the frame is about to be transmitted,
+        # and stamp it on the entry. A later retry of this same entry (an
+        # ambiguous QoS 1 failure left it in flight) reuses the stamped number,
+        # while a different message is never handed it.
+        sequence = self._claim_wire_sequence(entry)
         encoded = b"".join((body[:-1], b",", self._envelope_fragment(sequence), b"}"))
         topic = entry.get("topic")
         if topic is None:
@@ -394,17 +431,21 @@ class Core0:
         self._mqtt.publish_qos1(topic, encoded)
         if entry.get("kind") == KIND_TELEMETRY:
             self._led_manager.telemetry_sent()
-        self._next_sequence += 1
         if DEBUG:
             print("[DEBUG] QoS 1 published: seq={}".format(sequence))
 
     def _publish_core0_command_response(
-        self, command_id, command, success, targeted=True, data=None, error=None
+        self, command_id, command, success, targeted=True, data=None, error=None,
+        wire_sequence=None
     ):
         """Build and publish a Core 0 command response.
 
         The command response is serialized before publishing to honor the
         pre-serialized outbound-message contract.
+
+        ``wire_sequence`` carries a sequence already claimed for this logical
+        response (by a retrying caller), so the re-publish keeps that identity.
+        Omit it on a first attempt: _publish_entry then claims a fresh number.
         """
         payload = {
             "command_id": command_id,
@@ -432,7 +473,7 @@ class Core0:
             payload_bytes = serialize_and_validate_message(message)
         except MemoryError:
             raise
-        except (MessageTooLargeError, Exception) as err:
+        except Exception as err:
             if DEBUG:
                 print("[DEBUG] Command response serialization failed: {}".format(err))
             return
@@ -442,6 +483,11 @@ class Core0:
             "kind": KIND_COMMAND_RESPONSE,
             "payload_bytes": payload_bytes,
         }
+        # Carry the caller's claimed sequence into the entry so the retry keeps
+        # it; a first attempt (None) leaves the entry unstamped and
+        # _publish_entry claims a fresh number.
+        if wire_sequence is not None:
+            entry["_wire_sequence"] = wire_sequence
         self._publish_entry(entry)
 
     def _perform_reboot(self):
@@ -452,12 +498,16 @@ class Core0:
             return False
 
         try:
+            # Claim (or, on a retry, reuse) the wire sequence on the pending
+            # reboot request so a re-publish keeps the same sequence identity.
+            wire_sequence = self._claim_wire_sequence(request)
             self._publish_core0_command_response(
                 request["command_id"],
                 request["command"],
                 True,
                 targeted=request.get("targeted", False),
                 data={"rebooting": True},
+                wire_sequence=wire_sequence,
             )
         except MemoryError:
             raise
@@ -469,7 +519,6 @@ class Core0:
         self._pending_reboot = None
         print("[INFO] Rebooting in 5000 milliseconds")
         time.sleep_ms(5000)
-        time.sleep_ms(1000)
         print("[INFO] machine.reset()")
         machine.reset()
         return True

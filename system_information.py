@@ -142,6 +142,8 @@ class SystemInformation:
             "outbound_evicted": outbound["messages_evicted"],
             "telemetry_evicted": outbound["telemetry_evicted"],
             "outbound_rejected": outbound["messages_rejected"],
+            "outbound_queued_bytes": outbound["queued_bytes"],
+            "outbound_max_queued_bytes": outbound["max_queued_bytes"],
             "intercore_events_pending": events["pending"],
             "intercore_events_max": events["max"],
         }

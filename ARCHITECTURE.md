@@ -35,6 +35,9 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
     "outbound_queue_depth": 0,
     "outbound_queue_capacity": 16,
     "outbound_queue_utilization_percent": 0,
+    "outbound_queued_bytes": 0,
+    "outbound_max_queued_bytes": 32768,
+    "outbound_queue_byte_utilization_percent": 0,
     "utc_valid": true,
     "utc_sync_age_sec": 52
   }
@@ -80,6 +83,9 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 - `outbound_queue_depth`: Queued + in-flight entries
 - `outbound_queue_capacity`: Queue capacity from `OutboundQueue`
 - `outbound_queue_utilization_percent`: (depth * 100) // capacity (integer)
+- `outbound_queued_bytes`: Queued FIFO payload bytes (the in-flight entry is excluded, matching the queue's byte admission budget)
+- `outbound_max_queued_bytes`: Queue byte capacity from `OutboundQueue` (`DEFAULT_MAX_OUTBOUND_QUEUED_BYTES`, 32 KiB)
+- `outbound_queue_byte_utilization_percent`: (queued_bytes * 100) // max_queued_bytes (integer)
 
 ### UTC Fields
 
@@ -94,7 +100,7 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 - `core_1_inactive`: Core 1 activity exceeds threshold (3x read_loop_sec, min 60s)
 - `low_free_heap`: free_heap < minimum_free_heap
 - `device_count_mismatch`: devices_active != devices_configured
-- `outbound_queue_pressure`: utilization >= 75%
+- `outbound_queue_pressure`: max(entry utilization, byte utilization) >= 75%
 - `utc_not_valid`: UTC snapshot unavailable
 
 ### Queue Priority
@@ -152,6 +158,7 @@ Core 1 -> Core 0. Contains only data intended for MQTT.
 - The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40; health messages use HEALTH 70; the startup log uses INFO 50.
 - An in-flight QoS 1 entry counts toward the configured capacity but is never evicted.
 - A failed publish never discards the in-flight entry: it stays in flight and `take()` returns it again, so Core 0 retries until the broker PUBACKs (QoS 1 at-least-once delivery).
+- **Sequence identity across an ambiguous failure.** QoS 1 has an ambiguous failure mode: the PUBLISH frame can reach the broker while the PUBACK is lost, so a failed publish attempt may still have been delivered. The `sequence` envelope member is therefore claimed *before* the first transmission attempt and stamped on the logical object — the queue entry, or Core 0's persistent response/reboot dict for its own retryable messages — and is never rolled back or reused by a different message. A retry of the *same* logical message reuses its stamped number (both copies identify one message — legitimate QoS 1 duplicate delivery), while a *different* message (e.g. a `mqtt_connection_established` log published after a reconnect) always receives a fresh number. This makes `(runtime_id, sequence)` a safe unique event identity and lets a receiver recognize a retry of the same logical message. Claiming happens in `core0._claim_wire_sequence`, invoked from `_publish_entry` (queue/connection-log path) and from the response/reboot retry paths.
 
 #### Pre-serialized message storage
 
@@ -270,7 +277,7 @@ The CONNPACK advertises `mqtt_keepalive_sec` (30 s default), so the broker disco
 Two invariants in `mqtt_client.py` keep the bounded-wait contract sound (every blocking broker wait must be deadline-limited, so a dead link surfaces as a failure instead of stalling the run loop):
 
 - **One packet ID helper**: `next_packet_id()` advances the counter and wraps 65535 back to 1 (0 is reserved). QoS 1 publish, subscribe, and `Mqtt.get_next_packet_id()` (the network-probe path) all draw IDs from this single helper, so every message takes the next of 1, 2, ..., 65535, 1, 2, ... and the wrap is defined in exactly one place.
-- **Socket mode is the caller's contract**: `wait_msg()` reads in whatever socket mode it finds and never changes it, and every caller runs it in blocking-with-timeout mode — so a read always returns a full length and a link that stalls after the first frame byte surfaces as a timeout instead of blocking forever. `publish`/`ping`/`subscribe` bound their waits with their own timeouts. `check_msg()` is the poller: it first decides *readiness* with a non-blocking `select` poll (one readable byte means a packet has started; nothing returns `None` immediately, leaving the socket mode untouched), and only then parses the packet — that parse runs under the finite `mqtt_broker_response_timeout_sec` rather than non-blocking, because a non-blocking multi-byte read can short-read a PUBLISH split across TCP reads and deliver a corrupt frame. `check_msg()` restores normal blocking mode on the way out; in MicroPython `setblocking(True)` is identical to `settimeout(None)`, so a poll that left the socket non-blocking, or a wait that forced blocking mid-read, would silently clear the next operation's timeout.
+- **Socket mode is the caller's contract**: `wait_msg()` reads in whatever socket mode it finds and never changes it, and every caller runs it in blocking-with-timeout mode — so a read always returns a full length and a link that stalls after the first frame byte surfaces as a timeout instead of blocking forever. `publish`/`ping`/`subscribe` bound their waits with their own timeouts — and `publish` installs the QoS 1 timeout *before* the first PUBLISH frame byte is written, so a blackholed link whose send stops making progress fails the publish bounded (into recovery) instead of wedging Core 0 inside `sock.write()`, where the Core 1 heartbeat check could never run. `check_msg()` is the poller: it first decides *readiness* with a non-blocking `select` poll (one readable byte means a packet has started; nothing returns `None` immediately, leaving the socket mode untouched), and only then parses the packet — that parse runs under the finite `mqtt_broker_response_timeout_sec` rather than non-blocking, because a non-blocking multi-byte read can short-read a PUBLISH split across TCP reads and deliver a corrupt frame. `check_msg()` restores normal blocking mode on the way out; in MicroPython `setblocking(True)` is identical to `settimeout(None)`, so a poll that left the socket non-blocking, or a wait that forced blocking mid-read, would silently clear the next operation's timeout.
 - **The handshake is bounded the same way**: `Mqtt.connect()` calls `MQTTClient.connect(timeout=mqtt_broker_response_timeout_sec)`, which installs the finite socket timeout that the CONNACK wait runs under. `subscribe()` does not install its own timeout — it relies on the one `connect()` left in place — so that same finite timeout carries across both SUBACK waits. A broker that accepts the TCP connection and then goes silent fails the attempt within the timeout (the reconnect backoff then retries) instead of wedging Core 0. Once both subscriptions succeed, `Mqtt.connect()` restores normal blocking mode; every later operation (PUBACK, PINGRESP) installs and restores its own timeout.
 
 ## Network recovery
@@ -385,7 +392,7 @@ Core 1 generates health messages on a normal-runtime-anchored cadence: `health_i
    - Core 1 activity: `StateMailboxes.get_core_1_activity_ms()`
    - Heap: `gc.mem_free()` (current measurement)
    - Devices: `SystemInformation.get_devices()` (backed by `DeviceManager.get_status_snapshot()`)
-   - Queue: `OutboundQueue.get_depth_with_capacity()`
+   - Queue: `OutboundQueue.get_health_metrics()` (entry and byte budget views)
    - UTC: `StateMailboxes.get_utc_snapshot()`
 
 3. **Monotonic time calculations**:
@@ -393,7 +400,7 @@ Core 1 generates health messages on a normal-runtime-anchored cadence: `health_i
    - Uptime since boot is accumulated from deltas between recent samples (`uptime.py`), never as a single `ticks_diff(now, boot)` — that one-shot form is only guaranteed within half a tick period and wraps on long-running devices
    - UTC sync age: integer division of milliseconds by 1000
 
-4. **Queue pressure threshold**: 75% utilization (`outbound_queue_utilization_percent >= 75`)
+4. **Queue pressure threshold**: 75% of either budget — `max(outbound_queue_utilization_percent, outbound_queue_byte_utilization_percent) >= 75`. The queue has two independent ceilings (16 entries and 32 KiB queued bytes), and a handful of large entries can hit the byte ceiling while entry utilization is modest; the byte ceiling is the memory-protection boundary, so pressure must reflect the worse of the two views.
 
 5. **Low-priority retention**: Uses `RETENTION_PRIORITY_HEALTH = 70`, the lowest priority class
 
@@ -406,7 +413,7 @@ Health status is "degraded" when any of these conditions are true:
 - `core_1_inactive`: Activity age exceeds threshold (3x read_loop_sec, minimum 60 seconds)
 - `low_free_heap`: Free heap below configured reserve
 - `device_count_mismatch`: Active devices don't match configured count
-- `outbound_queue_pressure`: Queue utilization >= 75%
+- `outbound_queue_pressure`: Queue utilization (entry or byte) >= 75%
 - `utc_not_valid`: UTC snapshot unavailable
 
 If no degradation reasons exist, status is "healthy".

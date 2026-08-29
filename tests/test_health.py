@@ -28,6 +28,7 @@ from intercore import (  # noqa: E402
     InterCore,
     KIND_HEALTH,
     RETENTION_PRIORITY_HEALTH,
+    DEFAULT_MAX_OUTBOUND_QUEUED_BYTES,
 )
 from message_protocol import format_utc_epoch_ms  # noqa: E402
 from message_serializer import serialize_and_validate_message  # noqa: E402
@@ -272,6 +273,9 @@ def test_healthy_state_payload(health):
     assert p["devices_active"] == 1
     assert p["outbound_queue_depth"] == 0
     assert p["outbound_queue_capacity"] == 16
+    assert p["outbound_queued_bytes"] == 0
+    assert p["outbound_max_queued_bytes"] == DEFAULT_MAX_OUTBOUND_QUEUED_BYTES
+    assert p["outbound_queue_byte_utilization_percent"] == 0
     assert p["utc_valid"] is True
     assert payload["uptime_ms"] == NOW_MS - BOOT_TICKS_MS  # 10000
 
@@ -340,6 +344,63 @@ def test_queue_pressure_triggers_degraded(health):
 
     assert payload["payload"]["status"] == "degraded"
     assert "outbound_queue_pressure" in payload["payload"]["degraded_reasons"]
+
+
+def test_byte_budget_pressure_triggers_degraded(health):
+    """A near-full queued-byte budget degrades health at modest entry utilization.
+
+    4 entries of ~8 KiB each consume the 32 KiB byte budget while the entry
+    budget sits at 4/16 = 25%. The byte budget is the memory-protection
+    boundary (the admission ceiling), so it must drive the pressure reason
+    even though entry utilization alone is far below the 75% threshold.
+    """
+    health.set_healthy_baseline()
+    health.set_utc(_valid_utc_snapshot())
+    chunk = json.dumps({"id": 0, "pad": "x" * 8000}).encode()
+    assert 8000 < len(chunk) < 9000  # ~8 KiB per entry
+    for i in range(4):
+        entry = json.dumps({"id": i, "pad": "x" * 8000}).encode()
+        assert health.bus.outbound_queue.put_with_kind(
+            KIND_HEALTH, entry, RETENTION_PRIORITY_HEALTH
+        )
+        assert len(entry) == len(chunk)
+
+    payload = health.build()
+    p = payload["payload"]
+
+    assert p["status"] == "degraded"
+    assert "outbound_queue_pressure" in p["degraded_reasons"]
+    assert p["outbound_queue_depth"] == 4
+    assert p["outbound_queue_capacity"] == 16
+    assert p["outbound_queue_utilization_percent"] == 25  # entry view: below threshold
+    assert p["outbound_queued_bytes"] == 4 * len(chunk)
+    assert p["outbound_max_queued_bytes"] == DEFAULT_MAX_OUTBOUND_QUEUED_BYTES
+    assert (
+        p["outbound_queue_byte_utilization_percent"]
+        == (4 * len(chunk) * 100) // DEFAULT_MAX_OUTBOUND_QUEUED_BYTES
+    )
+    assert p["outbound_queue_byte_utilization_percent"] >= 75  # byte view: at/over threshold
+
+
+def test_byte_budget_below_threshold_is_not_pressure(health):
+    """Bytes below the 75% byte threshold (and low entries) stay healthy."""
+    health.set_healthy_baseline()
+    health.set_utc(_valid_utc_snapshot())
+    chunk = json.dumps({"id": 0, "pad": "x" * 3000}).encode()
+    for i in range(2):
+        health.bus.outbound_queue.put_with_kind(
+            KIND_HEALTH, json.dumps({"id": i, "pad": "x" * 3000}).encode(),
+            RETENTION_PRIORITY_HEALTH,
+        )
+
+    payload = health.build()
+    p = payload["payload"]
+
+    assert p["status"] == "healthy"
+    assert "outbound_queue_pressure" not in p["degraded_reasons"]
+    assert p["outbound_queue_utilization_percent"] == 12  # 2/16
+    assert p["outbound_queued_bytes"] == 2 * len(chunk)
+    assert p["outbound_queue_byte_utilization_percent"] < 75
 
 
 def test_utc_invalid_triggers_degraded(health):
@@ -437,6 +498,8 @@ def test_payload_structure_matches_spec(health):
         "minimum_free_heap_bytes", "heap_headroom_bytes", "devices_configured",
         "devices_active", "device_failures", "outbound_queue_depth",
         "outbound_queue_capacity", "outbound_queue_utilization_percent",
+        "outbound_queued_bytes", "outbound_max_queued_bytes",
+        "outbound_queue_byte_utilization_percent",
         "utc_valid", "utc_sync_age_sec",
     ):
         assert field in p

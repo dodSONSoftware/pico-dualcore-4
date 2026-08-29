@@ -292,6 +292,24 @@ class OutboundQueue:
             depth = len(self._queue) + (1 if self._in_flight is not None else 0)
             return depth, self._max_entries
 
+    def get_health_metrics(self):
+        """Return (depth, max_entries, queued_bytes, max_queued_bytes) for health reporting.
+
+        Depth and max_entries are the entry-budget view (the in-flight entry
+        counts toward depth, matching the entry budget in _admit_locked).
+        queued_bytes is the byte-budget view: only the queued FIFO, since the
+        in-flight entry is excluded from the byte budget by take(). Both views
+        are read under the same lock so the pair is consistent.
+        """
+        with self._lock:
+            depth = len(self._queue) + (1 if self._in_flight is not None else 0)
+            return (
+                depth,
+                self._max_entries,
+                self._queued_bytes,
+                self._max_queued_bytes,
+            )
+
 
 class InterCoreEventQueue:
     """Private FIFO for discrete Core 0 -> Core 1 events.

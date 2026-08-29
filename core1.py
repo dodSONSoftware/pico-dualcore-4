@@ -328,7 +328,12 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
 
     # Get queue status
     outbound_queue = intercore.outbound_queue
-    queue_depth, queue_capacity = outbound_queue.get_depth_with_capacity()
+    (
+        queue_depth,
+        queue_capacity,
+        queue_queued_bytes,
+        queue_max_queued_bytes,
+    ) = outbound_queue.get_health_metrics()
 
     # Get memory info
     try:
@@ -366,13 +371,22 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     # Calculate device failures from DeviceManager state
     device_failures = devices_configured - devices_active
 
-    # Calculate queue utilization percentage
+    # Calculate queue utilization percentages. The queue has two independent
+    # budgets (entry count and queued payload bytes); a handful of large
+    # entries can reach the byte ceiling while entry utilization is modest,
+    # so both are reported.
     queue_utilization_percent = 0
     if queue_capacity > 0:
         queue_utilization_percent = (queue_depth * 100) // queue_capacity
+    queue_byte_utilization_percent = 0
+    if queue_max_queued_bytes > 0:
+        queue_byte_utilization_percent = (queue_queued_bytes * 100) // queue_max_queued_bytes
 
-    # Determine queue pressure (75% threshold)
-    queue_pressure = queue_capacity > 0 and queue_utilization_percent >= 75
+    # Determine queue pressure: either budget at or beyond the 75% threshold
+    # is a full-condition risk, so pressure is the worse of the two.
+    queue_pressure = max(
+        queue_utilization_percent, queue_byte_utilization_percent
+    ) >= 75
 
     # Evaluate health status and build degraded reasons
     degraded_reasons = []
@@ -433,6 +447,9 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
             "outbound_queue_depth": queue_depth,
             "outbound_queue_capacity": queue_capacity,
             "outbound_queue_utilization_percent": queue_utilization_percent,
+            "outbound_queued_bytes": queue_queued_bytes,
+            "outbound_max_queued_bytes": queue_max_queued_bytes,
+            "outbound_queue_byte_utilization_percent": queue_byte_utilization_percent,
             "utc_valid": utc_valid,
             "utc_sync_age_sec": utc_sync_age_sec,
         },

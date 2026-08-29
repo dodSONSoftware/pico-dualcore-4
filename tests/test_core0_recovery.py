@@ -134,6 +134,11 @@ class FakeMqtt:
         # succeeding. 0 (default) keeps the existing always-success behavior.
         self.fail_probes_times = 0
         self._probe_publishes = 0
+        # Scripted publish_qos1 outcomes, in call order: "ok" (default) or
+        # "fail". A "fail" records the frame (the PUBLISH reached the broker),
+        # drops the session, and raises -- the ambiguous QoS 1 case where the
+        # frame was delivered but the PUBACK was lost. Empty means always ok.
+        self.publish_script = []
 
     def is_connected(self):
         return self.connected
@@ -158,10 +163,17 @@ class FakeMqtt:
         return 1
 
     def publish_qos1(self, topic, message):
+        outcome = self.publish_script.pop(0) if self.publish_script else "ok"
+        # The frame is transmitted either way: even a "fail" means the PUBLISH
+        # reached the broker; the failure is only that the PUBACK never came.
         self.published.append((topic, message))
         doc = json.loads(message)
         if doc.get("message_type") == "info_request":
             self._last_info_request = doc
+        if outcome == "fail":
+            # A failed QoS 1 publish drops the session, as the real client does.
+            self.mark_disconnected()
+            raise RuntimeError("PUBACK lost (simulated ambiguous QoS 1 failure)")
 
     def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):
         # Simulate the startup probes: fail the first fail_probes_times
@@ -451,7 +463,12 @@ def test_publish_entry_sequence_increments_per_published_entry(make_core0):
         assert queue.put_with_kind(
             KIND_HEALTH, serialize_and_validate_message(message), RETENTION_PRIORITY_HEALTH
         )
-        instance._publish_entry(queue.take())
+        entry = queue.take()
+        instance._publish_entry(entry)
+        # A successful publish completes the in-flight entry (as the run loop
+        # does), so the next take() returns the NEXT queued entry -- two
+        # different messages, and therefore two different sequences.
+        assert queue.complete_in_flight(entry)
 
     sequences = [json.loads(frame)["sequence"] for _topic, frame in instance._mqtt.published]
     assert sequences == [0, 1]
@@ -470,3 +487,113 @@ def test_publish_entry_rejects_payload_that_is_not_a_json_object(make_core0):
 
     assert instance._mqtt.published == []
     assert instance._next_sequence == 0
+
+
+def test_sequence_not_reused_across_ambiguous_qos1_failure_and_reconnect(make_core0):
+    """A PUBACK lost after delivery must not let a different message reuse the
+    in-flight entry's sequence, and a retry must keep it.
+
+    Reproduces the field capture: telemetry A publishes, the PUBACK is lost so
+    the entry stays in flight, the link drops and reconnects (publishing an
+    mqtt_connection_established log), and telemetry A is then retried. Before
+    the fix the connection log took telemetry A's sequence (a collision) and the
+    retry took a new one. Now the connection log gets a fresh number and the
+    retry reuses the in-flight entry's number, so two different logical messages
+    never share a sequence and a retry preserves its logical identity.
+    """
+    from intercore import KIND_TELEMETRY, RETENTION_PRIORITY_TELEMETRY
+    from message_serializer import serialize_and_validate_message
+
+    instance = make_core0()
+    mqtt = instance._mqtt
+    instance._network_stack_ready = True
+    instance._wifi.connected = True
+    mqtt.connected = True
+    queue = _real_outbound_queue(instance)
+
+    # Telemetry A is queued and taken in flight.
+    telemetry = {
+        "message_type": "telemetry",
+        "uptime_ms": 1411267,
+        "timestamp": None,
+        "payload": {"value": 42},
+    }
+    assert queue.put_with_kind(
+        KIND_TELEMETRY, serialize_and_validate_message(telemetry), RETENTION_PRIORITY_TELEMETRY
+    )
+    entry = queue.take()
+    assert queue.has_in_flight()
+
+    # Script the broker: accept telemetry A (PUBACK lost -> fail), then accept
+    # the connection log and the telemetry A retry.
+    mqtt.publish_script = ["fail", "ok", "ok"]
+
+    # Attempt 1: telemetry A transmits, the PUBACK is lost.
+    with pytest.raises(RuntimeError):
+        instance._publish_entry(entry)
+    # The entry stays in flight (QoS 1 must not drop it) and carries its
+    # claimed number so a retry can reuse it.
+    assert queue.has_in_flight()
+    telemetry_seq = json.loads(mqtt.published[0][1])["sequence"]
+    assert entry["_wire_sequence"] == telemetry_seq
+
+    # The failed publish dropped the link; recovery reconnects and queues the
+    # mqtt_connection_established log.
+    instance._recover_network_if_needed()
+    assert mqtt.connected is True
+    assert len(instance._pending_connection_logs) == 1
+
+    # The connection log publishes and must take a FRESH sequence (not A's).
+    instance._service_pending_connection_log()
+    log_seq = json.loads(mqtt.published[-1][1])["sequence"]
+    assert log_seq != telemetry_seq  # no collision with the in-flight message
+
+    # Telemetry A is retried and must PRESERVE its original sequence.
+    retried = queue.take()
+    assert retried is entry  # the same in-flight entry
+    instance._publish_entry(retried)
+    retry_seq = json.loads(mqtt.published[-1][1])["sequence"]
+    assert retry_seq == telemetry_seq  # same logical message, same number
+
+    # The two distinct logical messages have distinct sequences overall, and the
+    # counter advanced past both claimed numbers (nothing is handed out twice).
+    assert telemetry_seq != log_seq
+    assert instance._next_sequence == telemetry_seq + 2
+
+
+def test_command_response_retry_preserves_sequence_across_intervening_message(make_core0):
+    """A Core 0 command response re-published after an ambiguous failure keeps
+    the sequence it first claimed, even when an intervening message consumed a
+    number -- instead of silently shifting to a new one.
+    """
+    instance = make_core0()
+    mqtt = instance._mqtt
+    # fail (response attempt 1), ok (intervening connection log), ok (retry).
+    mqtt.publish_script = ["fail", "ok", "ok"]
+
+    response = {
+        "command_id": "req-1",
+        "command": "reboot",
+        "success": True,
+        "targeted": False,
+        "data": {"rebooting": True},
+    }
+    instance._pending_core0_responses.append(response)
+
+    # Attempt 1: transmits, PUBACK lost -> fails; the response stays pending.
+    with pytest.raises(RuntimeError):
+        instance._service_pending_core0_response()
+    first_seq = json.loads(mqtt.published[0][1])["sequence"]
+    assert instance._pending_core0_responses  # still queued for retry
+
+    # An intervening connection log publishes and consumes the next number.
+    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
+    instance._service_pending_connection_log()
+    log_seq = json.loads(mqtt.published[-1][1])["sequence"]
+    assert log_seq != first_seq
+
+    # Attempt 2: the retry must preserve the response's ORIGINAL sequence.
+    instance._service_pending_core0_response()
+    retry_seq = json.loads(mqtt.published[-1][1])["sequence"]
+    assert retry_seq == first_seq
+    assert not instance._pending_core0_responses  # consumed on success

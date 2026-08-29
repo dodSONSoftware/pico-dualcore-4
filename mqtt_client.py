@@ -38,6 +38,10 @@ class MQTTClient:
             port = 8883 if ssl else 1883
         self.client_id = client_id
         self.sock = None
+        # Readiness poller for check_msg(), built once per socket and reused
+        # across the ~100 ms polls instead of being constructed on every call.
+        self.poller = None
+        self._poller_sock = None
         self.server = server
         self.port = port
         self.ssl = ssl
@@ -205,7 +209,8 @@ class MQTTClient:
             retain: Retain flag
             qos: Quality of Service (0, 1, or 2)
             packet_id: Optional packet ID for QoS 1/2. If None, auto-increment.
-            timeout_ms: Optional timeout in milliseconds for QoS 1 PUBACK wait.
+            timeout_ms: Optional timeout in milliseconds for the QoS 1
+                exchange (the PUBLISH frame writes and the PUBACK wait).
         """
         pkt = bytearray(b"\x30\0\0\0")
         pkt[0] |= qos << 1 | retain
@@ -220,29 +225,37 @@ class MQTTClient:
             i += 1
         pkt[i] = sz
         # print(hex(len(pkt)), hexlify(pkt, ":"))
-        self.sock.write(pkt, i + 1)
-        self._send_str(topic)
         if qos > 0:
-            # Use provided packet_id or auto-increment
+            # Use provided packet_id or auto-increment (the packet id is packed
+            # into the frame at the point the existing wire order writes it).
             if packet_id is None:
                 pid = self.next_packet_id()
             else:
                 pid = packet_id
-            struct.pack_into("!H", pkt, 0, pid)
-            self.sock.write(pkt, 2)
-        self.sock.write(msg)
-        if qos == 1:
-            # Bound the PUBACK wait when a timeout is specified: a blackholed
-            # link then surfaces as an error (which marks the connection dead
-            # and lets Core 0's network recovery fire) instead of blocking
-            # the run loop indefinitely.
-            timed = timeout_ms is not None
-            if timed:
-                # The bounded wait depends on this timeout being active, so a
-                # failed installation must not be swallowed: let it propagate
-                # into Core 0's network recovery instead of entering the wait.
-                self.sock.settimeout(timeout_ms / 1000.0)
-            try:
+        # Bound the WHOLE QoS 1 exchange — the PUBLISH frame writes included —
+        # when a timeout is specified: a blackholed link whose writes stop
+        # making progress then surfaces as a bounded error (which marks the
+        # connection dead and lets Core 0's network recovery fire) instead of
+        # wedging Core 0 inside sock.write(), where even the Core 1 heartbeat
+        # check could never run. The timeout is installed before byte 1 of
+        # the frame goes out and restored only after the exchange finishes.
+        # The bounded exchange depends on this timeout being active, so a
+        # failed installation must not be swallowed: let it propagate into
+        # Core 0's network recovery before any byte is transmitted.
+        timed = qos == 1 and timeout_ms is not None
+        if timed:
+            self.sock.settimeout(timeout_ms / 1000.0)
+        try:
+            self.sock.write(pkt, i + 1)
+            self._send_str(topic)
+            if qos > 0:
+                # Pack the packet id only now — it reuses the opcode/length
+                # bytes already written above, so the wire order is
+                # header, topic, packet id, payload (as before this change).
+                struct.pack_into("!H", pkt, 0, pid)
+                self.sock.write(pkt, 2)
+            self.sock.write(msg)
+            if qos == 1:
                 while 1:
                     op = self.wait_msg()
                     if op == 0x40:
@@ -252,15 +265,15 @@ class MQTTClient:
                         rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
                         if pid == rcv_pid:
                             return
-            finally:
-                if timed:
-                    try:
-                        self.sock.settimeout(None)
-                    except MemoryError:
-                        raise
-                    except Exception:
-                        pass
-        elif qos == 2:
+        finally:
+            if timed:
+                try:
+                    self.sock.settimeout(None)
+                except MemoryError:
+                    raise
+                except Exception:
+                    pass
+        if qos == 2:
             assert 0
 
     def subscribe(self, topic, qos=0):
@@ -336,6 +349,38 @@ class MQTTClient:
             assert 0
         return op
 
+    def _ready_poller(self):
+        """Return a poller registered on the current socket, building it once.
+
+        The poller is created the first time a readiness check runs after the
+        socket is established and then reused for the life of the connection,
+        instead of building a fresh select.poll() + register() on every
+        ~100 ms check_msg() call. That per-call construction was ~350,000 poll
+        objects (plus a result list each) over a 10-hour run — pure GC churn
+        on the hot path. A reconnect installs a *new* socket object, so a
+        poller still bound to the old socket is discarded and a fresh one is
+        made; within a single connection the poller is shared.
+        """
+        if self.poller is None or self._poller_sock is not self.sock:
+            self.poller = select.poll()
+            self.poller.register(self.sock, select.POLLIN)
+            self._poller_sock = self.sock
+        return self.poller
+
+    def _socket_ready(self, poller):
+        """Non-blocking readiness: True iff the socket has a packet started.
+
+        Prefers MicroPython's allocation-free poller.ipoll() — it polls and
+        yields a reused (obj, event) tuple per ready stream rather than
+        materializing a result list — and falls back to poll() where ipoll is
+        not available (the CPython host suite has no ipoll). Both take a
+        zero timeout, so the check returns immediately either way.
+        """
+        ipoll = getattr(poller, "ipoll", None)
+        if ipoll is not None:
+            return any(ipoll(0))
+        return bool(poller.poll(0))
+
     # Checks whether a pending message from server is available.
     # If not, returns immediately with None. Otherwise, does
     # the same processing as wait_msg.
@@ -348,10 +393,9 @@ class MQTTClient:
         # requested there — so a PUBLISH split across TCP reads would
         # short-read its topic or payload and deliver a corrupt frame (or
         # raise a spurious disconnect) instead of waiting for the rest of the
-        # packet.
-        poller = select.poll()
-        poller.register(self.sock, select.POLLIN)
-        if not poller.poll(0):
+        # packet. The poller itself is built once per socket (see
+        # _ready_poller) and reused across the ~100 ms polls.
+        if not self._socket_ready(self._ready_poller()):
             # No packet has started: return immediately, leaving the socket in
             # whatever mode the caller left it in (the poll consumed nothing).
             return None
