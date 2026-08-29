@@ -1,3 +1,7 @@
+# test_architecture.py - Core ownership boundary tests
+# Copyright (c) 2026 dodson Software ( dodson labs )
+# SPDX-License-Identifier: MIT
+
 import ast
 import pathlib
 
@@ -39,11 +43,8 @@ def test_core0_has_no_sensor_stack_imports():
 
 
 def test_core1_has_no_mqtt_topic_configuration():
-    # Core 1 may use _MQTT_TOPIC_LOG for the startup log (shared with Core 0)
-    allowed_pattern = "_MQTT_TOPIC_LOG"
+    # Core 1 never names MQTT topics; Core 0 maps message kinds to topics at
+    # publish time (the startup log goes out under KIND_LOG).
     for path in CORE1_FILES:
         source = (ROOT / path).read_text()
-        # Check for mqtt_topic_ but allow the _MQTT_TOPIC_LOG constant
-        if "mqtt_topic_" in source:
-            # Allow if it's only in the _MQTT_TOPIC_LOG definition/comment
-            assert allowed_pattern in source, f"{path}: mqtt_topic_ found without {allowed_pattern}"
+        assert "mqtt_topic_" not in source, f"{path}: Core 1 references an MQTT topic name"

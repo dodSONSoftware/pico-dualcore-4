@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # release.py - Build a deployable artifact for the clean rebuild
+# Copyright (c) 2026 dodson Software ( dodson labs )
+# SPDX-License-Identifier: MIT
 
 import pathlib
 import tarfile
@@ -15,6 +17,7 @@ REQUIRED_FILES = {
     "config.py",
     "intercore.py",
     "message_protocol.py",
+    "message_serializer.py",
     "wifi.py",
     "mqtt.py",
     "mqtt_client.py",

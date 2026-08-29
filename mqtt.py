@@ -8,6 +8,10 @@ import time
 from debug import DEBUG
 from mqtt_client import MQTTClient
 
+# Bounded wait for PINGRESP so a dead link surfaces quickly instead of
+# blocking the Core 0 run loop for the full keepalive window.
+_MAX_PINGRESP_WAIT_SEC = 10
+
 
 class Mqtt:
     """Small MQTT lifecycle based on the original working client."""
@@ -17,12 +21,17 @@ class Mqtt:
         self._command_topic = config["mqtt_topic_command"]
         self._info_response_topic = config["mqtt_topic_info_response"]
         self._keepalive = config["mqtt_keepalive_sec"]
+        # Bounded wait for PUBACK so a blackholed link surfaces as a
+        # publish failure (and triggers network recovery) instead of
+        # blocking the Core 0 run loop indefinitely.
+        self._ack_timeout_ms = config["mqtt_broker_response_timeout_sec"] * 1000
         self._reconnect_delays = config["mqtt_reconnect_delays_sec"]
         self._message_callback = message_callback
         self._client = None
         self._connected = False
         self._connect_count = 0
         self._disconnect_count = 0
+        self._last_activity_ms = time.ticks_ms()
 
         try:
             uid = machine.unique_id()
@@ -35,6 +44,10 @@ class Mqtt:
 
     def is_connected(self):
         return self._connected and self._client is not None
+
+    def _touch(self):
+        """Record outbound MQTT activity (any sent packet resets the keepalive)."""
+        self._last_activity_ms = time.ticks_ms()
 
     def _new_client(self):
         client = MQTTClient(
@@ -79,6 +92,7 @@ class Mqtt:
                 self._client.subscribe(self._info_response_topic, qos=1)
                 self._connected = True
                 self._connect_count += 1
+                self._touch()
                 print("[INFO] MQTT connected: {}".format(self._broker))
                 return True
             except MemoryError:
@@ -112,16 +126,24 @@ class Mqtt:
             raise
 
     def publish_qos1(self, topic, message):
-        """Publish one application message and wait for its matching PUBACK."""
+        """Publish one application message and wait for its matching PUBACK.
+
+        The PUBACK wait is bounded by mqtt_broker_response_timeout_sec so a
+        blackholed link fails fast and the run loop's network recovery can
+        fire, instead of blocking here forever.
+        """
         if not self.is_connected():
             raise OSError("MQTT is not connected")
         try:
-            self._client.publish(topic, message, qos=1)
+            self._client.publish(
+                topic, message, qos=1, timeout_ms=self._ack_timeout_ms
+            )
         except MemoryError:
             raise
         except Exception:
             self.mark_disconnected()
             raise
+        self._touch()
 
     def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):
         """Publish one QoS 1 message with a specific packet ID and wait for matching PUBACK.
@@ -140,6 +162,7 @@ class Mqtt:
         try:
             # Pass timeout to mqtt_client's publish method
             self._client.publish(topic, message, qos=1, packet_id=packet_id, timeout_ms=timeout_ms)
+            self._touch()
             return True
         except MemoryError:
             raise
@@ -148,6 +171,38 @@ class Mqtt:
                 print("[DEBUG] QoS 1 publish with packet_id {} failed: {}".format(packet_id, err))
             self.mark_disconnected()
             return False
+
+    def _ping_interval_sec(self):
+        """Time between keepalive traffic and the mandatory PINGREQ.
+
+        The broker tolerates 1.5 x keepalive, so pinging at keepalive / 2
+        leaves a full interval of margin for jitter.
+        """
+        return max(self._keepalive // 2, 1)
+
+    def ping_due(self):
+        """True when keepalive traffic is due and the connection is alive."""
+        if not self.is_connected():
+            return False
+        if self._keepalive <= 0:
+            return False
+        interval_ms = self._ping_interval_sec() * 1000
+        return (
+            time.ticks_diff(time.ticks_ms(), self._last_activity_ms) >= interval_ms
+        )
+
+    def ping(self):
+        """Send PINGREQ and wait for PINGRESP to honor the advertised keepalive."""
+        if not self.is_connected():
+            raise OSError("MQTT is not connected")
+        try:
+            self._client.ping(timeout_sec=min(_MAX_PINGRESP_WAIT_SEC, self._ping_interval_sec()))
+        except MemoryError:
+            raise
+        except Exception:
+            self.mark_disconnected()
+            raise
+        self._touch()
 
     def get_next_packet_id(self):
         """Get the next packet ID to use for QoS 1 messages.

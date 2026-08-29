@@ -81,7 +81,7 @@ def test_collect_system_information_includes_all_sections():
         def get_devices(self):
             return {"configured": 1, "active": 1}
 
-        def get_devicestatus(self):
+        def get_device_status(self):
             return [{"id": "device1", "state": "ready"}]
 
         def get_cpu(self):
@@ -152,6 +152,16 @@ def test_build_startup_log_structure():
             self._messages_evicted = 0
             self._telemetry_evicted = 0
 
+        def put_with_kind(self, kind, payload_bytes, retention_priority):
+            if not isinstance(payload_bytes, (bytes, bytearray)):
+                raise ValueError("payload_bytes must be bytes")
+            self._queue.append({
+                "kind": kind,
+                "retention_priority": retention_priority,
+                "payload_bytes": bytes(payload_bytes),
+            })
+            return True
+
         def status(self):
             return {"pending": 0, "max": 16}
 
@@ -183,10 +193,6 @@ def test_build_startup_log_structure():
                     "mqtt": {"status": "ready"},
                     "subscriptions": {
                         "status": "ready",
-                        "topics": [
-                            "iot/v3/command",
-                            "iot/v3/info-response",
-                        ],
                     },
                     "utc": {"status": "synchronized"},
                     "core_0": {"status": "running"},
@@ -203,7 +209,7 @@ def test_build_startup_log_structure():
     }
 
     from core1 import _try_queue_startup_log
-    from intercore import RETENTION_PRIORITY_INFO
+    from intercore import RETENTION_PRIORITY_INFO, KIND_LOG
 
     intercore = MockInterCore()
     device_manager = MockDeviceManager()
@@ -218,7 +224,9 @@ def test_build_startup_log_structure():
     # Verify message was added to queue
     assert len(intercore.outbound_queue._queue) == 1, "Queue should have 1 entry"
     entry = intercore.outbound_queue._queue[0]
-    assert entry["topic"] == "iot/v3/log", "Queue entry should have log topic"
+    # Core 1 names only the kind; Core 0 resolves the log topic at publish time
+    assert entry["kind"] == KIND_LOG, "Queue entry should use the log kind"
+    assert "topic" not in entry, "Queue entry must not carry a hardcoded topic"
     assert entry["retention_priority"] == RETENTION_PRIORITY_INFO, "Queue entry should have INFO priority"
 
 

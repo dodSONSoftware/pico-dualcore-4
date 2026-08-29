@@ -1,3 +1,7 @@
+# test_led_manager.py - LEDManager behavior tests
+# Copyright (c) 2026 dodson Software ( dodson labs )
+# SPDX-License-Identifier: MIT
+
 import importlib.util
 import pathlib
 import sys

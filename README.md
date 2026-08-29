@@ -89,6 +89,13 @@ mpremote cp -r devices/ :devices/
 # etc for all modules...
 ```
 
+Or build a single deployable artifact containing the required file set:
+
+```bash
+python release.py
+# -> releases/sensor-firmware-<version>.tar.gz
+```
+
 ### Running
 
 After deployment, run from REPL:
@@ -201,8 +208,12 @@ Health messages are controlled by:
 ## Features
 
 - **QoS 1 MQTT**: Synchronous PUBLISH → PUBACK, one in-flight message
+- **MQTT Keepalive**: Explicit PINGREQ at keepalive/2 keeps the broker session alive
+- **Network Recovery**: Mid-run Wi-Fi/MQTT loss — including blackholed links — is detected and re-established automatically
 - **Health Messages**: Periodic diagnostic messages with status and 17+ fields
-- **UTC Synchronization**: Requests time from server on boot and periodically
+- **UTC Synchronization**: Mandatory at startup; non-blocking steady-state re-sync with deadline and retry throttling
+- **Core 1 Liveness**: Deadline-based heartbeat drives the `core_1_active` health field
+- **Startup Log**: One-time full system startup log published before telemetry
 - **LED Status**: Flashing during connection, pulse on telemetry send
 - **Reboot Command**: JSON command triggers clean reboot with acknowledgment
 - **Device Lifecycle**: Auto-retry initialization and read failures
@@ -222,13 +233,20 @@ The firmware expects `config_schema_version: 5`. Unknown top-level keys are reje
 |---------|-------------|
 | `read_loop_sec` | Telemetry read interval (seconds) |
 | `device_initialization_attempts` | Retry count for device init |
+| `device_initialization_retry_delay_ms` | Delay between device init retries (ms) |
 | `device_read_failure_threshold` | Consecutive failures before reinit |
-| `mqtt_keepalive_sec` | MQTT keepalive interval |
+| `mqtt_keepalive_sec` | MQTT keepalive interval (seconds) |
+| `mqtt_command_poll_ms` | MQTT receive pump interval (ms) |
+| `mqtt_broker_response_timeout_sec` | Bounded PUBACK/UTC-response wait (seconds) |
+| `network_probe_timeout_sec` | Startup probe PUBACK wait (seconds) |
 | `datetime_sync_interval_min` | UTC sync interval (minutes) |
 | `health_interval_sec` | Health message interval (seconds) |
 | `mqtt_topic_health` | MQTT topic for health messages |
 | `max_outbound_queue_entries` | Maximum queued messages |
+| `max_intercore_event_entries` | Core 0 → Core 1 event queue capacity |
 | `network_snapshot_interval_sec` | Network snapshot update interval |
+| `wifi_reconnect_delays_sec` | Wi-Fi reconnect backoff sequence (seconds) |
+| `mqtt_reconnect_delays_sec` | MQTT reconnect backoff sequence (seconds) |
 
 See [`config.json`](config.json) for complete example.
 
@@ -249,45 +267,101 @@ Send to `mqtt_topic_command`:
 
 The device responds with a command response, waits 6 seconds, then reboots.
 
+
+## Built-in Device
+
+There is one built-in device, it has a device type of "system_information" and a sensor_type of "system-info".
+
+Example:
+```
+{
+  "id": "p5h3DLqmWjCkLcXUtaFRq8yBsucEuY4A",
+  "device_type": "system-information",
+  "name": "System Information Sensor",
+  "sensor_type": "system-info",
+  "config": {
+    "include": [
+      "communications",  
+      "cpu",  
+      "device_status",  
+      "devices",  
+      "machine",  
+      "memory",  
+      "network",  
+      "queues",  
+      "runtime"
+    ]
+  }
+}
+```
+
+| Section          | Information returned                         |
+| ---------------- | -------------------------------------------- |
+| `communications` | Wi-Fi/MQTT connection state and counters     |
+| `cpu`            | CPU frequency                                |
+| `device_status`  | Detailed status for each configured device   |
+| `devices`        | Aggregate device counts/status               |
+| `machine`        | Hardware/platform/MicroPython information    |
+| `memory`         | MicroPython heap allocation/free/total       |
+| `network`        | Current Wi-Fi/network addressing and RSSI    |
+| `queues`         | Inter-core/outbound queue state and counters |
+| `runtime`        | Runtime timing/configuration information     |
+
 ## Development
 
 ### Project Structure
 
 ```
-├── main.py          # Entry point, orchestrates Core 0 and Core 1
-├── core0.py         # Core 0: Wi-Fi, MQTT, network stack
-├── core1.py         # Core 1: Sensors, devices, telemetry
-├── intercore.py     # Three-lane inter-core bus
-├── config.py        # Configuration loading and validation
-├── device_manager.py # Device lifecycle management
-├── devices/         # Device driver modules
+├── main.py            # Entry point, orchestrates Core 0 and Core 1
+├── core0.py           # Core 0: Wi-Fi, MQTT, keepalive, recovery, UTC, reboot
+├── core1.py           # Core 1: sensors, devices, telemetry, health, liveness
+├── intercore.py       # Three-lane inter-core bus
+├── config.py          # Configuration loading and validation
+├── device_manager.py  # Device lifecycle management
+├── device_factory.py  # Device construction from config
+├── devices/           # Device driver packages
 │   ├── __init__.py
-│   └── system_information.py
-├── led_manager.py   # LED state machine
-├── wifi.py          # Wi-Fi connection management
-├── mqtt.py          # MQTT client wrapper
+│   ├── device.py      # Device interface (initialize, read)
+│   └── system_information/
+│       ├── __init__.py
+│       └── system_information_device.py
+├── led_manager.py     # Core 0 LED state machine
+├── wifi.py            # Core 0 Wi-Fi connection management
+├── mqtt.py            # Core 0 MQTT lifecycle (QoS 1, keepalive PINGREQ)
+├── mqtt_client.py     # Low-level MQTT wire protocol client
 ├── message_protocol.py # Message formatting helpers
 ├── message_serializer.py # Message validation and pre-serialization
-├── hardware.py      # Hardware detection (Pico W/Pico 2 W)
-├── system_information.py # System state snapshots
-└── version.py       # Version constants
+├── system_information.py # System state snapshots (Core 1 data source)
+├── hardware.py        # Hardware detection (Pico W/Pico 2 W)
+├── debug.py           # Debug print switch
+├── release.py         # Release artifact builder
+├── config.json        # Runtime configuration
+├── config-secrets-example.json # Wi-Fi credential template
+└── version.py         # Version constants
 ```
 
 ### Adding a Device Driver
 
-1. Create `devices/my_sensor.py` implementing the `Device` interface
-2. Add to `device_factory.py` factory
-3. Register in `config.json` devices array
+1. Create a `devices/my_sensor/` package implementing the `Device` interface from `devices/device.py` (`initialize(config)`, `read()`)
+2. Register the `device_type` in the `device_factory.py` factory
+3. Add the package files to `REQUIRED_PACKAGES` in `release.py`
+4. Register in `config.json` devices array
 
-See [`devices/system_information.py`](devices/system_information.py) for reference.
+See [`devices/system_information/system_information_device.py`](devices/system_information/system_information_device.py) for reference.
 
 ### Testing
 
-Host-side validation runs before hardware deployment. See tests in [`tests/`](tests/).
+Host-side validation runs before hardware deployment:
+
+```bash
+python -m pytest tests/
+```
+
+See tests in [`tests/`](tests/) — covering core-ownership boundaries, configuration, inter-core bus semantics, health payloads, MQTT keepalive, UTC synchronization, network recovery, and Core 1 liveness.
 
 ## Hardware Status
 
-The 0.0.0 baseline is software-tested and passes host-side syntax and configuration validation. Hardware validation on Pico W/Pico 2 W with the system-information sensor is pending.
+Firmware 0.4.4 is software-tested and passes the full host-side test suite. Hardware validation on Pico W/Pico 2 W with the system-information sensor is pending.
 
 ## License
 

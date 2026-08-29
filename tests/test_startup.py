@@ -105,6 +105,12 @@ class MockMqtt:
         self.packet_id_counter += 1
         return pid
 
+    def ping_due(self):
+        return False
+
+    def ping(self):
+        pass
+
     def status(self):
         return {
             "connected": self._connected,

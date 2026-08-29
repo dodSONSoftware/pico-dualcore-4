@@ -1,3 +1,7 @@
+# mqtt_client.py - Low-level MQTT wire protocol client (Core 0)
+# Copyright (c) 2026 dodson Software ( dodson labs )
+# SPDX-License-Identifier: MIT
+
 import socket
 import struct
 from binascii import hexlify
@@ -111,8 +115,35 @@ class MQTTClient:
         self.sock.write(b"\xe0\0")
         self.sock.close()
 
-    def ping(self):
-        self.sock.write(b"\xc0\0")
+    def ping(self, timeout_sec=None):
+        """Send PINGREQ and wait for the matching PINGRESP.
+
+        Args:
+            timeout_sec: Optional timeout in seconds for the PINGRESP wait.
+                When the link is dead, a bounded wait surfaces the failure
+                instead of blocking until the next publish.
+        """
+        if timeout_sec is not None:
+            try:
+                self.sock.settimeout(timeout_sec)
+            except MemoryError:
+                raise
+            except Exception:
+                pass
+        try:
+            self.sock.write(b"\xc0\0")
+            while 1:
+                # wait_msg() consumes PINGRESP internally and returns None.
+                if self.wait_msg() is None:
+                    return
+        finally:
+            if timeout_sec is not None:
+                try:
+                    self.sock.settimeout(None)
+                except MemoryError:
+                    raise
+                except Exception:
+                    pass
 
     def publish(self, topic, msg, retain=False, qos=0, packet_id=None, timeout_ms=None):
         """Publish one or more application messages.
@@ -151,8 +182,12 @@ class MQTTClient:
             self.sock.write(pkt, 2)
         self.sock.write(msg)
         if qos == 1:
-            # Set timeout if specified
-            if timeout_ms is not None:
+            # Bound the PUBACK wait when a timeout is specified: a blackholed
+            # link then surfaces as an error (which marks the connection dead
+            # and lets Core 0's network recovery fire) instead of blocking
+            # the run loop indefinitely.
+            timed = timeout_ms is not None
+            if timed:
                 try:
                     timeout_sec = timeout_ms / 1000.0
                     self.sock.settimeout(timeout_sec)
@@ -160,18 +195,27 @@ class MQTTClient:
                     raise
                 except Exception:
                     pass
-            while 1:
-                op = self.wait_msg()
-                if op == 0x40:
-                    sz = self.sock.read(1)
-                    assert sz == b"\x02"
-                    rcv_pid = self.sock.read(2)
-                    rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
-                    if pid == rcv_pid:
-                        # Update pid for next auto-increment
-                        if packet_id is None:
-                            self.pid = pid
-                        return
+            try:
+                while 1:
+                    op = self.wait_msg()
+                    if op == 0x40:
+                        sz = self.sock.read(1)
+                        assert sz == b"\x02"
+                        rcv_pid = self.sock.read(2)
+                        rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
+                        if pid == rcv_pid:
+                            # Update pid for next auto-increment
+                            if packet_id is None:
+                                self.pid = pid
+                            return
+            finally:
+                if timed:
+                    try:
+                        self.sock.settimeout(None)
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        pass
         elif qos == 2:
             assert 0
 

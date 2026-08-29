@@ -17,7 +17,10 @@ Core 1 periodically publishes health messages to `iot/v3/health` containing diag
 - `machine`: Human-readable machine identifier
 
 **Network Fields:**
+- `network_stack_ready`: Boolean indicating the full startup contract has been verified
+- `wifi_connected`: Boolean indicating the Wi-Fi link is up
 - `wifi_rssi_dbm`: Current Wi-Fi signal strength (dBm)
+- `mqtt_connected`: Boolean indicating the MQTT broker connection is up
 
 **Memory Fields:**
 - `free_heap_bytes`: Current free heap
@@ -49,20 +52,27 @@ Core 1 periodically publishes health messages to `iot/v3/health` containing diag
 3. **Plain Data Only**: Only JSON-serializable data crosses core boundaries.
 4. **Fail-Fast Configuration**: Invalid config rejects before network starts.
 5. **QoS 1 MQTT**: Synchronous PUBACK required; only one message in flight.
+6. **Bounded broker waits**: Every blocking MQTT wait (PUBACK, PINGRESP) is deadline-limited; a dead link surfaces as a failed ping or publish and triggers mid-run network recovery instead of stalling the run loop.
 
 ## Critical Files
 
 | File | Purpose |
 |------|---------|
 | `main.py` | Entry point, orchestrates startup sequence |
-| `core0.py` | Network stack (Wi-Fi, MQTT, UTC, reboot) |
-| `core1.py` | Device lifecycle, sensor reads, telemetry, health messages |
+| `core0.py` | Network stack (Wi-Fi, MQTT, UTC, reboot, keepalive, recovery) |
+| `core1.py` | Device lifecycle, sensor reads, telemetry, health messages, liveness heartbeat |
 | `intercore.py` | Three-lane message bus implementation |
-| `device_manager.py` | Device lifecycle management |
+| `device_manager.py` | Device lifecycle management (init retries, read failures, reinit) |
+| `device_factory.py` | Device construction from config |
 | `config.py` | Configuration loading and validation |
 | `hardware.py` | Hardware detection (Pico W/Pico 2 W) |
-| `system_information.py` | System state snapshots |
+| `system_information.py` | System state snapshots (Core 1 data source) |
 | `message_serializer.py` | JSON-safe message validation and serialization |
+| `mqtt.py` | Core 0 MQTT lifecycle (QoS 1, keepalive PINGREQ, subscriptions) |
+| `mqtt_client.py` | Low-level MQTT wire protocol client |
+| `wifi.py` | Core 0 Wi-Fi connection management |
+| `led_manager.py` | Core 0 onboard LED state machine |
+| `release.py` | Builds the deployable release artifact (`releases/`) |
 
 ## Development Guidelines
 
@@ -91,10 +101,11 @@ Core 1 periodically publishes health messages to `iot/v3/health` containing diag
 
 ### Adding a New Device Driver
 
-1. Create `devices/my_sensor.py` with `Device` interface
-2. Add to `device_factory.py` factory function
-3. Register in `config.json` with unique `id`
-4. Test with `tests/test_device_manager.py`
+1. Create a `devices/my_sensor/` package: `__init__.py` plus a driver module (e.g. `my_sensor_device.py`) implementing the `Device` interface from `devices/device.py` (`initialize(config)`, `read()`)
+2. Register the `device_type` in `create_device()` in `device_factory.py`
+3. Add the package files to `REQUIRED_PACKAGES` in `release.py`
+4. Register in `config.json` with unique `id`
+5. Add tests in `tests/` covering initialization, read, and reinitialization behavior
 
 ### Modifying Inter-Core Protocol
 
@@ -139,12 +150,21 @@ Check for:
 - Core 0 logs to `mqtt_topic_log` on Wi-Fi/MQTT connect
 - LED flashes 50ms on/50ms off until MQTT connected
 - Check Wi-Fi retry delays in config
+- Core 0 sends PINGREQ when idle for `keepalive / 2`; a blackholed link (TCP up, no PINGRESP/PUBACK) surfaces as a failed ping or publish
+- A failed ping or publish marks the connection disconnected; `_recover_network_if_needed` re-runs `establish_network()` (startup and recovery share one code path)
+
+### UTC Synchronization
+
+- Startup is mandatory and bounded: 3 attempts, each waiting up to `mqtt_broker_response_timeout_sec`; if all fail, Core 1 never starts
+- Steady-state re-sync is non-blocking: the run loop sends the request, keeps a `mqtt_broker_response_timeout_sec` deadline, and never blocks on the answer
+- Re-requests are throttled to 30s; a malformed-but-reachable answer re-keys the throttle to ~0.5s
 
 ## Testing
 
 - `tests/` contains host-side unit tests
 - Run with: `python -m pytest tests/`
-- Hardware testing requires actual Pico device
+- The suite covers core-ownership boundaries (AST checks), config validation, inter-core bus semantics, health payloads, MQTT keepalive, UTC synchronization, network recovery, and the Core 1 liveness heartbeat
+- Hardware testing requires an actual Pico device
 
 ## Hardware Notes
 
@@ -155,7 +175,15 @@ Check for:
 
 ## Version History
 
-- **0.4.0**: Extended health messages with 8 additional operational fields: hardware_type, machine, wifi_rssi_dbm, heap_headroom_bytes, core_1_activity_age_ms, utc_sync_age_sec, device_failures, outbound_queue_utilization_percent. Added health message queueing support.
+- **0.4.4**: Fixed UTC retry throttle blocking its own prompt retry: a malformed-but-reachable time-server answer now re-keys the retry backoff to ~0.5s (previously the 30s interval, measured from the original send, blocked the resend even though the server had just answered); a silent server still gets the full 30s throttle.
+
+- **0.4.3**: MQTT keepalive PINGREQ and mid-run network recovery, non-blocking steady-state UTC synchronization with deadline and retry throttling, deadline-based Core 1 liveness heartbeat, and health-message generation gating during outages.
+
+- **0.4.2**: Added MQTT subscriptions to the startup log and fixed device counts.
+
+- **0.4.1**: Health message support with 17+ diagnostic fields, including the extended operational fields (hardware_type, machine, wifi_rssi_dbm, heap_headroom_bytes, core_1_activity_age_ms, utc_sync_age_sec, device_failures, outbound_queue_utilization_percent) and health message queueing support.
+
+- **0.4.0**: One-time full system startup log before telemetry.
 
 - **0.3.0**: Pre-serialized outbound MQTT queue with QoS 1
 

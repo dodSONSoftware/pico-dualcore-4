@@ -8,6 +8,7 @@ import _thread
 KIND_TELEMETRY = "telemetry"
 KIND_COMMAND_RESPONSE = "command_response"
 KIND_HEALTH = "health"
+KIND_LOG = "log"
 
 # Lower numeric values are more important and are retained preferentially.
 RETENTION_PRIORITY_CRITICAL = 10
@@ -49,25 +50,12 @@ class OutboundQueue:
         self._serialization_rejected = 0
         self._oversized_rejected = 0
 
-    def _topic_for_kind(self, kind):
-        """Return the MQTT topic for a given kind."""
-        if kind == KIND_TELEMETRY:
-            return "iot/v3/telemetry"
-        if kind == KIND_COMMAND_RESPONSE:
-            return "iot/v3/command-response"
-        if kind == KIND_HEALTH:
-            return "iot/v3/health"
-        raise ValueError("Unsupported outbound message kind: {}".format(kind))
-
     def _evict_oldest_by_priority_locked(self, retention_priority):
         for index, entry in enumerate(self._queue):
             if entry["retention_priority"] == retention_priority:
                 evicted = self._queue.pop(index)
                 self._messages_evicted += 1
-                # Check if evicted message is telemetry based on kind or topic
-                is_telemetry = (evicted.get("kind") == KIND_TELEMETRY) or \
-                               (evicted.get("topic") == self._topic_for_kind(KIND_TELEMETRY))
-                if is_telemetry:
+                if evicted["kind"] == KIND_TELEMETRY:
                     self._telemetry_evicted += 1
                 return True
         return False
@@ -88,7 +76,7 @@ class OutboundQueue:
         The in-flight QoS 1 entry counts toward max_entries but cannot be
         evicted. If no queued entry is available for eviction, admission fails.
         """
-        if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH):
+        if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(message, dict):
             raise ValueError("outbound message must be a dictionary")
@@ -154,17 +142,17 @@ class OutboundQueue:
             return True
 
     def put_with_kind(self, kind, payload_bytes, retention_priority):
-        """Admit one MQTT-bound message with a specific kind (e.g., health).
+        """Admit one MQTT-bound message with a specific kind (e.g., health, log).
 
         Args:
-            kind: Message kind (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH)
+            kind: Message kind (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG)
             payload_bytes: Pre-serialized, UTF-8 encoded payload
             retention_priority: Priority level for retention management
 
         Returns:
             bool: True if message was admitted, False otherwise
         """
-        if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH):
+        if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(payload_bytes, (bytes, bytearray)):
             raise ValueError("payload_bytes must be bytes")

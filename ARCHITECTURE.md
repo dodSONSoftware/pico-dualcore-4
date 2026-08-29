@@ -8,19 +8,22 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 
 ```json
 {
-  "message_schema_version": 4,
+  "message_schema_version": 3,
   "runtime_id": "<runtime-uuid>",
   "uptime_ms": <milliseconds>,
   "timestamp": "<utc-iso8601>",
   "source": "<device-source>",
   "message_type": "health",
-  "firmware_version": "0.4.0",
+  "firmware_version": "0.4.4",
   "payload": {
     "status": "healthy|degraded",
     "degraded_reasons": ["<reason1>", "<reason2>"],
     "hardware_type": "pico_w|pico_2_w",
     "machine": "Raspberry Pi Pico W with RP2040",
+    "network_stack_ready": true,
+    "wifi_connected": true,
     "wifi_rssi_dbm": -45,
+    "mqtt_connected": true,
     "core_1_active": true,
     "core_1_activity_age_ms": 42,
     "free_heap_bytes": 95728,
@@ -50,7 +53,10 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 
 ### Network Fields
 
+- `network_stack_ready`: True once Core 0 has verified the complete startup contract (from the network snapshot)
+- `wifi_connected`: Wi-Fi link is up (from the network snapshot)
 - `wifi_rssi_dbm`: Current Wi-Fi RSSI from Core 0 network snapshot (may be null)
+- `mqtt_connected`: MQTT broker connection is up (from the network snapshot)
 
 ### Memory Fields
 
@@ -134,14 +140,16 @@ Core 1 -> Core 0. Contains only data intended for MQTT.
 
 - FIFO and bounded.
 - Core 1 supplies only a message kind plus domain data; it does not know MQTT topics.
-- Core 0 maps the kind to the authoritative MQTT topic, publishes with QoS 1, and owns the MQTT envelope sequence.
+- Core 0 maps the kind to the authoritative MQTT topic, publishes with QoS 1, and owns the MQTT envelope sequence. Kinds: TELEMETRY → `mqtt_topic_telemetry`, COMMAND_RESPONSE → `mqtt_topic_command_response`, HEALTH → `mqtt_topic_health`, LOG → `mqtt_topic_log`.
+- The startup log and connection logs travel as KIND_LOG entries; no hardcoded topics cross into Core 1.
 - Core 1 captures creation-time `uptime_ms`/`timestamp`; Core 0 preserves them while adding source/runtime/firmware/schema/sequence.
-- The original MQTT client blocks until PUBACK, naturally enforcing one application QoS 1 publish in flight.
+- The MQTT client waits for the matching PUBACK before the next publish proceeds, naturally enforcing one application QoS 1 publish in flight. The wait is bounded by `mqtt_broker_response_timeout_sec`, so a blackholed link fails the publish (the entry stays in flight) instead of blocking the run loop.
 - Retention priority is explicit: lower numeric values are more important.
 - Priority classes are: CRITICAL 10, ERROR 20, WARN 30, TELEMETRY 40, INFO 50, HEALTH 70.
 - When full, the queue finds the least-important queued class (highest numeric priority). If the incoming message is more important, or equally important, the oldest entry in that least-important class is evicted. If the incoming message is less important, it is rejected.
-- The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40; health messages use HEALTH 70.
+- The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40; health messages use HEALTH 70; the startup log uses INFO 50.
 - An in-flight QoS 1 entry counts toward the configured capacity but is never evicted.
+- A failed publish never discards the in-flight entry: it stays in flight and `take()` returns it again, so Core 0 retries until the broker PUBACKs (QoS 1 at-least-once delivery).
 
 #### Pre-serialized message storage
 
@@ -170,7 +178,7 @@ After this change, any message present in the outbound queue is guaranteed to be
 - Within the configured application payload limit
 
 The queue entry stores:
-- `kind`: message kind (TELEMETRY, COMMAND_RESPONSE, HEALTH)
+- `kind`: message kind (TELEMETRY, COMMAND_RESPONSE, HEALTH, LOG)
 - `retention_priority`: numeric priority for eviction
 - `payload_bytes`: pre-serialized, UTF-8 encoded JSON payload
 
@@ -212,6 +220,10 @@ Core 0 intentionally follows the original known-good behavior:
 - reboot response is published, then the code waits 5 seconds + 1 second and calls `machine.reset()`;
 - no pre-reset network shutdown is performed.
 
+### Boot when the network never appears
+
+The connect loops in `establish_network()` are intentionally unbounded (a watchdog is listed under "Features intentionally not carried into the baseline"). If the configured SSID is absent, or the broker is unreachable, Core 0 retries forever: each Wi-Fi attempt observes the link for up to 20 s (200 × 100 ms), sleeps the configured backoff delays between attempts, then the whole sequence restarts. Core 1 never starts, and the flashing connection LED (50 ms on / 50 ms off) is the only visible state of this boot loop.
+
 ## QoS 1 network probe
 
 Core 0 uses QoS 1 MQTT to verify the network path during startup. The probe message is published to `mqtt_topic_network_probe` with a unique packet ID. Core 0 waits for the matching PUBACK from the broker before proceeding.
@@ -231,6 +243,39 @@ Two probes are performed during startup:
 2. After the 5-second stabilization wait
 
 Both probes must succeed with matching PUBACKs before Core 1 starts and before the network snapshot marks `network_stack_ready = True`.
+
+## MQTT keepalive
+
+The CONNPACK advertises `mqtt_keepalive_sec` (30 s default), so the broker disconnects the client if it sees no client packet within 1.5 x keepalive (45 s). Application traffic alone does not cover this gap — the health interval is 60 s — so Core 0 sends PINGREQ explicitly:
+
+- `Mqtt` tracks the last outbound MQTT activity (connect, PUBLISH, PINGREQ).
+- When idle for `keepalive / 2` (15 s default), `ping_due()` returns true and the Core 0 run loop sends a PINGREQ while no outbound entry is being published (a PUBLISH itself resets the broker's keepalive timer).
+- `ping()` waits for PINGRESP with a bounded timeout (capped at 10 s) so a dead link surfaces as a disconnect within one interval instead of blocking the run loop.
+- A failed PINGREQ marks the connection disconnected; `_recover_network_if_needed` reconnects.
+
+## Network recovery
+
+When the run loop detects a lost link (Wi-Fi down, or MQTT down with Wi-Fi up), `_recover_network_if_needed` re-establishes it before any further processing. A blackholed broker (TCP up, but no PINGRESP or PUBACK ever arrives) is detected the same way: every blocking broker wait is bounded, so a dead link surfaces as a failed ping or publish, marks the connection disconnected, and recovery fires on the next loop iteration.
+
+1. `network_stack_ready` is cleared and a forced network snapshot is published with `network_stack_ready = False`, so Core 1 health gating reflects the outage immediately.
+2. `establish_network()` re-establishes Wi-Fi and MQTT with the normal backoff and connection logs. The connection LED flashes while this happens because `establish_network()` arms it.
+3. `network_stack_ready` is restored, the connection LED stops, and a forced network snapshot is published with `network_stack_ready = True`.
+
+The startup path and the recovery path share `establish_network()`, so the connect loops, backoff, logging, and LED behavior live in one place and cannot diverge.
+
+## Core 0 run loop
+
+Each Core 0 iteration (10 ms period) services, in order:
+
+1. A pending reboot (publish the response, wait, `machine.reset()`).
+2. Network recovery via `_recover_network_if_needed` — this runs even before any publishing, so a lost link is detected and repaired at the top of the loop.
+3. Pending connection logs (when MQTT is connected).
+4. The MQTT receive pump (`check_msg`) at the configured `mqtt_command_poll_ms` cadence — this is how UTC responses and commands arrive without blocking.
+5. Pending Core 0 command responses (when MQTT is connected and no entry is in flight).
+6. One outbound queue entry, published with QoS 1; a failed publish leaves the entry in flight for retry, and a successful one calls `complete_in_flight`.
+7. A PINGREQ when keepalive traffic is due — only when no outbound entry is being published (a PUBLISH itself resets the broker timer).
+8. The network snapshot publish, rate-limited to `network_snapshot_interval_sec`.
+9. UTC housekeeping: discard a pending request whose deadline passed, then send a new request if the sync is due and the retry throttle allows.
 
 ## Core 1 baseline
 
@@ -255,7 +300,25 @@ Core 1 starts only after Core 0 has completed the deterministic startup contract
 7. UTC synchronization completed with valid snapshot
 8. Initial network snapshot published with `network_stack_ready = True`
 
-The `network_stack_ready` flag in the network snapshot indicates the complete startup contract has been verified.
+The `network_stack_ready` flag in the network snapshot indicates the complete startup contract has been verified. It is also cleared while a mid-run link outage is being recovered and restored after a successful re-establishment (see Network recovery).
+
+## Startup log
+
+Core 1's first action, before the first telemetry, is a one-time `system_startup_completed` log message. It is queued under KIND_LOG at INFO (50) retention priority; Core 0 maps the kind to `mqtt_topic_log` at publish time.
+
+The payload carries:
+
+- Startup status per subsystem (hardware, Wi-Fi, MQTT, subscriptions, UTC, Core 0, Core 1). Subscription readiness is reported without topic names — topic ownership stays in Core 0.
+- Device counts (configured / ready / initialization-failed) plus per-device ready and failed lists (device, name, sensor type).
+- A full `system_information` snapshot (all sections collected through `SystemInformation`).
+
+Telemetry admission is gated on startup-log admission: if the first admission attempt is rejected, Core 1 waits 100 ms and retries once. If it is still rejected, Core 1 raises and halts — no telemetry goes out without the startup log being admitted.
+
+## Core 1 liveness heartbeat
+
+Core 1 refreshes the `core_1_activity_ms` state mailbox on a 5-second deadline, independent of read-loop phase: the refresh fires on any 20 ms loop iteration once its deadline has passed, rather than on a fixed grid aligned to the loop step. A deadline-based refresh cannot starve even when the actual loop period (sleep plus processing) does not divide the refresh window evenly.
+
+Health messages report `core_1_active` as true while the stamp age is within threshold (`3 × read_loop_sec`, minimum 60 seconds), and add `core_1_inactive` to the degradation reasons when it is exceeded.
 
 ## Periodic Health Messages
 
@@ -270,7 +333,7 @@ Core 1 generates health messages periodically (every `health_interval_sec`) and 
    - RSSI: `StateMailboxes.get_network_snapshot().get("rssi")`
    - Core 1 activity: `StateMailboxes.get_core_1_activity_ms()`
    - Heap: `gc.mem_free()` (current measurement)
-   - Devices: `DeviceManager.get_status_snapshot()`
+   - Devices: `SystemInformation.get_devices()` (backed by `DeviceManager.get_status_snapshot()`)
    - Queue: `OutboundQueue.get_depth_with_capacity()`
    - UTC: `StateMailboxes.get_utc_snapshot()`
 
@@ -307,12 +370,21 @@ Core 0 performs the following sequence during `start()` before returning and all
 5. **Drain startup work**: Service pending connection logs
 6. **5-second wait**: Stabilization period
 7. **Network probe #2**: Publish QoS 1 probe message and wait for matching PUBACK
-8. **UTC synchronization**: Block until valid UTC response received
+8. **UTC synchronization**: Block until a valid UTC response is received or 3 bounded attempts are exhausted (each attempt waits up to `mqtt_broker_response_timeout_sec`)
 9. **Publish initial snapshots**: UTC and network snapshots to state mailboxes
 10. **Stop connection LED**: LED turns off
 11. **Return**: Core 0.start() returns, Core 1 starts
 
 If any step fails (Wi-Fi, MQTT, either probe, or UTC sync), Core 0 raises an exception and Core 1 never starts.
+
+## UTC time synchronization
+
+Core 0 is the only UTC acquirer. Requests are published to `mqtt_topic_info_request` with a unique `request_id`; the server is expected to answer on `mqtt_topic_info_response` echoing that `request_id`.
+
+- **Startup (required, bounded)**: `_synchronize_utc_required()` makes a fixed number of attempts (3 — a constant, deliberately not derived from the timeout setting), each waiting up to `mqtt_broker_response_timeout_sec` for a valid response while pumping MQTT. If all attempts fail, startup raises and Core 1 never starts.
+- **Steady state (non-blocking)**: when the snapshot is older than `datetime_sync_interval_min`, the run loop sends a request and records a `mqtt_broker_response_timeout_sec` deadline. The run loop keeps servicing the outbound queue, network recovery, and command responses; the answer arrives through the regular `check_msg()` pump. The run loop never blocks on a UTC request.
+- **Timeout and retry**: a pending request whose deadline passed is discarded, and re-requests are throttled to at most one per 30 seconds until a valid response arrives. An unresponsive time server therefore cannot stall the run loop or flood the broker. A malformed-but-reachable answer gets a much shorter backoff (~0.5s) since the server demonstrably answered us.
+- **Response validation**: a response is accepted only if it matches the current schema version, is targeted at this device, carries the matching `request_id`, and contains a valid `timestamp` and positive integer `utc_epoch_ms`. A malformed answer to *our own* pending request clears that request and re-keys the retry throttle to a short ~0.5s backoff (instead of the full 30s measured from the original send); a response for any other request id is ignored without disturbing pending state (our response may still be in flight).
 
 ## Features intentionally not carried into the baseline
 
@@ -351,5 +423,7 @@ The connection indication (50ms ON / 50ms OFF) remains active throughout the ent
 - UTC synchronization
 
 The connection LED stops only after the complete startup contract has been verified and the initial state snapshots have been published.
+
+The same flashing indication is reused after any mid-run outage: `establish_network()` arms it during recovery, and recovery stops it once the link is restored — it never remains flashing after a successful re-establishment.
 
 Successful telemetry publication requests a non-blocking one-second pulse.

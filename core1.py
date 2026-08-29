@@ -14,22 +14,17 @@ from device_manager import (
     DEVICE_RESULT_REINITIALIZATION_FAILED,
     DEVICE_STATE_READY,
     DEVICE_STATE_INITIALIZATION_FAILED,
-    DEVICE_STATE_REMOVED,
 )
 from intercore import (
     KIND_TELEMETRY,
     KIND_COMMAND_RESPONSE,
     KIND_HEALTH,
+    KIND_LOG,
     RETENTION_PRIORITY_CRITICAL,
     RETENTION_PRIORITY_TELEMETRY,
     RETENTION_PRIORITY_INFO,
     RETENTION_PRIORITY_HEALTH,
 )
-
-# Core 1 uses the same MQTT log topic as Core 0
-# This is a deliberate exception to the architecture rule - Core 1 needs to know
-# the log topic to queue startup logs before any network configuration is available
-_MQTT_TOPIC_LOG = "iot/v3/log"
 from message_protocol import format_utc_epoch_ms, is_json_safe
 from system_information import SystemInformation, SYSTEM_INFORMATION_SECTIONS
 
@@ -43,23 +38,12 @@ from message_serializer import (
 )
 
 
-def _build_common_envelope(intercore, boot_ticks_ms, message_type, runtime_id):
-    """Build the common MQTT envelope fields.
-
-    This function is not currently used - the startup log uses the envelope
-    directly in the payload as per the canonical message format. Kept for
-    potential future use.
-    """
-    # Placeholder - envelope is built inside the message payload for startup log
-    pass
-
-
 def _collect_system_information_full(system_information):
     """Collect full system information snapshot including all sections."""
     system_info = {}
     for section in SYSTEM_INFORMATION_SECTIONS:
         try:
-            getter_name = "get_{}".format(section.replace("_", ""))
+            getter_name = "get_{}".format(section)
             if hasattr(system_information, getter_name):
                 section_data = getattr(system_information, getter_name)()
                 if is_json_safe(section_data):
@@ -85,21 +69,14 @@ def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_mana
         boot_ticks_ms: Monotonic timestamp at firmware boot
         runtime_id: Unique runtime identifier
         device_manager: DeviceManager instance
-        config: Core 1 configuration for MQTT topics
+        config: Core 1 configuration
         startup_duration_ms: Duration of startup in milliseconds
         system_information: Optional SystemInformation instance with device_manager set
     """
     # Use provided source
 
-    # Get MQTT topics from config for subscriptions
-    mqtt_topics = []
-    if config is not None:
-        mqtt_topics = [
-            config.get("mqtt_topic_command", "iot/v3/command"),
-            config.get("mqtt_topic_info_response", "iot/v3/info-response"),
-        ]
-
-    # Build startup summary
+    # Build startup summary. Subscription readiness is reported without topic
+    # names: topic ownership belongs to Core 0 (message kind only crosses cores).
     startup_summary = {
         "uptime": startup_duration_ms,
         "hardware": {"status": "ready"},
@@ -107,7 +84,6 @@ def _build_startup_log(intercore, source, boot_ticks_ms, runtime_id, device_mana
         "mqtt": {"status": "ready"},
         "subscriptions": {
             "status": "ready",
-            "topics": mqtt_topics,
         },
         "utc": {"status": "synchronized"},
         "core_0": {"status": "running"},
@@ -183,34 +159,13 @@ def _try_queue_startup_log(intercore, source, message, retention_priority):
         print("[ERROR] Startup log serialization failed: {}".format(err))
         return False
 
-    # Create the queue entry with log topic
-    # Core 1 uses a constant for the log topic since it's shared with Core 0
-    entry = {
-        "topic": _MQTT_TOPIC_LOG,  # Use log topic directly
-        "retention_priority": retention_priority,
-        "payload_bytes": payload_bytes,
-    }
-
-    # Manually queue the entry following the same pattern as OutboundQueue.put
-    # but without re-serialization since we already have payload_bytes
-    with intercore.outbound_queue._lock:
-        occupied = len(intercore.outbound_queue._queue) + (1 if intercore.outbound_queue._in_flight is not None else 0)
-        if occupied >= intercore.outbound_queue._max_entries:
-            if not intercore.outbound_queue._queue:
-                intercore.outbound_queue._messages_rejected += 1
-                return False
-
-            worst_priority = max(entry["retention_priority"] for entry in intercore.outbound_queue._queue)
-            if retention_priority > worst_priority:
-                intercore.outbound_queue._messages_rejected += 1
-                return False
-
-            if not intercore.outbound_queue._evict_oldest_by_priority_locked(worst_priority):
-                intercore.outbound_queue._messages_rejected += 1
-                return False
-
-        intercore.outbound_queue._queue.append(entry)
-        return True
+    # Queue under KIND_LOG: Core 0 maps the kind to the log topic at publish
+    # time. Core 1 never names MQTT topics.
+    return intercore.outbound_queue.put_with_kind(
+        KIND_LOG,
+        payload_bytes,
+        retention_priority,
+    )
 
 
 def _message_time(intercore, boot_ticks_ms):
@@ -347,11 +302,11 @@ def _build_health_payload(intercore, boot_ticks_ms, source, config, runtime_id, 
 
     # Get Core 1 activity timestamp
     core_1_activity_ms = intercore.state_mailboxes.get_core_1_activity_ms()
-    # Calculate Core 1 activity age
-    core_1_inactive_ms = time.ticks_diff(now_ms, core_1_activity_ms) if core_1_activity_ms is not None else None
+    # Age of the last Core 1 activity report (None if never reported)
+    core_1_activity_age_ms = time.ticks_diff(now_ms, core_1_activity_ms) if core_1_activity_ms is not None else None
     # Calculate threshold: 3x the read loop interval (with reasonable minimum)
     core_1_activity_threshold_ms = max(config["read_loop_sec"] * 3 * 1000, 60000)  # 60 seconds min
-    core_1_active = core_1_inactive_ms is not None and core_1_inactive_ms <= core_1_activity_threshold_ms
+    core_1_active = core_1_activity_age_ms is not None and core_1_activity_age_ms <= core_1_activity_threshold_ms
 
     # Get device status from SystemInformation (which uses DeviceManager)
     devices = system_information.get_devices() if system_information else {"configured": 0, "active": 0}
@@ -361,9 +316,6 @@ def _build_health_payload(intercore, boot_ticks_ms, source, config, runtime_id, 
     # Get queue status
     outbound_queue = intercore.outbound_queue
     queue_depth, queue_capacity = outbound_queue.get_depth_with_capacity()
-
-    # Determine queue pressure (75% threshold)
-    queue_pressure = queue_capacity > 0 and (queue_depth / queue_capacity) >= 0.75
 
     # Get memory info
     try:
@@ -387,9 +339,6 @@ def _build_health_payload(intercore, boot_ticks_ms, source, config, runtime_id, 
 
     # Calculate heap headroom
     heap_headroom_bytes = free_heap - minimum_free_heap
-
-    # Calculate Core 1 activity age in milliseconds
-    core_1_activity_age_ms = time.ticks_diff(now_ms, core_1_activity_ms) if core_1_activity_ms is not None else None
 
     # Calculate UTC sync age in seconds
     utc_sync_age_sec = None
@@ -615,6 +564,10 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         health_interval_ms = config["health_interval_sec"] * 1000
         next_health_ms = time.ticks_add(time.ticks_ms(), health_interval_ms)
 
+        # Liveness heartbeat scheduler (deadline-based, independent of loop phase)
+        activity_interval_ms = 5000
+        next_activity_ms = time.ticks_add(time.ticks_ms(), activity_interval_ms)
+
         # Now that startup log and health are queued, telemetry can begin
         read_loop_ms = config["read_loop_sec"] * 1000
         next_read_ms = time.ticks_add(time.ticks_ms(), read_loop_ms)
@@ -641,10 +594,9 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 gc.collect()
 
             # Register Core 1 activity periodically (every 5 seconds)
-            if time.ticks_diff(now_ms, next_read_ms) < 0 and time.ticks_diff(now_ms, next_health_ms) < 0:
-                # Not time for read or health yet - update activity once per 5 seconds
-                if now_ms % 5000 < 20:
-                    intercore.state_mailboxes.set_core_1_activity_ms(now_ms)
+            if time.ticks_diff(now_ms, next_activity_ms) >= 0:
+                intercore.state_mailboxes.set_core_1_activity_ms(now_ms)
+                next_activity_ms = time.ticks_add(now_ms, activity_interval_ms)
 
             # Check for health message generation
             if time.ticks_diff(now_ms, next_health_ms) >= 0:

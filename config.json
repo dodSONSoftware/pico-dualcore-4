@@ -1,5 +1,5 @@
 {
-  "source": "Test-Pico-1",
+  "source": "Test-Pico-12",
   "config_schema_version": 5,
   "read_loop_sec": 20,
   "device_initialization_attempts": 3,
@@ -33,9 +33,7 @@
       "sensor_type": "system-info",
       "config": {
         "include": [
-          "network",
-          "runtime",
-          "device_status"
+          "queues"
         ]
       }
     }

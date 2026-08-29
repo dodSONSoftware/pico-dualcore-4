@@ -10,7 +10,6 @@ from message_protocol import is_json_safe
 DEVICE_STATE_READY = "ready"
 DEVICE_STATE_REINITIALIZE_PENDING = "reinitialize_pending"
 DEVICE_STATE_INITIALIZATION_FAILED = "initialization_failed"
-DEVICE_STATE_REMOVED = "removed"
 
 # Device result status constants
 DEVICE_RESULT_TELEMETRY = "telemetry"
@@ -338,33 +337,6 @@ class DeviceManager:
         """
         return list(self._active_devices)
 
-    def remove_device(self, device_id):
-        """
-        Remove a device from active collection and mark as permanently removed.
-
-        Args:
-            device_id: Unique device identifier to remove
-        """
-        managed_device = self._devices_by_id.get(device_id)
-        if managed_device is not None:
-            # Set the managed device's state to REMOVED before removing
-            managed_device.state = DEVICE_STATE_REMOVED
-
-            # Add to failed devices with removal state
-            self._failed_devices[device_id] = {
-                "id": device_id,
-                "device": managed_device.device_type,
-                "state": DEVICE_STATE_REMOVED,
-                "failure_reason": DEVICE_RESULT_REINITIALIZATION_FAILED,
-                "initialization_attempts_used": managed_device.initialization_attempts_used,
-                "consecutive_read_failures": managed_device.consecutive_read_failures,
-                "total_read_failures": managed_device.total_read_failures,
-            }
-
-            # Remove from active collections
-            self._active_devices.remove(managed_device)
-            del self._devices_by_id[device_id]
-
     def process_device(self, managed_device):
         """
         Process one device for the current cycle.
@@ -464,22 +436,21 @@ class DeviceManager:
         Returns:
             dict: Result with reinitialization status
         """
+        # Resolve the device definition once, before the retry loop
+        device_def = None
+        for d in self._devices_config:
+            if d["id"] == managed_device.device_id:
+                device_def = d
+                break
+        if device_def is None:
+            raise RuntimeError("Device definition not found for reinitialization")
+
         last_error = None
         attempts_used = 0
 
         for attempt in range(1, self._device_initialization_attempts + 1):
             attempts_used = attempt
             try:
-                # Get the device config for reinitialization
-                device_def = None
-                for d in self._devices_config:
-                    if d["id"] == managed_device.device_id:
-                        device_def = d
-                        break
-
-                if device_def is None:
-                    raise RuntimeError("Device definition not found for reinitialization")
-
                 managed_device.driver.initialize(device_def["config"])
                 # Initialization succeeded (returns None, raises on failure)
                 managed_device.clear_reinitialize_pending()
@@ -553,13 +524,9 @@ class DeviceManager:
             # Add optional fields if present
             if "failure_reason" in device_info:
                 snapshot["failure_reason"] = device_info["failure_reason"]
-            # Add age fields if now_ms is provided
-            if now_ms is not None:
-                snapshot["last_read_age_ms"] = None
-                snapshot["last_successful_read_age_ms"] = None
-            else:
-                snapshot["last_read_age_ms"] = None
-                snapshot["last_successful_read_age_ms"] = None
+            # Failed devices carry no read timestamps, so ages are always None
+            snapshot["last_read_age_ms"] = None
+            snapshot["last_successful_read_age_ms"] = None
 
             device_snapshots[device_id] = snapshot
 
@@ -577,17 +544,12 @@ class DeviceManager:
             1 for d in self._failed_devices.values()
             if d["state"] == DEVICE_STATE_INITIALIZATION_FAILED
         )
-        removed_after_read_failure = sum(
-            1 for d in self._failed_devices.values()
-            if d["state"] == DEVICE_STATE_REMOVED
-        )
 
         return {
             "devices": {
                 "configured": len(self._devices_config),
                 "active": active_count,
                 "initialization_failed": initialization_failed,
-                "removed_after_read_failure": removed_after_read_failure,
             },
             "device_status": device_status,
         }

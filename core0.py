@@ -7,7 +7,7 @@ import machine
 import time
 
 from debug import DEBUG
-from intercore import KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_TELEMETRY
+from intercore import KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG, KIND_TELEMETRY
 from message_protocol import format_utc_epoch_ms
 from mqtt import Mqtt
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
@@ -18,6 +18,9 @@ from message_serializer import serialize_and_validate_message, MessageTooLargeEr
 
 _MAX_PENDING_CORE0_RESPONSES = 4
 _MAX_PENDING_CONNECTION_LOGS = 4
+_UTC_STARTUP_MAX_ATTEMPTS = 3
+_UTC_RETRY_INTERVAL_MS = 30000
+_UTC_PROMPT_RETRY_DELAY_MS = 500
 
 
 class Core0:
@@ -42,6 +45,8 @@ class Core0:
         self._pending_connection_logs = []
         self._utc_request_counter = 0
         self._pending_utc_request_id = None
+        self._utc_request_deadline_ms = None
+        self._utc_last_attempt_ms = None
         self._utc_snapshot = None
         self._last_network_snapshot_ms = None
         self._last_command_poll_ms = time.ticks_ms()
@@ -95,10 +100,10 @@ class Core0:
         message = self._pending_connection_logs[0]
         try:
             payload_bytes = serialize_and_validate_message(message)
+            # KIND_LOG: _publish_entry resolves the log topic via _topic_for_kind
             entry = {
-                "topic": self._config["mqtt_topic_log"],
                 "payload_bytes": payload_bytes,
-                "kind": KIND_TELEMETRY,  # Use telemetry kind for topic lookup
+                "kind": KIND_LOG,
             }
             self._publish_entry(entry)
         except Exception as err:
@@ -273,19 +278,27 @@ class Core0:
         if doc.get("request_id") != self._pending_utc_request_id:
             return
 
+        # A malformed answer to OUR request is still an answer: clear the
+        # pending request so we retry after a short backoff instead of
+        # waiting out the full deadline or the 30s retry interval.
+        # (Responses that are not ours are rejected earlier above, without
+        # touching pending state.)
         payload = doc.get("payload")
         if not isinstance(payload, dict):
+            self._utc_note_reachable_failure()
             return
 
         timestamp = payload.get("timestamp")
         utc_epoch_ms = payload.get("utc_epoch_ms")
         if not isinstance(timestamp, str) or not timestamp:
+            self._utc_note_reachable_failure()
             return
         if (
             isinstance(utc_epoch_ms, bool)
             or not isinstance(utc_epoch_ms, int)
             or utc_epoch_ms <= 0
         ):
+            self._utc_note_reachable_failure()
             return
 
         try:
@@ -293,6 +306,7 @@ class Core0:
         except MemoryError:
             raise
         except Exception as err:
+            self._utc_note_reachable_failure()
             if DEBUG:
                 print("[DEBUG] UTC response rejected - invalid epoch: {}".format(err))
             return
@@ -306,7 +320,7 @@ class Core0:
         }
         self._utc_snapshot = snapshot
         self._intercore.state_mailboxes.set_utc_snapshot(snapshot)
-        self._pending_utc_request_id = None
+        self._utc_clear_pending()
         print("[INFO] UTC synchronized: {}".format(normalized_timestamp))
 
     def _topic_for_kind(self, kind):
@@ -316,6 +330,8 @@ class Core0:
             return self._config["mqtt_topic_command_response"]
         if kind == KIND_HEALTH:
             return self._config["mqtt_topic_health"]
+        if kind == KIND_LOG:
+            return self._config["mqtt_topic_log"]
         raise ValueError("Unsupported outbound message kind: {}".format(kind))
 
     def _make_envelope(self, entry, sequence):
@@ -332,10 +348,7 @@ class Core0:
             payload_str = payload.decode("utf-8")
         else:
             payload_str = payload
-        source = json.loads(payload_str)
-        envelope = {}
-        for key, value in source.items():
-            envelope[key] = value
+        envelope = json.loads(payload_str)
 
         envelope["sequence"] = sequence
         envelope["runtime_id"] = self._runtime_id
@@ -456,7 +469,34 @@ class Core0:
         self._intercore.state_mailboxes.set_network_snapshot(snapshot)
         self._last_network_snapshot_ms = now_ms
 
-    def _request_utc(self):
+    def _utc_clear_pending(self):
+        self._pending_utc_request_id = None
+        self._utc_request_deadline_ms = None
+
+    def _utc_note_reachable_failure(self):
+        """Clear a pending request answered with a malformed payload.
+
+        The server reached us, so the full retry interval does not apply:
+        re-key the throttle so the resend is allowed after a short delay
+        instead of up to _UTC_RETRY_INTERVAL_MS after the original send.
+        """
+        self._utc_clear_pending()
+        self._utc_last_attempt_ms = time.ticks_add(
+            time.ticks_ms(),
+            _UTC_PROMPT_RETRY_DELAY_MS - _UTC_RETRY_INTERVAL_MS,
+        )
+
+    def _utc_send_request(self):
+        """Send a UTC time request without blocking.
+
+        The response arrives through the normal MQTT pump; the deadline is
+        tracked so the run loop can give up on a request that never answers.
+
+        The pending request ID is armed before publishing: the client
+        delivers broker messages while awaiting the PUBACK, so a fast
+        response can arrive inside the publish call itself and must find
+        the request ID already set.
+        """
         self._utc_request_counter += 1
         request_id = "{}_{}".format(self._runtime_id, self._utc_request_counter)
         request = {
@@ -475,29 +515,63 @@ class Core0:
                 json.dumps(request),
             )
         except MemoryError:
+            self._pending_utc_request_id = None
             raise
         except Exception as err:
+            # Roll back the armed ID: no response can ever arrive for a
+            # request that was not delivered.
             self._pending_utc_request_id = None
             if DEBUG:
                 print("[DEBUG] UTC request publish failed: {}".format(err))
             return
 
+        self._utc_last_attempt_ms = time.ticks_ms()
         timeout_ms = self._config["mqtt_broker_response_timeout_sec"] * 1000
-        start_ms = time.ticks_ms()
+        self._utc_request_deadline_ms = time.ticks_add(time.ticks_ms(), timeout_ms)
+
+    def _utc_wait_response(self):
+        """Pump MQTT until the pending UTC response arrives or its deadline.
+
+        Used only during startup, when no other Core 0 work is in flight.
+        """
         while self._pending_utc_request_id is not None:
-            if time.ticks_diff(time.ticks_ms(), start_ms) >= timeout_ms:
-                self._pending_utc_request_id = None
-                return
+            if time.ticks_diff(
+                time.ticks_ms(), self._utc_request_deadline_ms
+            ) >= 0:
+                break
             try:
                 self._mqtt.check_msg()
             except MemoryError:
                 raise
             except Exception as err:
-                self._pending_utc_request_id = None
                 if DEBUG:
                     print("[DEBUG] UTC response wait failed: {}".format(err))
-                return
+                break
             time.sleep_ms(20)
+        self._utc_clear_pending()
+
+    def _utc_request_expired(self):
+        """Clear a pending UTC request whose deadline has passed."""
+        if self._pending_utc_request_id is None:
+            return
+        if time.ticks_diff(
+            time.ticks_ms(), self._utc_request_deadline_ms
+        ) >= 0:
+            self._utc_clear_pending()
+            if DEBUG:
+                print("[DEBUG] UTC request timed out")
+
+    def _utc_should_send_request(self):
+        """True when a new UTC request is due and retry throttling allows it."""
+        if self._pending_utc_request_id is not None:
+            return False
+        if not self._utc_sync_due():
+            return False
+        if self._utc_last_attempt_ms is not None and time.ticks_diff(
+            time.ticks_ms(), self._utc_last_attempt_ms
+        ) < _UTC_RETRY_INTERVAL_MS:
+            return False
+        return True
 
     def _utc_sync_due(self):
         if self._utc_snapshot is None:
@@ -569,8 +643,9 @@ class Core0:
 
     def _synchronize_utc_required(self):
         """Synchronize UTC during startup. Must succeed for startup to complete."""
-        for attempt in range(self._config["mqtt_broker_response_timeout_sec"]):
-            self._request_utc()
+        for attempt in range(_UTC_STARTUP_MAX_ATTEMPTS):
+            self._utc_send_request()
+            self._utc_wait_response()
             if self._utc_snapshot is not None:
                 return True
             # Wait before retry
@@ -620,17 +695,22 @@ class Core0:
             time.sleep(delay_sec)
 
     def _recover_network_if_needed(self):
-        if not self._wifi.is_connected():
-            self._mqtt.mark_disconnected()
-            self._publish_network_snapshot(force=True)
-            self.establish_network()
-            self._publish_network_snapshot(force=True)
+        if self._wifi.is_connected() and self._mqtt.is_connected():
             return
 
-        if not self._mqtt.is_connected():
-            self._publish_network_snapshot(force=True)
-            self.establish_network()
-            self._publish_network_snapshot(force=True)
+        # Report the outage immediately so the snapshot (and Core 1 health
+        # gating) reflects the loss; the flag is restored only after the
+        # link is re-established.
+        self._network_stack_ready = False
+        if not self._wifi.is_connected():
+            # Wi-Fi loss implies MQTT loss; drop the stale session state.
+            self._mqtt.mark_disconnected()
+        self._publish_network_snapshot(force=True)
+        self.establish_network()
+        self._network_stack_ready = True
+        # establish_network() armed the connection LED; recovery is complete.
+        self._led_manager.set_connecting(False)
+        self._publish_network_snapshot(force=True)
 
     def start(self):
         """Establish Core 0 network services before Core 1 is started.
@@ -644,54 +724,18 @@ class Core0:
         6. Run QoS 1 network probe #2
         7. Acquire UTC
         8. Publish initial UTC snapshot
-        9. Publish initial network snapshot
-        10. Stop connection LED
+        9. Mark the network stack ready
+        10. Publish initial network snapshot
+        11. Stop connection LED
 
         Returns only when the entire startup contract has succeeded.
         """
         self._led_manager.set_connecting(True)
 
-        # Step 1: Establish Wi-Fi
-        self._wifi_connected = False
-        while not self._wifi_connected:
-            if self._wifi.connect():
-                snapshot = self._wifi.snapshot(False)
-                self._queue_connection_log(
-                    "wifi_connection_established",
-                    "Connected to Wi-Fi",
-                    "wifi",
-                    {
-                        "ssid": snapshot["ssid"],
-                        "ip_address": snapshot["ip_address"],
-                        "rssi": snapshot["rssi"],
-                        "connect_count": snapshot["wifi_connect_count"],
-                    },
-                )
-                self._wifi_connected = True
-                break
-            delay_sec = self._config["wifi_reconnect_delays_sec"][-1]
-            print("[WARNING] Wi-Fi connection sequence exhausted; retrying in {} sec".format(delay_sec))
-            time.sleep(delay_sec)
-
-        # Step 2: Establish MQTT + subscriptions
-        self._mqtt_connected = False
-        while not self._mqtt_connected:
-            if self._mqtt.connect():
-                mqtt_status = self._mqtt.status()
-                self._queue_connection_log(
-                    "mqtt_connection_established",
-                    "Connected to MQTT broker",
-                    "mqtt",
-                    {
-                        "broker_address": self._config["mqtt_broker_ip_address"],
-                        "connect_count": mqtt_status["connect_count"],
-                    },
-                )
-                self._mqtt_connected = True
-                break
-            delay_sec = self._config["mqtt_reconnect_delays_sec"][-1]
-            print("[WARNING] MQTT connection sequence exhausted; retrying in {} sec".format(delay_sec))
-            time.sleep(delay_sec)
+        # Steps 1-2: Establish Wi-Fi, then MQTT + subscriptions.
+        # Shared with the run-loop recovery path so connect loops, backoff,
+        # logging, and LED behavior stay in one place.
+        self.establish_network()
 
         # Step 3: QoS 1 network probe #1
         if not self._perform_network_probe():
@@ -713,7 +757,7 @@ class Core0:
             raise RuntimeError("UTC synchronization failed during startup")
 
         # Step 8: Publish initial UTC snapshot
-        self._publish_utc_snapshot(force=True)
+        self._publish_utc_snapshot()
 
         # Step 9: Network startup proven complete - set ready flag
         self._network_stack_ready = True
@@ -723,11 +767,10 @@ class Core0:
 
         # Step 11: Stop connection LED
         self._led_manager.set_connecting(False)
-        self._led_manager.set_connecting(False)
 
         print("[INFO] Core 0 startup complete - network stack verified and ready")
 
-    def _publish_utc_snapshot(self, force=False):
+    def _publish_utc_snapshot(self):
         """Publish the current UTC snapshot to the state mailbox."""
         if self._utc_snapshot is None:
             return
@@ -735,7 +778,6 @@ class Core0:
 
     def run(self):
         """Run the Core 0 network/MQTT service loop."""
-        self._request_utc()
         poll_ms = self._config["mqtt_command_poll_ms"]
 
         while True:
@@ -788,14 +830,27 @@ class Core0:
                     except MemoryError:
                         raise
                     except Exception as err:
+                        # Keep the entry in flight so the next take() retries it:
+                        # QoS 1 must not drop a message the broker has not PUBACKed.
                         if DEBUG:
-                            print("[DEBUG] MQTT publish failed: {}".format(err))
-                    finally:
+                            print("[DEBUG] MQTT publish failed; entry remains in flight: {}".format(err))
+                    else:
                         self._intercore.outbound_queue.complete_in_flight(entry)
+                elif self._mqtt.ping_due():
+                    # No publish to send: PINGREQ keeps the broker from
+                    # disconnecting us at 1.5 x keepalive.
+                    try:
+                        self._mqtt.ping()
+                    except MemoryError:
+                        raise
+                    except Exception as err:
+                        if DEBUG:
+                            print("[DEBUG] MQTT PINGREQ failed: {}".format(err))
 
             self._publish_network_snapshot()
 
-            if self._mqtt.is_connected() and self._utc_sync_due():
-                self._request_utc()
+            self._utc_request_expired()
+            if self._mqtt.is_connected() and self._utc_should_send_request():
+                self._utc_send_request()
 
             time.sleep_ms(10)

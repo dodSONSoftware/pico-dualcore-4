@@ -1,3 +1,7 @@
+# test_config.py - Configuration loading and validation tests
+# Copyright (c) 2026 dodson Software ( dodson labs )
+# SPDX-License-Identifier: MIT
+
 import copy
 import json
 import pathlib

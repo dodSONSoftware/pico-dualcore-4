@@ -26,6 +26,7 @@ from intercore import (
     KIND_TELEMETRY,
     KIND_COMMAND_RESPONSE,
     KIND_HEALTH,
+    KIND_LOG,
     RETENTION_PRIORITY_CRITICAL,
     RETENTION_PRIORITY_ERROR,
     RETENTION_PRIORITY_TELEMETRY,
@@ -344,6 +345,18 @@ def test_health_message_kind_is_valid():
     assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"test": true}', RETENTION_PRIORITY_HEALTH)
 
 
+def test_log_message_kind_is_valid():
+    """Verify KIND_LOG is a valid outbound message kind for log messages."""
+    bus = InterCore(outbound_max=2, event_max=2)
+    # Log messages should be accepted with info priority
+    assert bus.outbound_queue.put_with_kind(KIND_LOG, b'{"test": true}', RETENTION_PRIORITY_INFO)
+
+    entry = bus.outbound_queue.take()
+    assert entry["kind"] == KIND_LOG
+    assert "topic" not in entry  # topic resolution is Core 0's job
+    bus.outbound_queue.complete_in_flight(entry)
+
+
 def test_health_message_is_lesser_priority_than_info():
     """Verify health messages can be evicted by info messages."""
     bus = InterCore(outbound_max=2, event_max=2)
@@ -462,11 +475,12 @@ def test_health_topic_routing_returns_configured_topic():
     assert topic_for_kind(KIND_HEALTH) == config["mqtt_topic_health"]
 
 
-def test_publish_failure_clears_in_flight_state():
-    """Verify that when publish fails, complete_in_flight must be called to clear state.
+def test_publish_failure_keeps_entry_in_flight_for_retry():
+    """Verify that a failed publish leaves the entry in flight so it can be retried.
 
-    This test verifies the fix for a bug where failed MQTT publishes would leave
-    the in-flight state permanently occupied, blocking the queue forever.
+    QoS 1 requires at-least-once delivery: a message the broker has not PUBACKed
+    must not be dropped. When a publish fails, Core 0 leaves the entry in flight,
+    and take() keeps returning the same entry until it is completed.
     """
     bus = InterCore(outbound_max=2, event_max=2)
 
@@ -480,12 +494,19 @@ def test_publish_failure_clears_in_flight_state():
     assert json.loads(first["payload_bytes"].decode("utf-8"))["id"] == 1
     assert bus.outbound_queue.has_in_flight()
 
-    # Simulate a failed publish - the bug was that complete_in_flight was not called
-    # After the fix, we call complete_in_flight even on failure
+    # Simulate a failed publish - complete_in_flight is NOT called
+    # The entry must stay in flight so it can be retried
+    assert bus.outbound_queue.has_in_flight()
+
+    # The same entry is returned again instead of advancing the queue
+    retry = bus.outbound_queue.take()
+    assert retry is first
+    assert json.loads(retry["payload_bytes"].decode("utf-8"))["id"] == 1
+
+    # Retry succeeds - complete it and the queue advances
     assert bus.outbound_queue.complete_in_flight(first)
     assert not bus.outbound_queue.has_in_flight()
 
-    # Now we should be able to take the second message
     second = bus.outbound_queue.take()
     assert second is not None
     assert json.loads(second["payload_bytes"].decode("utf-8"))["id"] == 2
