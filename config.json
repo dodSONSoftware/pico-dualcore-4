@@ -1,5 +1,5 @@
 {
-  "source": "Test-Pico-1",
+  "source": "Test-Pico-2",
   "config_schema_version": 5,
   "read_loop_sec": 20,
   "device_initialization_attempts": 3,

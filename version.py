@@ -2,6 +2,6 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
-FIRMWARE_VERSION = "0.4.22"
+FIRMWARE_VERSION = "0.4.23"
 CONFIG_SCHEMA_VERSION = 5
 MESSAGE_SCHEMA_VERSION = 3
