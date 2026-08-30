@@ -74,7 +74,14 @@ class Core0:
         return format_utc_epoch_ms(snapshot["utc_epoch_ms"] + elapsed_ms)
 
     def _target_matches(self, target):
-        if target == "*" or target == self._config["source"]:
+        if not isinstance(target, str):
+            return False
+        if target == "*":
+            return True
+        # Target matching is case-insensitive: a casing variant of the
+        # configured source addresses this device. Only the comparison is
+        # normalized; the stored source keeps its configured casing.
+        if target.lower() == self._config["source"].lower():
             return True
         return target == self._wifi.ip_address()
 

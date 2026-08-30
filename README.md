@@ -254,6 +254,14 @@ The firmware expects `config_schema_version: 5`. Unknown top-level keys are reje
 
 See [`config.json`](config.json) for complete example.
 
+## Command Target Matching
+
+`target` is matched against the configured `source`, the device's IP address,
+or `"*"`. The comparison against the source name is case-insensitive —
+`test-pico-2`, `TEST-PICO-2`, and `Test-Pico-2` all address a device
+configured as `Test-Pico-2` — and the device always responds with its
+configured casing unchanged.
+
 ## Reboot Command
 
 Send to `mqtt_topic_command`:
@@ -270,6 +278,58 @@ Send to `mqtt_topic_command`:
 ```
 
 The device responds with a command response, waits 6 seconds, then reboots.
+
+## Get Details Command
+
+`get-details` requests a current full system-information snapshot from Core 1.
+The command takes no options, so `payload` must be an empty object.
+
+Send to `mqtt_topic_command`:
+
+```json
+{
+  "message_type": "command",
+  "message_schema_version": 3,
+  "target": "<device-source>",
+  "command_id": "details-001",
+  "command": "get-details",
+  "payload": {}
+}
+```
+
+A successful `command_response` returns the system-information object directly
+in `payload.data`. It always contains every section in the authoritative
+`SYSTEM_INFORMATION_SECTIONS` list, independent of the configured
+`system-information` device `include` list.
+
+```json
+{
+  "message_type": "command_response",
+  "payload": {
+    "command_id": "details-001",
+    "command": "get-details",
+    "targeted": true,
+    "success": true,
+    "data": {
+      "network": {},
+      "memory": {},
+      "runtime": {},
+      "devices": {},
+      "cpu": {},
+      "machine": {},
+      "communications": {},
+      "queues": {},
+      "device_status": []
+    }
+  }
+}
+```
+
+The normal Core 0 MQTT envelope fields (`sequence`, `runtime_id`, `source`,
+`firmware_version`, and `message_schema_version`) plus `uptime_ms` and
+`timestamp` are also present on the published response. If an individual
+section cannot be collected, that section contains an `error` object and the
+remaining sections are still returned.
 
 
 ## Built-in Device

@@ -38,6 +38,9 @@ from message_serializer import (
 )
 
 
+COMMAND_GET_DETAILS = "get-details"
+
+
 def _collect_system_information_full(system_information):
     """Collect full system information snapshot including all sections."""
     system_info = {}
@@ -218,12 +221,44 @@ def _try_queue_response(intercore, response):
     )
 
 
-def _process_intercore_event(intercore, uptime_state):
+def _process_intercore_event(intercore, uptime_state, system_information=None):
     event = intercore.event_queue.take()
     if event is None:
         return None
 
-    # Baseline rebuild intentionally implements no Core 1 commands yet.
+    if event.get("command") == COMMAND_GET_DETAILS:
+        if event.get("payload") != {}:
+            return _build_command_response(
+                intercore,
+                uptime_state,
+                event,
+                False,
+                error={
+                    "code": "invalid_payload",
+                    "message": "get-details payload must be {}",
+                },
+            )
+
+        if system_information is None:
+            return _build_command_response(
+                intercore,
+                uptime_state,
+                event,
+                False,
+                error={
+                    "code": "system_information_unavailable",
+                    "message": "System information is unavailable",
+                },
+            )
+
+        return _build_command_response(
+            intercore,
+            uptime_state,
+            event,
+            True,
+            data=_collect_system_information_full(system_information),
+        )
+
     return _build_command_response(
         intercore,
         uptime_state,
@@ -644,7 +679,9 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 if _try_queue_response(intercore, pending_command_response):
                     pending_command_response = None
             else:
-                pending_command_response = _process_intercore_event(intercore, uptime_state)
+                pending_command_response = _process_intercore_event(
+                    intercore, uptime_state, system_information
+                )
                 if pending_command_response is not None:
                     if _try_queue_response(intercore, pending_command_response):
                         pending_command_response = None

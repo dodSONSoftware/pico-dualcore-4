@@ -207,7 +207,11 @@ Admission enforces both: an entry is admitted only if it fits within the entry-c
 
 ### 2. `event_queue`
 
-Core 0 -> Core 1. Contains private discrete commands/events.
+Core 0 -> Core 1. Contains private discrete commands/events. `get-details` is
+owned by Core 1 because the authoritative `SystemInformation` instance and
+device-manager state live there. The command requires an empty payload and
+returns a current snapshot containing every entry in
+`SYSTEM_INFORMATION_SECTIONS` as `command_response.payload.data`.
 
 - FIFO and bounded.
 - Every admitted event matters.
