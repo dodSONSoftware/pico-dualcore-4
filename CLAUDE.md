@@ -10,7 +10,7 @@ Core 1 periodically publishes health messages to `iot/v3/health` containing diag
 
 **Core Fields:**
 - `status`: "healthy" or "degraded"
-- `degraded_reasons`: Array of degradation reasons (e.g., "wifi_not_connected", "outbound_queue_pressure")
+- `degraded_reasons`: Array of degradation reasons (e.g., "wifi_not_connected", "low_free_heap")
 
 **Hardware Fields:**
 - `hardware_type`: Canonical hardware type ("pico_w" or "pico_2_w")
@@ -37,12 +37,14 @@ Core 1 periodically publishes health messages to `iot/v3/health` containing diag
 - `device_failures`: devices_configured - devices_active
 
 **Queue Fields:**
+The queues are heap-governed (no fixed capacity), so these are observability metrics, not utilization against a limit:
 - `outbound_queue_depth`: Current queued + in-flight entries
-- `outbound_queue_capacity`: Maximum queue entries
-- `outbound_queue_utilization_percent`: (depth * 100) // capacity
-- `outbound_queued_bytes`: Retained payload bytes (queued FIFO plus the in-flight entry, matching the byte admission budget)
-- `outbound_max_queued_bytes`: Maximum queued payload bytes (32 KiB)
-- `outbound_queue_byte_utilization_percent`: (queued_bytes * 100) // max_queued_bytes
+- `outbound_queued_bytes`: Retained payload bytes (queued FIFO plus the in-flight entry)
+- `outbound_queue_high_watermark`: Peak queue depth since boot
+- `outbound_queue_high_watermark_bytes`: Peak retained payload bytes since boot
+- `outbound_evicted`: Entries evicted under memory pressure (all kinds)
+- `telemetry_evicted`: Evicted entries of the telemetry kind
+- `outbound_rejected`: Admissions rejected because the free-heap reserve could not be restored
 
 **UTC Fields:**
 - `utc_valid`: Boolean indicating UTC time is valid
@@ -167,7 +169,7 @@ Check for:
 ## Testing
 
 - `tests/` contains host-side unit tests
-- Run with: `python -m pytest tests/`
+- Run with: `python3 -m pytest tests/` (host tests run on CPython; `tests/conftest.py` shims the MicroPython-only `gc.mem_free`)
 - The suite covers core-ownership boundaries (AST checks), config validation, inter-core bus semantics (including the per-message byte ceiling on both outbound admission paths, `put()` and `put_with_kind()`), health payloads, normal-runtime-anchored telemetry/health scheduling, MQTT keepalive, the bounded MQTT connect/subscribe handshake, the bounded QoS 1 publish write/PUBACK exchange, the bounded MQTT reconnect cleanup (a failed client's socket is closed directly, with no DISCONNECT write into the dead link), inbound MQTT packet size limits, UTC synchronization, network recovery, the self-healing startup verification, the Core 1 liveness heartbeat, the Core 0 stale-heartbeat watchdog, the Core 0 publish-path envelope splice, sequence identity across an ambiguous QoS 1 failure (a failed-attempt sequence is never reused by a different message and a retry preserves it), and the MemoryError propagation contract on the Core 0/Core 1 message paths
 - Hardware testing requires an actual Pico device
 
@@ -179,6 +181,8 @@ Check for:
 - Never call `machine.reset()` from Core 1
 
 ## Version History
+
+- **0.4.26**: Replaced the count-bounded queues with heap-reserve-bounded queues. The fixed capacity rules (outbound 16-entry count + 32 KiB aggregate byte budget; event 4-entry count) are gone: both FIFO lanes are now admitted against the global minimum free-heap reserve, sourced from `hardware.py` (64 KiB Pico W, 128 KiB Pico 2 W) — the single source of truth for queue memory safety, not deployment-configurable. `InterCore` now takes `minimum_free_heap_bytes` (from `main.py`'s early `detect_hardware()`) and creates one shared heap-admission lock, passed to both queues, that serializes the heap measurement, the pressure-path `gc.collect()`, and the eviction/admission decision — because the MicroPython heap is global to both cores. Outbound admission: fast path admits with no garbage collection when `gc.mem_free() >= reserve`; the pressure path collects once, and if the reserve is still not restored evicts the oldest entry in the least-important eligible queued class (only when the incoming entry is at least as important), reclaims, and rechecks — repeating until the reserve is restored or nothing eligible remains — then admits or rejects. The in-flight QoS 1 entry is never an eviction candidate, and priority/oldest-first semantics are otherwise unchanged. The event queue uses the same reserve and lock but never evicts an admitted event (discrete control operations): under pressure the new event is rejected and Core 0 reports the new `intercore_event_queue_memory_pressure` error code. The 16 KiB per-message ceiling (`MAX_OUTBOUND_MESSAGE_BYTES`) is retained and enforced on both admission paths. Retired: the `max_outbound_queue_entries`/`max_intercore_event_entries` config keys (`config_schema_version` 6 — configs carrying them fail fast as unknown keys), the `outbound_queue_capacity`/`outbound_queue_utilization_percent`/`outbound_max_queued_bytes`/`outbound_queue_byte_utilization_percent` health fields, the `outbound_queue_pressure` degradation reason (a below-reserve heap is itself the pressure condition, reported as `low_free_heap`), and `split_config()`'s third `bus_config` return value. Added health fields: `outbound_queue_high_watermark`, `outbound_queue_high_watermark_bytes`, `outbound_evicted`, `telemetry_evicted`, `outbound_rejected` (depth and `outbound_queued_bytes` retained); `SystemInformation.get_queues()` exports the same observability view plus the event-queue pending/high-watermark/rejected counters. `OutboundQueue.status()` now reports the depth/bytes high watermarks and eviction/rejection counters in place of the old capacity views; the queue-internal byte accounting (in-flight bytes retained until PUBACK) is unchanged. `MemoryError` propagation semantics are preserved throughout. `config_schema_version` bumped to 6 (no `message_schema_version` change).
 
 - **0.4.25**: Made command target matching case-insensitive. `Core0._target_matches()` compared the command `target` against the configured `source` with exact string equality, so a logically equivalent casing variant (e.g. `teSt-PICO-2` for a device configured as `Test-Pico-2`) silently failed to match and the command was ignored with no response. The source comparison now normalizes both sides with `lower()` (MicroPython-safe, no `casefold()` dependency) at the comparison boundary only: the stored/configured source keeps its original casing, responses are still emitted with the configured casing via `_envelope_fragment()`, and the broadcast (`*`) and IP-address targeting paths are unchanged. A non-string `target` still simply fails to match (an `isinstance` guard preserves that without raising where `lower()` would). Applies to every command on the shared routing path; no command-specific logic. Behavior fix (no `config_schema_version` or `message_schema_version` change).
 

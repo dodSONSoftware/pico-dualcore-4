@@ -54,14 +54,13 @@ def main():
 
     config = load_config("config.json")
     wifi_config = load_wifi_config("config-secrets.json")
-    core0_config, core1_config, bus_config = split_config(config)
+    core0_config, core1_config = split_config(config)
     config = None
 
-    intercore = InterCore(
-        outbound_max=bus_config["max_outbound_queue_entries"],
-        event_max=bus_config["max_intercore_event_entries"],
-    )
-    bus_config = None
+    # The bus is heap-governed: its admission bound is the board-specific
+    # minimum free-heap reserve (hardware.py is the single source of truth),
+    # shared by both queues through one heap-admission lock.
+    intercore = InterCore(minimum_free_heap_bytes=hardware["minimum_free_heap_bytes"])
 
     from core0 import Core0
 

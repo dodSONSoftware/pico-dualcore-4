@@ -167,7 +167,7 @@ def _reload_core1_under_fakes():
 
 def _core1_config():
     config = json.loads((ROOT / "config.json").read_text())
-    _core0, core1_config, _bus = split_config(config)
+    _core0, core1_config= split_config(config)
     # Liveness is independent of the device set; keep startup fast.
     core1_config["devices"] = []
     return core1_config
@@ -207,7 +207,7 @@ def test_core1_activity_stamp_survives_hostile_loop_phase():
         _install_fakes(fake_time)
         core1 = _reload_core1_under_fakes()
 
-        bus = InterCore(outbound_max=16, event_max=4)
+        bus = InterCore(minimum_free_heap_bytes=65536)
         bus.state_mailboxes.set_network_snapshot(dict(_NETWORK_SNAPSHOT))
 
         with pytest.raises(LoopStop):

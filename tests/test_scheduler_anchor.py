@@ -27,6 +27,7 @@ live in ``test_health_scheduling.py``.
 """
 
 import ast
+import gc
 import importlib
 import json
 import os as _real_os
@@ -201,7 +202,7 @@ def _reload_core1_under_fakes():
 def _core1_config():
     """Core 1 config with the default telemetry-producing device kept."""
     config = json.loads((ROOT / "config.json").read_text())
-    _core0, core1_config, _bus = split_config(config)
+    _core0, core1_config= split_config(config)
     return core1_config
 
 
@@ -284,7 +285,7 @@ def test_telemetry_and_health_share_the_same_anchor():
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     fake_time = FakeTime(startup_at_ms, startup_at_ms + 60000 + LOOP_STEP_MS)
@@ -324,7 +325,7 @@ def test_telemetry_first_deadline_from_anchor_not_boot():
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     fake_time = FakeTime(startup_at_ms, startup_at_ms + 20000 + LOOP_STEP_MS)
@@ -354,7 +355,7 @@ def test_fixed_cadence_telemetry_and_health_from_one_anchor():
     startup_at_ms = boot_ticks_ms + 13000
     last_boundary_ms = startup_at_ms + 120000  # health boundary at 133s uptime
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     fake_time = FakeTime(startup_at_ms, last_boundary_ms + LOOP_STEP_MS)
@@ -388,7 +389,7 @@ def test_health_outage_does_not_move_telemetry_deadlines():
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
-    bus = InterCore(outbound_max=32, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     events = [
@@ -427,7 +428,7 @@ def test_telemetry_delay_does_not_move_health_deadlines():
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     fake_time = FakeTime(startup_at_ms, startup_at_ms + 120000 + LOOP_STEP_MS)
@@ -468,7 +469,7 @@ def test_reconnects_and_utc_resync_do_not_reset_anchor():
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
-    bus = InterCore(outbound_max=32, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     def _utc_resync():
@@ -508,21 +509,28 @@ def test_startup_log_admission_failure_blocks_normal_runtime():
     """If the startup log is never admitted, no anchor exists and no
     periodic scheduling begins.
 
-    The outbound queue is pre-filled with CRITICAL entries (command
-    responses), so the INFO-priority startup log is rejected on both
+    The free heap is below the reserve with nothing to collect (memory
+    pressure), and the queue holds only CRITICAL entries (command
+    responses), so the less-important INFO-priority startup log cannot be
+    admitted -- no eviction is permitted -- and is rejected on both
     attempts; core1_main must halt and the queue must contain no
     telemetry or health.
     """
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
     for _ in range(16):
         admitted = bus.outbound_queue.put_with_kind(
             KIND_COMMAND_RESPONSE, b"{}", RETENTION_PRIORITY_CRITICAL
         )
         assert admitted
+
+    # Memory pressure for the admission attempts that follow: the free heap
+    # is below the reserve and unrecoverable (nothing to collect).
+    saved_mem_free = gc.mem_free
+    gc.mem_free = lambda: 0
 
     fake_time = FakeTime(startup_at_ms, startup_at_ms + 10 * LOOP_STEP_MS)
 
@@ -542,6 +550,7 @@ def test_startup_log_admission_failure_blocks_normal_runtime():
             core1.core1_main(bus, _core1_config(), boot_ticks_ms, "test-runtime")
     finally:
         _restore()
+        gc.mem_free = saved_mem_free
 
     telemetry, health, others = _drain_outbound(bus)
     assert telemetry == []
@@ -562,7 +571,7 @@ def test_telemetry_buffers_during_outage_health_skipped():
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     events = [

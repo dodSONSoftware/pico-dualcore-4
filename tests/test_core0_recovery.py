@@ -78,7 +78,7 @@ from version import MESSAGE_SCHEMA_VERSION  # noqa: E402
 
 def _load_core0_config():
     config = json.loads((ROOT / "config.json").read_text())
-    core0_config, _core1_config, _bus_config = split_config(config)
+    core0_config, _core1_config= split_config(config)
     return core0_config
 
 
@@ -401,10 +401,13 @@ def test_publish_utc_snapshot_has_no_force_argument(make_core0):
 
 
 def _real_outbound_queue(instance):
-    """Swap the fixture's mock queue for the real bounded queue."""
+    """Swap the fixture's mock queue for the real heap-governed queue."""
+    import _thread
     from intercore import OutboundQueue
 
-    instance._intercore.outbound_queue = OutboundQueue(16)
+    instance._intercore.outbound_queue = OutboundQueue(
+        65536, _thread.allocate_lock()
+    )
     return instance._intercore.outbound_queue
 
 

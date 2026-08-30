@@ -33,11 +33,12 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
     "devices_active": 1,
     "device_failures": 0,
     "outbound_queue_depth": 0,
-    "outbound_queue_capacity": 16,
-    "outbound_queue_utilization_percent": 0,
     "outbound_queued_bytes": 0,
-    "outbound_max_queued_bytes": 32768,
-    "outbound_queue_byte_utilization_percent": 0,
+    "outbound_queue_high_watermark": 0,
+    "outbound_queue_high_watermark_bytes": 0,
+    "outbound_evicted": 0,
+    "telemetry_evicted": 0,
+    "outbound_rejected": 0,
     "utc_valid": true,
     "utc_sync_age_sec": 52
   }
@@ -80,12 +81,15 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 
 ### Queue Fields
 
-- `outbound_queue_depth`: Queued + in-flight entries
-- `outbound_queue_capacity`: Queue capacity from `OutboundQueue`
-- `outbound_queue_utilization_percent`: (depth * 100) // capacity (integer)
-- `outbound_queued_bytes`: Retained payload bytes (the queued FIFO plus the in-flight entry, matching the queue's byte admission budget)
-- `outbound_max_queued_bytes`: Queue byte capacity from `OutboundQueue` (`DEFAULT_MAX_OUTBOUND_QUEUED_BYTES`, 32 KiB)
-- `outbound_queue_byte_utilization_percent`: (queued_bytes * 100) // max_queued_bytes (integer)
+The queues are heap-governed (no fixed capacity), so these are observability metrics, not utilization against a limit:
+
+- `outbound_queue_depth`: Queued + in-flight entries (current)
+- `outbound_queued_bytes`: Retained payload bytes (the queued FIFO plus the in-flight entry)
+- `outbound_queue_high_watermark`: Peak queue depth since boot
+- `outbound_queue_high_watermark_bytes`: Peak retained payload bytes since boot
+- `outbound_evicted`: Entries evicted under memory pressure (all kinds)
+- `telemetry_evicted`: Evicted entries of the telemetry kind
+- `outbound_rejected`: Admissions rejected because the free-heap reserve could not be restored
 
 ### UTC Fields
 
@@ -100,7 +104,6 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 - `core_1_inactive`: Core 1 activity exceeds threshold (3x read_loop_sec, min 60s)
 - `low_free_heap`: free_heap < minimum_free_heap
 - `device_count_mismatch`: devices_active != devices_configured
-- `outbound_queue_pressure`: max(entry utilization, byte utilization) >= 75%
 - `utc_not_valid`: UTC snapshot unavailable
 
 ### Queue Priority
@@ -145,7 +148,7 @@ See `hardware.py` for implementation details.
 
 Core 1 -> Core 0. Contains only data intended for MQTT.
 
-- FIFO and bounded by BOTH entry count (`max_outbound_queue_entries`) and queued payload bytes (`DEFAULT_MAX_OUTBOUND_QUEUED_BYTES`, 32 KiB) — entry count alone is not a memory-safety boundary (see Memory safety below).
+- FIFO and heap-governed: no fixed entry count or byte budget — admission is decided against the board's minimum free-heap reserve (see Memory safety below), so the queue retains whatever the heap can safely hold.
 - Core 1 supplies only a message kind plus domain data; it does not know MQTT topics.
 - Core 0 maps the kind to the authoritative MQTT topic, publishes with QoS 1, and owns the MQTT envelope (sequence, runtime_id, source, firmware_version, message_schema_version). Kinds: TELEMETRY → `mqtt_topic_telemetry`, COMMAND_RESPONSE → `mqtt_topic_command_response`, HEALTH → `mqtt_topic_health`, LOG → `mqtt_topic_log`.
 - The startup log and connection logs travel as KIND_LOG entries; no hardcoded topics cross into Core 1.
@@ -154,9 +157,9 @@ Core 1 -> Core 0. Contains only data intended for MQTT.
 - The MQTT client waits for the matching PUBACK before the next publish proceeds, naturally enforcing one application QoS 1 publish in flight. The wait is bounded by `mqtt_broker_response_timeout_sec`, so a blackholed link fails the publish (the entry stays in flight) instead of blocking the run loop.
 - Retention priority is explicit: lower numeric values are more important.
 - Priority classes are: CRITICAL 10, ERROR 20, WARN 30, TELEMETRY 40, INFO 50, HEALTH 70.
-- When either budget is full, the queue finds the least-important queued class (highest numeric priority). If the incoming message is more important, or equally important, the oldest entry in that least-important class is evicted — and only if evicting it frees enough room (by count or by bytes) for the incoming entry. If the incoming message is less important, or still would not fit after eviction, it is rejected without dropping a valid entry.
+- Under memory pressure (free heap below the reserve even after `gc.collect()`), the queue finds the least-important queued class (highest numeric priority). If the incoming message is at least as important, the oldest entry in that least-important class is evicted, the heap is reclaimed and rechecked, and this repeats until the reserve is restored or no eligible lower-priority entry remains. If the incoming message is less important than everything queued, or the queue is empty, it is rejected without dropping a valid entry.
 - The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40; health messages use HEALTH 70; the startup log uses INFO 50.
-- An in-flight QoS 1 entry counts toward both the entry-count capacity and the byte budget (its payload is retained until its PUBACK) but is never evicted.
+- An in-flight QoS 1 entry is retained until its PUBACK (its payload bytes stay counted in the retained-bytes metric) and is never an eviction candidate.
 - A failed publish never discards the in-flight entry: it stays in flight and `take()` returns it again, so Core 0 retries until the broker PUBACKs (QoS 1 at-least-once delivery).
 - **Sequence identity across an ambiguous failure.** QoS 1 has an ambiguous failure mode: the PUBLISH frame can reach the broker while the PUBACK is lost, so a failed publish attempt may still have been delivered. The `sequence` envelope member is therefore claimed *before* the first transmission attempt and stamped on the logical object — the queue entry, or Core 0's persistent response/reboot dict for its own retryable messages — and is never rolled back or reused by a different message. A retry of the *same* logical message reuses its stamped number (both copies identify one message — legitimate QoS 1 duplicate delivery), while a *different* message (e.g. a `mqtt_connection_established` log published after a reconnect) always receives a fresh number. This makes `(runtime_id, sequence)` a safe unique event identity and lets a receiver recognize a retry of the same logical message. Claiming happens in `core0._claim_wire_sequence`, invoked from `_publish_entry` (queue/connection-log path) and from the response/reboot retry paths.
 
@@ -198,12 +201,12 @@ Validation failures (unsupported value types, non-string keys, non-finite floats
 
 #### Memory safety
 
-Two static bounds keep the outbound path safe on MCU-scale heap (Pico W: 256 KiB SRAM, 64 KiB reserved). The size check happens after `json.dumps()` + UTF-8 `encode`, so at peak allocation the object graph, the serialized `str`, and the encoded `bytes` are all resident at once — a large payload can therefore exhaust heap before a limit is even reached. Both bounds are deliberately small:
+Two rules keep the outbound path safe on MCU-scale heap (Pico W: 256 KiB SRAM). The per-message size check happens after `json.dumps()` + UTF-8 `encode`, so at peak allocation the object graph, the serialized `str`, and the encoded `bytes` are all resident at once — a large payload can therefore exhaust heap before a limit is even reached:
 
 - **Per-message ceiling** — `message_serializer.MAX_OUTBOUND_MESSAGE_BYTES = 16 KiB`. Bounds a single message's transient peak (graph + str + bytes ≈ 3x the payload ≈ 48 KiB) and keeps the largest legitimate message (the one-shot startup log, the only payload that grows with device count) comfortably under the limit with margin. The queue enforces it on both admission paths: `put()` via the serialization step, and `put_with_kind()` via a direct byte-length check on the pre-serialized payload, so a caller bypassing `serialize_and_validate_message()` cannot admit a larger entry.
-- **Aggregate queued-byte budget** — `intercore.DEFAULT_MAX_OUTBOUND_QUEUED_BYTES = 32 KiB`. Bounds total *retained* payload bytes — the queued FIFO **and** the in-flight entry, whose payload is retained until its PUBACK — so a full queue (16 entries, including its in-flight entry) cannot exhaust heap on its own during an MQTT outage.
+- **Global free-heap reserve** — the board's minimum free heap (`hardware.py`: 64 KiB Pico W, 128 KiB Pico 2 W), the single source of truth for queue memory safety. An entry may be retained only while `gc.mem_free()` is at or above the reserve, so the queue cannot exhaust heap on its own during an MQTT outage, regardless of how many entries it holds.
 
-Admission enforces both: an entry is admitted only if it fits within the entry-count budget **and** the byte budget, evicting the oldest least-important entry only when that frees enough room. Because eviction is byte-feasibility-checked, a valid queued entry is never dropped to admit one that still would not fit. `OutboundQueue.status()` reports `queued_bytes` and `max_queued_bytes` for observability.
+Admission is heap-governed under one shared heap-admission lock (the heap is global to both cores, and both queues share the lock): fast path — reserve satisfied, admit, no garbage collection; pressure path — `gc.collect()` once, and if the reserve is still not restored, evict the oldest entry in the least-important eligible queued class, reclaim, and recheck, repeating until the reserve is restored or nothing eligible remains — then admit or reject. A valid queued entry is never dropped to admit a less important one, and the in-flight entry is never evicted. `OutboundQueue.status()` reports `queued_bytes`, the depth/bytes high watermarks, and the eviction/rejection counters for observability.
 
 ### 2. `event_queue`
 
@@ -213,7 +216,7 @@ device-manager state live there. The command requires an empty payload and
 returns a current snapshot containing every entry in
 `SYSTEM_INFORMATION_SECTIONS` as `command_response.payload.data`.
 
-- FIFO and bounded.
+- FIFO and heap-governed: the same global free-heap reserve and shared heap-admission lock as the outbound queue, but with NO eviction — an admitted event is a discrete control operation and is never displaced by a newer one. Under memory pressure the new event is rejected and the caller reports the `intercore_event_queue_memory_pressure` failure.
 - Every admitted event matters.
 - Entries are never automatically published to MQTT.
 - Reboot never enters this lane; Core 0 owns reboot completely.
@@ -397,7 +400,7 @@ Core 1 generates health messages on a normal-runtime-anchored cadence: `health_i
    - Core 1 activity: `StateMailboxes.get_core_1_activity_ms()`
    - Heap: `gc.mem_free()` (current measurement)
    - Devices: `SystemInformation.get_devices()` (backed by `DeviceManager.get_status_snapshot()`)
-   - Queue: `OutboundQueue.get_health_metrics()` (entry and byte budget views)
+   - Queue: `OutboundQueue.status()` (depth, retained bytes, high watermarks, eviction/rejection counters)
    - UTC: `StateMailboxes.get_utc_snapshot()`
 
 3. **Monotonic time calculations**:
@@ -405,7 +408,7 @@ Core 1 generates health messages on a normal-runtime-anchored cadence: `health_i
    - Uptime since boot is accumulated from deltas between recent samples (`uptime.py`), never as a single `ticks_diff(now, boot)` — that one-shot form is only guaranteed within half a tick period and wraps on long-running devices
    - UTC sync age: integer division of milliseconds by 1000
 
-4. **Queue pressure threshold**: 75% of either budget — `max(outbound_queue_utilization_percent, outbound_queue_byte_utilization_percent) >= 75`. The queue has two independent ceilings (16 entries and 32 KiB queued bytes), and a handful of large entries can hit the byte ceiling while entry utilization is modest; the byte ceiling is the memory-protection boundary, so pressure must reflect the worse of the two views.
+4. **Memory pressure**: free heap below the board reserve (`low_free_heap`). Both queues are admitted against the same global reserve (see Memory safety), so a below-reserve heap is itself the queue-pressure condition — no separate queue-utilization threshold exists.
 
 5. **Low-priority retention**: Uses `RETENTION_PRIORITY_HEALTH = 70`, the lowest priority class
 
@@ -418,7 +421,6 @@ Health status is "degraded" when any of these conditions are true:
 - `core_1_inactive`: Activity age exceeds threshold (3x read_loop_sec, minimum 60 seconds)
 - `low_free_heap`: Free heap below configured reserve
 - `device_count_mismatch`: Active devices don't match configured count
-- `outbound_queue_pressure`: Queue utilization (entry or byte) >= 75%
 - `utc_not_valid`: UTC snapshot unavailable
 
 If no degradation reasons exist, status is "healthy".

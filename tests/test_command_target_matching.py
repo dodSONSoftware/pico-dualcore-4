@@ -75,7 +75,7 @@ import core1  # noqa: E402
 
 def _load_core0_config():
     config = json.loads((ROOT / "config.json").read_text())
-    core0_config, _core1_config, _bus_config = split_config(config)
+    core0_config, _core1_config= split_config(config)
     return core0_config
 
 

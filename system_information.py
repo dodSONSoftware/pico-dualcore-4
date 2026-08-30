@@ -133,17 +133,19 @@ class SystemInformation:
         }
 
     def get_queues(self):
+        # Observability metrics only: both queues are heap-governed, so there
+        # is no fixed capacity to report.
         outbound = self._intercore.outbound_queue.status()
         events = self._intercore.event_queue.status()
         return {
             "outbound_pending": outbound["pending"],
-            "outbound_max": outbound["max"],
             "outbound_high_watermark": outbound["high_watermark"],
+            "outbound_high_watermark_bytes": outbound["high_watermark_bytes"],
             "outbound_evicted": outbound["messages_evicted"],
             "telemetry_evicted": outbound["telemetry_evicted"],
             "outbound_rejected": outbound["messages_rejected"],
             "outbound_queued_bytes": outbound["queued_bytes"],
-            "outbound_max_queued_bytes": outbound["max_queued_bytes"],
             "intercore_events_pending": events["pending"],
-            "intercore_events_max": events["max"],
+            "intercore_events_high_watermark": events["high_watermark"],
+            "intercore_events_rejected": events["rejected"],
         }

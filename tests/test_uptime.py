@@ -247,7 +247,7 @@ def test_core1_message_time_uptime_and_timestamp_survive_wrap():
         core1 = _reload_core1_under_fakes(fake)
         uptime = sys.modules["uptime"]
 
-        bus = InterCore(outbound_max=16, event_max=4)
+        bus = InterCore(minimum_free_heap_bytes=65536)
         epoch_ms = 1_700_000_000_000
         bus.state_mailboxes.set_utc_snapshot({
             "utc_epoch_ms": epoch_ms,

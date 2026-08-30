@@ -14,7 +14,7 @@ This firmware implements a clean architecture where:
 
 - **Core 0** exclusively owns Wi-Fi, MQTT, sockets, UTC time synchronization, and system reboot
 - **Core 1** exclusively owns device drivers, sensor reads, device lifecycle management, and telemetry construction
-- Communication between cores uses three bounded lanes with strict ownership rules
+- Communication between cores uses three lanes with strict ownership rules (the two FIFO lanes are heap-governed: admitted against the board's minimum free-heap reserve)
 
 ### Architecture
 
@@ -150,7 +150,7 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 
 ### Status
 - `status`: "healthy" or "degraded"
-- `degraded_reasons`: Array of degradation reasons (e.g., "wifi_not_connected", "outbound_queue_pressure")
+- `degraded_reasons`: Array of degradation reasons (e.g., "wifi_not_connected", "low_free_heap")
 
 ### Hardware
 - `hardware_type`: Canonical hardware type ("pico_w" or "pico_2_w")
@@ -177,9 +177,14 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 - `device_failures`: devices_configured - devices_active
 
 ### Queue
+The queues are heap-governed (no fixed capacity), so these are observability metrics:
 - `outbound_queue_depth`: Current queued + in-flight entries
-- `outbound_queue_capacity`: Maximum queue entries
-- `outbound_queue_utilization_percent`: (depth * 100) // capacity
+- `outbound_queued_bytes`: Retained payload bytes (queued FIFO plus in-flight entry)
+- `outbound_queue_high_watermark`: Peak queue depth since boot
+- `outbound_queue_high_watermark_bytes`: Peak retained payload bytes since boot
+- `outbound_evicted`: Entries evicted under memory pressure (all kinds)
+- `telemetry_evicted`: Evicted entries of the telemetry kind
+- `outbound_rejected`: Admissions rejected because the free-heap reserve could not be restored
 
 ### UTC
 - `utc_valid`: Boolean indicating UTC time is valid
@@ -194,7 +199,6 @@ The health status is "degraded" when any of these conditions are true:
 - `core_1_inactive`: Core 1 activity exceeds threshold (3x read_loop_sec, min 60s)
 - `low_free_heap`: free_heap < minimum_free_heap
 - `device_count_mismatch`: devices_active != devices_configured
-- `outbound_queue_pressure`: utilization >= 75%
 - `utc_not_valid`: UTC snapshot unavailable
 
 Health messages are only generated when MQTT is connected to prevent stale messages during outages.
@@ -229,7 +233,7 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 
 ### Schema Version
 
-The firmware expects `config_schema_version: 5`. Unknown top-level keys are rejected.
+The firmware expects `config_schema_version: 6`. Unknown top-level keys are rejected.
 
 ### Key Settings
 
@@ -246,8 +250,6 @@ The firmware expects `config_schema_version: 5`. Unknown top-level keys are reje
 | `datetime_sync_interval_min` | UTC sync interval (minutes) |
 | `health_interval_sec` | Health message interval (seconds) |
 | `mqtt_topic_health` | MQTT topic for health messages |
-| `max_outbound_queue_entries` | Maximum queued messages |
-| `max_intercore_event_entries` | Core 0 → Core 1 event queue capacity |
 | `network_snapshot_interval_sec` | Network snapshot update interval |
 | `wifi_reconnect_delays_sec` | Wi-Fi reconnect backoff sequence (seconds) |
 | `mqtt_reconnect_delays_sec` | MQTT reconnect backoff sequence (seconds) |

@@ -29,7 +29,7 @@ def _write(tmp_path, value):
 
 def test_config_loads_and_splits_ownership(tmp_path):
     config = load_config(_write(tmp_path, _base_config()))
-    core0, core1, bus = split_config(config)
+    core0, core1 = split_config(config)
 
     assert "devices" not in core0
     assert "mqtt_broker_ip_address" not in core1
@@ -39,7 +39,6 @@ def test_config_loads_and_splits_ownership(tmp_path):
     assert core0["mqtt_topic_telemetry"] == config["mqtt_topic_telemetry"]
     assert core0["mqtt_topic_log"] == config["mqtt_topic_log"]
     assert core0["mqtt_topic_health"] == config["mqtt_topic_health"]
-    assert bus["max_outbound_queue_entries"] == config["max_outbound_queue_entries"]
 
 
 def test_unknown_top_level_key_fails_fast(tmp_path):
@@ -56,11 +55,13 @@ def test_wrong_schema_version_fails_fast(tmp_path):
         load_config(_write(tmp_path, config))
 
 
-def test_invalid_queue_capacity_fails_fast(tmp_path):
-    config = _base_config()
-    config["max_outbound_queue_entries"] = 0
-    with pytest.raises(ConfigError, match="max_outbound_queue_entries"):
-        load_config(_write(tmp_path, config))
+def test_removed_queue_capacity_keys_are_rejected(tmp_path):
+    """The retired bus capacity keys are unknown config keys (schema v6)."""
+    for key in ("max_outbound_queue_entries", "max_intercore_event_entries"):
+        config = _base_config()
+        config[key] = 16
+        with pytest.raises(ConfigError, match="Unknown config key"):
+            load_config(_write(tmp_path, config))
 
 
 def test_duplicate_device_ids_fail_fast(tmp_path):

@@ -113,7 +113,7 @@ from intercore import InterCore  # noqa: E402
 
 def _load_core0_config():
     config = json.loads((ROOT / "config.json").read_text())
-    core0_config, _core1_config, _bus_config = split_config(config)
+    core0_config, _core1_config= split_config(config)
     return core0_config
 
 
@@ -188,7 +188,7 @@ def env():
     importlib.reload(core0_mod)
 
     instance = core0_mod.Core0(
-        InterCore(outbound_max=16, event_max=4),
+        InterCore(minimum_free_heap_bytes=65536),
         _load_core0_config(),
         {"wifi_ssid": "test-ssid", "wifi_password": "test-password"},
         "test-runtime",

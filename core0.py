@@ -261,14 +261,18 @@ class Core0:
             "targeted": targeted,
         }
         if not self._intercore.event_queue.put(event):
+            # The event queue is heap-governed and has no count capacity: the
+            # only rejection cause is a free-heap reserve that could not be
+            # restored, so the error names that cause rather than a "full"
+            # queue.
             self._queue_core0_response({
                 "command_id": command_id,
                 "command": command,
                 "success": False,
                 "targeted": targeted,
                 "error": {
-                    "code": "intercore_event_queue_full",
-                    "message": "Core 1 event queue is full",
+                    "code": "intercore_event_queue_memory_pressure",
+                    "message": "Insufficient free heap to queue the Core 1 event",
                 },
             })
 

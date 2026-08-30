@@ -28,7 +28,6 @@ from intercore import (  # noqa: E402
     InterCore,
     KIND_HEALTH,
     RETENTION_PRIORITY_HEALTH,
-    DEFAULT_MAX_OUTBOUND_QUEUED_BYTES,
 )
 from message_protocol import format_utc_epoch_ms  # noqa: E402
 from message_serializer import serialize_and_validate_message  # noqa: E402
@@ -163,18 +162,22 @@ class HealthEnv:
         }
         self._had_mem_free = hasattr(gc, "mem_free")
         self._saved_mem_free = getattr(gc, "mem_free", None)
+        self._saved_collect = gc.collect
 
         _install_fakes(self._fake_time)
         self.core1 = _reload_core1_under_fakes()
-        self.bus = InterCore(outbound_max=16, event_max=4)
+        self.bus = InterCore(minimum_free_heap_bytes=65536)
         self.config = self._core1_config()
         # MicroPython exposes gc.mem_free(); the host does not. Shim it to a
         # controllable value so free-heap fields are deterministic.
         gc.mem_free = lambda: self._free_heap
+        # The host gc.collect() is real CPython GC; the queue's pressure path
+        # only needs it to be callable and side-effect-free for these tests.
+        gc.collect = lambda: None
 
     def _core1_config(self):
         config = load_config(str(ROOT / "config.json"))
-        _core0, core1_config, _bus = split_config(config)
+        _core0, core1_config = split_config(config)
         return core1_config
 
     # -- builder inputs ------------------------------------------------
@@ -240,6 +243,7 @@ class HealthEnv:
             gc.mem_free = self._saved_mem_free
         elif hasattr(gc, "mem_free"):
             delattr(gc, "mem_free")
+        gc.collect = self._saved_collect
 
 
 @pytest.fixture
@@ -272,10 +276,12 @@ def test_healthy_state_payload(health):
     assert p["devices_configured"] == 1
     assert p["devices_active"] == 1
     assert p["outbound_queue_depth"] == 0
-    assert p["outbound_queue_capacity"] == 16
     assert p["outbound_queued_bytes"] == 0
-    assert p["outbound_max_queued_bytes"] == DEFAULT_MAX_OUTBOUND_QUEUED_BYTES
-    assert p["outbound_queue_byte_utilization_percent"] == 0
+    assert p["outbound_queue_high_watermark"] == 0
+    assert p["outbound_queue_high_watermark_bytes"] == 0
+    assert p["outbound_evicted"] == 0
+    assert p["telemetry_evicted"] == 0
+    assert p["outbound_rejected"] == 0
     assert p["utc_valid"] is True
     assert payload["uptime_ms"] == NOW_MS - BOOT_TICKS_MS  # 10000
 
@@ -331,76 +337,56 @@ def test_core_1_inactive_triggers_degraded(health):
     assert "core_1_inactive" in payload["payload"]["degraded_reasons"]
 
 
-def test_queue_pressure_triggers_degraded(health):
+def test_retained_queue_metrics_in_payload(health):
+    """Retained entries, depth, bytes, and high watermarks are reported."""
     health.set_healthy_baseline()
     health.set_utc(_valid_utc_snapshot())
-    # 12 of 16 = 75% -> at the pressure threshold.
-    for i in range(12):
-        health.bus.outbound_queue.put_with_kind(
-            KIND_HEALTH, json.dumps({"id": i}).encode(), RETENTION_PRIORITY_HEALTH
-        )
-
-    payload = health.build()
-
-    assert payload["payload"]["status"] == "degraded"
-    assert "outbound_queue_pressure" in payload["payload"]["degraded_reasons"]
-
-
-def test_byte_budget_pressure_triggers_degraded(health):
-    """A near-full queued-byte budget degrades health at modest entry utilization.
-
-    4 entries of ~8 KiB each consume the 32 KiB byte budget while the entry
-    budget sits at 4/16 = 25%. The byte budget is the memory-protection
-    boundary (the admission ceiling), so it must drive the pressure reason
-    even though entry utilization alone is far below the 75% threshold.
-    """
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    chunk = json.dumps({"id": 0, "pad": "x" * 8000}).encode()
-    assert 8000 < len(chunk) < 9000  # ~8 KiB per entry
-    for i in range(4):
-        entry = json.dumps({"id": i, "pad": "x" * 8000}).encode()
+    entries = []
+    for i in range(3):
+        entry = json.dumps({"id": i}).encode()
+        entries.append(entry)
         assert health.bus.outbound_queue.put_with_kind(
             KIND_HEALTH, entry, RETENTION_PRIORITY_HEALTH
-        )
-        assert len(entry) == len(chunk)
-
-    payload = health.build()
-    p = payload["payload"]
-
-    assert p["status"] == "degraded"
-    assert "outbound_queue_pressure" in p["degraded_reasons"]
-    assert p["outbound_queue_depth"] == 4
-    assert p["outbound_queue_capacity"] == 16
-    assert p["outbound_queue_utilization_percent"] == 25  # entry view: below threshold
-    assert p["outbound_queued_bytes"] == 4 * len(chunk)
-    assert p["outbound_max_queued_bytes"] == DEFAULT_MAX_OUTBOUND_QUEUED_BYTES
-    assert (
-        p["outbound_queue_byte_utilization_percent"]
-        == (4 * len(chunk) * 100) // DEFAULT_MAX_OUTBOUND_QUEUED_BYTES
-    )
-    assert p["outbound_queue_byte_utilization_percent"] >= 75  # byte view: at/over threshold
-
-
-def test_byte_budget_below_threshold_is_not_pressure(health):
-    """Bytes below the 75% byte threshold (and low entries) stay healthy."""
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    chunk = json.dumps({"id": 0, "pad": "x" * 3000}).encode()
-    for i in range(2):
-        health.bus.outbound_queue.put_with_kind(
-            KIND_HEALTH, json.dumps({"id": i, "pad": "x" * 3000}).encode(),
-            RETENTION_PRIORITY_HEALTH,
         )
 
     payload = health.build()
     p = payload["payload"]
 
     assert p["status"] == "healthy"
-    assert "outbound_queue_pressure" not in p["degraded_reasons"]
-    assert p["outbound_queue_utilization_percent"] == 12  # 2/16
-    assert p["outbound_queued_bytes"] == 2 * len(chunk)
-    assert p["outbound_queue_byte_utilization_percent"] < 75
+    assert p["outbound_queue_depth"] == 3
+    assert p["outbound_queued_bytes"] == sum(len(e) for e in entries)
+    assert p["outbound_queue_high_watermark"] == 3
+    assert p["outbound_queue_high_watermark_bytes"] == sum(len(e) for e in entries)
+    assert p["outbound_evicted"] == 0
+    assert p["telemetry_evicted"] == 0
+    assert p["outbound_rejected"] == 0
+
+
+def test_admission_rejections_are_visible_in_payload(health):
+    """A rejection under memory pressure is counted and reported in health.
+
+    The heap is below the reserve with nothing to collect, so admission is
+    rejected (the queue has no capacity to give up). The health payload
+    reflects both the pressure (low_free_heap) and the rejection counter.
+    """
+    health.set_healthy_baseline()
+    health.set_utc(_valid_utc_snapshot())
+    health.set_free_heap(40000)  # below the 65536 reserve
+    assert (
+        health.bus.outbound_queue.put_with_kind(
+            KIND_HEALTH, json.dumps({"id": 0}).encode(), RETENTION_PRIORITY_HEALTH
+        )
+        is False
+    )
+
+    payload = health.build()
+    p = payload["payload"]
+
+    assert p["status"] == "degraded"
+    assert "low_free_heap" in p["degraded_reasons"]
+    assert p["outbound_queue_depth"] == 0
+    assert p["outbound_rejected"] == 1
+    assert p["outbound_evicted"] == 0
 
 
 def test_utc_invalid_triggers_degraded(health):
@@ -433,10 +419,8 @@ def test_multiple_degradation_reasons(health):
     health.set_network({
         "wifi_connected": False, "mqtt_connected": True, "network_stack_ready": False,
     })
-    for i in range(12):
-        health.bus.outbound_queue.put_with_kind(
-            KIND_HEALTH, json.dumps({"id": i}).encode(), RETENTION_PRIORITY_HEALTH
-        )
+    health.set_free_heap(40000)  # below the reserve as well
+    health.set_devices(1, 0)
 
     payload = health.build()
 
@@ -444,8 +428,9 @@ def test_multiple_degradation_reasons(health):
     assert payload["payload"]["status"] == "degraded"
     assert "network_stack_not_ready" in reasons
     assert "wifi_not_connected" in reasons
-    assert "outbound_queue_pressure" in reasons
-    assert len(reasons) >= 3
+    assert "low_free_heap" in reasons
+    assert "device_count_mismatch" in reasons
+    assert len(reasons) >= 4
 
 
 # ---------------------------------------------------------------------------
@@ -497,9 +482,9 @@ def test_payload_structure_matches_spec(health):
         "core_1_active", "core_1_activity_age_ms", "free_heap_bytes",
         "minimum_free_heap_bytes", "heap_headroom_bytes", "devices_configured",
         "devices_active", "device_failures", "outbound_queue_depth",
-        "outbound_queue_capacity", "outbound_queue_utilization_percent",
-        "outbound_queued_bytes", "outbound_max_queued_bytes",
-        "outbound_queue_byte_utilization_percent",
+        "outbound_queued_bytes", "outbound_queue_high_watermark",
+        "outbound_queue_high_watermark_bytes", "outbound_evicted",
+        "telemetry_evicted", "outbound_rejected",
         "utc_valid", "utc_sync_age_sec",
     ):
         assert field in p
@@ -522,26 +507,32 @@ def test_payload_is_json_safe(health):
 
 def test_queue_depth_calculation():
     """Outbound queue depth counts both queued and in-flight entries."""
-    bus = InterCore(outbound_max=16, event_max=4)
+    saved_mem_free = getattr(gc, "mem_free", None)
+    saved_collect = gc.collect
+    gc.mem_free = lambda: 256 * 1024
+    gc.collect = lambda: None
+    try:
+        bus = InterCore(minimum_free_heap_bytes=65536)
 
-    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
-    assert depth == 0
-    assert capacity == 16
+        assert bus.outbound_queue.get_depth() == 0
 
-    assert bus.outbound_queue.put_with_kind(
-        KIND_HEALTH, json.dumps({"id": 1}).encode(), RETENTION_PRIORITY_HEALTH
-    )
-    depth, _ = bus.outbound_queue.get_depth_with_capacity()
-    assert depth == 1
+        assert bus.outbound_queue.put_with_kind(
+            KIND_HEALTH, json.dumps({"id": 1}).encode(), RETENTION_PRIORITY_HEALTH
+        )
+        assert bus.outbound_queue.get_depth() == 1
 
-    first = bus.outbound_queue.take()
-    assert first is not None
-    depth, _ = bus.outbound_queue.get_depth_with_capacity()
-    assert depth == 1  # in-flight still counts
+        first = bus.outbound_queue.take()
+        assert first is not None
+        assert bus.outbound_queue.get_depth() == 1  # in-flight still counts
 
-    bus.outbound_queue.complete_in_flight(first)
-    depth, _ = bus.outbound_queue.get_depth_with_capacity()
-    assert depth == 0
+        bus.outbound_queue.complete_in_flight(first)
+        assert bus.outbound_queue.get_depth() == 0
+    finally:
+        if saved_mem_free is not None:
+            gc.mem_free = saved_mem_free
+        else:
+            delattr(gc, "mem_free")
+        gc.collect = saved_collect
 
 
 # ---------------------------------------------------------------------------
@@ -665,22 +656,6 @@ def test_device_state_and_failures(health):
     assert p["devices_active"] == 0
     assert p["device_failures"] == 1
     assert "device_count_mismatch" in p["degraded_reasons"]
-
-
-def test_outbound_queue_utilization_percent_field(health):
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    for i in range(12):  # 12 of 16 = 75%
-        health.bus.outbound_queue.put_with_kind(
-            KIND_HEALTH, json.dumps({"id": i}).encode(), RETENTION_PRIORITY_HEALTH
-        )
-
-    payload = health.build()
-
-    p = payload["payload"]
-    assert p["outbound_queue_depth"] == 12
-    assert p["outbound_queue_capacity"] == 16
-    assert p["outbound_queue_utilization_percent"] == 75
 
 
 def test_existing_classification_unchanged(health):

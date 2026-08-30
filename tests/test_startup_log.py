@@ -94,7 +94,19 @@ def test_collect_system_information_includes_all_sections():
             return {"wifi_connected": True, "mqtt_connected": True}
 
         def get_queues(self):
-            return {"pending": 0, "max": 16, "high_watermark": 0}
+            # Heap-governed queue: depth/high-watermark/counter metrics, no capacity.
+            return {
+                "outbound_pending": 0,
+                "outbound_high_watermark": 0,
+                "outbound_high_watermark_bytes": 0,
+                "outbound_evicted": 0,
+                "telemetry_evicted": 0,
+                "outbound_rejected": 0,
+                "outbound_queued_bytes": 0,
+                "intercore_events_pending": 0,
+                "intercore_events_high_watermark": 0,
+                "intercore_events_rejected": 0,
+            }
 
         def set_device_manager(self, dm):
             pass
@@ -147,7 +159,6 @@ def test_build_startup_log_structure():
             self._lock = MagicMock()
             self._queue = []
             self._in_flight = None
-            self._max_entries = 16
             self._messages_rejected = 0
             self._messages_evicted = 0
             self._telemetry_evicted = 0
@@ -163,7 +174,19 @@ def test_build_startup_log_structure():
             return True
 
         def status(self):
-            return {"pending": 0, "max": 16}
+            return {
+                "pending": len(self._queue),
+                "depth": len(self._queue) + (1 if self._in_flight is not None else 0),
+                "in_flight": self._in_flight is not None,
+                "queued_bytes": 0,
+                "high_watermark": 0,
+                "high_watermark_bytes": 0,
+                "messages_evicted": self._messages_evicted,
+                "telemetry_evicted": self._telemetry_evicted,
+                "messages_rejected": self._messages_rejected,
+                "serialization_rejected": 0,
+                "oversized_rejected": 0,
+            }
 
     class MockInterCore:
         def __init__(self):
@@ -283,7 +306,7 @@ def test_startup_summary_uses_explicit_duration_ms():
 def test_split_config_core1_does_not_include_source():
     """Verify split_config does not include source in core1 config."""
     config = _base_config()
-    core0, core1, bus = split_config(config)
+    core0, core1 = split_config(config)
 
     assert "source" in core0, "core0 config should include source"
     assert "source" not in core1, "core1 config should NOT include source"

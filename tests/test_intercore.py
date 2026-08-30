@@ -1,815 +1,659 @@
-# Host-side behavioral tests for the three-lane transport.
+# test_intercore.py - Tests for the three-lane inter-core bus
+# Copyright (c) 2026 dodson Software ( dodson labs )
+# SPDX-License-Identifier: MIT
 
+"""
+Host-side tests for the inter-core bus.
+
+Both FIFO lanes are heap-governed: admission is decided against the global
+minimum free-heap reserve, with gc.collect() run only on the pressure path and
+(only the outbound queue) evicting the least-important eligible entries.
+These tests exercise that policy through a fake heap standing in for
+gc.mem_free()/gc.collect(), which CPython does not provide.
+"""
+
+import gc
 import json
 import pathlib
 import sys
+from unittest.mock import MagicMock
 
 import pytest
 
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.modules.setdefault("machine", MagicMock())
 
-# Mock machine module for host-side testing
-class MockMachine:
-    PWM = None
-    Pin = None
-
-sys.modules['machine'] = MockMachine()
-
-# Mock network module for host-side testing
-class MockNetwork:
-    WLAN = None
-
-sys.modules['network'] = MockNetwork()
-
-from intercore import (
-    InterCore,
-    OutboundQueue,
-    DEFAULT_MAX_OUTBOUND_QUEUED_BYTES,
-    KIND_TELEMETRY,
-    KIND_COMMAND_RESPONSE,
-    KIND_HEALTH,
-    KIND_LOG,
+from intercore import (  # noqa: E402
     RETENTION_PRIORITY_CRITICAL,
     RETENTION_PRIORITY_ERROR,
-    RETENTION_PRIORITY_TELEMETRY,
-    RETENTION_PRIORITY_INFO,
     RETENTION_PRIORITY_HEALTH,
+    RETENTION_PRIORITY_INFO,
+    RETENTION_PRIORITY_TELEMETRY,
+    InterCore,
+    InterCoreEventQueue,
+    KIND_HEALTH,
+    KIND_TELEMETRY,
+    OutboundQueue,
+    StateMailboxes,
 )
+from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES  # noqa: E402
 
 
-def put(bus, kind, message, priority):
-    return bus.outbound_queue.put(kind, message, priority)
+# Pico W reserve, and a heap with plenty of headroom over it.
+RESERVE = 65536
+HEAPY = 256 * 1024
+KB = 1024
 
 
-def _bytes_of(n):
-    """A payload of exactly n bytes (JSON-ish, avoids serializer overhead)."""
-    return b"{" + b"x" * (n - 2) + b"}"
+class FakeHeap:
+    """Host-side stand-in for the MicroPython heap seen through gc.
 
-
-def drain(bus):
-    values = []
-    while True:
-        entry = bus.outbound_queue.take()
-        if entry is None:
-            break
-        # Parse the pre-serialized payload_bytes to get message fields
-        message = json.loads(entry["payload_bytes"].decode("utf-8"))
-        values.append(message["id"])
-        assert bus.outbound_queue.complete_in_flight(entry)
-    return values
-
-
-def test_more_important_message_evicts_oldest_least_important_entry():
-    bus = InterCore(outbound_max=4, event_max=2)
-    assert put(bus, KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_INFO)
-    assert put(bus, KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_HEALTH)
-    assert put(bus, KIND_TELEMETRY, {"id": 3}, RETENTION_PRIORITY_TELEMETRY)
-    assert put(bus, KIND_TELEMETRY, {"id": 4}, RETENTION_PRIORITY_HEALTH)
-
-    assert put(bus, KIND_COMMAND_RESPONSE, {"id": 5}, RETENTION_PRIORITY_CRITICAL)
-
-    # Oldest HEALTH entry (id 2) is evicted; FIFO order of survivors is preserved.
-    assert drain(bus) == [1, 3, 4, 5]
-
-
-def test_equal_priority_evicts_oldest_entry_in_that_class():
-    bus = InterCore(outbound_max=3, event_max=2)
-    assert put(bus, KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
-    assert put(bus, KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_TELEMETRY)
-    assert put(bus, KIND_COMMAND_RESPONSE, {"id": 3}, RETENTION_PRIORITY_CRITICAL)
-
-    assert put(bus, KIND_TELEMETRY, {"id": 4}, RETENTION_PRIORITY_TELEMETRY)
-
-    assert drain(bus) == [2, 3, 4]
-
-
-def test_less_important_message_is_rejected_when_queue_is_full():
-    bus = InterCore(outbound_max=2, event_max=2)
-    assert put(bus, KIND_COMMAND_RESPONSE, {"id": 1}, RETENTION_PRIORITY_CRITICAL)
-    assert put(bus, KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_ERROR)
-
-    assert not put(bus, KIND_TELEMETRY, {"id": 3}, RETENTION_PRIORITY_HEALTH)
-    assert drain(bus) == [1, 2]
-
-
-def test_command_response_critical_evicts_telemetry():
-    bus = InterCore(outbound_max=2, event_max=2)
-    assert put(bus, KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
-    assert put(bus, KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_TELEMETRY)
-
-    assert put(bus, KIND_COMMAND_RESPONSE, {"id": 3}, RETENTION_PRIORITY_CRITICAL)
-    assert drain(bus) == [2, 3]
-
-
-def test_in_flight_consumes_capacity_and_is_never_evicted():
-    bus = InterCore(outbound_max=2, event_max=2)
-    assert put(bus, KIND_COMMAND_RESPONSE, {"id": 1}, RETENTION_PRIORITY_CRITICAL)
-    assert put(bus, KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_TELEMETRY)
-
-    first = bus.outbound_queue.take()
-    assert json.loads(first["payload_bytes"].decode("utf-8"))["id"] == 1
-
-    # In-flight critical entry remains untouched; queued telemetry is the only
-    # eviction candidate and is replaced by equal-priority newer telemetry.
-    assert put(bus, KIND_TELEMETRY, {"id": 3}, RETENTION_PRIORITY_TELEMETRY)
-    assert bus.outbound_queue.take() is first
-    status = bus.outbound_queue.status()
-    assert status["pending"] == 1
-    assert status["in_flight"]
-    assert bus.outbound_queue.complete_in_flight(first)
-    assert drain(bus) == [3]
-
-
-def test_full_capacity_with_only_in_flight_entry_rejects_new_message():
-    bus = InterCore(outbound_max=1, event_max=1)
-    assert put(bus, KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_HEALTH)
-    first = bus.outbound_queue.take()
-
-    assert not put(bus, KIND_COMMAND_RESPONSE, {"id": 2}, RETENTION_PRIORITY_CRITICAL)
-    assert bus.outbound_queue.take() is first
-    assert bus.outbound_queue.complete_in_flight(first)
-
-
-def test_priority_eviction_status_counters():
-    bus = InterCore(outbound_max=2, event_max=1)
-    assert put(bus, KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
-    assert put(bus, KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_HEALTH)
-    assert put(bus, KIND_COMMAND_RESPONSE, {"id": 3}, RETENTION_PRIORITY_CRITICAL)
-    assert not put(bus, KIND_TELEMETRY, {"id": 4}, RETENTION_PRIORITY_HEALTH)
-
-    status = bus.outbound_queue.status()
-    assert status["messages_evicted"] == 1
-    assert status["telemetry_evicted"] == 1
-    assert status["messages_rejected"] == 1
-    assert status["high_watermark"] == 2
-
-
-def test_event_queue_is_fifo():
-    bus = InterCore(outbound_max=2, event_max=2)
-    assert bus.event_queue.put({"id": 1})
-    assert bus.event_queue.put({"id": 2})
-    assert bus.event_queue.take()["id"] == 1
-    assert bus.event_queue.take()["id"] == 2
-
-
-def test_state_mailbox_replaces_latest_value():
-    bus = InterCore(outbound_max=2, event_max=2)
-    first = {"rssi": -60}
-    second = {"rssi": -50}
-    bus.state_mailboxes.set_network_snapshot(first)
-    assert bus.state_mailboxes.get_network_snapshot() is first
-    bus.state_mailboxes.set_network_snapshot(second)
-    assert bus.state_mailboxes.get_network_snapshot() is second
-
-
-def test_invalid_queue_capacity_fails_fast():
-    with pytest.raises(ValueError):
-        InterCore(outbound_max=0, event_max=1)
-    with pytest.raises(ValueError):
-        InterCore(outbound_max=1, event_max=0)
-
-
-def test_utc_mailbox_replaces_latest_value():
-    bus = InterCore(outbound_max=2, event_max=2)
-    first = {"utc_epoch_ms": 1}
-    second = {"utc_epoch_ms": 2}
-    bus.state_mailboxes.set_utc_snapshot(first)
-    assert bus.state_mailboxes.get_utc_snapshot() is first
-    bus.state_mailboxes.set_utc_snapshot(second)
-    assert bus.state_mailboxes.get_utc_snapshot() is second
-
-
-def test_intercore_lanes_reject_invalid_boundary_objects():
-    bus = InterCore(outbound_max=2, event_max=2)
-    with pytest.raises(ValueError, match="Unsupported outbound message kind"):
-        put(bus, "unknown", {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
-    with pytest.raises(ValueError, match="outbound message"):
-        put(bus, KIND_TELEMETRY, "not-a-dict", RETENTION_PRIORITY_TELEMETRY)
-    with pytest.raises(ValueError, match="retention_priority"):
-        put(bus, KIND_TELEMETRY, {"id": 1}, True)
-    with pytest.raises(ValueError, match="retention_priority"):
-        put(bus, KIND_TELEMETRY, {"id": 1}, 9)
-    with pytest.raises(ValueError, match="retention_priority"):
-        put(bus, KIND_TELEMETRY, {"id": 1}, 71)
-    with pytest.raises(ValueError, match="inter-core event"):
-        bus.event_queue.put("not-a-dict")
-    with pytest.raises(ValueError, match="network snapshot"):
-        bus.state_mailboxes.set_network_snapshot(None)
-    with pytest.raises(ValueError, match="UTC snapshot"):
-        bus.state_mailboxes.set_utc_snapshot(None)
-
-
-def test_queue_entry_stores_payload_bytes():
-    """Verify the queue stores pre-serialized bytes, not the dict."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    message = {"id": "test", "value": 42}
-    assert put(bus, KIND_TELEMETRY, message, RETENTION_PRIORITY_TELEMETRY)
-
-    entry = bus.outbound_queue.take()
-    assert "payload_bytes" in entry
-    assert isinstance(entry["payload_bytes"], bytes)
-    # The original message dict should not be stored
-    assert "message" not in entry
-    # The bytes should be valid JSON
-    parsed = json.loads(entry["payload_bytes"].decode("utf-8"))
-    assert parsed["id"] == "test"
-    assert parsed["value"] == 42
-    assert bus.outbound_queue.complete_in_flight(entry)
-
-
-def test_message_mutation_does_not_affect_queued_payload():
-    """Verify queued payload is immutable after admission."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    message = {"id": "original", "value": 1}
-    assert put(bus, KIND_TELEMETRY, message, RETENTION_PRIORITY_TELEMETRY)
-
-    # Mutate original message after queue admission
-    message["id"] = "modified"
-    message["value"] = 999
-
-    entry = bus.outbound_queue.take()
-    parsed = json.loads(entry["payload_bytes"].decode("utf-8"))
-    # The queued payload should still have original values
-    assert parsed["id"] == "original"
-    assert parsed["value"] == 1
-    assert bus.outbound_queue.complete_in_flight(entry)
-
-
-def test_invalid_value_rejected():
-    """Verify unsupported value types are rejected."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    # Object instance is not JSON-serializable
-    with pytest.raises(ValueError, match="Unsupported type"):
-        put(bus, KIND_TELEMETRY, {"id": "test", "data": object()}, RETENTION_PRIORITY_TELEMETRY)
-
-
-def test_non_string_key_rejected():
-    """Verify non-string dictionary keys are rejected."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    with pytest.raises(ValueError, match="Non-string key"):
-        put(bus, KIND_TELEMETRY, {123: "invalid"}, RETENTION_PRIORITY_TELEMETRY)
-
-
-def test_nan_float_rejected():
-    """Verify NaN float values are rejected."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    with pytest.raises(ValueError, match="Non-finite float"):
-        put(bus, KIND_TELEMETRY, {"id": "test", "value": float("nan")}, RETENTION_PRIORITY_TELEMETRY)
-
-
-def test_infinity_float_rejected():
-    """Verify Infinity float values are rejected."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    with pytest.raises(ValueError, match="Non-finite float"):
-        put(bus, KIND_TELEMETRY, {"id": "test", "value": float("inf")}, RETENTION_PRIORITY_TELEMETRY)
-    with pytest.raises(ValueError, match="Non-finite float"):
-        put(bus, KIND_TELEMETRY, {"id": "test", "value": -float("inf")}, RETENTION_PRIORITY_TELEMETRY)
-
-
-def test_nested_invalid_rejected():
-    """Verify nested invalid values are rejected."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    with pytest.raises(ValueError, match="Non-finite float"):
-        put(bus, KIND_TELEMETRY, {
-            "id": "test",
-            "nested": {"value": float("nan")}
-        }, RETENTION_PRIORITY_TELEMETRY)
-
-
-def _message_serializing_to(total_bytes):
-    """A message whose JSON/UTF-8 serialization is exactly total_bytes long.
-
-    Measures the wrapper overhead by serializing the same shape with an empty
-    payload, then sizes the ASCII payload to hit the target exactly.
+    ``garbage_bytes`` models collectable garbage: the first gc.collect() that
+    runs while garbage remains releases it. Evicted queue entries release their
+    payload bytes immediately (reference counting), which install() wires in so
+    the reserve check sees them, matching MicroPython's refcounted heap.
     """
-    overhead = len(json.dumps({"id": "test", "data": ""}).encode("utf-8"))
-    assert overhead <= total_bytes
-    return {"id": "test", "data": "x" * (total_bytes - overhead)}
+
+    def __init__(self, free_bytes, garbage_bytes=0):
+        self.free_bytes = free_bytes
+        self._garbage = garbage_bytes
+        self.collects = 0
+
+    def mem_free(self):
+        return self.free_bytes
+
+    def collect(self):
+        self.collects += 1
+        if self._garbage:
+            self.free_bytes += self._garbage
+            self._garbage = 0
+
+    def install(self, monkeypatch, queue):
+        # gc.mem_free does not exist on the CPython host; add it for the test.
+        monkeypatch.setattr(gc, "mem_free", self.mem_free, raising=False)
+        monkeypatch.setattr(gc, "collect", self.collect)
+        original_evict = queue._evict_oldest_by_priority_locked
+
+        def evict_and_release(priority):
+            before = queue._queued_bytes
+            evicted = original_evict(priority)
+            if evicted:
+                self.free_bytes += before - queue._queued_bytes
+            return evicted
+
+        monkeypatch.setattr(queue, "_evict_oldest_by_priority_locked", evict_and_release)
 
 
-def test_exact_max_size_admitted():
-    """Verify a message at exactly the max size is admitted."""
-    from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
-    message = _message_serializing_to(MAX_OUTBOUND_MESSAGE_BYTES)
-    bus = InterCore(outbound_max=2, event_max=2)
-
-    admitted = put(bus, KIND_TELEMETRY, message, RETENTION_PRIORITY_TELEMETRY)
-    assert admitted is True
-
-    entry = bus.outbound_queue.take()
-    assert entry is not None
-    assert len(entry["payload_bytes"]) == MAX_OUTBOUND_MESSAGE_BYTES
-    assert bus.outbound_queue.complete_in_flight(entry)
+def _queue(monkeypatch, free_bytes=HEAPY, garbage_bytes=0):
+    """An InterCore bus whose fake heap starts at free_bytes."""
+    ic = InterCore(RESERVE)
+    heap = FakeHeap(free_bytes, garbage_bytes)
+    heap.install(monkeypatch, ic.outbound_queue)
+    return ic, heap
 
 
-def test_one_byte_over_max_rejected():
-    """Verify a message one byte over the max size is rejected, not admitted."""
-    from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
-    message = _message_serializing_to(MAX_OUTBOUND_MESSAGE_BYTES + 1)
-    bus = InterCore(outbound_max=2, event_max=2)
-
-    admitted = put(bus, KIND_TELEMETRY, message, RETENTION_PRIORITY_TELEMETRY)
-    assert admitted is False
-
-    assert bus.outbound_queue.take() is None
-    status = bus.outbound_queue.status()
-    assert status["oversized_rejected"] == 1
+# ---------------------------------------------------------------------------
+# Construction and configuration
+# ---------------------------------------------------------------------------
 
 
-def test_oversized_rejected():
-    """Verify messages exceeding max size are rejected."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
-    # Create a message larger than MAX_OUTBOUND_MESSAGE_BYTES
-    payload = "x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1000)
-    message = {"id": "test", "data": payload}
-    assert not put(bus, KIND_TELEMETRY, message, RETENTION_PRIORITY_TELEMETRY)
-
-    status = bus.outbound_queue.status()
-    assert status["oversized_rejected"] >= 1
+def test_intercore_requires_positive_reserve():
+    for bad in (0, -1, "64", 1.5, True):
+        with pytest.raises(ValueError):
+            InterCore(bad)
 
 
-def test_put_with_kind_one_byte_over_max_rejected():
-    """put_with_kind() enforces the same per-message ceiling as put()."""
-    from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
-    bus = InterCore(outbound_max=2, event_max=2)
+def test_outbound_requires_positive_reserve():
+    lock = InterCore(RESERVE)._heap_admission_lock
+    for bad in (0, -1, "64", True):
+        with pytest.raises(ValueError):
+            OutboundQueue(bad, lock)
 
-    admitted = bus.outbound_queue.put_with_kind(
-        KIND_HEALTH, _bytes_of(MAX_OUTBOUND_MESSAGE_BYTES + 1), RETENTION_PRIORITY_HEALTH
+
+def test_event_queue_requires_positive_reserve():
+    lock = InterCore(RESERVE)._heap_admission_lock
+    for bad in (0, -1, "64", True):
+        with pytest.raises(ValueError):
+            InterCoreEventQueue(bad, lock)
+
+
+def test_facade_exposes_three_lanes_and_reserve():
+    ic = InterCore(RESERVE)
+    assert ic.minimum_free_heap_bytes == RESERVE
+    assert isinstance(ic.outbound_queue, OutboundQueue)
+    assert isinstance(ic.event_queue, InterCoreEventQueue)
+    assert isinstance(ic.state_mailboxes, StateMailboxes)
+
+
+# ---------------------------------------------------------------------------
+# Shared heap-admission lock
+# ---------------------------------------------------------------------------
+
+
+def test_both_queues_share_one_heap_admission_lock():
+    ic = InterCore(RESERVE)
+    lock = ic.outbound_queue._heap_admission_lock
+    assert lock is ic.event_queue._heap_admission_lock
+    assert lock is ic._heap_admission_lock
+    # It is a distinct lock from each queue's internal list lock.
+    assert lock is not ic.outbound_queue._lock
+    assert lock is not ic.event_queue._lock
+
+
+def test_heap_lock_held_during_admission(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    lock = ic._heap_admission_lock
+    observed = []
+    monkeypatch.setattr(
+        gc, "mem_free", lambda: observed.append(lock.locked()) or heap.mem_free()
     )
-    assert admitted is False
+    assert ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    # Every heap measurement was taken under the shared lock...
+    assert observed and all(observed)
+    # ...and the lock is released when admission returns.
+    assert lock.locked() is False
 
-    assert bus.outbound_queue.take() is None
-    status = bus.outbound_queue.status()
-    assert status["oversized_rejected"] == 1
 
-
-def test_put_with_kind_exact_max_size_admitted():
-    """A payload at exactly the max size is admitted by put_with_kind()."""
-    from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
-    bus = InterCore(outbound_max=2, event_max=2)
-
-    assert bus.outbound_queue.put_with_kind(
-        KIND_HEALTH, _bytes_of(MAX_OUTBOUND_MESSAGE_BYTES), RETENTION_PRIORITY_HEALTH
+def test_heap_lock_released_on_rejection(monkeypatch):
+    ic, heap = _queue(monkeypatch, free_bytes=0)
+    lock = ic._heap_admission_lock
+    observed = []
+    monkeypatch.setattr(
+        gc, "mem_free", lambda: observed.append(lock.locked()) or heap.mem_free()
     )
-
-    entry = bus.outbound_queue.take()
-    assert entry is not None
-    assert len(entry["payload_bytes"]) == MAX_OUTBOUND_MESSAGE_BYTES
-    assert bus.outbound_queue.complete_in_flight(entry)
-
-
-def test_status_counters_include_serialization_rejections():
-    """Verify serialization rejections are counted."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    # Try to put an invalid message
-    try:
-        put(bus, KIND_TELEMETRY, {"id": "test", "data": object()}, RETENTION_PRIORITY_TELEMETRY)
-    except ValueError:
-        pass  # Expected
-
-    status = bus.outbound_queue.status()
-    assert "serialization_rejected" in status
-    assert "oversized_rejected" in status
+    assert ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is False
+    assert observed and all(observed)
+    assert lock.locked() is False
+    # The lock is still usable after the rejected admission.
+    lock.acquire()
+    lock.release()
 
 
-# --- Aggregate queued-byte budget (memory-safety boundary) ---
+def test_heap_lock_released_on_exception(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    lock = ic._heap_admission_lock
+    queue = ic.outbound_queue
 
-def test_per_message_ceiling_is_mcu_scale():
-    """The per-message ceiling is at most 16 KiB (regression guard vs 128 KiB)."""
-    from message_serializer import get_max_message_bytes
-    assert 8 * 1024 <= get_max_message_bytes() <= 16 * 1024
+    def _boom(*args):
+        raise RuntimeError("append failed")
 
-
-def test_default_byte_budget_is_mcu_scale():
-    """The default queued-byte budget is MCU-safe and holds a realistic queue."""
-    # Well under a Pico W's heap (256 KiB).
-    assert DEFAULT_MAX_OUTBOUND_QUEUED_BYTES <= 64 * 1024
-    # Comfortably holds a full queue of 16 entries at a realistic ~2 KiB each.
-    assert DEFAULT_MAX_OUTBOUND_QUEUED_BYTES >= 16 * 2 * 1024
-
-
-def test_byte_budget_limits_admission_before_count():
-    """A high-count / low-byte queue admits only until the byte budget is hit."""
-    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
-    # Third 40-byte entry would push to 120 > 100; same class, so evict the oldest.
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
-    status = bus.outbound_queue.status()
-    assert status["queued_bytes"] <= 100
-    assert status["pending"] == 2  # bounded by bytes, not by the count budget of 10
+    monkeypatch.setattr(queue, "_append_locked", _boom)
+    with pytest.raises(RuntimeError):
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
+    assert lock.locked() is False
+    lock.acquire()
+    lock.release()
 
 
-def test_byte_budget_respected_after_eviction():
-    """Eviction frees enough bytes for the incoming entry; the budget still holds."""
-    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_HEALTH)
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
-    # 60 + 40 already fills the budget; the next evicts the oldest (60) -> 40 + 40.
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
-    status = bus.outbound_queue.status()
-    assert status["queued_bytes"] <= 100
+# ---------------------------------------------------------------------------
+# Outbound admission: put()
+# ---------------------------------------------------------------------------
+
+
+def test_put_non_dict_rejected(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    with pytest.raises(ValueError):
+        ic.outbound_queue.put(KIND_TELEMETRY, "not a dict", RETENTION_PRIORITY_TELEMETRY)
+
+
+def test_put_rejects_invalid_kind(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    with pytest.raises(ValueError):
+        ic.outbound_queue.put("bogus", {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
+
+
+def test_put_rejects_invalid_priority(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    for bad in (True, 5, 80, "10"):
+        with pytest.raises(ValueError):
+            ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, bad)
+
+
+def test_put_serializes(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert queue.put(KIND_TELEMETRY, {"value": 42, "label": "x"}, RETENTION_PRIORITY_TELEMETRY) is True
+    entry = queue.take()
+    assert json.loads(entry["payload_bytes"]) == {"value": 42, "label": "x"}
+    assert entry["retention_priority"] == RETENTION_PRIORITY_TELEMETRY
+
+
+def test_put_rejects_non_string_keys(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    with pytest.raises(ValueError):
+        ic.outbound_queue.put(KIND_TELEMETRY, {1: "x"}, RETENTION_PRIORITY_TELEMETRY)
+
+
+def test_put_rejects_nan(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    with pytest.raises(ValueError):
+        ic.outbound_queue.put(KIND_TELEMETRY, {"v": float("nan")}, RETENTION_PRIORITY_TELEMETRY)
+
+
+def test_put_rejects_infinity(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    with pytest.raises(ValueError):
+        ic.outbound_queue.put(KIND_TELEMETRY, {"v": float("inf")}, RETENTION_PRIORITY_TELEMETRY)
+
+
+def test_put_rejects_unsupported_type(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    with pytest.raises(ValueError):
+        ic.outbound_queue.put(KIND_TELEMETRY, {"v": object()}, RETENTION_PRIORITY_TELEMETRY)
+
+
+def test_put_memoryerror_from_serialization_propagates(monkeypatch):
+    import message_serializer
+
+    ic, _ = _queue(monkeypatch)
+
+    def _exhaust(*args, **kwargs):
+        raise MemoryError
+
+    monkeypatch.setattr(message_serializer, "serialize_and_validate_message", _exhaust)
+    with pytest.raises(MemoryError):
+        ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
+
+
+def test_put_rejects_oversized_message(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    big = {"blob": "x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1)}
+    assert queue.put(KIND_TELEMETRY, big, RETENTION_PRIORITY_TELEMETRY) is False
+    assert queue.get_depth() == 0
+    assert queue.status()["oversized_rejected"] == 1
+
+
+def test_more_than_sixteen_small_messages_retained(monkeypatch):
+    """No fixed entry count: 20 small messages are all retained."""
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    for i in range(20):
+        payload = json.dumps({"i": i}).encode("utf-8")
+        assert queue.put_with_kind(KIND_TELEMETRY, payload, RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.get_depth() == 20
+    status = queue.status()
+    assert status["pending"] == 20
+    assert status["high_watermark"] == 20
+    assert status["queued_bytes"] == sum(len(json.dumps({"i": i})) for i in range(20))
+
+
+def test_fifo_order(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    for i in range(3):
+        assert queue.put_with_kind(KIND_TELEMETRY, json.dumps({"i": i}).encode(), RETENTION_PRIORITY_TELEMETRY)
+    for i in range(3):
+        entry = queue.take()
+        assert json.loads(entry["payload_bytes"]) == {"i": i}
+        assert queue.complete_in_flight(entry) is True
+
+
+# ---------------------------------------------------------------------------
+# Outbound admission: the heap-reserve policy
+# ---------------------------------------------------------------------------
+
+
+def test_fast_path_admits_without_gc(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    assert ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    assert heap.collects == 0
+
+
+def test_pressure_path_runs_gc_once_and_admits(monkeypatch):
+    """Heap below the reserve with collectable garbage: gc alone restores it."""
+    ic, heap = _queue(monkeypatch, free_bytes=RESERVE - 4096, garbage_bytes=8192)
+    assert ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    assert heap.collects == 1
+    assert heap.mem_free() >= RESERVE
+
+
+def test_gc_restores_reserve_without_eviction(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is True
+    # The heap drops below the reserve, leaving collectable garbage.
+    heap.free_bytes = RESERVE - 2048
+    heap._garbage = 4096
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"b":2}', RETENTION_PRIORITY_TELEMETRY) is True
+    status = queue.status()
     assert status["pending"] == 2
-    assert status["messages_evicted"] >= 1
-
-
-def test_byte_budget_less_important_rejected_without_evicting():
-    """A less-important incoming entry is rejected, not the valid entry evicted."""
-    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
-    # A 60-byte CRITICAL entry fills most of the budget.
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_CRITICAL)
-    # A 50-byte HEALTH entry would exceed the budget, but HEALTH (70) is less
-    # important than CRITICAL (10): reject rather than evict the critical entry.
-    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(50), RETENTION_PRIORITY_HEALTH)
-    status = bus.outbound_queue.status()
-    assert status["pending"] == 1
-    assert status["queued_bytes"] == 60
     assert status["messages_evicted"] == 0
-    assert status["messages_rejected"] >= 1
+    assert status["messages_rejected"] == 0
 
 
-def test_byte_budget_never_evicts_for_nothing():
-    """A valid entry is not dropped to admit one that still would not fit."""
-    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_HEALTH)
-    # 150 bytes does not fit even after evicting the 60-byte entry (150 > 100).
-    # It must be rejected; the valid 60-byte entry must survive.
-    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(150), RETENTION_PRIORITY_HEALTH)
-    status = bus.outbound_queue.status()
-    assert status["pending"] == 1
-    assert status["queued_bytes"] == 60
-    assert status["messages_evicted"] == 0
-    assert status["messages_rejected"] >= 1
-
-
-def test_byte_budget_includes_in_flight_entry():
-    """The in-flight entry's retained bytes count toward the byte budget.
-
-    The in-flight payload is not freed until its PUBACK (complete_in_flight),
-    so it must consume budget along with the queued FIFO. Previously take()
-    subtracted it, letting the queue retain (budget + in-flight) of payload
-    while reporting only the budget.
-    """
-    # A 200-byte entry moved in-flight; the budget is 250 bytes.
-    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=250)
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(200), RETENTION_PRIORITY_HEALTH)
-    first = bus.outbound_queue.take()
-    assert bus.outbound_queue.has_in_flight()
-
-    # With the in-flight entry counted, a further 60 bytes exceeds the budget
-    # (200 + 60 = 260 > 250). Nothing is queued to evict, so admission fails --
-    # even though the old in-flight-excluded budget had 250 bytes of room.
-    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_HEALTH)
-
-    status = bus.outbound_queue.status()
-    assert status["in_flight"]
+def test_rejected_when_reserve_cannot_be_restored(monkeypatch):
+    """Empty queue, heap below reserve and no garbage: admission is rejected."""
+    ic, heap = _queue(monkeypatch, free_bytes=0)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is False
+    status = queue.status()
     assert status["pending"] == 0
-    # The reported byte budget includes the retained in-flight entry.
-    assert status["queued_bytes"] == 200
-
-    # Completing the in-flight entry frees exactly its own bytes.
-    assert bus.outbound_queue.complete_in_flight(first)
-    assert bus.outbound_queue.status()["queued_bytes"] == 0
-
-
-def test_dict_path_enforces_byte_budget():
-    """put() (dict -> serialize) also enforces the queued-byte budget."""
-    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
-    for _ in range(20):
-        bus.outbound_queue.put(KIND_TELEMETRY, {"id": "a", "v": 1}, RETENTION_PRIORITY_TELEMETRY)
-    assert bus.outbound_queue.status()["queued_bytes"] <= 100
-
-
-def test_status_exposes_byte_budget():
-    bus = InterCore(outbound_max=4, event_max=2, outbound_max_bytes=2048)
-    status = bus.outbound_queue.status()
-    assert status["max_queued_bytes"] == 2048
-    assert status["queued_bytes"] == 0
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(256), RETENTION_PRIORITY_HEALTH)
-    assert bus.outbound_queue.status()["queued_bytes"] == 256
-
-
-def test_outbound_queue_rejects_bad_byte_budget():
-    with pytest.raises(ValueError, match="max_queued_bytes"):
-        OutboundQueue(4, 0)
-    with pytest.raises(ValueError, match="max_queued_bytes"):
-        OutboundQueue(4, True)
-    with pytest.raises(ValueError, match="max_queued_bytes"):
-        OutboundQueue(4, -1)
-
-
-def test_connection_log_like_message():
-    """Verify connection log-like messages are handled correctly."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    from message_serializer import serialize_and_validate_message
-
-    # This is the format used by _queue_connection_log
-    log_message = {
-        "message_type": "log",
-        "payload": {
-            "level": "info",
-            "message": "Connected to Wi-Fi",
-            "event": "wifi_connection_established",
-            "module": "wifi",
-            "data": {"ssid": "test", "ip_address": "10.0.0.1"},
-        },
-    }
-
-    # Serialize and verify it works
-    payload_bytes = serialize_and_validate_message(log_message)
-    assert isinstance(payload_bytes, bytes)
-    assert len(payload_bytes) > 0
-
-    # Verify the message can be reconstructed
-    reconstructed = json.loads(payload_bytes.decode("utf-8"))
-    assert reconstructed["message_type"] == "log"
-    assert reconstructed["payload"]["message"] == "Connected to Wi-Fi"
-
-
-def test_health_message_kind_is_valid():
-    """Verify KIND_HEALTH is a valid outbound message kind."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    # Health messages should be accepted with health priority
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"test": true}', RETENTION_PRIORITY_HEALTH)
-
-
-def test_log_message_kind_is_valid():
-    """Verify KIND_LOG is a valid outbound message kind for log messages."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    # Log messages should be accepted with info priority
-    assert bus.outbound_queue.put_with_kind(KIND_LOG, b'{"test": true}', RETENTION_PRIORITY_INFO)
-
-    entry = bus.outbound_queue.take()
-    assert entry["kind"] == KIND_LOG
-    assert "topic" not in entry  # topic resolution is Core 0's job
-    bus.outbound_queue.complete_in_flight(entry)
-
-
-def test_health_message_is_lesser_priority_than_info():
-    """Verify health messages can be evicted by info messages."""
-    bus = InterCore(outbound_max=2, event_max=2)
-    # Queue two health messages
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 1}', RETENTION_PRIORITY_HEALTH)
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 2}', RETENTION_PRIORITY_HEALTH)
-
-    # Try to add an info message (more important) when full
-    # Info has priority 50, health has priority 70
-    # So info should evict the oldest health (id 1)
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 3}', RETENTION_PRIORITY_INFO)
-
-    # The oldest health (id 1) should be evicted
-    # Queue is now [2, 3] after eviction and addition
-    entry = bus.outbound_queue.take()
-    message = json.loads(entry["payload_bytes"].decode("utf-8"))
-    assert message["id"] == 2  # id 1 was evicted, 2 is now oldest
-    bus.outbound_queue.complete_in_flight(entry)
-
-    entry = bus.outbound_queue.take()
-    message = json.loads(entry["payload_bytes"].decode("utf-8"))
-    assert message["id"] == 3
-    bus.outbound_queue.complete_in_flight(entry)
+    assert status["messages_rejected"] == 1
+    assert status["messages_evicted"] == 0
+
+
+def test_critical_evicts_lower_priority_until_reserve_restored(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    telemetry_payload = b"t" * 12 * KB
+    health_payload = b"h" * 8 * KB
+    assert queue.put_with_kind(KIND_TELEMETRY, telemetry_payload, RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.put_with_kind(KIND_HEALTH, health_payload, RETENTION_PRIORITY_HEALTH) is True
+    # Pressure: 8 KiB short of the reserve, no garbage to collect.
+    heap.free_bytes = RESERVE - 8 * KB
+    incoming = b"c" * 4 * KB
+    assert queue.put_with_kind(KIND_TELEMETRY, incoming, RETENTION_PRIORITY_CRITICAL) is True
+    status = queue.status()
+    # The least-important entry (HEALTH, 8 KiB) was evicted; TELEMETRY kept.
+    assert status["pending"] == 2
+    assert status["messages_evicted"] == 1
+    assert status["telemetry_evicted"] == 0
+    assert status["messages_rejected"] == 0
+    first = queue.take()
+    assert first["payload_bytes"] == telemetry_payload
+    assert queue.complete_in_flight(first) is True
+    second = queue.take()
+    assert second["payload_bytes"] == incoming
+
+
+def test_multiple_evictions_allowed(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    for kind, priority in (
+        (KIND_TELEMETRY, RETENTION_PRIORITY_TELEMETRY),
+        (KIND_TELEMETRY, RETENTION_PRIORITY_INFO),
+        (KIND_HEALTH, RETENTION_PRIORITY_HEALTH),
+    ):
+        assert queue.put_with_kind(kind, b"x" * 8 * KB, priority) is True
+    # 16 KiB short: exactly two 8 KiB evictions restore the reserve.
+    heap.free_bytes = RESERVE - 16 * KB
+    assert queue.put_with_kind(KIND_TELEMETRY, b"c" * 2 * KB, RETENTION_PRIORITY_CRITICAL) is True
+    status = queue.status()
+    assert status["pending"] == 2  # original TELEMETRY + incoming CRITICAL
+    assert status["messages_evicted"] == 2
+    assert status["telemetry_evicted"] == 1  # only the TELEMETRY-kind one
+    assert status["messages_rejected"] == 0
+
+
+def test_less_important_cannot_evict_more_important(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b"t" * 8 * KB, RETENTION_PRIORITY_TELEMETRY) is True
+    heap.free_bytes = 0  # unrecoverable pressure
+    assert (
+        queue.put_with_kind(KIND_HEALTH, b"h" * 8 * KB, RETENTION_PRIORITY_HEALTH) is False
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["messages_rejected"] == 1
+    assert status["messages_evicted"] == 0
+    assert queue.take()["payload_bytes"] == b"t" * 8 * KB
+
+
+def test_equal_priority_can_evict(monkeypatch):
+    """An incoming entry may displace queued entries of the same priority."""
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b"o" * 1024, RETENTION_PRIORITY_TELEMETRY) is True
+    heap.free_bytes = RESERVE - 1024
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b"new", RETENTION_PRIORITY_TELEMETRY) is True
+    )
+    assert queue.status()["pending"] == 1
+    assert queue.status()["messages_evicted"] == 1
+    assert queue.take()["payload_bytes"] == b"new"
+
+
+def test_eviction_is_oldest_first_within_priority_class(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    payloads = {i: b"t%d" % i + b"p" * (8 * KB - 2) for i in range(3)}
+    for i in range(3):
+        assert queue.put_with_kind(KIND_TELEMETRY, payloads[i], RETENTION_PRIORITY_TELEMETRY) is True
+    # 16 KiB short: the two oldest same-priority entries must be the evicted ones.
+    heap.free_bytes = RESERVE - 16 * KB
+    assert queue.put_with_kind(KIND_TELEMETRY, b"c", RETENTION_PRIORITY_CRITICAL) is True
+    first = queue.take()
+    assert first["payload_bytes"] == payloads[2]  # youngest original survived
+    assert queue.complete_in_flight(first) is True
+    second = queue.take()
+    assert second["payload_bytes"] == b"c"         # incoming admitted last
+    assert queue.status()["telemetry_evicted"] == 2
+    assert queue.status()["messages_evicted"] == 2
+
+
+def test_in_flight_entry_is_never_evicted(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b"t" * 16 * KB, RETENTION_PRIORITY_TELEMETRY) is True
+    in_flight = queue.take()
+    assert queue.has_in_flight() is True
+    # Unrecoverable pressure and an empty FIFO: only the in-flight entry
+    # exists, and it is not an eviction candidate.
+    heap.free_bytes = 0
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b"c" * 4 * KB, RETENTION_PRIORITY_CRITICAL) is False
+    )
+    assert queue.has_in_flight() is True
+    assert queue.status()["messages_evicted"] == 0
+    assert queue.status()["messages_rejected"] == 1
+    assert queue.complete_in_flight(in_flight) is True
+    assert in_flight["payload_bytes"] == b"t" * 16 * KB
 
-    assert bus.outbound_queue.take() is None
-
-
-def test_health_message_is_rejected_when_queue_is_full():
-    """Verify health messages are rejected when queue is full and no eviction possible."""
-    bus = InterCore(outbound_max=1, event_max=2)
-    # Fill the queue with a critical message
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 1}', RETENTION_PRIORITY_CRITICAL)
-
-    first = bus.outbound_queue.take()
-    bus.outbound_queue.complete_in_flight(first)
-
-    # Queue is now empty but capacity is 1
-    # Take it again to leave in_flight
-    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 2}', RETENTION_PRIORITY_HEALTH)
-    first = bus.outbound_queue.take()
-
-    # Now try to add health when in_flight is occupied
-    # This should fail since in_flight counts toward max
-    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, b'{"id": 3}', RETENTION_PRIORITY_HEALTH)
-    bus.outbound_queue.complete_in_flight(first)
-
-
-def test_health_queue_depth_helper():
-    """Verify the health queue depth helper returns correct values."""
-    bus = InterCore(outbound_max=4, event_max=2)
-
-    # Empty queue should return (0, 4)
-    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
-    assert depth == 0
-    assert capacity == 4
-
-    # Add one message
-    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
-    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
-    assert depth == 1
-    assert capacity == 4
-
-    # Take and complete to check in-flight counting
-    first = bus.outbound_queue.take()
-    assert first is not None
-    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
-    # In-flight counts toward depth
-    assert depth == 1
-    assert capacity == 4
-
-    bus.outbound_queue.complete_in_flight(first)
-    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
-    assert depth == 0
-    assert capacity == 4
 
+# ---------------------------------------------------------------------------
+# Outbound in-flight accounting
+# ---------------------------------------------------------------------------
 
-def test_health_queue_depth_calculation():
-    """Verify queue depth is queued + in_flight."""
-    bus = InterCore(outbound_max=4, event_max=2)
 
-    # Add two messages
-    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
-    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_TELEMETRY)
+def test_take_empty_queue(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    assert ic.outbound_queue.take() is None
 
-    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
-    assert depth == 2
-    assert capacity == 4
-
-    # Take one (moves to in_flight)
-    first = bus.outbound_queue.take()
-    assert first is not None
-    depth, capacity = bus.outbound_queue.get_depth_with_capacity()
-    assert depth == 2  # 1 queued + 1 in_flight
-    assert capacity == 4
-
-
-def test_health_topic_routing_returns_configured_topic():
-    """Verify KIND_HEALTH routes to the configured mqtt_topic_health."""
-    from config import load_config, split_config
-
-    config_path = pathlib.Path(__file__).resolve().parents[1] / "config.json"
-    config = load_config(str(config_path))
-    core0, _, bus_config = split_config(config)
-
-    bus = InterCore(outbound_max=bus_config["max_outbound_queue_entries"],
-                   event_max=bus_config["max_intercore_event_entries"])
-
-    # Create a Core0-like topic resolver using the config
-    def topic_for_kind(kind):
-        if kind == KIND_HEALTH:
-            return core0["mqtt_topic_health"]
-        raise ValueError("Unsupported outbound message kind")
-
-    # Verify KIND_HEALTH returns the configured health topic
-    assert topic_for_kind(KIND_HEALTH) == "iot/v3/health"
-    assert topic_for_kind(KIND_HEALTH) == config["mqtt_topic_health"]
-
-
-def test_publish_failure_keeps_entry_in_flight_for_retry():
-    """Verify that a failed publish leaves the entry in flight so it can be retried.
-
-    QoS 1 requires at-least-once delivery: a message the broker has not PUBACKed
-    must not be dropped. When a publish fails, Core 0 leaves the entry in flight,
-    and take() keeps returning the same entry until it is completed.
-    """
-    bus = InterCore(outbound_max=2, event_max=2)
-
-    # Add two messages
-    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 1}, RETENTION_PRIORITY_TELEMETRY)
-    assert bus.outbound_queue.put(KIND_TELEMETRY, {"id": 2}, RETENTION_PRIORITY_TELEMETRY)
-
-    # Take first message (moves to in_flight)
-    first = bus.outbound_queue.take()
-    assert first is not None
-    assert json.loads(first["payload_bytes"].decode("utf-8"))["id"] == 1
-    assert bus.outbound_queue.has_in_flight()
-
-    # Simulate a failed publish - complete_in_flight is NOT called
-    # The entry must stay in flight so it can be retried
-    assert bus.outbound_queue.has_in_flight()
-
-    # The same entry is returned again instead of advancing the queue
-    retry = bus.outbound_queue.take()
-    assert retry is first
-    assert json.loads(retry["payload_bytes"].decode("utf-8"))["id"] == 1
-
-    # Retry succeeds - complete it and the queue advances
-    assert bus.outbound_queue.complete_in_flight(first)
-    assert not bus.outbound_queue.has_in_flight()
-
-    second = bus.outbound_queue.take()
-    assert second is not None
-    assert json.loads(second["payload_bytes"].decode("utf-8"))["id"] == 2
-    assert bus.outbound_queue.has_in_flight()
-
-    # Complete the second message
-    assert bus.outbound_queue.complete_in_flight(second)
-    assert not bus.outbound_queue.has_in_flight()
-
-    # Queue should now be empty
-    assert bus.outbound_queue.take() is None
-
-
-class TestCommandResponsePreSerializedFormat:
-    """Regression tests for Core 0 command-response pre-serialized format.
-
-    These tests verify that command responses use the pre-serialized
-    payload_bytes contract.
-    """
-
-    def test_command_response_entry_format(self, tmp_path):
-        """Verify command-response entries contain payload_bytes, not message."""
-        from config import load_config
-
-        config_path = pathlib.Path(__file__).resolve().parents[1] / "config.json"
-        config = load_config(str(config_path))
-
-        bus = InterCore(outbound_max=16, event_max=4)
-
-        # Build a command response message
-        message = {
-            "message_type": "command_response",
-            "payload": {
-                "command_id": "reboot-001",
-                "command": "reboot",
-                "targeted": False,
-                "success": True,
-                "data": {"rebooting": True},
-            },
-        }
-
-        # Serialize (same pattern as _publish_core0_command_response)
-        from message_serializer import serialize_and_validate_message
-        payload_bytes = serialize_and_validate_message(message)
-
-        # Verify payload_bytes is bytes and not a dict with 'message' key
-        assert isinstance(payload_bytes, bytes)
-
-        # Create entry with payload_bytes (same as fixed _publish_core0_command_response)
-        entry = {
-            "kind": KIND_COMMAND_RESPONSE,
-            "payload_bytes": payload_bytes,
-        }
-
-        # Verify entry doesn't have the obsolete 'message' field
-        assert "message" not in entry
-        assert "payload_bytes" in entry
-
-        # Add to queue
-        bus.outbound_queue.put_with_kind(
-            KIND_COMMAND_RESPONSE, payload_bytes, RETENTION_PRIORITY_CRITICAL
-        )
-
-        # Verify the entry was queued with payload_bytes
-        queued_entry = bus.outbound_queue.take()
-        assert queued_entry is not None
-        assert "payload_bytes" in queued_entry
-        assert "message" not in queued_entry
-        assert queued_entry["kind"] == KIND_COMMAND_RESPONSE
-
-        # Verify payload_bytes is valid JSON with expected content
-        deserialized = json.loads(queued_entry["payload_bytes"].decode("utf-8"))
-        assert deserialized["message_type"] == "command_response"
-        assert deserialized["payload"]["command_id"] == "reboot-001"
-        assert deserialized["payload"]["success"] is True
-
-    def test_command_response_payload_is_serialized_bytes(self, tmp_path):
-        """Verify command-response payload_bytes is properly serialized."""
-        from config import load_config
-
-        config_path = pathlib.Path(__file__).resolve().parents[1] / "config.json"
-        config = load_config(str(config_path))
-
-        bus = InterCore(outbound_max=16, event_max=4)
-
-        # Build a command response message with error
-        message = {
-            "message_type": "command_response",
-            "payload": {
-                "command_id": "reboot-002",
-                "command": "reboot",
-                "targeted": False,
-                "success": False,
-                "error": {"code": "test_error", "message": "Test error"},
-            },
-        }
-
-        from message_serializer import serialize_and_validate_message
-        payload_bytes = serialize_and_validate_message(message)
-
-        entry = {
-            "topic": config["mqtt_topic_command_response"],
-            "kind": KIND_COMMAND_RESPONSE,
-            "payload_bytes": payload_bytes,
-        }
-
-        # Verify entry format
-        assert "payload_bytes" in entry
-        assert "message" not in entry
-        assert isinstance(entry["payload_bytes"], bytes)
-
-        # Decode and verify
-        payload_str = entry["payload_bytes"].decode("utf-8")
-        deserialized = json.loads(payload_str)
-        assert deserialized["message_type"] == "command_response"
-        assert deserialized["payload"]["success"] is False
-        assert deserialized["payload"]["error"]["code"] == "test_error"
+
+def test_take_returns_in_flight_again(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is True
+    entry = queue.take()
+    assert queue.take() is entry
+
+
+def test_complete_in_flight_releases_retained_bytes(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    payload = b'{"a":1}'
+    assert queue.put_with_kind(KIND_TELEMETRY, payload, RETENTION_PRIORITY_TELEMETRY) is True
+    entry = queue.take()
+    # Retained in flight: still counted.
+    assert queue.status()["queued_bytes"] == len(payload)
+    assert queue.get_depth() == 1
+    assert queue.complete_in_flight(entry) is True
+    assert queue.status()["queued_bytes"] == 0
+    assert queue.get_depth() == 0
+
+
+def test_complete_in_flight_wrong_entry_rejected(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.complete_in_flight({"other": True}) is False
+
+
+def test_has_in_flight_empty(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    assert ic.outbound_queue.has_in_flight() is False
+
+
+def test_get_depth_empty(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    assert ic.outbound_queue.get_depth() == 0
+
+
+def test_high_watermark_tracks_peak(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    for i in range(5):
+        assert queue.put_with_kind(KIND_TELEMETRY, b"p", RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.status()["high_watermark"] == 5
+    for _ in range(5):
+        queue.complete_in_flight(queue.take())
+    assert queue.status()["high_watermark"] == 5  # watermark is a peak, not current
+    assert queue.status()["high_watermark_bytes"] >= 5
+
+
+# ---------------------------------------------------------------------------
+# put_with_kind()
+# ---------------------------------------------------------------------------
+
+
+def test_put_with_kind_non_bytes_rejected(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    with pytest.raises(ValueError):
+        ic.outbound_queue.put_with_kind(KIND_TELEMETRY, "not bytes", RETENTION_PRIORITY_TELEMETRY)
+
+
+def test_put_with_kind_rejects_oversized_payload(monkeypatch):
+    """The 16 KiB per-message ceiling holds on the pre-serialized path too."""
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    oversized = b"x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1)
+    assert queue.put_with_kind(KIND_TELEMETRY, oversized, RETENTION_PRIORITY_TELEMETRY) is False
+    assert queue.get_depth() == 0
+    assert queue.status()["oversized_rejected"] == 1
+
+
+def test_memoryerror_during_admission_propagates(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+
+    def _oom(*args):
+        raise MemoryError
+
+    monkeypatch.setattr(ic.outbound_queue, "_append_locked", _oom)
+    with pytest.raises(MemoryError):
+        ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
+    assert ic.outbound_queue.get_depth() == 0
+
+
+# ---------------------------------------------------------------------------
+# Inter-core event queue
+# ---------------------------------------------------------------------------
+
+
+def test_event_put_non_dict_raises(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    with pytest.raises(ValueError):
+        ic.event_queue.put("not a dict")
+
+
+def test_event_take_empty(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+    assert ic.event_queue.take() is None
+
+
+def test_event_queue_retains_more_than_four_events(monkeypatch):
+    """No fixed entry count: 6 events are all retained."""
+    ic, _ = _queue(monkeypatch)
+    for i in range(6):
+        assert ic.event_queue.put({"seq": i}) is True
+    status = ic.event_queue.status()
+    assert status["pending"] == 6
+    assert status["high_watermark"] == 6
+    assert status["rejected"] == 0
+
+
+def test_event_queue_gc_restores_admission(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    heap.free_bytes = RESERVE - 1024
+    heap._garbage = 2048
+    assert ic.event_queue.put({"seq": 1}) is True
+    assert heap.collects == 1
+
+
+def test_event_queue_pressure_rejects_new_event(monkeypatch):
+    ic, _ = _queue(monkeypatch, free_bytes=0)
+    assert ic.event_queue.put({"seq": 1}) is False
+    status = ic.event_queue.status()
+    assert status["pending"] == 0
+    assert status["rejected"] == 1
+
+
+def test_event_queue_never_evicts_admitted_events(monkeypatch):
+    ic, heap = _queue(monkeypatch)
+    assert ic.event_queue.put({"seq": 1}) is True
+    heap.free_bytes = 0  # unrecoverable pressure
+    assert ic.event_queue.put({"seq": 2}) is False
+    # The admitted event is untouched; the new one was rejected.
+    assert ic.event_queue.take() == {"seq": 1}
+    assert ic.event_queue.status()["pending"] == 0
+    assert ic.event_queue.status()["rejected"] == 1
+
+
+def test_event_queue_memoryerror_propagates(monkeypatch):
+    ic, _ = _queue(monkeypatch)
+
+    def _oom():
+        raise MemoryError
+
+    monkeypatch.setattr(gc, "mem_free", _oom, raising=False)
+    with pytest.raises(MemoryError):
+        ic.event_queue.put({"seq": 1})
+
+
+# ---------------------------------------------------------------------------
+# State mailboxes
+# ---------------------------------------------------------------------------
+
+
+def test_state_mailboxes_default_none():
+    boxes = StateMailboxes()
+    assert boxes.get_network_snapshot() is None
+    assert boxes.get_utc_snapshot() is None
+    assert boxes.get_core_1_activity_ms() is None
+    assert boxes.get_hardware() is None
+
+
+def test_state_mailboxes_set_get_network():
+    boxes = StateMailboxes()
+    snapshot = {"ssid": "test", "ip_address": "1.2.3.4"}
+    boxes.set_network_snapshot(snapshot)
+    assert boxes.get_network_snapshot() is snapshot
+
+
+def test_state_mailboxes_set_get_utc():
+    boxes = StateMailboxes()
+    snapshot = {"utc_epoch_ms": 1234567890000}
+    boxes.set_utc_snapshot(snapshot)
+    assert boxes.get_utc_snapshot() is snapshot
+
+
+def test_state_mailboxes_replacement_semantics():
+    boxes = StateMailboxes()
+    first = {"v": 1}
+    second = {"v": 2}
+    boxes.set_network_snapshot(first)
+    boxes.set_network_snapshot(second)
+    assert boxes.get_network_snapshot() is second
+
+
+def test_state_mailboxes_type_validation():
+    boxes = StateMailboxes()
+    for setter in (
+        boxes.set_network_snapshot,
+        boxes.set_utc_snapshot,
+        boxes.set_hardware,
+    ):
+        with pytest.raises(ValueError):
+            setter("not a dict")
+    with pytest.raises(ValueError):
+        boxes.set_core_1_activity_ms("not an int")
+    with pytest.raises(ValueError):
+        boxes.set_core_1_activity_ms(True)
+
+
+def test_state_mailboxes_core_1_activity():
+    boxes = StateMailboxes()
+    boxes.set_core_1_activity_ms(12345)
+    assert boxes.get_core_1_activity_ms() == 12345

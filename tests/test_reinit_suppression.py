@@ -163,9 +163,9 @@ class ReinitEnv:
         )
 
         raw = json.loads((ROOT / "config.json").read_text())
-        _core0, core1_config, _bus = split_config(raw)
+        _core0, core1_config= split_config(raw)
         self.config = core1_config
-        self.bus = InterCore(outbound_max=16, event_max=4)
+        self.bus = InterCore(minimum_free_heap_bytes=65536)
         self.uptime_state = self.core1.create_uptime_state(BOOT_TICKS_MS)
 
     def process_and_handle(self):

@@ -30,8 +30,6 @@ _REQUIRED_KEYS = (
     "datetime_sync_interval_min",
     "network_snapshot_interval_sec",
     "network_probe_timeout_sec",
-    "max_outbound_queue_entries",
-    "max_intercore_event_entries",
     "mqtt_topic_telemetry",
     "mqtt_topic_log",
     "mqtt_topic_command",
@@ -169,8 +167,6 @@ def load_config(path="config.json"):
         "datetime_sync_interval_min",
         "network_snapshot_interval_sec",
         "network_probe_timeout_sec",
-        "max_outbound_queue_entries",
-        "max_intercore_event_entries",
         "health_interval_sec",
     ):
         _require_positive_integer(config, key)
@@ -202,7 +198,12 @@ def load_wifi_config(path="config-secrets.json"):
 
 
 def split_config(config):
-    """Create the immutable-by-convention per-core startup configuration."""
+    """Create the immutable-by-convention per-core startup configuration.
+
+    The inter-core bus carries no configuration: its heap-reserve admission
+    bound is a board property owned by hardware.py and passed to InterCore
+    directly, so there is no bus_config to split out.
+    """
     core0 = {
         "source": config["source"],
         "mqtt_broker_ip_address": config["mqtt_broker_ip_address"],
@@ -233,8 +234,4 @@ def split_config(config):
         "devices": config["devices"],
     }
 
-    bus_config = {
-        "max_outbound_queue_entries": config["max_outbound_queue_entries"],
-        "max_intercore_event_entries": config["max_intercore_event_entries"],
-    }
-    return core0, core1, bus_config
+    return core0, core1

@@ -189,7 +189,7 @@ def _reload_core1_under_fakes():
 
 def _core1_config(health_interval_sec):
     config = json.loads((ROOT / "config.json").read_text())
-    _core0, core1_config, _bus = split_config(config)
+    _core0, core1_config= split_config(config)
     # Scheduling is independent of the device set; keep startup fast.
     core1_config["devices"] = []
     core1_config["health_interval_sec"] = health_interval_sec
@@ -246,7 +246,7 @@ def test_no_immediate_health_after_startup_log_admission():
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000  # startup completes at 13s uptime
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     fake_time = FakeTime(startup_at_ms, startup_at_ms + LOOP_STEP_MS)
@@ -273,7 +273,7 @@ def test_first_health_at_anchor_plus_interval_not_boot_or_immediate():
     startup_at_ms = boot_ticks_ms + 13000
     first_boundary_ms = startup_at_ms + 60000
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     fake_time = FakeTime(startup_at_ms, first_boundary_ms + LOOP_STEP_MS)
@@ -300,7 +300,7 @@ def test_fixed_cadence_from_normal_runtime_anchor():
     startup_at_ms = boot_ticks_ms + 13000
     last_boundary_ms = startup_at_ms + 240000
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     fake_time = FakeTime(startup_at_ms, last_boundary_ms + LOOP_STEP_MS)
@@ -329,7 +329,7 @@ def test_no_cumulative_drift_across_intervals():
     startup_at_ms = boot_ticks_ms + 13010  # 13.01s uptime, off-grid
     second_boundary_ms = startup_at_ms + 120000
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     fake_time = FakeTime(startup_at_ms, second_boundary_ms + LOOP_STEP_MS)
@@ -363,7 +363,7 @@ def test_missed_boundaries_after_stall_skipped_not_replayed():
     stall_at_ms = boot_ticks_ms + 185000
     resume_at_ms = stall_at_ms + 120000  # 305s uptime
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     events = [(stall_at_ms, lambda: fake_time.advance(120000))]
@@ -397,7 +397,7 @@ def test_mqtt_outage_skips_boundaries_and_does_not_replay_on_recovery():
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
-    bus = InterCore(outbound_max=16, event_max=4)
+    bus = InterCore(minimum_free_heap_bytes=65536)
     bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
     def _mqtt_down():
@@ -444,7 +444,7 @@ def test_new_runtime_creates_new_anchor():
         startup_at_ms = boot_ticks_ms + startup_uptime_ms
         first_boundary_ms = startup_at_ms + 60000
 
-        bus = InterCore(outbound_max=16, event_max=4)
+        bus = InterCore(minimum_free_heap_bytes=65536)
         bus.state_mailboxes.set_network_snapshot(dict(_ready_network_snapshot()))
 
         fake_time = FakeTime(startup_at_ms, first_boundary_ms + LOOP_STEP_MS)

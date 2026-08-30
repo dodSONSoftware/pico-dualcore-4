@@ -361,14 +361,11 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     devices_configured = devices["configured"]
     devices_active = devices["active"]
 
-    # Get queue status
-    outbound_queue = intercore.outbound_queue
-    (
-        queue_depth,
-        queue_capacity,
-        queue_queued_bytes,
-        queue_max_queued_bytes,
-    ) = outbound_queue.get_health_metrics()
+    # Get queue status. The queue is heap-governed (no fixed capacity), so the
+    # reportable metrics are depth, retained bytes, high watermarks, and the
+    # memory-pressure eviction/rejection counters -- not utilization against a
+    # capacity that no longer exists.
+    outbound_status = intercore.outbound_queue.status()
 
     # Get memory info
     try:
@@ -406,23 +403,6 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     # Calculate device failures from DeviceManager state
     device_failures = devices_configured - devices_active
 
-    # Calculate queue utilization percentages. The queue has two independent
-    # budgets (entry count and queued payload bytes); a handful of large
-    # entries can reach the byte ceiling while entry utilization is modest,
-    # so both are reported.
-    queue_utilization_percent = 0
-    if queue_capacity > 0:
-        queue_utilization_percent = (queue_depth * 100) // queue_capacity
-    queue_byte_utilization_percent = 0
-    if queue_max_queued_bytes > 0:
-        queue_byte_utilization_percent = (queue_queued_bytes * 100) // queue_max_queued_bytes
-
-    # Determine queue pressure: either budget at or beyond the 75% threshold
-    # is a full-condition risk, so pressure is the worse of the two.
-    queue_pressure = max(
-        queue_utilization_percent, queue_byte_utilization_percent
-    ) >= 75
-
     # Evaluate health status and build degraded reasons
     degraded_reasons = []
     network_stack_ready = bool(network_snapshot.get("network_stack_ready"))
@@ -441,8 +421,6 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
         degraded_reasons.append("low_free_heap")
     if devices_active != devices_configured:
         degraded_reasons.append("device_count_mismatch")
-    if queue_pressure:
-        degraded_reasons.append("outbound_queue_pressure")
     if not utc_valid:
         degraded_reasons.append("utc_not_valid")
 
@@ -479,12 +457,13 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
             "devices_configured": devices_configured,
             "devices_active": devices_active,
             "device_failures": device_failures,
-            "outbound_queue_depth": queue_depth,
-            "outbound_queue_capacity": queue_capacity,
-            "outbound_queue_utilization_percent": queue_utilization_percent,
-            "outbound_queued_bytes": queue_queued_bytes,
-            "outbound_max_queued_bytes": queue_max_queued_bytes,
-            "outbound_queue_byte_utilization_percent": queue_byte_utilization_percent,
+            "outbound_queue_depth": outbound_status["depth"],
+            "outbound_queued_bytes": outbound_status["queued_bytes"],
+            "outbound_queue_high_watermark": outbound_status["high_watermark"],
+            "outbound_queue_high_watermark_bytes": outbound_status["high_watermark_bytes"],
+            "outbound_evicted": outbound_status["messages_evicted"],
+            "telemetry_evicted": outbound_status["telemetry_evicted"],
+            "outbound_rejected": outbound_status["messages_rejected"],
             "utc_valid": utc_valid,
             "utc_sync_age_sec": utc_sync_age_sec,
         },

@@ -196,7 +196,7 @@ def _make_core0():
     importlib.reload(core0_mod)
 
     config = json.loads((ROOT / "config.json").read_text())
-    core0_config, _core1_config, _bus_config = split_config(config)
+    core0_config, _core1_config= split_config(config)
 
     instance = core0_mod.Core0(
         _MockInterCore(),

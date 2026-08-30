@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 import _thread
+import gc
 
 
 KIND_TELEMETRY = "telemetry"
@@ -21,17 +22,10 @@ RETENTION_PRIORITY_HEALTH = 70
 RETENTION_PRIORITY_MIN = RETENTION_PRIORITY_CRITICAL
 RETENTION_PRIORITY_MAX = RETENTION_PRIORITY_HEALTH
 
-# Aggregate retained-payload budget for the outbound queue (32 KiB).
-#
-# Entry count alone is not a memory-safety boundary: 16 retained 16 KiB payloads
-# would be 256 KiB, exhausting a Pico W's heap. This budget caps total retained
-# payload bytes so the queue is bounded by BOTH entry count and bytes. Sized to
-# hold a realistic full queue (16 entries x ~2 KiB). The single in-flight entry
-# is retained until its PUBACK (take() does not free it), so it counts against
-# this budget along with the queued FIFO -- a full queue plus its in-flight
-# entry still cannot exceed it. Per-message size is bounded separately by
-# message_serializer.MAX_OUTBOUND_MESSAGE_BYTES (16 KiB).
-DEFAULT_MAX_OUTBOUND_QUEUED_BYTES = 32 * 1024
+
+def _require_positive_integer(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("{} must be a positive integer".format(name))
 
 
 class OutboundQueue:
@@ -49,42 +43,52 @@ class OutboundQueue:
     injects them at publish time; a queued message must not carry any of them
     at the top level, or the wire document would repeat a member name.
 
-    Capacity rule:
-    The queue is bounded by BOTH entry count (max_entries) and retained payload
-    bytes (max_queued_bytes, which include the in-flight entry). Either budget
-    being exceeded is a full condition.
+    Capacity rule (heap-governed):
+    The queue has NO fixed entry-count or retained-byte capacity. Admission is
+    governed by the global minimum free-heap reserve (a board property owned
+    by hardware.py): an entry may be retained only while gc.mem_free() is at
+    or above the reserve. The queue tracks depth, retained payload bytes
+    (queued FIFO plus in-flight entry), and high watermarks for observability
+    -- they are metrics, not capacity limits.
 
-    Retention rule:
-    Lower numeric retention priorities are more important. When a budget is
-    full, the oldest entry in the least-important queued priority class is
-    evicted only when the incoming entry is at least as important AND evicting
-    it frees enough room (by count or by bytes) for the incoming entry. A valid
-    queued entry is never dropped to admit one that still would not fit. An
-    in-flight QoS 1 entry consumes both budgets (its payload is retained until
-    its PUBACK) but is never an eviction candidate.
+    Admission rule (heap-governed):
+    Fast path: if gc.mem_free() >= the reserve, the entry is admitted with no
+    garbage collection. Pressure path: if the heap is below the reserve,
+    gc.collect() runs once; if the reserve is still not restored, the oldest
+    entry in the least-important queued priority class is evicted (only when
+    the incoming entry is at least as important), gc.collect() runs again, and
+    the heap is rechecked. Eviction repeats until the reserve is restored or
+    no eligible lower-priority entry remains, then the incoming entry is
+    admitted or rejected. The in-flight QoS 1 entry is retained until its
+    PUBACK and is never an eviction candidate.
+
+    Concurrency rule:
+    The heap, and therefore the reserve, is global to both cores. The
+    heap measurement, pressure-path gc.collect(), eviction decisions, and
+    admission all run while the shared heap-admission lock (owned by InterCore
+    and shared with the event queue) is held, so the two queues cannot both
+    admit against the same stale free-heap reading.
     """
 
-    def __init__(self, max_entries, max_queued_bytes=DEFAULT_MAX_OUTBOUND_QUEUED_BYTES):
-        if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries <= 0:
-            raise ValueError("max_entries must be a positive integer")
-        if (
-            isinstance(max_queued_bytes, bool)
-            or not isinstance(max_queued_bytes, int)
-            or max_queued_bytes <= 0
-        ):
-            raise ValueError("max_queued_bytes must be a positive integer")
-        self._max_entries = max_entries
-        self._max_queued_bytes = max_queued_bytes
+    def __init__(self, minimum_free_heap_bytes, heap_admission_lock):
+        _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
+        self._minimum_free_heap_bytes = minimum_free_heap_bytes
+        self._heap_admission_lock = heap_admission_lock
         self._queue = []
         self._in_flight = None
         self._lock = _thread.allocate_lock()
+        # Observability only -- metrics, not capacity limits.
         self._high_watermark = 0
+        self._high_watermark_bytes = 0
         self._queued_bytes = 0
         self._messages_evicted = 0
         self._telemetry_evicted = 0
         self._messages_rejected = 0
         self._serialization_rejected = 0
         self._oversized_rejected = 0
+
+    def _reserve_restored(self):
+        return gc.mem_free() >= self._minimum_free_heap_bytes
 
     def _evict_oldest_by_priority_locked(self, retention_priority):
         for index, entry in enumerate(self._queue):
@@ -97,84 +101,74 @@ class OutboundQueue:
                 return True
         return False
 
-    def _oldest_entry_size_for_priority_locked(self, retention_priority):
-        """Return the byte size of the oldest queued entry in a priority class.
-
-        Used to feasibility-check eviction BEFORE it happens so a valid entry is
-        never dropped to admit one that still would not fit. Returns None when
-        the class is absent.
-        """
-        for entry in self._queue:
-            if entry["retention_priority"] == retention_priority:
-                return len(entry["payload_bytes"])
-        return None
-
-    def _admit_locked(self, kind, payload_bytes, retention_priority):
-        """Apply the admission decision for an entry. Lock must be held.
-
-        Enforces BOTH the entry-count budget and the queued-byte budget under the
-        retention/eviction policy. Evicts the oldest entry in the least-important
-        queued class only when the incoming entry is at least as important AND the
-        eviction frees enough room (by count or by bytes). Returns True if the
-        entry was admitted, False if it was rejected.
-        """
-        new_bytes = len(payload_bytes)
-        occupied = len(self._queue) + (1 if self._in_flight is not None else 0)
-        count_full = occupied >= self._max_entries
-        bytes_over = (self._queued_bytes + new_bytes) > self._max_queued_bytes
-
-        if count_full or bytes_over:
-            if not self._queue:
-                self._messages_rejected += 1
-                return False
-
-            worst_priority = max(entry["retention_priority"] for entry in self._queue)
-            # Incoming is less important than everything queued: do not evict.
-            if retention_priority > worst_priority:
-                self._messages_rejected += 1
-                return False
-
-            evicted_size = self._oldest_entry_size_for_priority_locked(worst_priority)
-            if evicted_size is None:
-                self._messages_rejected += 1
-                return False
-
-            # Evict only if it frees enough room for the incoming entry;
-            # otherwise reject without disturbing the valid queued entry.
-            if (self._queued_bytes - evicted_size + new_bytes) > self._max_queued_bytes:
-                self._messages_rejected += 1
-                return False
-
-            self._evict_oldest_by_priority_locked(worst_priority)
-
+    def _append_locked(self, kind, payload_bytes, retention_priority):
         entry = {
             "kind": kind,
             "retention_priority": retention_priority,
             "payload_bytes": payload_bytes,
         }
         self._queue.append(entry)
-        self._queued_bytes += new_bytes
-
+        self._queued_bytes += len(payload_bytes)
         depth = len(self._queue)
         if depth > self._high_watermark:
             self._high_watermark = depth
+        if self._queued_bytes > self._high_watermark_bytes:
+            self._high_watermark_bytes = self._queued_bytes
         return True
+
+    def _admit_heap_governed(self, kind, payload_bytes, retention_priority):
+        """Apply the heap-reserve admission decision. No locks are held on entry.
+
+        Fast path: reserve satisfied -> admit, no garbage collection.
+        Pressure path: gc.collect() once; if the reserve is still not restored,
+        evict the oldest entry in the least-important eligible queued class,
+        gc.collect(), and recheck -- repeating until the reserve is restored or
+        no eligible lower-priority entry remains, then admit or reject.
+        """
+        with self._heap_admission_lock:
+            if not self._reserve_restored():
+                gc.collect()
+            if self._reserve_restored():
+                with self._lock:
+                    return self._append_locked(kind, payload_bytes, retention_priority)
+
+            # Genuine retained-memory pressure: displace the least-important
+            # eligible entries one at a time, reclaiming after each, until the
+            # reserve is restored or nothing eligible remains.
+            with self._lock:
+                while True:
+                    if not self._queue:
+                        self._messages_rejected += 1
+                        return False
+                    # Explicit loop: no generator/list allocation in the
+                    # pressure path (MCU-safe).
+                    worst_priority = RETENTION_PRIORITY_MIN
+                    for entry in self._queue:
+                        if entry["retention_priority"] > worst_priority:
+                            worst_priority = entry["retention_priority"]
+                    # Incoming is less important than everything queued: reject
+                    # rather than evict a more important retained entry.
+                    if retention_priority > worst_priority:
+                        self._messages_rejected += 1
+                        return False
+                    self._evict_oldest_by_priority_locked(worst_priority)
+                    gc.collect()
+                    if self._reserve_restored():
+                        return self._append_locked(kind, payload_bytes, retention_priority)
 
     def put(self, kind, message, retention_priority):
         """Admit one MQTT-bound message after validation, serialization, and encoding.
 
-        The message is validated, serialized to JSON, UTF-8 encoded, and size-checked
-        before admission. The queue stores the final payload bytes, not the original
-        dictionary.
+        The message is validated, serialized to JSON, UTF-8 encoded, and
+        size-checked before admission. The queue stores the final payload
+        bytes, not the original dictionary.
 
-        When full, compare the incoming priority with the least-important
-        queued priority (highest numeric value):
-          * incoming more important: evict oldest least-important entry
-          * incoming equally important: evict oldest entry in that class
-          * incoming less important: reject incoming entry
+        Admission is heap-governed (see the class docstring): the entry is
+        retained only while the global free-heap reserve is satisfied, evicting
+        the least-important eligible entries under memory pressure.
 
-        The in-flight QoS 1 entry counts toward max_entries but cannot be
-        evicted. If no queued entry is available for eviction, admission fails.
+        The in-flight QoS 1 entry is retained until its PUBACK and is never an
+        eviction candidate.
         """
         if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
@@ -213,8 +207,7 @@ class OutboundQueue:
             self._serialization_rejected += 1
             return False
 
-        with self._lock:
-            return self._admit_locked(kind, payload_bytes, retention_priority)
+        return self._admit_heap_governed(kind, payload_bytes, retention_priority)
 
     def put_with_kind(self, kind, payload_bytes, retention_priority):
         """Admit one MQTT-bound message with a specific kind (e.g., health, log).
@@ -223,6 +216,7 @@ class OutboundQueue:
         The per-message ceiling is enforced here, not by the caller: a payload
         longer than MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) is rejected without
         affecting queue state, the same as the put() serialization path.
+        Admission is then heap-governed (see the class docstring).
 
         Args:
             kind: Message kind (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG)
@@ -255,8 +249,7 @@ class OutboundQueue:
             self._oversized_rejected += 1
             return False
 
-        with self._lock:
-            return self._admit_locked(kind, payload_bytes, retention_priority)
+        return self._admit_heap_governed(kind, payload_bytes, retention_priority)
 
     def take(self):
         """Return the current in-flight entry or move one queued entry into it."""
@@ -268,8 +261,7 @@ class OutboundQueue:
             self._in_flight = self._queue.pop(0)
             # The entry left the queued FIFO, but its payload is still retained
             # (freed only when complete_in_flight releases it), so it stays
-            # counted toward the byte budget: the budget caps ALL retained
-            # payload, not just the FIFO.
+            # counted in the retained-byte metric.
             return self._in_flight
 
     def complete_in_flight(self, entry):
@@ -277,7 +269,7 @@ class OutboundQueue:
             if self._in_flight is entry:
                 self._in_flight = None
                 # The in-flight payload is released only now (PUBACK received),
-                # so its bytes return to the budget here, not at take().
+                # so its bytes leave the retained-byte metric here.
                 self._queued_bytes -= len(entry["payload_bytes"])
                 return True
             return False
@@ -287,14 +279,24 @@ class OutboundQueue:
             return self._in_flight is not None
 
     def status(self):
+        """Return the queue's observability metrics.
+
+        depth/pending are the entry view (the in-flight entry counts toward
+        depth); queued_bytes is the retained-payload view (the queued FIFO plus
+        the in-flight entry, retained until its PUBACK). Both include the
+        in-flight entry and are read under the same lock so the snapshot is
+        consistent. None of these are capacity limits -- admission is governed
+        by the global free-heap reserve.
+        """
         with self._lock:
+            in_flight = self._in_flight is not None
             return {
                 "pending": len(self._queue),
-                "in_flight": self._in_flight is not None,
-                "max": self._max_entries,
+                "depth": len(self._queue) + (1 if in_flight else 0),
+                "in_flight": in_flight,
                 "queued_bytes": self._queued_bytes,
-                "max_queued_bytes": self._max_queued_bytes,
                 "high_watermark": self._high_watermark,
+                "high_watermark_bytes": self._high_watermark_bytes,
                 "messages_evicted": self._messages_evicted,
                 "telemetry_evicted": self._telemetry_evicted,
                 "messages_rejected": self._messages_rejected,
@@ -307,62 +309,58 @@ class OutboundQueue:
         with self._lock:
             return len(self._queue) + (1 if self._in_flight is not None else 0)
 
-    def get_depth_with_capacity(self):
-        """Return queue depth and capacity tuple for health reporting."""
-        with self._lock:
-            depth = len(self._queue) + (1 if self._in_flight is not None else 0)
-            return depth, self._max_entries
-
-    def get_health_metrics(self):
-        """Return (depth, max_entries, queued_bytes, max_queued_bytes) for health reporting.
-
-        Depth and max_entries are the entry-budget view (the in-flight entry
-        counts toward depth, matching the entry budget in _admit_locked).
-        queued_bytes is the byte-budget view: ALL retained payload bytes, the
-        queued FIFO plus the in-flight entry (retained until its PUBACK), since
-        the budget caps retained memory, not just the FIFO. Both views include
-        the in-flight entry and are read under the same lock so the pair is
-        consistent.
-        """
-        with self._lock:
-            depth = len(self._queue) + (1 if self._in_flight is not None else 0)
-            return (
-                depth,
-                self._max_entries,
-                self._queued_bytes,
-                self._max_queued_bytes,
-            )
-
 
 class InterCoreEventQueue:
     """Private FIFO for discrete Core 0 -> Core 1 events.
 
     These events are never MQTT-bound merely because they are in this queue.
+
+    Capacity rule (heap-governed):
+    The queue has NO fixed entry-count capacity. Admission is governed by the
+    same global minimum free-heap reserve the outbound queue uses, under the
+    same shared heap-admission lock: an event may be retained only while
+    gc.mem_free() is at or above the reserve.
+
+    No-eviction rule:
+    An admitted event is a discrete control operation and is never evicted to
+    make room for a newer one. When the reserve cannot be satisfied (even
+    after gc.collect()), the new event is rejected and the caller reports the
+    memory-pressure failure; already-admitted events are untouched.
     """
 
-    def __init__(self, max_entries):
-        if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries <= 0:
-            raise ValueError("max_entries must be a positive integer")
-        self._max_entries = max_entries
+    def __init__(self, minimum_free_heap_bytes, heap_admission_lock):
+        _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
+        self._minimum_free_heap_bytes = minimum_free_heap_bytes
+        self._heap_admission_lock = heap_admission_lock
         self._queue = []
         self._lock = _thread.allocate_lock()
         self._high_watermark = 0
         self._rejected = 0
 
     def put(self, event):
+        """Admit one event, or reject it under memory pressure.
+
+        Fast path: reserve satisfied -> admit, no garbage collection.
+        Pressure path: gc.collect() once; if the reserve is still not
+        restored, the new event is rejected -- never at the cost of an
+        already-admitted event.
+        """
         if not isinstance(event, dict):
             raise ValueError("inter-core event must be a dictionary")
 
         # After successful admission, event is immutable.
-        with self._lock:
-            if len(self._queue) >= self._max_entries:
-                self._rejected += 1
-                return False
-            self._queue.append(event)
-            depth = len(self._queue)
-            if depth > self._high_watermark:
-                self._high_watermark = depth
-            return True
+        with self._heap_admission_lock:
+            if gc.mem_free() < self._minimum_free_heap_bytes:
+                gc.collect()
+            if gc.mem_free() >= self._minimum_free_heap_bytes:
+                with self._lock:
+                    self._queue.append(event)
+                    depth = len(self._queue)
+                    if depth > self._high_watermark:
+                        self._high_watermark = depth
+                    return True
+            self._rejected += 1
+            return False
 
     def take(self):
         with self._lock:
@@ -374,7 +372,6 @@ class InterCoreEventQueue:
         with self._lock:
             return {
                 "pending": len(self._queue),
-                "max": self._max_entries,
                 "high_watermark": self._high_watermark,
                 "rejected": self._rejected,
             }
@@ -439,9 +436,24 @@ class StateMailboxes:
 
 
 class InterCore:
-    """Container exposing the three explicit communication lanes."""
+    """Container exposing the three explicit communication lanes.
 
-    def __init__(self, outbound_max=16, event_max=4, outbound_max_bytes=DEFAULT_MAX_OUTBOUND_QUEUED_BYTES):
-        self.outbound_queue = OutboundQueue(outbound_max, outbound_max_bytes)
-        self.event_queue = InterCoreEventQueue(event_max)
+    The two FIFO lanes are heap-governed: both admit only while gc.mem_free()
+    stays at or above the board-specific minimum free-heap reserve (single
+    source of truth: hardware.py), and they serialize that check -- together
+    with the pressure-path gc.collect() and the outbound eviction decisions --
+    on one shared heap-admission lock, because the MicroPython heap (and its
+    reserve) is global to both cores.
+    """
+
+    def __init__(self, minimum_free_heap_bytes):
+        _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
+        self.minimum_free_heap_bytes = minimum_free_heap_bytes
+        self._heap_admission_lock = _thread.allocate_lock()
+        self.outbound_queue = OutboundQueue(
+            minimum_free_heap_bytes, self._heap_admission_lock
+        )
+        self.event_queue = InterCoreEventQueue(
+            minimum_free_heap_bytes, self._heap_admission_lock
+        )
         self.state_mailboxes = StateMailboxes()

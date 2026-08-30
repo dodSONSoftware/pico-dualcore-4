@@ -134,7 +134,7 @@ def test_config_has_network_probe_properties():
 def test_core0_config_has_network_probe():
     """Verify network probe config is in Core 0's view."""
     config = _base_config()
-    core0, core1, bus = split_config(config)
+    core0, core1 = split_config(config)
 
     assert "network_probe_timeout_sec" in core0
     assert "mqtt_topic_network_probe" in core0

@@ -27,8 +27,9 @@ import json
 # Pico W (256 KiB SRAM, 64 KiB reserved). 16 KiB keeps a single message's transient
 # peak (graph + str + bytes, ~3x) to roughly 48 KiB and leaves ~6x headroom over the
 # largest legitimate message (the one-shot startup log, which is the only payload that
-# grows with device count). The aggregate retained footprint is separately bounded by
-# OutboundQueue's queued-byte budget (see intercore.DEFAULT_MAX_OUTBOUND_QUEUED_BYTES).
+# grows with device count). The aggregate retained footprint is separately governed
+# by the global minimum free-heap reserve that both inter-core queues enforce at
+# admission (the reserve itself is owned by hardware.py).
 MAX_OUTBOUND_MESSAGE_BYTES = 16 * 1024
 
 
