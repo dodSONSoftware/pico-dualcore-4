@@ -7,7 +7,7 @@ import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-CORE0_FILES = ("core0.py", "wifi.py", "mqtt.py", "mqtt_client.py")
+CORE0_FILES = ("core0.py", "wifi.py", "mqtt.py", "mqtt_client.py", "network_diagnostics.py")
 CORE1_FILES = (
     "core1.py",
     "device_manager.py",

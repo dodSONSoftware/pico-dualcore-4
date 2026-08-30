@@ -162,9 +162,20 @@ class FakeMqtt:
         self.connected = False
 
     def status(self):
-        return {"connected": self.connected, "connect_count": 1, "disconnect_count": 0}
+        return {
+            "connected": self.connected,
+            "connect_count": 1,
+            "disconnect_count": 0,
+            "publish_attempt_count": 0,
+            "publish_retry_count": 0,
+            "puback_timeout_count": 0,
+            "connection_failure_count": 0,
+            "reconnect_success_count": 0,
+            "last_reconnect_duration_ms": 0,
+            "last_outage_duration_ms": 0,
+        }
 
-    def publish_qos1(self, topic, message):
+    def publish_qos1(self, topic, message, is_retry=False):
         pass
 
     def check_msg(self):

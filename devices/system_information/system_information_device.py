@@ -80,6 +80,10 @@ class SystemInformationDevice(Device):
             return self._system_information.get_queues()
         if section == "device_status":
             return self._system_information.get_device_status()
+        if section == "configuration":
+            return self._system_information.get_configuration()
+        if section == "capabilities":
+            return self._system_information.get_capabilities()
 
         raise ValueError(
             "Unsupported system information section: {}".format(section)

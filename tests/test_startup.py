@@ -93,10 +93,12 @@ class MockMqtt:
     def check_msg(self):
         pass
 
-    def publish_qos1(self, topic, message):
+    def publish_qos1(self, topic, message, is_retry=False):
         pass
 
-    def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):
+    def publish_qos1_with_packet_id(
+        self, topic, message, packet_id, timeout_ms=None, is_retry=False
+    ):
         # Simulate successful PUBACK
         return True
 
@@ -116,6 +118,13 @@ class MockMqtt:
             "connected": self._connected,
             "connect_count": self._connect_count,
             "disconnect_count": self._disconnect_count,
+            "publish_attempt_count": 0,
+            "publish_retry_count": 0,
+            "puback_timeout_count": 0,
+            "connection_failure_count": 0,
+            "reconnect_success_count": 0,
+            "last_reconnect_duration_ms": 0,
+            "last_outage_duration_ms": 0,
         }
 
 

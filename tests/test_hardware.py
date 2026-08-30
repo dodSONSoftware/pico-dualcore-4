@@ -22,21 +22,53 @@ sys.modules['machine'] = MockMachine()
 from system_information import SystemInformation
 
 
+class FakeResetCauseMachine:
+    """Fake ``machine`` module exposing reset-cause constants for host tests.
+
+    ``reset_cause()`` returns the configured cause, or raises the configured
+    error, so each test drives the production mapping path in hardware.py.
+    """
+
+    PWRON_RESET = 0
+    HARD_RESET = 1
+    WDT_RESET = 2
+    DEEPSLEEP_RESET = 3
+    SOFT_RESET = 4
+
+    def __init__(self, cause=None, error=None):
+        self._cause = cause
+        self._error = error
+
+    def reset_cause(self):
+        if self._error is not None:
+            raise self._error
+        return self._cause
+
+
 class MockInterCore:
     """Mock inter-core bus for testing."""
-    def __init__(self):
+    def __init__(self, hardware=None):
         self.outbound_queue = None
         self.event_queue = None
-        self.state_mailboxes = MockStateMailboxes()
+        self.state_mailboxes = MockStateMailboxes(hardware)
 
 
 class MockStateMailboxes:
     """Mock state mailboxes for testing."""
+    def __init__(self, hardware=None):
+        self._hardware = hardware
+
     def get_network_snapshot(self):
         return {"wifi_connected": False, "mqtt_connected": False}
 
     def get_utc_snapshot(self):
         return None
+
+    def get_hardware(self):
+        return self._hardware
+
+    def set_hardware(self, hardware):
+        self._hardware = hardware
 
 
 class MockConfig:
@@ -63,6 +95,66 @@ class TestHardwareConstants:
     def test_pico_2_w_heap_reserve(self):
         """Verify Pico 2 W minimum free-heap reserve."""
         assert hardware.PICO_2_W_MIN_FREE_HEAP_BYTES == 131072  # 128 KiB
+
+    def test_reset_cause_constants(self):
+        """Verify the canonical reset-cause strings."""
+        assert hardware.RESET_CAUSE_POWER_ON == "power_on_reset"
+        assert hardware.RESET_CAUSE_HARD == "hard_reset"
+        assert hardware.RESET_CAUSE_WATCHDOG == "watchdog_reset"
+        assert hardware.RESET_CAUSE_DEEP_SLEEP == "deep_sleep_reset"
+        assert hardware.RESET_CAUSE_SOFT == "soft_reset"
+        assert hardware.RESET_CAUSE_UNKNOWN == "unknown"
+
+
+class TestReadLastResetCause:
+    """Test the production machine.reset_cause() -> canonical string mapping."""
+
+    def _install(self, monkeypatch, fake):
+        monkeypatch.setitem(sys.modules, "machine", fake)
+
+    def test_power_on_reset(self, monkeypatch):
+        self._install(monkeypatch, FakeResetCauseMachine(cause=FakeResetCauseMachine.PWRON_RESET))
+
+        assert hardware.read_last_reset_cause() == "power_on_reset"
+
+    def test_hard_reset(self, monkeypatch):
+        self._install(monkeypatch, FakeResetCauseMachine(cause=FakeResetCauseMachine.HARD_RESET))
+
+        assert hardware.read_last_reset_cause() == "hard_reset"
+
+    def test_watchdog_reset(self, monkeypatch):
+        self._install(monkeypatch, FakeResetCauseMachine(cause=FakeResetCauseMachine.WDT_RESET))
+
+        assert hardware.read_last_reset_cause() == "watchdog_reset"
+
+    def test_deep_sleep_reset(self, monkeypatch):
+        self._install(monkeypatch, FakeResetCauseMachine(cause=FakeResetCauseMachine.DEEPSLEEP_RESET))
+
+        assert hardware.read_last_reset_cause() == "deep_sleep_reset"
+
+    def test_soft_reset(self, monkeypatch):
+        self._install(monkeypatch, FakeResetCauseMachine(cause=FakeResetCauseMachine.SOFT_RESET))
+
+        assert hardware.read_last_reset_cause() == "soft_reset"
+
+    def test_unknown_integer_returns_unknown(self, monkeypatch):
+        """An unrecognized cause value must safely become "unknown"."""
+        self._install(monkeypatch, FakeResetCauseMachine(cause=99))
+
+        assert hardware.read_last_reset_cause() == "unknown"
+
+    def test_ordinary_exception_returns_unknown(self, monkeypatch):
+        """An ordinary read failure must degrade to "unknown", not raise."""
+        self._install(monkeypatch, FakeResetCauseMachine(error=RuntimeError("no cause")))
+
+        assert hardware.read_last_reset_cause() == "unknown"
+
+    def test_memory_error_propagates(self, monkeypatch):
+        """Heap exhaustion must propagate, not be swallowed as "unknown"."""
+        self._install(monkeypatch, FakeResetCauseMachine(error=MemoryError("heap")))
+
+        with pytest.raises(MemoryError):
+            hardware.read_last_reset_cause()
 
 
 class TestDetectHardware:
@@ -287,3 +379,38 @@ class TestGetMachineConsumesSharedClassifier:
 
         assert result["hardware_type"] == "unknown"
         assert result["minimum_free_heap_bytes"] is None
+
+
+class TestGetMachineLastResetCause:
+    """get_machine() reports the startup snapshot's reset cause (never re-reads it)."""
+
+    def test_reports_reset_cause_from_startup_snapshot(self):
+        """The snapshot's last_reset_cause is carried into the machine section."""
+        intercore = MockInterCore(hardware={
+            "hardware_type": "pico_2_w",
+            "machine": "Raspberry Pi Pico 2 W with RP2350",
+            "minimum_free_heap_bytes": 131072,
+            "last_reset_cause": "watchdog_reset",
+        })
+
+        result = SystemInformation(intercore, MockConfig()).get_machine()
+
+        assert result["last_reset_cause"] == "watchdog_reset"
+
+    def test_falls_back_to_unknown_when_field_unavailable(self):
+        """A snapshot without the field reports "unknown" rather than failing."""
+        intercore = MockInterCore(hardware={
+            "hardware_type": "pico_w",
+            "machine": "Raspberry Pi Pico W with RP2040",
+            "minimum_free_heap_bytes": 65536,
+        })
+
+        result = SystemInformation(intercore, MockConfig()).get_machine()
+
+        assert result["last_reset_cause"] == "unknown"
+
+    def test_falls_back_to_unknown_when_snapshot_unavailable(self):
+        """No published snapshot at all reports "unknown" rather than failing."""
+        result = SystemInformation(MockInterCore(), MockConfig()).get_machine()
+
+        assert result["last_reset_cause"] == "unknown"

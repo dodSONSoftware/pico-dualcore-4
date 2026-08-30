@@ -6,7 +6,7 @@
 
 The health cadence is defined relative to the normal-runtime anchor,
 ``normal_runtime_start_ticks_ms`` -- captured exactly once, immediately
-after ``system_startup_completed`` has been successfully admitted to the
+after ``runtime_started`` has been successfully admitted to the
 outbound queue:
 
 - boundaries fall at ``health_interval_sec`` multiples from the anchor
@@ -257,7 +257,7 @@ def test_no_immediate_health_after_startup_log_admission():
     assert len(others) == 1
     startup_log = json.loads(others[0]["payload_bytes"].decode("utf-8"))
     assert others[0]["kind"] == KIND_LOG
-    assert startup_log["payload"]["event"] == "system_startup_completed"
+    assert startup_log["payload"]["event"] == "runtime_started"
     assert startup_log["uptime_ms"] == 13000
 
 

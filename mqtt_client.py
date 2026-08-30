@@ -2,6 +2,7 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
+import errno
 import select
 import socket
 import struct
@@ -21,6 +22,28 @@ MAX_INBOUND_PACKET_BYTES = 16 * 1024
 
 class MQTTException(Exception):
     pass
+
+
+class MQTTPubackTimeout(MQTTException):
+    """The complete QoS 1 PUBLISH frame was written, then the PUBACK wait timed out.
+
+    Distinct from a PUBLISH frame *write* timeout (an ordinary socket failure):
+    here the whole frame went out and the firmware gave up waiting for its
+    matching PUBACK. The Mqtt layer counts only this condition in
+    puback_timeout_count, so it is raised here and nowhere else.
+    """
+    pass
+
+
+def is_socket_timeout(err):
+    """True iff ``err`` is a socket timeout (a finite wait that expired).
+
+    Classified by the numeric timeout errno, not the human-readable message:
+    MicroPython raises OSError(errno.ETIMEDOUT, ...) when a bounded read/write
+    times out. A connection reset, a closed read (OSError(-1)), a protocol
+    violation, or any non-OSError is not a timeout.
+    """
+    return getattr(err, "errno", None) == errno.ETIMEDOUT
 
 
 class MQTTClient:
@@ -256,15 +279,26 @@ class MQTTClient:
                 self.sock.write(pkt, 2)
             self.sock.write(msg)
             if qos == 1:
-                while 1:
-                    op = self.wait_msg()
-                    if op == 0x40:
-                        sz = self.sock.read(1)
-                        assert sz == b"\x02"
-                        rcv_pid = self.sock.read(2)
-                        rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
-                        if pid == rcv_pid:
-                            return
+                # The PUBLISH frame is fully written by here. A timeout in this
+                # wait is specifically a PUBACK timeout, so it surfaces as its
+                # own exception for the Mqtt layer to count in
+                # puback_timeout_count. Any other socket error (a reset, a
+                # closed read, a protocol violation) is not a timeout and is
+                # re-raised unchanged so it is never miscounted as one.
+                try:
+                    while 1:
+                        op = self.wait_msg()
+                        if op == 0x40:
+                            sz = self.sock.read(1)
+                            assert sz == b"\x02"
+                            rcv_pid = self.sock.read(2)
+                            rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
+                            if pid == rcv_pid:
+                                return
+                except OSError as err:
+                    if is_socket_timeout(err):
+                        raise MQTTPubackTimeout()
+                    raise
         finally:
             if timed:
                 try:
