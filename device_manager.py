@@ -18,19 +18,6 @@ DEVICE_RESULT_REINITIALIZED = "reinitialized"
 DEVICE_RESULT_REINITIALIZATION_FAILED = "reinitialization_failed"
 
 
-class DeviceReconfigureError(Exception):
-    """A reconfigure candidate failed to build or initialize.
-
-    Carries the failing device id so the transaction layer can report a stable
-    error code with focused data (never the full candidate set).
-    """
-
-    def __init__(self, device_id, message):
-        super().__init__("device reconfiguration failed for {}: {}".format(device_id, message))
-        self.device_id = device_id
-        self.message = message
-
-
 class ManagedDevice:
     """Runtime wrapper around a successfully initialized device."""
 
@@ -340,115 +327,6 @@ class DeviceManager:
                 initialized_count += 1
 
         return initialized_count, all_failed_device_details, all_attempt_logs
-
-    def apply_dynamic_limits(self, values):
-        """Apply DYNAMIC lifecycle-limit keys (values already patch-validated).
-
-        Takes effect from the next initialization/reinitialization attempt.
-        """
-        for key, value in values.items():
-            if key == "device_initialization_attempts":
-                self._device_initialization_attempts = value
-            elif key == "device_initialization_retry_delay_ms":
-                self._device_initialization_retry_delay_ms = value
-            elif key == "device_read_failure_threshold":
-                self._device_read_failure_threshold = value
-            else:
-                raise ValueError("unknown device limit key: {}".format(key))
-
-    def _build_candidate(self, device_def):
-        """Build and initialize one candidate without touching the active set.
-
-        Uses the same bounded retry policy as boot initialization. Any
-        construction or initialization failure raises DeviceReconfigureError;
-        a MemoryError propagates. The candidate is fully initialized before it
-        is ever visible to reads -- the known-good set is never torn down
-        first.
-        """
-        device_id = device_def["id"]
-        device_type = device_def["device_type"]
-
-        driver, driver_error = self._create_driver(device_def)
-        if driver is None:
-            raise DeviceReconfigureError(device_id, str(driver_error))
-
-        attempts_used, initialized = self._initialize_driver_with_retries(
-            driver, device_def, device_id, device_type, []
-        )
-        if not initialized:
-            raise DeviceReconfigureError(
-                device_id,
-                "initialization failed after {} attempt(s)".format(attempts_used),
-            )
-
-        managed_device = ManagedDevice(
-            device_id=device_id,
-            device_type=device_type,
-            sensor_type=device_def.get("sensor_type", "unknown"),
-            driver=driver,
-            name=device_def.get("name"),
-        )
-        managed_device.initialization_attempts_used = attempts_used
-        return managed_device
-
-    def reconfigure_devices(self, candidate_definitions):
-        """All-or-nothing device set swap for a RECONFIGURE transaction.
-
-        Devices whose definition is unchanged keep their existing
-        ManagedDevice (runtime state, failure counts, and reinit position
-        survive); new or changed ids are built and fully initialized as
-        candidates. If ANY candidate fails, every candidate is discarded,
-        the active set is untouched, and DeviceReconfigureError is raised.
-
-        On success the active list, the id index, and the device config
-        (so reinitialization lookups see the new definitions) are swapped
-        atomically, and a rollback token is returned. This is deliberately
-        stricter than boot initialization, which continues past failures.
-        """
-        previous_by_id = {}
-        for device_def in self._devices_config:
-            previous_by_id[device_def["id"]] = device_def
-        current_by_id = {}
-        for managed_device in self._active_devices:
-            current_by_id[managed_device.device_id] = managed_device
-
-        new_candidates = []
-        for device_def in candidate_definitions:
-            device_id = device_def["id"]
-            current_def = previous_by_id.get(device_id)
-            current_managed = current_by_id.get(device_id)
-            if (
-                current_managed is not None
-                and current_def is not None
-                and current_def == device_def
-            ):
-                # Unchanged: retain the running instance exactly.
-                new_candidates.append(current_managed)
-                continue
-            # New or changed: fully initialize the candidate first.
-            new_candidates.append(self._build_candidate(device_def))
-
-        token = {
-            "active_devices": self._active_devices,
-            "devices_by_id": self._devices_by_id,
-            "devices_config": self._devices_config,
-        }
-        self._active_devices = new_candidates
-        self._devices_by_id = {}
-        for managed_device in new_candidates:
-            self._devices_by_id[managed_device.device_id] = managed_device
-        self._devices_config = candidate_definitions
-        return token
-
-    def rollback_devices(self, token):
-        """Restore the pre-reconfigure active set, id index, and config.
-
-        Discards the candidate instances (unreferenced; drivers carry no
-        shutdown interface). Safe to call once per token.
-        """
-        self._active_devices = token["active_devices"]
-        self._devices_by_id = token["devices_by_id"]
-        self._devices_config = token["devices_config"]
 
     def get_active_devices(self):
         """

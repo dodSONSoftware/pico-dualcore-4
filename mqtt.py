@@ -6,7 +6,7 @@ import machine
 import time
 
 from debug import DEBUG
-from mqtt_client import MQTTClient, MQTTPubackTimeout
+from mqtt_client import MQTTClient
 
 # Bounded wait for PINGRESP so a dead link surfaces quickly instead of
 # blocking the Core 0 run loop for the full keepalive window.
@@ -32,24 +32,6 @@ class Mqtt:
         self._connect_count = 0
         self._disconnect_count = 0
         self._last_activity_ms = time.ticks_ms()
-
-        # Runtime-lifetime MQTT reliability metrics (all reset naturally on
-        # reboot). The Mqtt object is the single source of truth: no counter is
-        # duplicated in Core 0/Core 1/SystemInformation/queue/socket, and no
-        # per-attempt or outage history is retained (only scalars plus two
-        # active timing stamps).
-        # Integer counters.
-        self._publish_attempt_count = 0
-        self._publish_retry_count = 0
-        self._puback_timeout_count = 0
-        self._connection_failure_count = 0
-        self._reconnect_success_count = 0
-        # Active timing stamps (None when no outage/reconnect is in progress);
-        # the finished durations, zero until the first such event completes.
-        self._outage_started_ms = None
-        self._reconnect_started_ms = None
-        self._last_reconnect_duration_ms = 0
-        self._last_outage_duration_ms = 0
 
         try:
             uid = machine.unique_id()
@@ -114,18 +96,6 @@ class Mqtt:
         On success the socket returns to normal blocking mode; every later
         operation (PUBACK, PINGRESP) installs and restores its own timeout.
         """
-        # Reconnect start: once this runtime has connected at least once, an
-        # entry to connect() is a reconnect. The timer starts on the first
-        # attempt after the session was lost and is NOT restarted by each
-        # subsequent attempt, nor reset if Core 0 exhausts one connect() and
-        # calls it again for the same outage (the existing timestamp is kept).
-        if self._connect_count > 0 and self._reconnect_started_ms is None:
-            self._reconnect_started_ms = time.ticks_ms()
-            # Defensive fallback: a reconnect that somehow reached here without
-            # a prior mark_disconnected() still gets a valid outage span,
-            # anchored to the reconnect start.
-            if self._outage_started_ms is None:
-                self._outage_started_ms = self._reconnect_started_ms
         for attempt_index, delay_sec in enumerate(self._reconnect_delays):
             try:
                 self._close_old_client()
@@ -150,35 +120,11 @@ class Mqtt:
                 self._connected = True
                 self._connect_count += 1
                 self._touch()
-                # A success after a prior successful connection is a reconnect.
-                # Record the just-completed reconnect and outage spans (both use
-                # ticks_diff, safe across the tick-counter wrap) and clear the
-                # active stamps. The initial connection (connect_count still 1)
-                # skips this: it leaves the reconnect count and both durations
-                # at zero.
-                if self._connect_count > 1:
-                    now_ms = time.ticks_ms()
-                    self._reconnect_success_count += 1
-                    if self._reconnect_started_ms is not None:
-                        self._last_reconnect_duration_ms = time.ticks_diff(
-                            now_ms, self._reconnect_started_ms
-                        )
-                    if self._outage_started_ms is not None:
-                        self._last_outage_duration_ms = time.ticks_diff(
-                            now_ms, self._outage_started_ms
-                        )
-                    self._reconnect_started_ms = None
-                    self._outage_started_ms = None
                 print("[INFO] MQTT connected: {}".format(self._broker))
                 return True
             except MemoryError:
                 raise
             except Exception as err:
-                # Every failed connection/handshake/subscription attempt counts
-                # exactly once; MemoryError (handled above) does not. The final
-                # exhausted return False below is not an attempt, so it is not
-                # double-counted.
-                self._connection_failure_count += 1
                 if self._connected:
                     self._disconnect_count += 1
                 self._connected = False
@@ -193,54 +139,7 @@ class Mqtt:
     def mark_disconnected(self):
         if self._connected:
             self._disconnect_count += 1
-            self._connected = False
-            # A known connected->disconnected transition starts the outage
-            # timer. It runs only when a connection had previously succeeded
-            # (this runtime was actually up) and no timer is already active, so
-            # the several recovery paths that can mark the SAME outage (a
-            # publish/ping/check failure, then a Wi-Fi loss, ...) count it
-            # exactly once and never restart the clock mid-outage.
-            if self._connect_count > 0 and self._outage_started_ms is None:
-                self._outage_started_ms = time.ticks_ms()
-            return
         self._connected = False
-
-    def update_connection_config(self, values):
-        """Apply the MQTT RECONFIGURE key set (values already patch-validated).
-
-        Updates only the connection parameters the next connect() will use:
-        broker address, keepalive, the two topics connect() subscribes to,
-        and the bounded broker-response timeout (read per call, so it is live
-        immediately). Takes effect only when combined with the existing
-        reconfigure operation: mark_disconnected() -> this -> connect(),
-        which runs the bounded handshake and both subscriptions.
-        """
-        for key, value in values.items():
-            if key == "mqtt_broker_ip_address":
-                self._broker = value
-            elif key == "mqtt_keepalive_sec":
-                self._keepalive = value
-            elif key == "mqtt_broker_response_timeout_sec":
-                self._ack_timeout_ms = value * 1000
-            elif key == "mqtt_topic_command":
-                self._command_topic = value
-            elif key == "mqtt_topic_info_response":
-                self._info_response_topic = value
-            elif key == "mqtt_reconnect_delays_sec":
-                self._reconnect_delays = value
-            else:
-                raise ValueError("unknown MQTT connection key: {}".format(key))
-
-    def mqtt_config_snapshot(self):
-        """The connection parameters, for the coordinator's restore-on-failure."""
-        return {
-            "mqtt_broker_ip_address": self._broker,
-            "mqtt_keepalive_sec": self._keepalive,
-            "mqtt_broker_response_timeout_sec": self._ack_timeout_ms // 1000,
-            "mqtt_topic_command": self._command_topic,
-            "mqtt_topic_info_response": self._info_response_topic,
-            "mqtt_reconnect_delays_sec": list(self._reconnect_delays),
-        }
 
     def check_msg(self):
         """Poll for one pending inbound packet and deliver it to the callback.
@@ -260,46 +159,27 @@ class Mqtt:
             self.mark_disconnected()
             raise
 
-    def publish_qos1(self, topic, message, is_retry=False):
+    def publish_qos1(self, topic, message):
         """Publish one application message and wait for its matching PUBACK.
 
         The PUBACK wait is bounded by mqtt_broker_response_timeout_sec so a
         blackholed link fails fast and the run loop's network recovery can
         fire, instead of blocking here forever.
-
-        ``is_retry`` is the Core 0 logical-message classification (the Core 0
-        owner knows whether the same logical message was attempted before); it
-        is never inferred here from a packet id, topic, or payload.
         """
         if not self.is_connected():
             raise OSError("MQTT is not connected")
-        # The attempt begins here, immediately before the low-level publish:
-        # a message that is merely serialized, queued, gated, or rejected has
-        # not been attempted, while every actual low-level invocation is.
-        self._publish_attempt_count += 1
-        if is_retry:
-            self._publish_retry_count += 1
         try:
             self._client.publish(
                 topic, message, qos=1, timeout_ms=self._ack_timeout_ms
             )
         except MemoryError:
             raise
-        except MQTTPubackTimeout:
-            # The PUBLISH frame went out and the PUBACK wait expired: count it
-            # precisely (not approximated from a generic publish failure) and
-            # mark the disconnect for recovery.
-            self._puback_timeout_count += 1
-            self.mark_disconnected()
-            raise
         except Exception:
             self.mark_disconnected()
             raise
         self._touch()
 
-    def publish_qos1_with_packet_id(
-        self, topic, message, packet_id, timeout_ms=None, is_retry=False
-    ):
+    def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):
         """Publish one QoS 1 message with a specific packet ID and wait for matching PUBACK.
 
         Args:
@@ -307,17 +187,11 @@ class Mqtt:
             message: Message body
             packet_id: Specific packet ID to use
             timeout_ms: Optional timeout in milliseconds
-            is_retry: Core 0 logical-message retry classification (see
-                publish_qos1).
 
         Returns True if PUBACK received with matching ID, False on timeout/error.
         """
         if not self.is_connected():
             raise OSError("MQTT is not connected")
-        # Count the actual low-level publish invocation, as in publish_qos1.
-        self._publish_attempt_count += 1
-        if is_retry:
-            self._publish_retry_count += 1
 
         try:
             # Pass timeout to mqtt_client's publish method
@@ -326,14 +200,6 @@ class Mqtt:
             return True
         except MemoryError:
             raise
-        except MQTTPubackTimeout:
-            # Count the PUBACK timeout precisely before converting it into this
-            # method's existing False return (callers use the return value).
-            self._puback_timeout_count += 1
-            if DEBUG:
-                print("[DEBUG] QoS 1 publish with packet_id {} PUBACK timed out".format(packet_id))
-            self.mark_disconnected()
-            return False
         except Exception as err:
             if DEBUG:
                 print("[DEBUG] QoS 1 publish with packet_id {} failed: {}".format(packet_id, err))
@@ -384,20 +250,8 @@ class Mqtt:
         return self._client.next_packet_id()
 
     def status(self):
-        """Authoritative read interface for connection state and reliability metrics.
-
-        The internal names stay short; Core 0 copies them into the shared
-        network snapshot under the canonical ``mqtt_*`` external names.
-        """
         return {
             "connected": self.is_connected(),
             "connect_count": self._connect_count,
             "disconnect_count": self._disconnect_count,
-            "publish_attempt_count": self._publish_attempt_count,
-            "publish_retry_count": self._publish_retry_count,
-            "puback_timeout_count": self._puback_timeout_count,
-            "connection_failure_count": self._connection_failure_count,
-            "reconnect_success_count": self._reconnect_success_count,
-            "last_reconnect_duration_ms": self._last_reconnect_duration_ms,
-            "last_outage_duration_ms": self._last_outage_duration_ms,
         }

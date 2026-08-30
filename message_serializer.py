@@ -27,23 +27,9 @@ import json
 # Pico W (256 KiB SRAM, 64 KiB reserved). 16 KiB keeps a single message's transient
 # peak (graph + str + bytes, ~3x) to roughly 48 KiB and leaves ~6x headroom over the
 # largest legitimate message (the one-shot startup log, which is the only payload that
-# grows with device count). The aggregate retained footprint is governed by the
-# board's free-heap reserve (see intercore.MemoryStats), not a fixed byte budget.
+# grows with device count). The aggregate retained footprint is separately bounded by
+# OutboundQueue's queued-byte budget (see intercore.DEFAULT_MAX_OUTBOUND_QUEUED_BYTES).
 MAX_OUTBOUND_MESSAGE_BYTES = 16 * 1024
-
-
-# Headroom the OPTIONAL (non-pressure) controlled GC defends, on top of the
-# board reserve, before serializing an outbound message: at the serialization
-# peak the object graph, the serialized str, and the encoded bytes are all
-# resident, roughly 3x a 16 KiB payload, so we want ~2 extra copies of headroom
-# beyond the stored payload.
-SERIALIZATION_GC_HEADROOM_BYTES = 2 * MAX_OUTBOUND_MESSAGE_BYTES
-
-# Headroom the OPTIONAL controlled GC defends, on top of the board reserve, at
-# the Core 0 publish boundary (before the assembled wire frame is allocated) and
-# after a Core 1 read cycle: the unit defended is one 16 KiB message plus its
-# small envelope.
-PUBLISH_GC_HEADROOM_BYTES = MAX_OUTBOUND_MESSAGE_BYTES
 
 
 class SerializationError(Exception):

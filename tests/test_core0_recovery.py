@@ -73,11 +73,6 @@ def _install_mocks():
 # test module imported core0 first.
 from config import split_config  # noqa: E402
 from message_protocol import format_utc_epoch_ms  # noqa: E402
-from observability import (  # noqa: E402
-    EVENT_MQTT_CONNECTION_ESTABLISHED,
-    LEVEL_INFO,
-    REASON_NONE,
-)
 from version import MESSAGE_SCHEMA_VERSION  # noqa: E402
 
 
@@ -106,7 +101,6 @@ class FakeWifi:
     def __init__(self):
         self.connected = False
         self.connect_calls = 0
-        self.reconnect_triggers = []
 
     def is_connected(self):
         return self.connected
@@ -115,9 +109,6 @@ class FakeWifi:
         self.connected = True
         self.connect_calls += 1
         return True
-
-    def note_reconnect_trigger(self, trigger):
-        self.reconnect_triggers.append(trigger)
 
     def snapshot(self, mqtt_connected):
         return {
@@ -148,12 +139,6 @@ class FakeMqtt:
         # drops the session, and raises -- the ambiguous QoS 1 case where the
         # frame was delivered but the PUBACK was lost. Empty means always ok.
         self.publish_script = []
-        # Logical retry classification received from Core 0 -- the point of the
-        # retry-classification tests is that Core 0 tells Mqtt which attempts
-        # are retries of the same logical message.
-        self.publish_qos1_is_retry = []
-        self._publish_attempt_count = 0
-        self._publish_retry_count = 0
 
     def is_connected(self):
         return self.connected
@@ -172,24 +157,12 @@ class FakeMqtt:
             "connected": self.connected,
             "connect_count": self.connect_calls,
             "disconnect_count": 0,
-            "publish_attempt_count": self._publish_attempt_count,
-            "publish_retry_count": self._publish_retry_count,
-            "puback_timeout_count": 0,
-            "connection_failure_count": 0,
-            "reconnect_success_count": 0,
-            "last_reconnect_duration_ms": 0,
-            "last_outage_duration_ms": 0,
         }
 
     def get_next_packet_id(self):
         return 1
 
-    def publish_qos1(self, topic, message, is_retry=False):
-        # Mirror the real Mqtt's publish accounting so status() is consistent.
-        self._publish_attempt_count += 1
-        if is_retry:
-            self._publish_retry_count += 1
-        self.publish_qos1_is_retry.append(is_retry)
+    def publish_qos1(self, topic, message):
         outcome = self.publish_script.pop(0) if self.publish_script else "ok"
         # The frame is transmitted either way: even a "fail" means the PUBLISH
         # reached the broker; the failure is only that the PUBACK never came.
@@ -202,12 +175,7 @@ class FakeMqtt:
             self.mark_disconnected()
             raise RuntimeError("PUBACK lost (simulated ambiguous QoS 1 failure)")
 
-    def publish_qos1_with_packet_id(
-        self, topic, message, packet_id, timeout_ms=None, is_retry=False
-    ):
-        self._publish_attempt_count += 1
-        if is_retry:
-            self._publish_retry_count += 1
+    def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):
         # Simulate the startup probes: fail the first fail_probes_times
         # publishes (dropping the session, as the real client does on a failed
         # QoS 1 publish), then deliver a matching PUBACK.
@@ -265,17 +233,7 @@ class MockInterCore:
     def __init__(self):
         self.state_mailboxes = RecordingMailboxes()
         self.outbound_queue = MagicMock()
-        # The runtime-recovery path reads the queue depth to decide whether to
-        # open a post-outage drain episode; an empty queue (depth 0) starts no
-        # episode, which is what these recovery tests are focused on.
-        self.outbound_queue.get_depth.return_value = 0
         self.event_queue = MagicMock()
-        # Core 0's publish boundary reads the shared MemoryStats (observe the
-        # free heap + optional headroom collect) and the board reserve. Both
-        # return values are unused in the publish path, so a no-op stand-in
-        # keeps these tests focused on the publish/sequence behavior.
-        self.memory_stats = MagicMock()
-        self.minimum_free_heap_bytes = 65536
 
 
 @pytest.fixture
@@ -444,12 +402,9 @@ def test_publish_utc_snapshot_has_no_force_argument(make_core0):
 
 def _real_outbound_queue(instance):
     """Swap the fixture's mock queue for the real bounded queue."""
-    from intercore import OutboundQueue, MemoryStats
+    from intercore import OutboundQueue
 
-    # Real queue + real MemoryStats (the healthy conftest heap means the
-    # pressure-relief path is a no-op, so admission exercises the entry/priority
-    # path these tests target). The 16-entry ceiling matches the old behavior.
-    instance._intercore.outbound_queue = OutboundQueue(65536, MemoryStats(), 16)
+    instance._intercore.outbound_queue = OutboundQueue(16)
     return instance._intercore.outbound_queue
 
 
@@ -458,12 +413,12 @@ def test_publish_entry_splices_core0_envelope_and_keeps_body_intact(make_core0):
 
     Core 0 must not decode, parse, or re-serialize the payload: the message
     body must appear in the published frame exactly as the sender queued it,
-    and the six envelope members must be Core 0's own values (its runtime_id
+    and the five envelope members must be Core 0's own values (its runtime_id
     and configured source, not anything a sender might have embedded).
     """
     from intercore import KIND_HEALTH, RETENTION_PRIORITY_HEALTH
     from message_serializer import serialize_and_validate_message
-    from version import FIRMWARE_BUILD_COMMIT, FIRMWARE_VERSION
+    from version import FIRMWARE_VERSION
 
     instance = make_core0()
     queue = _real_outbound_queue(instance)
@@ -487,11 +442,10 @@ def test_publish_entry_splices_core0_envelope_and_keeps_body_intact(make_core0):
     assert doc["source"] == instance._config["source"]
     assert doc["firmware_version"] == FIRMWARE_VERSION
     assert doc["message_schema_version"] == MESSAGE_SCHEMA_VERSION
-    assert doc["firmware_build_commit"] == FIRMWARE_BUILD_COMMIT
     # Removing the spliced envelope restores exactly what the sender queued:
     # proof the body was carried through, not parsed and rebuilt.
     for key in ("sequence", "runtime_id", "source", "firmware_version",
-                "message_schema_version", "firmware_build_commit"):
+                "message_schema_version"):
         del doc[key]
     assert doc == message
     assert instance._next_sequence == 1
@@ -641,10 +595,7 @@ def test_command_response_retry_preserves_sequence_across_intervening_message(ma
     assert instance._pending_core0_responses  # still queued for retry
 
     # An intervening connection log publishes and consumes the next number.
-    instance._queue_connection_log(
-        LEVEL_INFO, EVENT_MQTT_CONNECTION_ESTABLISHED, REASON_NONE,
-        "Connected to MQTT broker", {},
-    )
+    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
     instance._service_pending_connection_log()
     log_seq = json.loads(mqtt.published[-1][1])["sequence"]
     assert log_seq != first_seq
@@ -664,165 +615,3 @@ def test_command_response_retry_preserves_sequence_across_intervening_message(ma
     assert retry_seq == first_seq
     assert first_frame == retry_frame  # same logical message: same identity AND content
     assert not instance._pending_core0_responses  # consumed on success
-
-
-# ---------------------------------------------------------------------------
-# Logical retry classification (owned by Core 0, passed to Mqtt)
-#
-# Core 0 is the owner of logical message identity: it knows whether the same
-# logical message was attempted before, and must tell Mqtt explicitly rather
-# than letting it be inferred from a packet id, topic, payload, or connection
-# count. These tests drive the real Core 0 publish paths and assert the
-# (publish_attempt_count, publish_retry_count) they hand to Mqtt, plus that the
-# retry preserves the existing logical sequence identity.
-# ---------------------------------------------------------------------------
-
-def test_queue_retry_classified_and_sequence_preserved(make_core0):
-    """A queued telemetry entry whose first publish failed is a RETRY when the
-    same in-flight entry is taken again after a reconnect -- and it keeps its
-    sequence. A different message published across the same window is an
-    attempt, never a retry."""
-    from intercore import KIND_TELEMETRY, RETENTION_PRIORITY_TELEMETRY
-    from message_serializer import serialize_and_validate_message
-
-    instance = make_core0()
-    mqtt = instance._mqtt
-    instance._network_stack_ready = True
-    instance._wifi.connected = True
-    mqtt.connected = True
-    queue = _real_outbound_queue(instance)
-
-    telemetry = {
-        "message_type": "telemetry",
-        "uptime_ms": 1411267,
-        "timestamp": None,
-        "payload": {"value": 42},
-    }
-    assert queue.put_with_kind(
-        KIND_TELEMETRY, serialize_and_validate_message(telemetry), RETENTION_PRIORITY_TELEMETRY
-    )
-    entry = queue.take()
-    assert queue.has_in_flight()
-
-    # Attempt 1 of telemetry A: a fresh attempt (not a retry); the PUBACK is
-    # lost so it fails and the entry stays in flight.
-    mqtt.publish_script = ["fail", "ok", "ok"]
-    with pytest.raises(RuntimeError):
-        instance._publish_entry(entry)
-    assert mqtt._publish_attempt_count == 1
-    assert mqtt._publish_retry_count == 0
-    assert mqtt.publish_qos1_is_retry == [False]
-    assert queue.has_in_flight()
-    telemetry_seq = json.loads(mqtt.published[0][1])["sequence"]
-
-    # Recovery reconnects and publishes the connection log: a NEW logical
-    # message, so an attempt -- never classified as a retry of A.
-    instance._recover_network_if_needed()
-    assert mqtt.connected is True
-    assert len(instance._pending_connection_logs) == 1
-    instance._service_pending_connection_log()
-    assert mqtt._publish_attempt_count == 2
-    assert mqtt._publish_retry_count == 0
-    assert mqtt.publish_qos1_is_retry[-1] is False
-
-    # The retry of the SAME in-flight entry is a retry (is_retry=True) and
-    # preserves its original sequence.
-    retried = queue.take()
-    assert retried is entry  # the same logical object
-    instance._publish_entry(retried)
-    assert mqtt._publish_attempt_count == 3
-    assert mqtt._publish_retry_count == 1
-    assert mqtt.publish_qos1_is_retry == [False, False, True]
-    assert json.loads(mqtt.published[-1][1])["sequence"] == telemetry_seq
-
-
-def test_command_response_retry_classified_and_marker_on_container(make_core0):
-    """A Core 0 command response that fails then retries: the first attempt is
-    not a retry, the second (same logical response) is. The retry marker lives
-    on the persistent response container, not the per-attempt entry, so the
-    classification survives across the entry rebuild on each attempt."""
-    instance = make_core0()
-    mqtt = instance._mqtt
-    mqtt.publish_script = ["fail", "ok"]
-
-    response = {
-        "command_id": "req-1",
-        "command": "reboot",
-        "success": True,
-        "targeted": False,
-        "data": {"rebooting": True},
-    }
-    instance._pending_core0_responses.append(response)
-
-    # Attempt 1: a fresh logical message (not a retry); fails.
-    with pytest.raises(RuntimeError):
-        instance._service_pending_core0_response()
-    assert mqtt._publish_attempt_count == 1
-    assert mqtt._publish_retry_count == 0
-    assert mqtt.publish_qos1_is_retry == [False]
-    # The marker is owned by the persistent container, not the per-attempt entry.
-    assert response["_publish_attempted"] is True
-
-    # Attempt 2: the retry of the same logical response is classified as a
-    # retry, sourced from the container marker.
-    instance._service_pending_core0_response()
-    assert mqtt._publish_attempt_count == 2
-    assert mqtt._publish_retry_count == 1
-    assert mqtt.publish_qos1_is_retry == [False, True]
-    assert not instance._pending_core0_responses
-
-
-def test_pending_reboot_retry_classified(make_core0):
-    """The pending reboot response follows the same retry classification as a
-    command response: first attempt not a retry, retry of the same pending
-    reboot classified as a retry, with the marker on the persistent request."""
-    instance = make_core0()
-    mqtt = instance._mqtt
-    _real_outbound_queue(instance)  # an empty real queue: has_in_flight() is False
-    mqtt.publish_script = ["fail", "ok"]
-
-    reboot_request = {
-        "command_id": "reboot-1",
-        "command": "reboot",
-        "success": True,
-        "targeted": False,
-    }
-    instance._pending_reboot = reboot_request
-
-    # Attempt 1: not a retry; fails (the reboot stays pending).
-    assert instance._perform_reboot() is False
-    assert mqtt._publish_attempt_count == 1
-    assert mqtt._publish_retry_count == 0
-    assert mqtt.publish_qos1_is_retry == [False]
-    assert instance._pending_reboot is reboot_request
-    assert reboot_request["_publish_attempted"] is True
-
-    # Attempt 2: the retry of the same pending reboot is classified as a retry.
-    assert instance._perform_reboot() is True
-    assert mqtt._publish_attempt_count == 2
-    assert mqtt._publish_retry_count == 1
-    assert mqtt.publish_qos1_is_retry == [False, True]
-    assert instance._pending_reboot is None
-
-
-def test_new_utc_requests_are_attempts_not_retries(make_core0):
-    """Each UTC request is a fresh logical message (new request_id): a retry
-    counter must not count them. Request #2 is a new attempt, never a retry of
-    request #1's failed delivery."""
-    instance = make_core0()
-    mqtt = instance._mqtt
-
-    # Request #1: a fresh attempt (Core 0 does not classify it as a retry).
-    instance._utc_send_request()
-    assert mqtt._publish_attempt_count == 1
-    assert mqtt._publish_retry_count == 0
-    first_counter = instance._utc_request_counter
-    assert mqtt.publish_qos1_is_retry == [False]
-
-    # Request #2: a NEW logical message (a new request_id) -- even if request
-    # #1's response was never delivered, this is an attempt, not a retry.
-    instance._utc_send_request()
-    assert mqtt._publish_attempt_count == 2
-    assert mqtt._publish_retry_count == 0
-    assert instance._utc_request_counter == first_counter + 1
-    assert mqtt.publish_qos1_is_retry == [False, False]

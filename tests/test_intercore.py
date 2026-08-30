@@ -24,8 +24,7 @@ sys.modules['network'] = MockNetwork()
 from intercore import (
     InterCore,
     OutboundQueue,
-    MemoryStats,
-    MAX_OUTBOUND_QUEUE_ENTRIES,
+    DEFAULT_MAX_OUTBOUND_QUEUED_BYTES,
     KIND_TELEMETRY,
     KIND_COMMAND_RESPONSE,
     KIND_HEALTH,
@@ -374,12 +373,7 @@ def test_status_counters_include_serialization_rejections():
     assert "oversized_rejected" in status
 
 
-# --- Memory-safety boundary ---
-#
-# The primary memory-safety boundary is the board's free-heap reserve, defended
-# at admission (see test_memory_stats.py for the heap-pressure scenarios). The
-# queue keeps a fixed entry ceiling as a pathological sanity guard and reports
-# retained payload bytes as a diagnostic.
+# --- Aggregate queued-byte budget (memory-safety boundary) ---
 
 def test_per_message_ceiling_is_mcu_scale():
     """The per-message ceiling is at most 16 KiB (regression guard vs 128 KiB)."""
@@ -387,60 +381,122 @@ def test_per_message_ceiling_is_mcu_scale():
     assert 8 * 1024 <= get_max_message_bytes() <= 16 * 1024
 
 
-def test_entry_ceiling_is_a_fixed_sanity_guard():
-    """The 64-entry ceiling is a fixed internal constant, not a user knob."""
-    assert MAX_OUTBOUND_QUEUE_ENTRIES == 64
-    # And it is the default when a bus is constructed without an explicit ceiling.
-    bus = InterCore(event_max=2)
-    assert bus.outbound_queue.status()["max_entries"] == MAX_OUTBOUND_QUEUE_ENTRIES
+def test_default_byte_budget_is_mcu_scale():
+    """The default queued-byte budget is MCU-safe and holds a realistic queue."""
+    # Well under a Pico W's heap (256 KiB).
+    assert DEFAULT_MAX_OUTBOUND_QUEUED_BYTES <= 64 * 1024
+    # Comfortably holds a full queue of 16 entries at a realistic ~2 KiB each.
+    assert DEFAULT_MAX_OUTBOUND_QUEUED_BYTES >= 16 * 2 * 1024
 
 
-def test_outbound_queue_rejects_bad_reserve():
-    stats = MemoryStats()
-    with pytest.raises(ValueError, match="minimum_free_heap_bytes"):
-        OutboundQueue(-1, stats)
-    with pytest.raises(ValueError, match="minimum_free_heap_bytes"):
-        OutboundQueue(True, stats)
+def test_byte_budget_limits_admission_before_count():
+    """A high-count / low-byte queue admits only until the byte budget is hit."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    # Third 40-byte entry would push to 120 > 100; same class, so evict the oldest.
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    status = bus.outbound_queue.status()
+    assert status["queued_bytes"] <= 100
+    assert status["pending"] == 2  # bounded by bytes, not by the count budget of 10
 
 
-def test_outbound_queue_rejects_bad_memory_stats():
-    with pytest.raises(ValueError, match="memory_stats"):
-        OutboundQueue(65536, None)
-    with pytest.raises(ValueError, match="memory_stats"):
-        OutboundQueue(65536, object())
+def test_byte_budget_respected_after_eviction():
+    """Eviction frees enough bytes for the incoming entry; the budget still holds."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_HEALTH)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    # 60 + 40 already fills the budget; the next evicts the oldest (60) -> 40 + 40.
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(40), RETENTION_PRIORITY_HEALTH)
+    status = bus.outbound_queue.status()
+    assert status["queued_bytes"] <= 100
+    assert status["pending"] == 2
+    assert status["messages_evicted"] >= 1
 
 
-def test_outbound_queue_rejects_bad_ceiling():
-    stats = MemoryStats()
-    with pytest.raises(ValueError, match="entry_ceiling"):
-        OutboundQueue(65536, stats, entry_ceiling=0)
-    with pytest.raises(ValueError, match="entry_ceiling"):
-        OutboundQueue(65536, stats, entry_ceiling=True)
+def test_byte_budget_less_important_rejected_without_evicting():
+    """A less-important incoming entry is rejected, not the valid entry evicted."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    # A 60-byte CRITICAL entry fills most of the budget.
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_CRITICAL)
+    # A 50-byte HEALTH entry would exceed the budget, but HEALTH (70) is less
+    # important than CRITICAL (10): reject rather than evict the critical entry.
+    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(50), RETENTION_PRIORITY_HEALTH)
+    status = bus.outbound_queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == 60
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] >= 1
 
 
-def test_retained_bytes_include_in_flight_entry():
-    """The in-flight entry's retained bytes stay counted until complete_in_flight.
+def test_byte_budget_never_evicts_for_nothing():
+    """A valid entry is not dropped to admit one that still would not fit."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_HEALTH)
+    # 150 bytes does not fit even after evicting the 60-byte entry (150 > 100).
+    # It must be rejected; the valid 60-byte entry must survive.
+    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(150), RETENTION_PRIORITY_HEALTH)
+    status = bus.outbound_queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == 60
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] >= 1
 
-    The in-flight payload is not freed until its PUBACK, so the retained-bytes
-    diagnostic (reported as outbound_queued_bytes) reflects it along with the
-    queued FIFO -- not just the FIFO.
+
+def test_byte_budget_includes_in_flight_entry():
+    """The in-flight entry's retained bytes count toward the byte budget.
+
+    The in-flight payload is not freed until its PUBACK (complete_in_flight),
+    so it must consume budget along with the queued FIFO. Previously take()
+    subtracted it, letting the queue retain (budget + in-flight) of payload
+    while reporting only the budget.
     """
-    bus = InterCore(outbound_max=10, event_max=2)
+    # A 200-byte entry moved in-flight; the budget is 250 bytes.
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=250)
     assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(200), RETENTION_PRIORITY_HEALTH)
     first = bus.outbound_queue.take()
     assert bus.outbound_queue.has_in_flight()
-    assert bus.outbound_queue.status()["queued_bytes"] == 200
+
+    # With the in-flight entry counted, a further 60 bytes exceeds the budget
+    # (200 + 60 = 260 > 250). Nothing is queued to evict, so admission fails --
+    # even though the old in-flight-excluded budget had 250 bytes of room.
+    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_HEALTH)
+
+    status = bus.outbound_queue.status()
+    assert status["in_flight"]
+    assert status["pending"] == 0
+    # The reported byte budget includes the retained in-flight entry.
+    assert status["queued_bytes"] == 200
+
+    # Completing the in-flight entry frees exactly its own bytes.
     assert bus.outbound_queue.complete_in_flight(first)
     assert bus.outbound_queue.status()["queued_bytes"] == 0
 
 
-def test_status_reports_entry_ceiling_and_retained_bytes():
-    bus = InterCore(outbound_max=4, event_max=2)
+def test_dict_path_enforces_byte_budget():
+    """put() (dict -> serialize) also enforces the queued-byte budget."""
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=100)
+    for _ in range(20):
+        bus.outbound_queue.put(KIND_TELEMETRY, {"id": "a", "v": 1}, RETENTION_PRIORITY_TELEMETRY)
+    assert bus.outbound_queue.status()["queued_bytes"] <= 100
+
+
+def test_status_exposes_byte_budget():
+    bus = InterCore(outbound_max=4, event_max=2, outbound_max_bytes=2048)
     status = bus.outbound_queue.status()
-    assert status["max_entries"] == 4
+    assert status["max_queued_bytes"] == 2048
     assert status["queued_bytes"] == 0
     assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(256), RETENTION_PRIORITY_HEALTH)
     assert bus.outbound_queue.status()["queued_bytes"] == 256
+
+
+def test_outbound_queue_rejects_bad_byte_budget():
+    with pytest.raises(ValueError, match="max_queued_bytes"):
+        OutboundQueue(4, 0)
+    with pytest.raises(ValueError, match="max_queued_bytes"):
+        OutboundQueue(4, True)
+    with pytest.raises(ValueError, match="max_queued_bytes"):
+        OutboundQueue(4, -1)
 
 
 def test_connection_log_like_message():
@@ -594,7 +650,8 @@ def test_health_topic_routing_returns_configured_topic():
     config = load_config(str(config_path))
     core0, _, bus_config = split_config(config)
 
-    bus = InterCore(event_max=bus_config["max_intercore_event_entries"])
+    bus = InterCore(outbound_max=bus_config["max_outbound_queue_entries"],
+                   event_max=bus_config["max_intercore_event_entries"])
 
     # Create a Core0-like topic resolver using the config
     def topic_for_kind(kind):

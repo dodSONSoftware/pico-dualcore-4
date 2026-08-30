@@ -43,7 +43,6 @@ def test_system_information_sections():
         "communications",
         "queues",
         "device_status",
-        "capabilities",
     )
 
     for section in required_sections:
@@ -97,28 +96,6 @@ def test_collect_system_information_includes_all_sections():
         def get_queues(self):
             return {"pending": 0, "max": 16, "high_watermark": 0}
 
-        def get_configuration(self):
-            return {
-                "config_schema_version": 9,
-                "config_generation": 0,
-                "config_checksum_sha256": "0" * 64,
-                "reboot_required": False,
-                "pending_restart_keys": [],
-            }
-
-        def get_capabilities(self):
-            return {
-                "devices": ["system-information"],
-                "features": [
-                    "health",
-                    "commands",
-                    "mqtt_qos1",
-                    "outage_buffering",
-                    "network_diagnostics",
-                    "heap_pressure_queue",
-                ],
-            }
-
         def set_device_manager(self, dm):
             pass
 
@@ -131,214 +108,6 @@ def test_collect_system_information_includes_all_sections():
     # Check all sections are present
     for section in SYSTEM_INFORMATION_SECTIONS:
         assert section in result, f"Section '{section}' not in collected system information"
-
-
-def test_communications_reports_mqtt_reliability_metrics():
-    """get_communications() carries all seven MQTT reliability metrics from the
-    Core 0 network snapshot, and an older/incomplete snapshot (no metric keys)
-    falls back to integer zero, never null."""
-    # Mock machine module
-    sys.modules['machine'] = MagicMock()
-    sys.modules['gc'] = MagicMock()
-    sys.modules['os'] = MagicMock()
-    sys.modules['sys'] = MagicMock()
-
-    from system_information import SystemInformation
-
-    def make_si(snapshot):
-        class _Mailboxes:
-            def get_network_snapshot(self):
-                return snapshot
-
-        class _Intercore:
-            def __init__(self):
-                self.state_mailboxes = _Mailboxes()
-
-        return SystemInformation(_Intercore(), None)
-
-    # A fully-populated snapshot: exact values carried through.
-    snapshot = {
-        "wifi_connected": True,
-        "mqtt_connected": True,
-        "mqtt_publish_attempt_count": 3,
-        "mqtt_publish_retry_count": 1,
-        "mqtt_puback_timeout_count": 2,
-        "mqtt_connection_failure_count": 5,
-        "mqtt_reconnect_success_count": 1,
-        "mqtt_last_reconnect_duration_ms": 12000,
-        "mqtt_last_outage_duration_ms": 16000,
-    }
-    comms = make_si(snapshot).get_communications()
-    assert comms["mqtt_publish_attempt_count"] == 3
-    assert comms["mqtt_publish_retry_count"] == 1
-    assert comms["mqtt_puback_timeout_count"] == 2
-    assert comms["mqtt_connection_failure_count"] == 5
-    assert comms["mqtt_reconnect_success_count"] == 1
-    assert comms["mqtt_last_reconnect_duration_ms"] == 12000
-    assert comms["mqtt_last_outage_duration_ms"] == 16000
-    for field, value in (
-        ("mqtt_publish_attempt_count", 3),
-        ("mqtt_publish_retry_count", 1),
-        ("mqtt_puback_timeout_count", 2),
-        ("mqtt_connection_failure_count", 5),
-        ("mqtt_reconnect_success_count", 1),
-        ("mqtt_last_reconnect_duration_ms", 12000),
-        ("mqtt_last_outage_duration_ms", 16000),
-    ):
-        assert isinstance(comms[field], int)
-        assert comms[field] is not None
-
-    # An older/incomplete snapshot (no metric keys) falls back to integer zero.
-    empty = make_si({"wifi_connected": True, "mqtt_connected": True}).get_communications()
-    for field in (
-        "mqtt_publish_attempt_count",
-        "mqtt_publish_retry_count",
-        "mqtt_puback_timeout_count",
-        "mqtt_connection_failure_count",
-        "mqtt_reconnect_success_count",
-        "mqtt_last_reconnect_duration_ms",
-        "mqtt_last_outage_duration_ms",
-    ):
-        assert empty[field] == 0
-        assert isinstance(empty[field], int)
-        assert empty[field] is not None
-
-
-def test_network_section_reports_wifi_diagnostics():
-    """get_network() carries the passive Wi-Fi quality fields and the
-    gateway/DNS/broker reachability view from the Core 0 network snapshot.
-    Diagnostic fields are null-tolerant: an older/incomplete snapshot
-    (no key) reports null, never a fabricated value."""
-    sys.modules['machine'] = MagicMock()
-    sys.modules['gc'] = MagicMock()
-    sys.modules['os'] = MagicMock()
-    sys.modules['sys'] = MagicMock()
-
-    from system_information import SystemInformation
-
-    def make_si(snapshot):
-        class _Mailboxes:
-            def get_network_snapshot(self):
-                return snapshot
-
-        class _Intercore:
-            def __init__(self):
-                self.state_mailboxes = _Mailboxes()
-
-        return SystemInformation(_Intercore(), None)
-
-    snapshot = {
-        "wifi_connected": True,
-        "mqtt_connected": True,
-        "ssid": "test-ssid",
-        "ip_address": "192.168.1.100",
-        "rssi": -50,
-        "netmask": "255.255.255.0",
-        "gateway": "192.168.1.1",
-        "dns": "10.10.10.53",
-        "wifi_rssi_min_dbm": -90,
-        "wifi_rssi_max_dbm": -42,
-        "wifi_rssi_moving_average_dbm": -63,
-        "wifi_rssi_sample_count": 12,
-        "wifi_bssid": "aa:bb:cc:dd:ee:ff",
-        "wifi_channel": 6,
-        "wifi_association_details_supported": True,
-        "gateway_reachability_supported": True,
-        "gateway_reachable": True,
-        "gateway_last_latency_ms": 12,
-        "dns_reachable": True,
-        "dns_last_latency_ms": 8,
-        "mqtt_broker_last_round_trip_ms": 900,
-        "network_diagnostics_last_run_age_ms": 4200,
-    }
-    net = make_si(snapshot).get_network()
-    # The section's rssi key is reported under the canonical name.
-    assert net["wifi_rssi_dbm"] == -50
-    assert net["wifi_rssi_min_dbm"] == -90
-    assert net["wifi_rssi_max_dbm"] == -42
-    assert net["wifi_rssi_moving_average_dbm"] == -63
-    assert net["wifi_rssi_sample_count"] == 12
-    assert net["dns_server"] == "10.10.10.53"
-    assert net["wifi_bssid"] == "aa:bb:cc:dd:ee:ff"
-    assert net["wifi_channel"] == 6
-    assert net["wifi_association_details_supported"] is True
-    assert net["gateway_reachability_supported"] is True
-    assert net["gateway_reachable"] is True
-    assert net["gateway_last_latency_ms"] == 12
-    assert net["dns_reachable"] is True
-    assert net["dns_last_latency_ms"] == 8
-    assert net["mqtt_broker_last_round_trip_ms"] == 900
-    assert net["network_diagnostics_last_run_age_ms"] == 4200
-
-    # An older/incomplete snapshot: diagnostic fields are null, never a value.
-    older = make_si({"wifi_connected": True, "mqtt_connected": True}).get_network()
-    for field in (
-        "wifi_rssi_min_dbm",
-        "wifi_rssi_max_dbm",
-        "wifi_rssi_moving_average_dbm",
-        "wifi_rssi_sample_count",
-        "wifi_bssid",
-        "wifi_channel",
-        "wifi_association_details_supported",
-        "gateway_reachability_supported",
-        "gateway_reachable",
-        "gateway_last_latency_ms",
-        "dns_reachable",
-        "dns_last_latency_ms",
-        "mqtt_broker_last_round_trip_ms",
-        "network_diagnostics_last_run_age_ms",
-    ):
-        assert older[field] is None
-
-
-def test_communications_reports_wifi_diagnostics_history():
-    """get_communications() carries the reconnect/DHCP history fields with
-    safe defaults (integer zero, "unknown", False) for an older/incomplete
-    snapshot, and the exact values when the snapshot provides them."""
-    sys.modules['machine'] = MagicMock()
-    sys.modules['gc'] = MagicMock()
-    sys.modules['os'] = MagicMock()
-    sys.modules['sys'] = MagicMock()
-
-    from system_information import SystemInformation
-
-    def make_si(snapshot):
-        class _Mailboxes:
-            def get_network_snapshot(self):
-                return snapshot
-
-        class _Intercore:
-            def __init__(self):
-                self.state_mailboxes = _Mailboxes()
-
-        return SystemInformation(_Intercore(), None)
-
-    snapshot = {
-        "wifi_connected": True,
-        "mqtt_connected": True,
-        "wifi_last_reconnect_duration_ms": 8000,
-        "wifi_last_dhcp_acquisition_duration_ms": 4200,
-        "wifi_last_status_reason": "got_ip",
-        "wifi_last_reconnect_trigger": "wifi_disconnected",
-        "network_diagnostics_run_count": 3,
-        "mqtt_broker_latency_enabled": True,
-    }
-    comms = make_si(snapshot).get_communications()
-    assert comms["wifi_last_reconnect_duration_ms"] == 8000
-    assert comms["wifi_last_dhcp_acquisition_duration_ms"] == 4200
-    assert comms["wifi_last_status_reason"] == "got_ip"
-    assert comms["wifi_last_reconnect_trigger"] == "wifi_disconnected"
-    assert comms["network_diagnostics_run_count"] == 3
-    assert comms["mqtt_broker_latency_enabled"] is True
-
-    # Older/incomplete snapshot: safe defaults, never null or a fabricated value.
-    older = make_si({"wifi_connected": True, "mqtt_connected": True}).get_communications()
-    assert older["wifi_last_reconnect_duration_ms"] == 0
-    assert older["wifi_last_dhcp_acquisition_duration_ms"] == 0
-    assert older["wifi_last_status_reason"] == "unknown"
-    assert older["wifi_last_reconnect_trigger"] == "unknown"
-    assert older["network_diagnostics_run_count"] == 0
-    assert older["mqtt_broker_latency_enabled"] is False
 
 
 def test_build_startup_log_structure():
@@ -402,22 +171,18 @@ def test_build_startup_log_structure():
             self.outbound_queue = MockOutboundQueue()
 
     # The message carries only Core 1's own fields: the envelope keys
-    # (sequence, runtime_id, source, firmware_version, message_schema_version,
-    # firmware_build_commit) are Core 0's and are injected at publish time.
-    # The payload is the stable log shape: level, event, reason_code are
-    # always present; module is not part of the vocabulary.
+    # (sequence, runtime_id, source, firmware_version, message_schema_version)
+    # are Core 0's and are injected at publish time.
     message = {
         "message_type": "log",
         "uptime_ms": 5000,
         "timestamp": None,
         "payload": {
-            "level": "INFO",
-            "event": "runtime_started",
-            "reason_code": "none",
+            "level": "info",
+            "event": "system_startup_completed",
+            "module": "system",
             "message": "System startup completed",
             "data": {
-                "last_reset_cause": "power_on_reset",
-                "boot_reason": "power_on",
                 "startup": {
                     "duration_ms": 5000,
                     "hardware": {"status": "ready"},

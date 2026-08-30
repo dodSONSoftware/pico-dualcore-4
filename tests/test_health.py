@@ -28,6 +28,7 @@ from intercore import (  # noqa: E402
     InterCore,
     KIND_HEALTH,
     RETENTION_PRIORITY_HEALTH,
+    DEFAULT_MAX_OUTBOUND_QUEUED_BYTES,
 )
 from message_protocol import format_utc_epoch_ms  # noqa: E402
 from message_serializer import serialize_and_validate_message  # noqa: E402
@@ -212,7 +213,6 @@ class HealthEnv:
             "hardware_type": "pico_w",
             "machine": "Raspberry Pi Pico W with RP2040",
             "minimum_free_heap_bytes": 65536,
-            "last_reset_cause": "power_on_reset",
         })
         self.set_devices(1, 1)
         self.set_free_heap(100000)
@@ -274,9 +274,8 @@ def test_healthy_state_payload(health):
     assert p["outbound_queue_depth"] == 0
     assert p["outbound_queue_capacity"] == 16
     assert p["outbound_queued_bytes"] == 0
-    # The low-watermark minimum tracks the lowest observed free heap and is
-    # historical/diagnostic only; a single healthy sample leaves it at that sample.
-    assert p["minimum_free_heap_observed_bytes"] == 100000
+    assert p["outbound_max_queued_bytes"] == DEFAULT_MAX_OUTBOUND_QUEUED_BYTES
+    assert p["outbound_queue_byte_utilization_percent"] == 0
     assert p["utc_valid"] is True
     assert payload["uptime_ms"] == NOW_MS - BOOT_TICKS_MS  # 10000
 
@@ -347,31 +346,61 @@ def test_queue_pressure_triggers_degraded(health):
     assert "outbound_queue_pressure" in payload["payload"]["degraded_reasons"]
 
 
-def test_low_watermark_reports_lowest_sample_without_degrading(health):
-    """minimum_free_heap_observed_bytes is the lowest observed free heap.
+def test_byte_budget_pressure_triggers_degraded(health):
+    """A near-full queued-byte budget degrades health at modest entry utilization.
 
-    The builder submits every sample to the shared MemoryStats, so the field
-    tracks the lowest value seen since boot even after the heap recovers. It
-    is historical/diagnostic: a low *past* minimum must never by itself add a
-    degraded reason (only a *current* free_heap below the reserve does).
+    4 entries of ~8 KiB each consume the 32 KiB byte budget while the entry
+    budget sits at 4/16 = 25%. The byte budget is the memory-protection
+    boundary (the admission ceiling), so it must drive the pressure reason
+    even though entry utilization alone is far below the 75% threshold.
     """
     health.set_healthy_baseline()
     health.set_utc(_valid_utc_snapshot())
+    chunk = json.dumps({"id": 0, "pad": "x" * 8000}).encode()
+    assert 8000 < len(chunk) < 9000  # ~8 KiB per entry
+    for i in range(4):
+        entry = json.dumps({"id": i, "pad": "x" * 8000}).encode()
+        assert health.bus.outbound_queue.put_with_kind(
+            KIND_HEALTH, entry, RETENTION_PRIORITY_HEALTH
+        )
+        assert len(entry) == len(chunk)
 
-    # First sample dips below the reserve (low_free_heap applies now), then
-    # recovers above it. The minimum must keep the low sample.
-    health.set_free_heap(40000)
-    low = health.build()["payload"]
-    assert low["minimum_free_heap_observed_bytes"] == 40000
-    assert "low_free_heap" in low["degraded_reasons"]
+    payload = health.build()
+    p = payload["payload"]
 
-    health.set_free_heap(200000)  # recovered above the 65536 reserve
-    recovered = health.build()["payload"]
-    assert recovered["free_heap_bytes"] == 200000
-    assert recovered["minimum_free_heap_observed_bytes"] == 40000  # still the low sample
-    # Current heap is healthy -> no low_free_heap, and nothing else degrades it.
-    assert "low_free_heap" not in recovered["degraded_reasons"]
-    assert recovered["status"] == "healthy"
+    assert p["status"] == "degraded"
+    assert "outbound_queue_pressure" in p["degraded_reasons"]
+    assert p["outbound_queue_depth"] == 4
+    assert p["outbound_queue_capacity"] == 16
+    assert p["outbound_queue_utilization_percent"] == 25  # entry view: below threshold
+    assert p["outbound_queued_bytes"] == 4 * len(chunk)
+    assert p["outbound_max_queued_bytes"] == DEFAULT_MAX_OUTBOUND_QUEUED_BYTES
+    assert (
+        p["outbound_queue_byte_utilization_percent"]
+        == (4 * len(chunk) * 100) // DEFAULT_MAX_OUTBOUND_QUEUED_BYTES
+    )
+    assert p["outbound_queue_byte_utilization_percent"] >= 75  # byte view: at/over threshold
+
+
+def test_byte_budget_below_threshold_is_not_pressure(health):
+    """Bytes below the 75% byte threshold (and low entries) stay healthy."""
+    health.set_healthy_baseline()
+    health.set_utc(_valid_utc_snapshot())
+    chunk = json.dumps({"id": 0, "pad": "x" * 3000}).encode()
+    for i in range(2):
+        health.bus.outbound_queue.put_with_kind(
+            KIND_HEALTH, json.dumps({"id": i, "pad": "x" * 3000}).encode(),
+            RETENTION_PRIORITY_HEALTH,
+        )
+
+    payload = health.build()
+    p = payload["payload"]
+
+    assert p["status"] == "healthy"
+    assert "outbound_queue_pressure" not in p["degraded_reasons"]
+    assert p["outbound_queue_utilization_percent"] == 12  # 2/16
+    assert p["outbound_queued_bytes"] == 2 * len(chunk)
+    assert p["outbound_queue_byte_utilization_percent"] < 75
 
 
 def test_utc_invalid_triggers_degraded(health):
@@ -464,28 +493,14 @@ def test_payload_structure_matches_spec(health):
     p = payload["payload"]
     for field in (
         "status", "degraded_reasons", "hardware_type", "machine",
-        "last_reset_cause",
         "network_stack_ready", "wifi_connected", "wifi_rssi_dbm", "mqtt_connected",
         "core_1_active", "core_1_activity_age_ms", "free_heap_bytes",
         "minimum_free_heap_bytes", "heap_headroom_bytes", "devices_configured",
         "devices_active", "device_failures", "outbound_queue_depth",
         "outbound_queue_capacity", "outbound_queue_utilization_percent",
-        "outbound_queued_bytes",
-        "outbound_queue_drain_active",
-        "outbound_queue_last_drain_start_depth",
-        "outbound_queue_last_drain_message_count",
-        "outbound_queue_last_drain_duration_ms",
-        "outbound_queue_last_drain_rate_per_sec",
-        "minimum_free_heap_observed_bytes",
+        "outbound_queued_bytes", "outbound_max_queued_bytes",
+        "outbound_queue_byte_utilization_percent",
         "utc_valid", "utc_sync_age_sec",
-        "mqtt_publish_attempt_count", "mqtt_publish_retry_count",
-        "mqtt_puback_timeout_count", "mqtt_connection_failure_count",
-        "mqtt_reconnect_success_count", "mqtt_last_reconnect_duration_ms",
-        "mqtt_last_outage_duration_ms",
-        "wifi_rssi_min_dbm", "wifi_rssi_max_dbm", "wifi_rssi_moving_average_dbm",
-        "wifi_last_reconnect_duration_ms", "wifi_last_dhcp_acquisition_duration_ms",
-        "gateway_reachable", "dns_reachable",
-        "mqtt_broker_last_round_trip_ms", "wifi_bssid", "wifi_channel",
     ):
         assert field in p
 
@@ -550,231 +565,6 @@ def test_hardware_type_and_machine_fields(health):
     assert p["machine"] == "Raspberry Pi Pico 2 W with RP2350"
     assert p["minimum_free_heap_bytes"] == 131072
     assert p["status"] == "healthy"
-
-
-def test_watchdog_reset_cause_is_reported_without_degrading_health(health):
-    """A historical watchdog_reset is reported but never degrades health.
-
-    last_reset_cause describes the boot event that began the current runtime;
-    it must appear in the payload exactly as captured, while the current
-    classification stays healthy with no degraded reasons.
-    """
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    health.set_hardware({
-        "hardware_type": "pico_w",
-        "machine": "Raspberry Pi Pico W with RP2040",
-        "minimum_free_heap_bytes": 65536,
-        "last_reset_cause": "watchdog_reset",
-    })
-
-    payload = health.build()
-
-    p = payload["payload"]
-    assert p["last_reset_cause"] == "watchdog_reset"
-    assert p["status"] == "healthy"
-    assert p["degraded_reasons"] == []
-
-
-def test_reset_cause_defaults_to_unknown_when_absent(health):
-    """A hardware snapshot without last_reset_cause reports "unknown"."""
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    health.set_hardware({
-        "hardware_type": "pico_w",
-        "machine": "Raspberry Pi Pico W with RP2040",
-        "minimum_free_heap_bytes": 65536,
-    })
-
-    payload = health.build()
-
-    p = payload["payload"]
-    assert p["last_reset_cause"] == "unknown"
-    assert p["status"] == "healthy"
-
-
-def test_mqtt_reliability_metrics_reported_without_degrading_health(health):
-    """The seven MQTT reliability metrics are carried into the health payload
-    from the Core 0 network snapshot, and historical failures never add a
-    degraded reason: they describe what happened, not current liveness.
-
-    A device that is fully healthy right now but has a rich failure history
-    (PUBACK timeouts, connection failures, reconnects, outages) must still
-    report healthy with no degraded reasons -- and none of the forbidden
-    historical-failure reasons may appear.
-    """
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    health.set_network({
-        "wifi_connected": True,
-        "mqtt_connected": True,
-        "network_stack_ready": True,
-        "rssi": -50,
-        "mqtt_publish_attempt_count": 10,
-        "mqtt_publish_retry_count": 3,
-        "mqtt_puback_timeout_count": 5,      # historical failure
-        "mqtt_connection_failure_count": 8,  # historical failure
-        "mqtt_reconnect_success_count": 3,
-        "mqtt_last_reconnect_duration_ms": 12000,
-        "mqtt_last_outage_duration_ms": 16000,
-    })
-
-    payload = health.build()
-    p = payload["payload"]
-
-    assert p["mqtt_publish_attempt_count"] == 10
-    assert p["mqtt_publish_retry_count"] == 3
-    assert p["mqtt_puback_timeout_count"] == 5
-    assert p["mqtt_connection_failure_count"] == 8
-    assert p["mqtt_reconnect_success_count"] == 3
-    assert p["mqtt_last_reconnect_duration_ms"] == 12000
-    assert p["mqtt_last_outage_duration_ms"] == 16000
-
-    # Historical failures must not degrade current health: the link is up and
-    # every current-state rule is satisfied, so no degraded reasons at all.
-    assert p["status"] == "healthy"
-    assert p["degraded_reasons"] == []
-    for reason in ("mqtt_publish_retry", "mqtt_puback_timeout",
-                   "mqtt_connection_failure", "mqtt_previous_outage"):
-        assert reason not in p["degraded_reasons"]
-
-
-def test_mqtt_reliability_metrics_default_to_zero(health):
-    """A network snapshot without the metric fields reports integer zero,
-    never null."""
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    # set_healthy_baseline's network snapshot carries no mqtt_* metric fields.
-
-    payload = health.build()
-    p = payload["payload"]
-
-    for field in (
-        "mqtt_publish_attempt_count",
-        "mqtt_publish_retry_count",
-        "mqtt_puback_timeout_count",
-        "mqtt_connection_failure_count",
-        "mqtt_reconnect_success_count",
-        "mqtt_last_reconnect_duration_ms",
-        "mqtt_last_outage_duration_ms",
-    ):
-        assert p[field] == 0
-        assert isinstance(p[field], int)
-        assert p[field] is not None
-
-
-def test_post_outage_drain_metrics_reported_without_degrading_health(health):
-    """The five post-outage drain metrics are carried into the health payload
-    from the Core 0 network snapshot (Core 0 is the single source), and a
-    historically slow drain never adds a degraded reason: the current-state
-    rules remain the only source of degraded reasons."""
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    health.set_network({
-        "wifi_connected": True,
-        "mqtt_connected": True,
-        "network_stack_ready": True,
-        "rssi": -50,
-        "outbound_queue_drain_active": False,
-        "outbound_queue_last_drain_start_depth": 64,
-        "outbound_queue_last_drain_message_count": 64,
-        "outbound_queue_last_drain_duration_ms": 30000,  # a slow past drain
-        "outbound_queue_last_drain_rate_per_sec": 2,     # well under 5/s
-    })
-
-    payload = health.build()
-    p = payload["payload"]
-
-    assert p["outbound_queue_drain_active"] is False
-    assert p["outbound_queue_last_drain_start_depth"] == 64
-    assert p["outbound_queue_last_drain_message_count"] == 64
-    assert p["outbound_queue_last_drain_duration_ms"] == 30000
-    assert p["outbound_queue_last_drain_rate_per_sec"] == 2
-
-    # A past slow drain is historical/diagnostic: the device is fully healthy
-    # right now, so no degraded reasons at all.
-    assert p["status"] == "healthy"
-    assert p["degraded_reasons"] == []
-    for reason in ("outbound_queue_drain_slow", "outbound_queue_drain",
-                   "drain_rate_low", "outbound_queue_pressure"):
-        assert reason not in p["degraded_reasons"]
-
-
-def test_post_outage_drain_metrics_default_to_safe_values(health):
-    """A network snapshot without the drain fields reports false/0 (never
-    null) before the first completed drain."""
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    # set_healthy_baseline's network snapshot carries no drain fields.
-
-    payload = health.build()
-    p = payload["payload"]
-
-    assert p["outbound_queue_drain_active"] is False
-    assert p["outbound_queue_last_drain_start_depth"] == 0
-    assert p["outbound_queue_last_drain_message_count"] == 0
-    assert p["outbound_queue_last_drain_duration_ms"] == 0
-    assert p["outbound_queue_last_drain_rate_per_sec"] == 0
-    for field in (
-        "outbound_queue_last_drain_start_depth",
-        "outbound_queue_last_drain_message_count",
-        "outbound_queue_last_drain_duration_ms",
-        "outbound_queue_last_drain_rate_per_sec",
-    ):
-        assert isinstance(p[field], int)
-        assert p[field] is not None
-
-
-def test_network_diagnostics_reported_without_degrading_health(health):
-    """The network-quality and diagnostics fields are carried into the health
-    payload from the Core 0 network snapshot, and a weak/failed history never
-    adds a degraded reason: they describe what happened, not current liveness.
-
-    A device that is fully healthy right now but has a rough link history
-    (weak RSSI floor, slow DHCP, gateway and DNS probes failing, a slow
-    broker round trip) must still report healthy with no degraded reasons --
-    and none of the forbidden historical-diagnostics reasons may appear.
-    """
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    health.set_network({
-        "wifi_connected": True,
-        "mqtt_connected": True,
-        "network_stack_ready": True,
-        "rssi": -50,
-        "wifi_rssi_min_dbm": -90,                 # weak historical floor
-        "wifi_rssi_max_dbm": -42,
-        "wifi_rssi_moving_average_dbm": -63,
-        "wifi_last_reconnect_duration_ms": 8000,
-        "wifi_last_dhcp_acquisition_duration_ms": 4200,
-        "gateway_reachable": False,               # probed and failed
-        "dns_reachable": False,                   # probed and failed
-        "mqtt_broker_last_round_trip_ms": 900,
-        "wifi_bssid": None,
-        "wifi_channel": None,
-    })
-
-    payload = health.build()
-    p = payload["payload"]
-
-    assert p["wifi_rssi_min_dbm"] == -90
-    assert p["wifi_rssi_max_dbm"] == -42
-    assert p["wifi_rssi_moving_average_dbm"] == -63
-    assert p["wifi_last_reconnect_duration_ms"] == 8000
-    assert p["wifi_last_dhcp_acquisition_duration_ms"] == 4200
-    assert p["gateway_reachable"] is False
-    assert p["dns_reachable"] is False
-    assert p["mqtt_broker_last_round_trip_ms"] == 900
-    assert p["wifi_bssid"] is None
-    assert p["wifi_channel"] is None
-
-    # A failed probe or weak RSSI history must not degrade current health:
-    # the link is up and every current-state rule is satisfied.
-    assert p["status"] == "healthy"
-    assert p["degraded_reasons"] == []
-    for reason in ("gateway_unreachable", "dns_unreachable", "weak_rssi",
-                   "slow_dhcp", "high_broker_latency"):
-        assert reason not in p["degraded_reasons"]
 
 
 def test_wifi_rssi_dbm_field(health):

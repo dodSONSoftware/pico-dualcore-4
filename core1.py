@@ -21,30 +21,11 @@ from intercore import (
     KIND_HEALTH,
     KIND_LOG,
     RETENTION_PRIORITY_CRITICAL,
-    RETENTION_PRIORITY_WARN,
     RETENTION_PRIORITY_TELEMETRY,
     RETENTION_PRIORITY_INFO,
     RETENTION_PRIORITY_HEALTH,
-    CONFIG_TX_ACTION_APPLY,
-    CONFIG_TX_ACTION_COMMIT,
-    CONFIG_TX_ACTION_ROLLBACK,
 )
 from message_protocol import format_utc_epoch_ms, is_json_safe
-from observability import (
-    BOOT_REASON_UNKNOWN,
-    EVENT_COMMAND_REJECTED,
-    EVENT_DEVICE_READ_FAILED,
-    EVENT_DEVICE_REINITIALIZATION_COMPLETED,
-    EVENT_DEVICE_REINITIALIZATION_FAILED,
-    EVENT_RUNTIME_STARTED,
-    LEVEL_INFO,
-    LEVEL_WARNING,
-    REASON_COMMAND_UNKNOWN,
-    REASON_DEVICE_READ_EXCEPTION,
-    REASON_DEVICE_REINITIALIZATION_FAILED,
-    REASON_NONE,
-    build_event_payload,
-)
 from system_information import SystemInformation, SYSTEM_INFORMATION_SECTIONS
 from uptime import create_uptime_state, current_uptime_ms
 
@@ -54,7 +35,6 @@ from message_serializer import (
     UnsupportedValueError,
     NonStringKeyError,
     NonFiniteFloatError,
-    PUBLISH_GC_HEADROOM_BYTES,
 )
 
 
@@ -77,7 +57,7 @@ def _collect_system_information_full(system_information):
 
 
 def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information=None):
-    """Build the runtime_started log message.
+    """Build the system_startup_completed log message.
 
     The message carries only Core 1's own fields (message_type, uptime_ms,
     timestamp, payload). It must NOT carry the envelope keys (sequence,
@@ -140,40 +120,22 @@ def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup
         system_information = SystemInformation(intercore, config)
     system_info = _collect_system_information_full(system_information)
 
-    # Boot identity context from the startup hardware snapshot (published by
-    # main() before any core runs; immutable for this runtime). An unavailable
-    # snapshot degrades to "unknown" instead of failing the startup log.
-    try:
-        hardware = intercore.state_mailboxes.get_hardware()
-    except MemoryError:
-        raise
-    except Exception:
-        hardware = None
-    last_reset_cause = "unknown"
-    boot_reason = BOOT_REASON_UNKNOWN
-    if isinstance(hardware, dict):
-        last_reset_cause = hardware.get("last_reset_cause") or "unknown"
-        boot_reason = hardware.get("boot_reason") or BOOT_REASON_UNKNOWN
-
     # Build the message. Core 0 injects the envelope (sequence, runtime_id,
-    # source, firmware_version, message_schema_version, firmware_build_commit)
-    # at publish time.
+    # source, firmware_version, message_schema_version) at publish time.
     payload = {
         "message_type": "log",
         "uptime_ms": startup_duration_ms,
         "timestamp": _current_utc_timestamp(intercore),
-        "payload": build_event_payload(
-            LEVEL_INFO,
-            EVENT_RUNTIME_STARTED,
-            REASON_NONE,
-            "System startup completed",
-            {
-                "last_reset_cause": last_reset_cause,
-                "boot_reason": boot_reason,
+        "payload": {
+            "level": "info",
+            "event": "system_startup_completed",
+            "module": "system",
+            "message": "System startup completed",
+            "data": {
                 "startup": startup_summary,
                 "system_information": system_info,
             },
-        ),
+        },
     }
 
     return payload
@@ -262,50 +224,16 @@ def _process_intercore_event(intercore, uptime_state):
         return None
 
     # Baseline rebuild intentionally implements no Core 1 commands yet.
-    uptime_ms, timestamp = _message_time(intercore, uptime_state)
-    rejection_log = {
-        "message_type": "log",
-        "uptime_ms": uptime_ms,
-        "timestamp": timestamp,
-        "payload": build_event_payload(
-            LEVEL_WARNING,
-            EVENT_COMMAND_REJECTED,
-            REASON_COMMAND_UNKNOWN,
-            "Command is not implemented in baseline firmware",
-            {"command": event.get("command"), "command_id": event.get("command_id")},
-        ),
-    }
-    if not intercore.outbound_queue.put(KIND_LOG, rejection_log, RETENTION_PRIORITY_WARN):
-        print("[WARNING] Core 1 command rejection log rejected")
     return _build_command_response(
         intercore,
         uptime_state,
         event,
         False,
         error={
-            "code": REASON_COMMAND_UNKNOWN,
+            "code": "unsupported_command",
             "message": "Command is not implemented in baseline firmware",
         },
     )
-
-
-def _queue_device_log(intercore, uptime_state, level, event, reason_code, message, data, priority):
-    """Queue one device diagnostic log event (KIND_LOG).
-
-    Transitions only (a read failure, a reinitialization outcome) -- a
-    successful read never logs: its measurement is the telemetry message.
-    A queue rejection never fails the device cycle: the console print is the
-    local record, and the wire event is best-effort.
-    """
-    uptime_ms, timestamp = _message_time(intercore, uptime_state)
-    log_message = {
-        "message_type": "log",
-        "uptime_ms": uptime_ms,
-        "timestamp": timestamp,
-        "payload": build_event_payload(level, event, reason_code, message, data),
-    }
-    if not intercore.outbound_queue.put(KIND_LOG, log_message, priority):
-        print("[WARNING] Core 1 device log rejected")
 
 
 def _handle_device_result(intercore, config, uptime_state, result):
@@ -338,41 +266,10 @@ def _handle_device_result(intercore, config, uptime_state, result):
         print("[WARNING] Core 1 device read failed: {}: {}".format(
             result["device_id"], result.get("error")
         ))
-        _queue_device_log(
-            intercore,
-            uptime_state,
-            LEVEL_WARNING,
-            EVENT_DEVICE_READ_FAILED,
-            REASON_DEVICE_READ_EXCEPTION,
-            "Device read failed",
-            {
-                "device_id": result["device_id"],
-                "device": result["device"],
-                "consecutive_read_failures": result.get("consecutive_read_failures"),
-                # Exception text stays human-readable (never a reason code);
-                # the reason code is the canonical vocabulary above.
-                "error": str(result.get("error")),
-            },
-            RETENTION_PRIORITY_WARN,
-        )
         return
 
     if status == DEVICE_RESULT_REINITIALIZED:
         print("[INFO] Core 1 device reinitialized: {}".format(result["device_id"]))
-        _queue_device_log(
-            intercore,
-            uptime_state,
-            LEVEL_INFO,
-            EVENT_DEVICE_REINITIALIZATION_COMPLETED,
-            REASON_NONE,
-            "Device reinitialized",
-            {
-                "device_id": result["device_id"],
-                "device": result["device"],
-                "reinitialization_attempts_used": result.get("reinitialization_attempts_used"),
-            },
-            RETENTION_PRIORITY_INFO,
-        )
         return
 
     if status == DEVICE_RESULT_REINITIALIZATION_FAILED:
@@ -383,20 +280,6 @@ def _handle_device_result(intercore, config, uptime_state, result):
             print("[WARNING] Core 1 device reinitialization failed: {}: {}".format(
                 result["device_id"], result.get("error")
             ))
-            _queue_device_log(
-                intercore,
-                uptime_state,
-                LEVEL_WARNING,
-                EVENT_DEVICE_REINITIALIZATION_FAILED,
-                REASON_DEVICE_REINITIALIZATION_FAILED,
-                "Device reinitialization failed",
-                {
-                    "device_id": result["device_id"],
-                    "device": result["device"],
-                    "error": str(result.get("error")),
-                },
-                RETENTION_PRIORITY_WARN,
-            )
 
 
 def _build_health_payload(intercore, uptime_state, config, system_information):
@@ -404,9 +287,9 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
 
     The message carries only Core 1's own fields (message_type, uptime_ms,
     timestamp, payload). The envelope keys (sequence, runtime_id, source,
-    firmware_version, message_schema_version, firmware_build_commit) are owned
-    by Core 0, which injects them at publish time; repeating them here would
-    duplicate a name in the wire document.
+    firmware_version, message_schema_version) are owned by Core 0, which
+    injects them at publish time; repeating them here would duplicate a name
+    in the wire document.
 
     Args:
         intercore: InterCore bus instance
@@ -449,6 +332,7 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
         queue_depth,
         queue_capacity,
         queue_queued_bytes,
+        queue_max_queued_bytes,
     ) = outbound_queue.get_health_metrics()
 
     # Get memory info
@@ -459,33 +343,18 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     except Exception:
         free_heap = 0
 
-    # Submit the current free heap to the shared MemoryStats -- the single
-    # source of the low-watermark minimum -- rather than tracking a Core 1-only
-    # minimum. The observed minimum is historical/diagnostic and never affects
-    # status (free_heap < reserve is the only heap-based degraded reason).
-    intercore.memory_stats.observe_free_heap(free_heap)
-    minimum_free_heap_observed = intercore.memory_stats.minimum_free_heap_observed()
-    if minimum_free_heap_observed is None:
-        minimum_free_heap_observed = free_heap
-
-    # Get hardware info from state mailboxes. last_reset_cause and boot_reason
-    # are historical (they describe the boot that started this runtime), so
-    # they are reported as-is and must never add a degraded reason.
+    # Get hardware info from state mailboxes
     try:
         hardware = intercore.state_mailboxes.get_hardware()
         minimum_free_heap = hardware.get("minimum_free_heap_bytes") if hardware else 65536
         hardware_type = hardware.get("hardware_type", "unknown")
         machine = hardware.get("machine", "unknown")
-        last_reset_cause = hardware.get("last_reset_cause") or "unknown"
-        boot_reason = hardware.get("boot_reason") or BOOT_REASON_UNKNOWN
     except MemoryError:
         raise
     except Exception:
         minimum_free_heap = 65536
         hardware_type = "unknown"
         machine = "unknown"
-        last_reset_cause = "unknown"
-        boot_reason = BOOT_REASON_UNKNOWN
 
     # Get RSSI from network snapshot
     wifi_rssi_dbm = network_snapshot.get("rssi")
@@ -502,17 +371,22 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     # Calculate device failures from DeviceManager state
     device_failures = devices_configured - devices_active
 
-    # Queue utilization is the entry view against the fixed entry ceiling.
-    # queue_queued_bytes (retained payload bytes) is reported as a diagnostic;
-    # it is no longer a budget, so there is no separate byte-utilization field.
+    # Calculate queue utilization percentages. The queue has two independent
+    # budgets (entry count and queued payload bytes); a handful of large
+    # entries can reach the byte ceiling while entry utilization is modest,
+    # so both are reported.
     queue_utilization_percent = 0
     if queue_capacity > 0:
         queue_utilization_percent = (queue_depth * 100) // queue_capacity
+    queue_byte_utilization_percent = 0
+    if queue_max_queued_bytes > 0:
+        queue_byte_utilization_percent = (queue_queued_bytes * 100) // queue_max_queued_bytes
 
-    # Queue pressure: the queue at or beyond the 75% entry threshold is a
-    # full-condition risk. (Heap pressure is defended at admission and is a
-    # separate, current-state concern surfaced by low_free_heap below.)
-    queue_pressure = queue_utilization_percent >= 75
+    # Determine queue pressure: either budget at or beyond the 75% threshold
+    # is a full-condition risk, so pressure is the worse of the two.
+    queue_pressure = max(
+        queue_utilization_percent, queue_byte_utilization_percent
+    ) >= 75
 
     # Evaluate health status and build degraded reasons
     degraded_reasons = []
@@ -558,8 +432,6 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
             "degraded_reasons": degraded_reasons,
             "hardware_type": hardware_type,
             "machine": machine,
-            "last_reset_cause": last_reset_cause,
-            "boot_reason": boot_reason,
             "network_stack_ready": network_stack_ready,
             "wifi_connected": wifi_connected,
             "wifi_rssi_dbm": wifi_rssi_dbm,
@@ -576,51 +448,10 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
             "outbound_queue_capacity": queue_capacity,
             "outbound_queue_utilization_percent": queue_utilization_percent,
             "outbound_queued_bytes": queue_queued_bytes,
-            # Post-outage queue drain (from the Core 0 network snapshot; Core 0
-            # is the single source). Historical/observational only: a past
-            # slow drain must never add a degraded reason (the current-state
-            # rules above remain the only source of degraded reasons).
-            "outbound_queue_drain_active": network_snapshot.get(
-                "outbound_queue_drain_active", False),
-            "outbound_queue_last_drain_start_depth": network_snapshot.get(
-                "outbound_queue_last_drain_start_depth", 0),
-            "outbound_queue_last_drain_message_count": network_snapshot.get(
-                "outbound_queue_last_drain_message_count", 0),
-            "outbound_queue_last_drain_duration_ms": network_snapshot.get(
-                "outbound_queue_last_drain_duration_ms", 0),
-            "outbound_queue_last_drain_rate_per_sec": network_snapshot.get(
-                "outbound_queue_last_drain_rate_per_sec", 0),
-            "minimum_free_heap_observed_bytes": minimum_free_heap_observed,
+            "outbound_max_queued_bytes": queue_max_queued_bytes,
+            "outbound_queue_byte_utilization_percent": queue_byte_utilization_percent,
             "utc_valid": utc_valid,
             "utc_sync_age_sec": utc_sync_age_sec,
-            # MQTT reliability metrics (from the Core 0 network snapshot). These
-            # are historical/diagnostic: they describe what happened and must
-            # never add a degraded reason on their own (the current-state rules
-            # above remain the only source of degraded reasons).
-            "mqtt_publish_attempt_count": network_snapshot.get("mqtt_publish_attempt_count", 0),
-            "mqtt_publish_retry_count": network_snapshot.get("mqtt_publish_retry_count", 0),
-            "mqtt_puback_timeout_count": network_snapshot.get("mqtt_puback_timeout_count", 0),
-            "mqtt_connection_failure_count": network_snapshot.get("mqtt_connection_failure_count", 0),
-            "mqtt_reconnect_success_count": network_snapshot.get("mqtt_reconnect_success_count", 0),
-            "mqtt_last_reconnect_duration_ms": network_snapshot.get("mqtt_last_reconnect_duration_ms", 0),
-            "mqtt_last_outage_duration_ms": network_snapshot.get("mqtt_last_outage_duration_ms", 0),
-            # Network quality and diagnostics (from the Core 0 network
-            # snapshot). Historical/observational: they must never add a
-            # degraded reason (the current-state rules above remain the only
-            # source of degraded reasons). Null means not-yet-tested or
-            # unsupported (gateway_reachable/dns_reachable are true/false
-            # only after a probe has run).
-            "wifi_rssi_min_dbm": network_snapshot.get("wifi_rssi_min_dbm"),
-            "wifi_rssi_max_dbm": network_snapshot.get("wifi_rssi_max_dbm"),
-            "wifi_rssi_moving_average_dbm": network_snapshot.get("wifi_rssi_moving_average_dbm"),
-            "wifi_last_reconnect_duration_ms": network_snapshot.get("wifi_last_reconnect_duration_ms", 0),
-            "wifi_last_dhcp_acquisition_duration_ms": network_snapshot.get(
-                "wifi_last_dhcp_acquisition_duration_ms", 0),
-            "gateway_reachable": network_snapshot.get("gateway_reachable"),
-            "dns_reachable": network_snapshot.get("dns_reachable"),
-            "mqtt_broker_last_round_trip_ms": network_snapshot.get("mqtt_broker_last_round_trip_ms"),
-            "wifi_bssid": network_snapshot.get("wifi_bssid"),
-            "wifi_channel": network_snapshot.get("wifi_channel"),
         },
     }
 
@@ -713,7 +544,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # after startup-log admission, below).
         uptime_state = create_uptime_state(boot_ticks_ms)
 
-        system_information = SystemInformation(intercore, config, runtime_id)
+        system_information = SystemInformation(intercore, config)
         device_manager = DeviceManager(config, system_information=system_information)
         system_information.set_device_manager(device_manager)
 
@@ -755,7 +586,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         print("[INFO] Startup log admitted to outbound queue")
 
         # The single normal-runtime scheduling anchor, captured exactly once,
-        # immediately after runtime_started is admitted. All
+        # immediately after system_startup_completed is admitted. All
         # periodic Core 1 work (telemetry and health) derives its fixed
         # boundaries from this moment -- not from boot_ticks_ms (which
         # remains the boot-lifetime reference for uptime and startup-duration
@@ -765,9 +596,15 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # reboot -- a new runtime with a new runtime_id -- creates a new one.
         normal_runtime_start_ticks_ms = time.ticks_ms()
 
-        # The startup hardware snapshot (board identity, heap reserve, last
-        # reset cause) is published by main() before core operation begins;
-        # Core 1 only reads it, so it stays immutable for this runtime.
+        # Store hardware info in state mailboxes (from system_information)
+        try:
+            hardware = system_information.get_machine()
+            intercore.state_mailboxes.set_hardware(hardware)
+        except MemoryError:
+            raise
+        except Exception as err:
+            if DEBUG:
+                print("[DEBUG] Hardware storage failed: {}".format(err))
 
         # Register initial Core 1 activity
         intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
@@ -802,122 +639,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         pending_command_response = None
 
-        # Rollback snapshot for the in-flight configuration transaction
-        # (previous Core 1 values + the device rollback token), retained
-        # until the coordinator's commit or rollback instruction.
-        config_tx_rollback = None
-
         while True:
-            # Configuration transaction: Core 1 applies its own keys. One
-            # mailbox poll per pass (no busy-spin); the transaction stays in
-            # flight until Core 0 takes the result, so a queued request can
-            # never race a rollback. Applied values are used from the very
-            # next scheduling check below.
-            config_tx_request = intercore.config_transaction_mailbox.take_request()
-            if config_tx_request is not None:
-                config_tx_error = None
-                config_tx_action = config_tx_request.get("action")
-                if config_tx_action == CONFIG_TX_ACTION_APPLY:
-                    config_tx_changes = config_tx_request.get("changes") or {}
-                    config_tx_device_token = None
-                    if "devices" in config_tx_changes:
-                        # Controlled-GC boundary before candidate device
-                        # construction (same pattern as the read-cycle
-                        # boundary): leave headroom for the candidate build
-                        # peak. Admission still defends the reserve.
-                        intercore.memory_stats.collect_if_below(
-                            intercore.minimum_free_heap_bytes + PUBLISH_GC_HEADROOM_BYTES
-                        )
-                        try:
-                            config_tx_device_token = device_manager.reconfigure_devices(
-                                config_tx_changes["devices"]
-                            )
-                        except MemoryError:
-                            raise
-                        except Exception as err:
-                            # All-or-nothing on this core: nothing is applied
-                            # (no DYNAMIC value either); the known-good device
-                            # set is untouched.
-                            config_tx_error = str(err)
-                    if config_tx_error is None:
-                        # Snapshot the previous state first (for the rollback
-                        # instruction), then apply. A changed interval rebases
-                        # its next deadline from now -- prospective, never a
-                        # catch-up burst (invariant 10's skip policy).
-                        config_tx_rollback = {
-                            "applied_keys": sorted(config_tx_changes.keys()),
-                            "read_loop_ms": read_loop_ms,
-                            "health_interval_ms": health_interval_ms,
-                            "read_loop_sec": config.get("read_loop_sec"),
-                            "health_interval_sec": config.get("health_interval_sec"),
-                            "limits": {
-                                "device_initialization_attempts": device_manager._device_initialization_attempts,
-                                "device_initialization_retry_delay_ms": device_manager._device_initialization_retry_delay_ms,
-                                "device_read_failure_threshold": device_manager._device_read_failure_threshold,
-                            },
-                            "device_token": config_tx_device_token,
-                        }
-                        for key, value in config_tx_changes.items():
-                            config[key] = value
-                        limits = {}
-                        for key in (
-                            "device_initialization_attempts",
-                            "device_initialization_retry_delay_ms",
-                            "device_read_failure_threshold",
-                        ):
-                            if key in config_tx_changes:
-                                limits[key] = config_tx_changes[key]
-                        if limits:
-                            device_manager.apply_dynamic_limits(limits)
-                        rebase_now_ms = time.ticks_ms()
-                        if "read_loop_sec" in config_tx_changes:
-                            read_loop_ms = config_tx_changes["read_loop_sec"] * 1000
-                            next_read_ms = time.ticks_add(rebase_now_ms, read_loop_ms)
-                        if "health_interval_sec" in config_tx_changes:
-                            health_interval_ms = config_tx_changes["health_interval_sec"] * 1000
-                            next_health_ms = time.ticks_add(rebase_now_ms, health_interval_ms)
-                elif config_tx_action == CONFIG_TX_ACTION_COMMIT:
-                    # The commit instruction discards the retained rollback
-                    # snapshot (and the device rollback token with it).
-                    config_tx_rollback = None
-                elif config_tx_action == CONFIG_TX_ACTION_ROLLBACK:
-                    if config_tx_rollback is not None:
-                        applied = config_tx_rollback["applied_keys"]
-                        limits = {}
-                        for key in (
-                            "device_initialization_attempts",
-                            "device_initialization_retry_delay_ms",
-                            "device_read_failure_threshold",
-                        ):
-                            if key in applied:
-                                limits[key] = config_tx_rollback["limits"][key]
-                        if limits:
-                            device_manager.apply_dynamic_limits(limits)
-                        rebase_now_ms = time.ticks_ms()
-                        if "read_loop_sec" in applied:
-                            config["read_loop_sec"] = config_tx_rollback["read_loop_sec"]
-                            read_loop_ms = config_tx_rollback["read_loop_ms"]
-                            next_read_ms = time.ticks_add(rebase_now_ms, read_loop_ms)
-                        if "health_interval_sec" in applied:
-                            config["health_interval_sec"] = config_tx_rollback["health_interval_sec"]
-                            health_interval_ms = config_tx_rollback["health_interval_ms"]
-                            next_health_ms = time.ticks_add(rebase_now_ms, health_interval_ms)
-                        if "devices" in applied and config_tx_rollback["device_token"] is not None:
-                            device_manager.rollback_devices(config_tx_rollback["device_token"])
-                        config_tx_rollback = None
-                    # A rollback instruction when the apply failed before
-                    # applying anything is a no-op success.
-                else:
-                    config_tx_error = "unknown transaction action: {}".format(config_tx_action)
-                if not intercore.config_transaction_mailbox.put_result(
-                    {
-                        "transaction_id": config_tx_request["transaction_id"],
-                        "success": config_tx_error is None,
-                        "error": config_tx_error,
-                    }
-                ):
-                    print("[ERROR] Core 1 config transaction result rejected")
-
             if pending_command_response is not None:
                 if _try_queue_response(intercore, pending_command_response):
                     pending_command_response = None
@@ -950,13 +672,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 skip_now_ms = time.ticks_ms()
                 while time.ticks_diff(skip_now_ms, next_read_ms) >= 0:
                     next_read_ms = time.ticks_add(next_read_ms, read_loop_ms)
-                # Boundary 4 (after each read cycle): an OPTIONAL controlled
-                # collect, cooldown-gated, that leaves headroom for the next
-                # cycle's serialization peak. Not a safety invariant -- the
-                # admission path defends the reserve when it is breached.
-                intercore.memory_stats.collect_if_below(
-                    intercore.minimum_free_heap_bytes + PUBLISH_GC_HEADROOM_BYTES
-                )
+                gc.collect()
 
             # Register Core 1 activity periodically (every 5 seconds)
             if time.ticks_diff(now_ms, next_activity_ms) >= 0:

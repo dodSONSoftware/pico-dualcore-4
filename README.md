@@ -155,7 +155,6 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 ### Hardware
 - `hardware_type`: Canonical hardware type ("pico_w" or "pico_2_w")
 - `machine`: Human-readable machine identifier
-- `last_reset_cause`: How the current boot began ("power_on_reset", "hard_reset", "watchdog_reset", "deep_sleep_reset", "soft_reset", or "unknown"); historical information — it never changes the health status
 
 ### Network
 - `wifi_rssi_dbm`: Current Wi-Fi signal strength (dBm)
@@ -165,9 +164,8 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 
 ### Memory
 - `free_heap_bytes`: Current free heap
-- `minimum_free_heap_bytes`: Board heap reserve (64KB Pico W, 128KB Pico 2 W; a code constant, not config)
+- `minimum_free_heap_bytes`: Configured heap reserve (64KB Pico W, 128KB Pico 2 W)
 - `heap_headroom_bytes`: free_heap - minimum_free_heap (may be negative)
-- `minimum_free_heap_observed_bytes`: Lowest free heap observed at an explicit checkpoint since boot (diagnostic; never changes the health status)
 
 ### Core Activity
 - `core_1_active`: Boolean indicating Core 1 liveness
@@ -180,14 +178,8 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 
 ### Queue
 - `outbound_queue_depth`: Current queued + in-flight entries
-- `outbound_queue_capacity`: Fixed entry ceiling (the internal 64-entry sanity guard; the free-heap reserve — not the entry count — is the memory-safety boundary)
+- `outbound_queue_capacity`: Maximum queue entries
 - `outbound_queue_utilization_percent`: (depth * 100) // capacity
-- `outbound_queued_bytes`: Diagnostic retained payload bytes (queued FIFO plus the in-flight entry)
-- `outbound_queue_drain_active`: Whether Core 0 is currently draining a post-outage outbound backlog
-- `outbound_queue_last_drain_start_depth`: Queue depth at the start of the last completed post-outage drain (0 before the first)
-- `outbound_queue_last_drain_message_count`: Queue entries completed during the last completed drain (0 before the first)
-- `outbound_queue_last_drain_duration_ms`: Monotonic span from drain start to queue empty (0 before the first)
-- `outbound_queue_last_drain_rate_per_sec`: Average successful drain throughput, integer (0 before the first; a past slow drain never degrades health)
 
 ### UTC
 - `utc_valid`: Boolean indicating UTC time is valid
@@ -200,9 +192,9 @@ The health status is "degraded" when any of these conditions are true:
 - `wifi_not_connected`: Wi-Fi disconnected
 - `mqtt_not_connected`: MQTT broker connection lost
 - `core_1_inactive`: Core 1 activity exceeds threshold (3x read_loop_sec, min 60s)
-- `low_free_heap`: free_heap < minimum_free_heap (the only heap-based trigger; the observed low-watermark minimum never adds a reason)
+- `low_free_heap`: free_heap < minimum_free_heap
 - `device_count_mismatch`: devices_active != devices_configured
-- `outbound_queue_pressure`: entry utilization (depth / entry ceiling) >= 75%
+- `outbound_queue_pressure`: utilization >= 75%
 - `utc_not_valid`: UTC snapshot unavailable
 
 Health messages are only generated when MQTT is connected to prevent stale messages during outages.
@@ -220,8 +212,6 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 - **QoS 1 MQTT**: Synchronous PUBLISH → PUBACK, one in-flight message
 - **MQTT Keepalive**: Explicit PINGREQ at keepalive/2 keeps the broker session alive
 - **Network Recovery**: Mid-run Wi-Fi/MQTT loss — including blackholed links — is detected and re-established automatically
-- **Post-Outage Queue Drain**: Buffered outbound messages are drained after reconnect with metrics (`outbound_queue_drain_*` in health and the queues section) and an optional non-blocking drain-rate ceiling (`mqtt_post_outage_drain_rate_per_sec`, disabled by default)
-- **Network Diagnostics**: Passive Wi-Fi quality (RSSI min/max/moving average, reconnect/DHCP durations, status reasons, BSSID/channel where available) plus bounded, staged gateway/DNS/broker reachability probes — observational only, never degrades health, never calls `wlan.scan()`
 - **Health Messages**: Periodic diagnostic messages with status and 17+ fields
 - **Anchored Scheduling**: Telemetry and health boundaries are fixed to one shared runtime anchor captured at startup; missed boundaries are skipped, never replayed
 - **Tick-Wrap-Safe Uptime**: Uptime is accumulated from recent sample deltas, staying correct on long-running devices
@@ -239,7 +229,7 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 
 ### Schema Version
 
-The firmware expects `config_schema_version: 8`. Unknown top-level keys are rejected (the former `max_outbound_queue_entries` key is obsolete in schema 6 — the queue size is no longer user-tunable).
+The firmware expects `config_schema_version: 5`. Unknown top-level keys are rejected.
 
 ### Key Settings
 
@@ -252,17 +242,15 @@ The firmware expects `config_schema_version: 8`. Unknown top-level keys are reje
 | `mqtt_keepalive_sec` | MQTT keepalive interval (seconds) |
 | `mqtt_command_poll_ms` | MQTT receive pump interval (ms) |
 | `mqtt_broker_response_timeout_sec` | Bounded PUBACK/UTC-response wait (seconds) |
-| `mqtt_post_outage_drain_rate_per_sec` | Optional upper bound on buffered-queue publish attempts per second **while draining a backlog after an MQTT reconnect**; `0` (default) preserves the unlimited fast drain; positive integer only. Affects only post-outage drains — never startup, normal publishing, command responses, or keepalive |
 | `network_probe_timeout_sec` | Startup probe PUBACK wait (seconds) |
 | `datetime_sync_interval_min` | UTC sync interval (minutes) |
 | `health_interval_sec` | Health message interval (seconds) |
 | `mqtt_topic_health` | MQTT topic for health messages |
+| `max_outbound_queue_entries` | Maximum queued messages |
 | `max_intercore_event_entries` | Core 0 → Core 1 event queue capacity |
 | `network_snapshot_interval_sec` | Network snapshot update interval |
 | `wifi_reconnect_delays_sec` | Wi-Fi reconnect backoff sequence (seconds) |
 | `mqtt_reconnect_delays_sec` | MQTT reconnect backoff sequence (seconds) |
-| `network_diagnostics_interval_sec` | Active network diagnostics cycle period (seconds); `0` disables active probes (passive RSSI sampling continues); otherwise 60–86400 |
-| `network_diagnostics_broker_latency_enabled` | Include the optional MQTT broker round-trip latency probe in the diagnostics cycle (default `false`) |
 
 See [`config.json`](config.json) for complete example.
 
@@ -342,8 +330,7 @@ Example:
 │       ├── __init__.py
 │       └── system_information_device.py
 ├── led_manager.py     # Core 0 LED state machine
-├── wifi.py            # Core 0 Wi-Fi connection management + passive Wi-Fi quality diagnostics
-├── network_diagnostics.py # Core 0 bounded reachability probes (gateway ICMP, DNS)
+├── wifi.py            # Core 0 Wi-Fi connection management
 ├── mqtt.py            # Core 0 MQTT lifecycle (QoS 1, keepalive PINGREQ)
 ├── mqtt_client.py     # Low-level MQTT wire protocol client
 ├── message_protocol.py # Message formatting helpers
@@ -375,7 +362,7 @@ Host-side validation runs before hardware deployment:
 python -m pytest tests/
 ```
 
-See tests in [`tests/`](tests/) — covering core-ownership boundaries, configuration, inter-core bus semantics, health payloads, normal-runtime-anchored telemetry/health scheduling, tick-wrap-safe uptime, MQTT keepalive, UTC synchronization, network recovery, Core 1 liveness, and network diagnostics.
+See tests in [`tests/`](tests/) — covering core-ownership boundaries, configuration, inter-core bus semantics, health payloads, normal-runtime-anchored telemetry/health scheduling, tick-wrap-safe uptime, MQTT keepalive, UTC synchronization, network recovery, and Core 1 liveness.
 
 ## Hardware Status
 

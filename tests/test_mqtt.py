@@ -2,7 +2,6 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
-import errno
 import pathlib
 import sys
 import time as real_time
@@ -24,7 +23,6 @@ from mqtt_client import (  # noqa: E402
     MAX_INBOUND_PACKET_BYTES,
     MQTTClient,
     MQTTException,
-    MQTTPubackTimeout,
 )
 from mqtt import Mqtt  # noqa: E402
 
@@ -120,10 +118,7 @@ class MockSocket:
         if self.write_stalls:
             if self.timeout_value is None:
                 raise HangDetected("write would block forever (no timeout)")
-            # A bounded write failure: MicroPython raises OSError(ETIMEDOUT, ...)
-            # when a finite-timeout socket operation times out. (A write-phase
-            # timeout is an ordinary publish failure, never a PUBACK timeout.)
-            raise OSError(errno.ETIMEDOUT, "write timeout (bounded by installed timeout)")
+            raise OSError("write timeout (bounded by installed timeout)")
         if self.write_requires_timeout and self.timeout_value is None:
             raise HangDetected("write would block forever (no timeout)")
         # MicroPython sockets accept str writes (encoded); CPython does not,
@@ -148,11 +143,7 @@ class MockSocket:
             return b""
         if self.timeout_value is None:
             raise HangDetected("read would block forever (infinite blocking)")
-        # A bounded read failure: MicroPython raises OSError(ETIMEDOUT, ...)
-        # when a finite-timeout socket operation times out. This errno is what
-        # mqtt_client's is_socket_timeout() keys on to distinguish a PUBACK-wait
-        # timeout from a reset/closed/protocol error.
-        raise OSError(errno.ETIMEDOUT, "read timeout")
+        raise OSError("read timeout")
 
     def settimeout(self, value):
         if self.settimeout_error is not None:
@@ -316,18 +307,11 @@ def test_publish_qos1_waits_for_matching_puback_and_restores_timeout():
 
 
 def test_publish_qos1_times_out_when_puback_never_arrives():
-    """PUBLISH frame sent, PUBACK never arrives: a dedicated PUBACK timeout.
-
-    The frame is fully written, the firmware is waiting for its PUBACK, and the
-    wait expires -- exactly the condition MQTTPubackTimeout (and thus the
-    puback_timeout_count metric) exists to name. A plain OSError is no longer
-    the right type here.
-    """
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket(incoming=b"")
     client.sock = sock
 
-    with pytest.raises(MQTTPubackTimeout):
+    with pytest.raises(OSError):
         client.publish(b"t", b"x", qos=1, timeout_ms=4000)
 
     # The PUBLISH frame went out, the bounded wait gave up, and the socket
@@ -422,18 +406,12 @@ def test_publish_qos1_delivers_interleaved_publish_before_puback():
 # ---------------------------------------------------------------------------
 
 def test_publish_qos1_times_out_when_puback_stalls_after_opcode():
-    """A PUBACK that stalls after its first byte is a PUBACK-wait timeout.
-
-    The frame is already fully written and the firmware is mid-way through
-    reading its matching PUBACK when the link stalls: that is the PUBACK-wait
-    phase timing out, so it is a MQTTPubackTimeout (counted in
-    puback_timeout_count), not a generic OSError.
-    """
+    """A PUBACK that stalls after its first byte must time out, not hang."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket(incoming=b"\x40")  # PUBACK opcode, then the link stalls
     client.sock = sock
 
-    with pytest.raises(MQTTPubackTimeout):
+    with pytest.raises(OSError):
         client.publish(b"t", b"x", qos=1, timeout_ms=4000)
 
     # The PUBLISH went out; the bounded wait gave up rather than blocking.
@@ -442,18 +420,12 @@ def test_publish_qos1_times_out_when_puback_stalls_after_opcode():
 
 
 def test_publish_qos1_times_out_when_puback_pid_stalls():
-    """A PUBACK that stalls after its size byte is a PUBACK-wait timeout.
-
-    The frame is fully written and the firmware is reading the PID bytes of its
-    matching PUBACK when the link stalls: the PUBACK-wait phase timed out, so it
-    is a MQTTPubackTimeout (counted in puback_timeout_count), not a generic
-    OSError.
-    """
+    """A PUBACK that stalls after its size byte must time out, not hang."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket(incoming=b"\x40\x02")  # opcode + size byte, pid stalls
     client.sock = sock
 
-    with pytest.raises(MQTTPubackTimeout):
+    with pytest.raises(OSError):
         client.publish(b"t", b"x", qos=1, timeout_ms=4000)
 
     assert bytes(sock.written) == b"\x32\x06\x00\x01t\x00\x01x"
@@ -917,253 +889,6 @@ def test_reconnect_cleanup_closes_stalled_socket_without_writing(ticks, monkeypa
     # The new session owns a fresh client and socket.
     assert mqtt._client is not old_client
     assert mqtt._client.sock is new_sock
-
-
-# ---------------------------------------------------------------------------
-# Mqtt-layer reliability metrics (the single source of truth)
-#
-# These drive the real Mqtt object and pin the seven runtime-lifetime metrics
-# it owns: the five integer counters and the two last-duration scalars. The
-# low-level client (MQTTClient) and the Core 0 layer both defer to Mqtt for
-# these, so the semantics live here. The retry classification (which attempt is
-# a retry of the same logical message) is the one thing Core 0 owns and passes
-# in; the tests below pin that Mqtt honors it without inferring it from a
-# packet id, topic, payload, time, or connection count.
-# ---------------------------------------------------------------------------
-
-_OK_HANDSHAKE = (
-    b"\x20\x02\x00\x00"       # CONNACK
-    b"\x90\x03\x00\x01\x00"   # SUBACK pid 1 (command topic)
-    b"\x90\x03\x00\x02\x00"   # SUBACK pid 2 (info response topic)
-)
-
-
-def _mqtt_with_delays(ticks, delays):
-    config = {
-        "mqtt_broker_ip_address": "10.0.0.1",
-        "mqtt_topic_command": "iot/v3/command",
-        "mqtt_topic_info_response": "iot/v3/info_response",
-        "mqtt_keepalive_sec": 30,
-        "mqtt_broker_response_timeout_sec": 4,
-        "mqtt_reconnect_delays_sec": delays,
-    }
-    return Mqtt(config, lambda topic, msg: None)
-
-
-def _mock_broker_socket_script(monkeypatch, socks):
-    """Route each MQTTClient.connect() at the next scripted broker socket."""
-    import mqtt_client
-    iterator = iter(socks)
-    monkeypatch.setattr(
-        mqtt_client.socket, "socket", lambda *a, **k: next(iterator)
-    )
-    monkeypatch.setattr(
-        mqtt_client.socket,
-        "getaddrinfo",
-        lambda *a, **k: [(None, None, None, ("127.0.0.1", 1883))],
-    )
-
-
-def test_publish_attempt_and_retry_counting(ticks):
-    """Attempts and retries are counted per actual low-level publish; the retry
-    flag comes from Core 0 and is honored, not inferred here."""
-    mqtt = _mqtt(ticks)
-    mqtt._connected = True
-    mqtt._client = FakeClient()
-
-    # First attempt of message A.
-    mqtt.publish_qos1("iot/v3/telemetry", "A")
-    assert mqtt._publish_attempt_count == 1
-    assert mqtt._publish_retry_count == 0
-
-    # Retry of the SAME logical message A (Core 0 passes is_retry=True).
-    mqtt.publish_qos1("iot/v3/telemetry", "A", is_retry=True)
-    assert mqtt._publish_attempt_count == 2
-    assert mqtt._publish_retry_count == 1
-
-    # A different logical message B: an attempt, but not a retry of A.
-    mqtt.publish_qos1("iot/v3/telemetry", "B")
-    assert mqtt._publish_attempt_count == 3
-    assert mqtt._publish_retry_count == 1
-
-
-def test_puback_timeout_counted_at_mqtt_layer(ticks):
-    """A PUBACK wait that expires after the frame was written is the one and
-    only thing counted as a PUBACK timeout (precisely, not approximated)."""
-    mqtt = _mqtt(ticks)
-    client = MQTTClient("pico_test", "broker", keepalive=30)
-    sock = MockSocket(incoming=b"")  # frame goes out, PUBACK never arrives
-    client.sock = sock
-    mqtt._client = client
-    mqtt._connected = True
-
-    with pytest.raises(MQTTPubackTimeout):
-        mqtt.publish_qos1("iot/v3/telemetry", "{}")
-
-    assert mqtt._publish_attempt_count == 1
-    assert mqtt._publish_retry_count == 0
-    assert mqtt._puback_timeout_count == 1
-    assert mqtt.is_connected() is False
-
-
-def test_write_timeout_is_not_puback_timeout(ticks):
-    """A stalled PUBLISH frame WRITE is a publish failure, never a PUBACK
-    timeout: the frame never left, so no PUBACK was ever owed."""
-    mqtt = _mqtt(ticks)
-    client = MQTTClient("pico_test", "broker", keepalive=30)
-    sock = MockSocket(incoming=b"")
-    sock.write_stalls = True  # the PUBLISH frame write itself stalls
-    client.sock = sock
-    mqtt._client = client
-    mqtt._connected = True
-
-    with pytest.raises(OSError):
-        mqtt.publish_qos1("iot/v3/telemetry", "{}")
-
-    assert mqtt._publish_attempt_count == 1
-    assert mqtt._publish_retry_count == 0
-    assert mqtt._puback_timeout_count == 0  # the key distinction
-    assert mqtt.is_connected() is False
-
-
-def test_connection_failure_counting(ticks, monkeypatch):
-    """Three failed connection attempts then a success: 3 failures, and the
-    first successful connection is NOT a reconnect."""
-    _mock_broker_socket_script(
-        monkeypatch,
-        [MockSocket(incoming=b""), MockSocket(incoming=b""),
-         MockSocket(incoming=b""), MockSocket(incoming=_OK_HANDSHAKE)],
-    )
-    mqtt = _mqtt_with_delays(ticks, [1, 2, 3, 4])
-
-    assert mqtt.connect() is True
-
-    assert mqtt._connect_count == 1
-    assert mqtt._connection_failure_count == 3
-    assert mqtt._reconnect_success_count == 0  # initial connection
-    assert mqtt._last_reconnect_duration_ms == 0
-    assert mqtt._last_outage_duration_ms == 0
-
-
-def test_reconnect_success_counting(ticks, monkeypatch):
-    """initial + two reconnects -> connect_count 3, reconnect_success 2."""
-    import mqtt_client
-    monkeypatch.setattr(
-        mqtt_client.socket,
-        "socket",
-        lambda *a, **k: MockSocket(incoming=_OK_HANDSHAKE),
-    )
-    monkeypatch.setattr(
-        mqtt_client.socket,
-        "getaddrinfo",
-        lambda *a, **k: [(None, None, None, ("127.0.0.1", 1883))],
-    )
-    mqtt = _mqtt(ticks)
-
-    # Initial connection: not a reconnect.
-    assert mqtt.connect() is True
-    assert mqtt._connect_count == 1
-    assert mqtt._reconnect_success_count == 0
-
-    # Session lost -> reconnect #1.
-    mqtt.mark_disconnected()
-    assert mqtt.connect() is True
-    assert mqtt._connect_count == 2
-    assert mqtt._reconnect_success_count == 1
-
-    # Session lost again -> reconnect #2.
-    mqtt.mark_disconnected()
-    assert mqtt.connect() is True
-    assert mqtt._connect_count == 3
-    assert mqtt._reconnect_success_count == 2
-
-
-def test_repeated_mark_disconnected_does_not_restart_outage_timer(ticks):
-    """Several recovery paths can mark the SAME outage; the outage clock starts
-    at the first connected->disconnected transition and is never restarted."""
-    mqtt = _mqtt(ticks)
-    mqtt._connect_count = 1  # a connection had previously succeeded
-    mqtt._connected = True
-
-    ticks.now_ms = 1000
-    mqtt.mark_disconnected()
-    assert mqtt._outage_started_ms == 1000
-
-    ticks.now_ms = 3000
-    mqtt.mark_disconnected()  # a later path notices the same loss
-    assert mqtt._outage_started_ms == 1000
-
-    ticks.now_ms = 5000
-    mqtt.mark_disconnected()
-    assert mqtt._outage_started_ms == 1000
-
-
-class _ClockAdvanceSocket(MockSocket):
-    """Serves a scripted handshake, advancing the fake clock to a target.
-
-    Models the real elapsed time between the last failed reconnect attempt and
-    the successful handshake (backoff sleeps plus the successful connect),
-    which a static fake clock cannot express mid-call. The first read -- the
-    CONNACK, i.e. recovery completing -- is when the clock jumps to the success
-    moment, so the durations measured on success span the whole recovery, not
-    just the final handshake.
-    """
-
-    def __init__(self, ticks, target_ms, incoming):
-        super().__init__(incoming=incoming)
-        self._ticks = ticks
-        self._target_ms = target_ms
-
-    def read(self, n=None):
-        self._ticks.now_ms = self._target_ms
-        return super().read(n)
-
-
-def test_reconnect_and_outage_duration_span_recovery(ticks, monkeypatch):
-    """Reconnect duration spans its first attempt to success (not restarted per
-    attempt); outage duration spans the connected->disconnected transition,
-    including the Wi-Fi recovery time before the MQTT reconnect work began."""
-    mqtt = _mqtt_with_delays(ticks, [1, 2, 3, 4])
-
-    script = [
-        MockSocket(incoming=_OK_HANDSHAKE),  # initial connect
-        MockSocket(incoming=b""),            # reconnect attempt 1 (fails)
-        MockSocket(incoming=b""),            # reconnect attempt 2 (fails)
-        # Successful handshake; the clock jumps to the success moment (17000)
-        # on its CONNACK read.
-        _ClockAdvanceSocket(ticks, target_ms=17000, incoming=_OK_HANDSHAKE),
-    ]
-    _mock_broker_socket_script(monkeypatch, script)
-
-    # Initial connection (not a reconnect): both durations stay zero.
-    assert mqtt.connect() is True
-    assert mqtt._connect_count == 1
-    assert mqtt._reconnect_success_count == 0
-    assert mqtt._last_reconnect_duration_ms == 0
-    assert mqtt._last_outage_duration_ms == 0
-
-    # The session is lost: the outage is detected at t=1000.
-    ticks.now_ms = 1000
-    mqtt.mark_disconnected()
-    assert mqtt._outage_started_ms == 1000
-
-    # Wi-Fi recovery (not MQTT reconnect work) takes time; the MQTT reconnect
-    # work itself begins at t=5000.
-    ticks.now_ms = 5000
-
-    # Two failed reconnect attempts (with backoff between them), then the
-    # successful handshake completes at t=17000.
-    assert mqtt.connect() is True
-
-    assert mqtt._connect_count == 2
-    assert mqtt._reconnect_success_count == 1
-    # Reconnect spans its first attempt (t=5000) to the success (t=17000) --
-    # NOT restarted by the two failed attempts in between.
-    assert mqtt._last_reconnect_duration_ms == 12000
-    # Outage spans the connected->disconnected transition (t=1000) to the
-    # success (t=17000), including the 4000ms of Wi-Fi recovery before the MQTT
-    # reconnect work began.
-    assert mqtt._last_outage_duration_ms == 16000
 
 
 # ---------------------------------------------------------------------------
