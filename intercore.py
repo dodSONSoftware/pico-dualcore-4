@@ -24,11 +24,12 @@ RETENTION_PRIORITY_MAX = RETENTION_PRIORITY_HEALTH
 # Aggregate retained-payload budget for the outbound queue (32 KiB).
 #
 # Entry count alone is not a memory-safety boundary: 16 retained 16 KiB payloads
-# would be 256 KiB, exhausting a Pico W's heap. This budget caps total queued
+# would be 256 KiB, exhausting a Pico W's heap. This budget caps total retained
 # payload bytes so the queue is bounded by BOTH entry count and bytes. Sized to
-# hold a realistic full queue (16 entries x ~2 KiB) with margin. The single
-# in-flight entry is tracked by the entry-count rule (it is in transit, not
-# retained) and is not counted here. Per-message size is bounded separately by
+# hold a realistic full queue (16 entries x ~2 KiB). The single in-flight entry
+# is retained until its PUBACK (take() does not free it), so it counts against
+# this budget along with the queued FIFO -- a full queue plus its in-flight
+# entry still cannot exceed it. Per-message size is bounded separately by
 # message_serializer.MAX_OUTBOUND_MESSAGE_BYTES (16 KiB).
 DEFAULT_MAX_OUTBOUND_QUEUED_BYTES = 32 * 1024
 
@@ -49,8 +50,9 @@ class OutboundQueue:
     at the top level, or the wire document would repeat a member name.
 
     Capacity rule:
-    The queue is bounded by BOTH entry count (max_entries) and queued payload
-    bytes (max_queued_bytes). Either budget being exceeded is a full condition.
+    The queue is bounded by BOTH entry count (max_entries) and retained payload
+    bytes (max_queued_bytes, which include the in-flight entry). Either budget
+    being exceeded is a full condition.
 
     Retention rule:
     Lower numeric retention priorities are more important. When a budget is
@@ -58,8 +60,8 @@ class OutboundQueue:
     evicted only when the incoming entry is at least as important AND evicting
     it frees enough room (by count or by bytes) for the incoming entry. A valid
     queued entry is never dropped to admit one that still would not fit. An
-    in-flight QoS 1 entry consumes entry capacity but is never an eviction
-    candidate.
+    in-flight QoS 1 entry consumes both budgets (its payload is retained until
+    its PUBACK) but is never an eviction candidate.
     """
 
     def __init__(self, max_entries, max_queued_bytes=DEFAULT_MAX_OUTBOUND_QUEUED_BYTES):
@@ -217,6 +219,11 @@ class OutboundQueue:
     def put_with_kind(self, kind, payload_bytes, retention_priority):
         """Admit one MQTT-bound message with a specific kind (e.g., health, log).
 
+        The caller guarantees the bytes are pre-serialized, UTF-8 encoded JSON.
+        The per-message ceiling is enforced here, not by the caller: a payload
+        longer than MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) is rejected without
+        affecting queue state, the same as the put() serialization path.
+
         Args:
             kind: Message kind (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG)
             payload_bytes: Pre-serialized, UTF-8 encoded payload
@@ -238,6 +245,16 @@ class OutboundQueue:
                 )
             )
 
+        # Enforce the same per-message ceiling the put() serialization path
+        # enforces, so the queue's own boundary holds on both admission paths.
+        # No re-parsing or JSON allocation: the bytes are already final, only
+        # their length matters.
+        from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
+        if len(payload_bytes) > MAX_OUTBOUND_MESSAGE_BYTES:
+            # Oversized messages are rejected (do not affect queue state)
+            self._oversized_rejected += 1
+            return False
+
         with self._lock:
             return self._admit_locked(kind, payload_bytes, retention_priority)
 
@@ -249,15 +266,19 @@ class OutboundQueue:
             if not self._queue:
                 return None
             self._in_flight = self._queue.pop(0)
-            # The entry left the queued FIFO; it is now in-flight and no longer
-            # counted toward the queued-byte budget.
-            self._queued_bytes -= len(self._in_flight["payload_bytes"])
+            # The entry left the queued FIFO, but its payload is still retained
+            # (freed only when complete_in_flight releases it), so it stays
+            # counted toward the byte budget: the budget caps ALL retained
+            # payload, not just the FIFO.
             return self._in_flight
 
     def complete_in_flight(self, entry):
         with self._lock:
             if self._in_flight is entry:
                 self._in_flight = None
+                # The in-flight payload is released only now (PUBACK received),
+                # so its bytes return to the budget here, not at take().
+                self._queued_bytes -= len(entry["payload_bytes"])
                 return True
             return False
 
@@ -297,9 +318,11 @@ class OutboundQueue:
 
         Depth and max_entries are the entry-budget view (the in-flight entry
         counts toward depth, matching the entry budget in _admit_locked).
-        queued_bytes is the byte-budget view: only the queued FIFO, since the
-        in-flight entry is excluded from the byte budget by take(). Both views
-        are read under the same lock so the pair is consistent.
+        queued_bytes is the byte-budget view: ALL retained payload bytes, the
+        queued FIFO plus the in-flight entry (retained until its PUBACK), since
+        the budget caps retained memory, not just the FIFO. Both views include
+        the in-flight entry and are read under the same lock so the pair is
+        consistent.
         """
         with self._lock:
             depth = len(self._queue) + (1 if self._in_flight is not None else 0)

@@ -821,6 +821,77 @@ def test_mqtt_connect_subscribes_both_topics_and_restores_blocking(ticks, monkey
 
 
 # ---------------------------------------------------------------------------
+# Mqtt reconnect cleanup: disposing an already-failed client must never
+# write to the stalled socket
+#
+# Regression for the stale-cleanup hang that partially defeated the 0.4.16
+# bounded-publish fix. A QoS 1 publish that stalls on a blackholed link
+# fails bounded (the PUBLISH write or the PUBACK wait), but its finally
+# restores the socket to infinite-blocking mode and the failed socket stays
+# attached to the Mqtt. The next reconnect attempt used to dispose of that
+# client by sending an MQTT DISCONNECT frame: a write on an already-failed
+# link, in infinite-blocking mode, with no timeout. On a real blackholed
+# link that write wedges Core 0 forever -- and with Core 0 wedged, its Core
+# 1 heartbeat watchdog never runs either, so no recovery path remains. The
+# cleanup must close the TCP socket directly and attempt no write at all.
+# ---------------------------------------------------------------------------
+
+def test_reconnect_cleanup_closes_stalled_socket_without_writing(ticks, monkeypatch):
+    """After a publish failure, the reconnect cleanup must close without writing.
+
+    write_stalls models the blackholed link: any send attempted in
+    infinite-blocking mode (the state the failed socket is in after the
+    publish's bounded exchange unwinds its timeout) raises HangDetected.
+    HangDetected is a BaseException that escapes Mqtt.connect()'s
+    ``except Exception``, so a regression to a DISCONNECT write fails this
+    test hard instead of returning a silent connect failure.
+    """
+    mqtt = _mqtt(ticks)
+
+    # An established session on a blackholed link.
+    old_client = MQTTClient("pico_test", "broker", keepalive=30)
+    old_sock = MockSocket(incoming=b"")  # link up, but no PUBACK ever arrives
+    old_sock.write_stalls = True  # every send on this link stalls
+    old_client.sock = old_sock
+    mqtt._client = old_client
+    mqtt._connected = True
+
+    # The publish fails bounded (the 0.4.16 path) and the Mqtt layer marks
+    # the disconnect, leaving the failed socket attached in infinite-blocking
+    # mode -- the exact state the old cleanup then wrote a DISCONNECT into.
+    with pytest.raises(OSError):
+        mqtt.publish_qos1("iot/v3/telemetry", "{}")
+
+    assert mqtt.is_connected() is False
+    assert mqtt._disconnect_count == 1
+    assert old_sock.timeout_value is None  # infinite-blocking again
+    assert old_sock.written == b""  # the stalled frame write never got out
+
+    # The reconnect now runs against a fresh broker socket; disposing the
+    # old client must close its socket without attempting any write.
+    new_sock = MockSocket(incoming=(
+        b"\x20\x02\x00\x00"       # CONNACK
+        b"\x90\x03\x00\x01\x00"   # SUBACK pid 1 (command topic)
+        b"\x90\x03\x00\x02\x00"   # SUBACK pid 2 (info response topic)
+    ))
+    _mock_broker_socket(monkeypatch, new_sock)
+
+    # Old code raised HangDetected here (DISCONNECT write into the stalled
+    # socket); the fix closes the socket directly and the reconnect proceeds.
+    assert mqtt.connect() is True
+    assert mqtt.is_connected() is True
+
+    # The old socket was closed directly and received no DISCONNECT frame
+    # (b"\xe0\x00") or any other write: it is exactly as empty as the
+    # failed publish left it.
+    assert old_sock.closed is True
+    assert old_sock.written == b""
+    # The new session owns a fresh client and socket.
+    assert mqtt._client is not old_client
+    assert mqtt._client.sock is new_sock
+
+
+# ---------------------------------------------------------------------------
 # MQTTClient packet ID wrapping (1..65535, never 0, never above 65535)
 # ---------------------------------------------------------------------------
 

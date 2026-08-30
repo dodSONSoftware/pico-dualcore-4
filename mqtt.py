@@ -59,24 +59,30 @@ class Mqtt:
         return client
 
     def _close_old_client(self):
-        if self._client is None:
+        # Dispose of the old client by closing its TCP socket directly. This
+        # path only runs when the session is not connected (connect() is only
+        # entered while not connected), so the client is always failed or
+        # never established and a graceful MQTT DISCONNECT frame is not
+        # warranted. Writing one into a socket whose link has already failed
+        # is exactly what must not happen: after a bounded exchange fails,
+        # its finally has restored the socket to infinite-blocking mode, and
+        # a DISCONNECT write on a blackholed link would wedge Core 0 inside
+        # sock.write() with no timeout -- and with Core 0 wedged, its Core 1
+        # heartbeat watchdog could never run either. A direct socket close
+        # performs no write at all.
+        client = self._client
+        self._client = None
+
+        if client is None or client.sock is None:
             return
+
         try:
-            self._client.disconnect()
+            client.sock.close()
         except MemoryError:
             raise
         except Exception as err:
             if DEBUG:
-                print("[DEBUG] MQTT disconnect cleanup failed: {}".format(err))
-            try:
-                if self._client.sock is not None:
-                    self._client.sock.close()
-            except MemoryError:
-                raise
-            except Exception as close_err:
-                if DEBUG:
-                    print("[DEBUG] MQTT socket close cleanup failed: {}".format(close_err))
-        self._client = None
+                print("[DEBUG] MQTT socket cleanup failed: {}".format(err))
 
     def connect(self):
         """Connect and subscribe, with the whole handshake time-bounded.

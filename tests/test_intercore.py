@@ -329,6 +329,36 @@ def test_oversized_rejected():
     assert status["oversized_rejected"] >= 1
 
 
+def test_put_with_kind_one_byte_over_max_rejected():
+    """put_with_kind() enforces the same per-message ceiling as put()."""
+    from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
+    bus = InterCore(outbound_max=2, event_max=2)
+
+    admitted = bus.outbound_queue.put_with_kind(
+        KIND_HEALTH, _bytes_of(MAX_OUTBOUND_MESSAGE_BYTES + 1), RETENTION_PRIORITY_HEALTH
+    )
+    assert admitted is False
+
+    assert bus.outbound_queue.take() is None
+    status = bus.outbound_queue.status()
+    assert status["oversized_rejected"] == 1
+
+
+def test_put_with_kind_exact_max_size_admitted():
+    """A payload at exactly the max size is admitted by put_with_kind()."""
+    from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
+    bus = InterCore(outbound_max=2, event_max=2)
+
+    assert bus.outbound_queue.put_with_kind(
+        KIND_HEALTH, _bytes_of(MAX_OUTBOUND_MESSAGE_BYTES), RETENTION_PRIORITY_HEALTH
+    )
+
+    entry = bus.outbound_queue.take()
+    assert entry is not None
+    assert len(entry["payload_bytes"]) == MAX_OUTBOUND_MESSAGE_BYTES
+    assert bus.outbound_queue.complete_in_flight(entry)
+
+
 def test_status_counters_include_serialization_rejections():
     """Verify serialization rejections are counted."""
     bus = InterCore(outbound_max=2, event_max=2)
@@ -411,6 +441,36 @@ def test_byte_budget_never_evicts_for_nothing():
     assert status["queued_bytes"] == 60
     assert status["messages_evicted"] == 0
     assert status["messages_rejected"] >= 1
+
+
+def test_byte_budget_includes_in_flight_entry():
+    """The in-flight entry's retained bytes count toward the byte budget.
+
+    The in-flight payload is not freed until its PUBACK (complete_in_flight),
+    so it must consume budget along with the queued FIFO. Previously take()
+    subtracted it, letting the queue retain (budget + in-flight) of payload
+    while reporting only the budget.
+    """
+    # A 200-byte entry moved in-flight; the budget is 250 bytes.
+    bus = InterCore(outbound_max=10, event_max=2, outbound_max_bytes=250)
+    assert bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(200), RETENTION_PRIORITY_HEALTH)
+    first = bus.outbound_queue.take()
+    assert bus.outbound_queue.has_in_flight()
+
+    # With the in-flight entry counted, a further 60 bytes exceeds the budget
+    # (200 + 60 = 260 > 250). Nothing is queued to evict, so admission fails --
+    # even though the old in-flight-excluded budget had 250 bytes of room.
+    assert not bus.outbound_queue.put_with_kind(KIND_HEALTH, _bytes_of(60), RETENTION_PRIORITY_HEALTH)
+
+    status = bus.outbound_queue.status()
+    assert status["in_flight"]
+    assert status["pending"] == 0
+    # The reported byte budget includes the retained in-flight entry.
+    assert status["queued_bytes"] == 200
+
+    # Completing the in-flight entry frees exactly its own bytes.
+    assert bus.outbound_queue.complete_in_flight(first)
+    assert bus.outbound_queue.status()["queued_bytes"] == 0
 
 
 def test_dict_path_enforces_byte_budget():

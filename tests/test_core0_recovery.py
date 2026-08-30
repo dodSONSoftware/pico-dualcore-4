@@ -565,6 +565,13 @@ def test_command_response_retry_preserves_sequence_across_intervening_message(ma
     """A Core 0 command response re-published after an ambiguous failure keeps
     the sequence it first claimed, even when an intervening message consumed a
     number -- instead of silently shifting to a new one.
+
+    And, because (runtime_id, sequence) is now a unique event identity, the
+    retry must be the SAME document, not just the same identity: the serialized
+    bytes are frozen on the first attempt and re-published verbatim, so two
+    frames carrying one logical message are byte-identical. (Before the fix the
+    retry rebuilt the message with a newer uptime_ms/timestamp, so a deduplicator
+    keying on (runtime_id, sequence) could drop one of two differing documents.)
     """
     instance = make_core0()
     mqtt = instance._mqtt
@@ -583,7 +590,8 @@ def test_command_response_retry_preserves_sequence_across_intervening_message(ma
     # Attempt 1: transmits, PUBACK lost -> fails; the response stays pending.
     with pytest.raises(RuntimeError):
         instance._service_pending_core0_response()
-    first_seq = json.loads(mqtt.published[0][1])["sequence"]
+    first_frame = mqtt.published[0][1]
+    first_seq = json.loads(first_frame)["sequence"]
     assert instance._pending_core0_responses  # still queued for retry
 
     # An intervening connection log publishes and consumes the next number.
@@ -592,8 +600,18 @@ def test_command_response_retry_preserves_sequence_across_intervening_message(ma
     log_seq = json.loads(mqtt.published[-1][1])["sequence"]
     assert log_seq != first_seq
 
-    # Attempt 2: the retry must preserve the response's ORIGINAL sequence.
+    # Advance the clock before the retry so a rebuild WOULD change the
+    # document: the retry must NOT pick up the newer uptime, which is only
+    # possible if it reuses the frozen bytes from attempt 1 instead of
+    # re-serializing. (Without this, both attempts saw the same clock and the
+    # old rebuild-then-reserialize path happened to produce identical frames.)
+    _FAKE_TIME.now_ms = 5000
+
+    # Attempt 2: the retry must preserve the response's ORIGINAL sequence and
+    # re-publish the SAME serialized document (byte-identical frame).
     instance._service_pending_core0_response()
-    retry_seq = json.loads(mqtt.published[-1][1])["sequence"]
+    retry_frame = mqtt.published[-1][1]
+    retry_seq = json.loads(retry_frame)["sequence"]
     assert retry_seq == first_seq
+    assert first_frame == retry_frame  # same logical message: same identity AND content
     assert not instance._pending_core0_responses  # consumed on success

@@ -366,7 +366,7 @@ See tests in [`tests/`](tests/) — covering core-ownership boundaries, configur
 
 ## Hardware Status
 
-Firmware 0.4.6 is software-tested and passes the full host-side test suite (178 tests). Hardware validation on Pico W/Pico 2 W with the system-information sensor is pending.
+The firmware is software-tested against the full host-side test suite (run `python -m pytest tests/`) and hardware-validated on a Pico 2 W with the system-information sensor: a live capture shows successful startup, telemetry, health, an MQTT reconnect, outbound queue saturation with eviction, and recovery. The current firmware version is defined in a single place — see `FIRMWARE_VERSION` in [`version.py`](version.py) — rather than being restated here.
 
 ## License
 

@@ -282,6 +282,7 @@ class Core0:
             data=response.get("data"),
             error=response.get("error"),
             wire_sequence=wire_sequence,
+            container=response,
         )
         self._pending_core0_responses.pop(0)
 
@@ -436,7 +437,7 @@ class Core0:
 
     def _publish_core0_command_response(
         self, command_id, command, success, targeted=True, data=None, error=None,
-        wire_sequence=None
+        wire_sequence=None, container=None
     ):
         """Build and publish a Core 0 command response.
 
@@ -446,37 +447,54 @@ class Core0:
         ``wire_sequence`` carries a sequence already claimed for this logical
         response (by a retrying caller), so the re-publish keeps that identity.
         Omit it on a first attempt: _publish_entry then claims a fresh number.
+
+        ``container`` is the persistent logical object for this response (the
+        pending response or reboot dict). When given, the serialized bytes are
+        built once, on the first attempt, and frozen on it; a retry after an
+        ambiguous QoS 1 failure re-publishes those SAME bytes. Combined with the
+        sequence being claimed on the same container, a retry is now the same
+        logical message with the same identity AND the same wire content, the
+        way the outbound queue's in-flight entry reuses its pre-serialized
+        bytes. Omit it to build-and-publish with no persistent owner.
         """
-        payload = {
-            "command_id": command_id,
-            "command": command,
-            "targeted": targeted,
-            "success": success,
-        }
-        if success:
-            payload["data"] = data
-        else:
-            payload["error"] = error
+        payload_bytes = container.get("_payload_bytes") if container is not None else None
+        if payload_bytes is None:
+            payload = {
+                "command_id": command_id,
+                "command": command,
+                "targeted": targeted,
+                "success": success,
+            }
+            if success:
+                payload["data"] = data
+            else:
+                payload["error"] = error
 
-        # Build the logical message first. Uptime and timestamp are the
-        # sender's to carry (the envelope is spliced in at publish time), so
-        # they are captured at construction time, not at publish time.
-        message = {
-            "message_type": "command_response",
-            "uptime_ms": self._uptime_ms(),
-            "timestamp": self._current_utc_timestamp(),
-            "payload": payload,
-        }
+            # Build the logical message first. Uptime and timestamp are the
+            # sender's to carry (the envelope is spliced in at publish time),
+            # so they are captured at construction time, not at publish time.
+            message = {
+                "message_type": "command_response",
+                "uptime_ms": self._uptime_ms(),
+                "timestamp": self._current_utc_timestamp(),
+                "payload": payload,
+            }
 
-        # Serialize and encode the message for the pre-serialized queue
-        try:
-            payload_bytes = serialize_and_validate_message(message)
-        except MemoryError:
-            raise
-        except Exception as err:
-            if DEBUG:
-                print("[DEBUG] Command response serialization failed: {}".format(err))
-            return
+            # Serialize and encode the message for the pre-serialized queue
+            try:
+                payload_bytes = serialize_and_validate_message(message)
+            except MemoryError:
+                raise
+            except Exception as err:
+                if DEBUG:
+                    print("[DEBUG] Command response serialization failed: {}".format(err))
+                return
+            if container is not None:
+                # Freeze the bytes on the persistent container so a retry after
+                # an ambiguous QoS 1 failure re-publishes the same document
+                # (same sequence, same content) instead of rebuilding it with a
+                # newer uptime/timestamp.
+                container["_payload_bytes"] = payload_bytes
 
         entry = {
             "topic": self._config["mqtt_topic_command_response"],
@@ -508,6 +526,7 @@ class Core0:
                 targeted=request.get("targeted", False),
                 data={"rebooting": True},
                 wire_sequence=wire_sequence,
+                container=request,
             )
         except MemoryError:
             raise

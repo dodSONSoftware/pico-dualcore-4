@@ -14,7 +14,7 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
   "timestamp": "<utc-iso8601>",
   "source": "<device-source>",
   "message_type": "health",
-  "firmware_version": "0.4.6",
+  "firmware_version": "<firmware-version>",
   "payload": {
     "status": "healthy|degraded",
     "degraded_reasons": ["<reason1>", "<reason2>"],
@@ -83,7 +83,7 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 - `outbound_queue_depth`: Queued + in-flight entries
 - `outbound_queue_capacity`: Queue capacity from `OutboundQueue`
 - `outbound_queue_utilization_percent`: (depth * 100) // capacity (integer)
-- `outbound_queued_bytes`: Queued FIFO payload bytes (the in-flight entry is excluded, matching the queue's byte admission budget)
+- `outbound_queued_bytes`: Retained payload bytes (the queued FIFO plus the in-flight entry, matching the queue's byte admission budget)
 - `outbound_max_queued_bytes`: Queue byte capacity from `OutboundQueue` (`DEFAULT_MAX_OUTBOUND_QUEUED_BYTES`, 32 KiB)
 - `outbound_queue_byte_utilization_percent`: (queued_bytes * 100) // max_queued_bytes (integer)
 
@@ -156,7 +156,7 @@ Core 1 -> Core 0. Contains only data intended for MQTT.
 - Priority classes are: CRITICAL 10, ERROR 20, WARN 30, TELEMETRY 40, INFO 50, HEALTH 70.
 - When either budget is full, the queue finds the least-important queued class (highest numeric priority). If the incoming message is more important, or equally important, the oldest entry in that least-important class is evicted — and only if evicting it frees enough room (by count or by bytes) for the incoming entry. If the incoming message is less important, or still would not fit after eviction, it is rejected without dropping a valid entry.
 - The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40; health messages use HEALTH 70; the startup log uses INFO 50.
-- An in-flight QoS 1 entry counts toward the configured capacity but is never evicted.
+- An in-flight QoS 1 entry counts toward both the entry-count capacity and the byte budget (its payload is retained until its PUBACK) but is never evicted.
 - A failed publish never discards the in-flight entry: it stays in flight and `take()` returns it again, so Core 0 retries until the broker PUBACKs (QoS 1 at-least-once delivery).
 - **Sequence identity across an ambiguous failure.** QoS 1 has an ambiguous failure mode: the PUBLISH frame can reach the broker while the PUBACK is lost, so a failed publish attempt may still have been delivered. The `sequence` envelope member is therefore claimed *before* the first transmission attempt and stamped on the logical object — the queue entry, or Core 0's persistent response/reboot dict for its own retryable messages — and is never rolled back or reused by a different message. A retry of the *same* logical message reuses its stamped number (both copies identify one message — legitimate QoS 1 duplicate delivery), while a *different* message (e.g. a `mqtt_connection_established` log published after a reconnect) always receives a fresh number. This makes `(runtime_id, sequence)` a safe unique event identity and lets a receiver recognize a retry of the same logical message. Claiming happens in `core0._claim_wire_sequence`, invoked from `_publish_entry` (queue/connection-log path) and from the response/reboot retry paths.
 
@@ -200,8 +200,8 @@ Validation failures (unsupported value types, non-string keys, non-finite floats
 
 Two static bounds keep the outbound path safe on MCU-scale heap (Pico W: 256 KiB SRAM, 64 KiB reserved). The size check happens after `json.dumps()` + UTF-8 `encode`, so at peak allocation the object graph, the serialized `str`, and the encoded `bytes` are all resident at once — a large payload can therefore exhaust heap before a limit is even reached. Both bounds are deliberately small:
 
-- **Per-message ceiling** — `message_serializer.MAX_OUTBOUND_MESSAGE_BYTES = 16 KiB`. Bounds a single message's transient peak (graph + str + bytes ≈ 3x the payload ≈ 48 KiB) and keeps the largest legitimate message (the one-shot startup log, the only payload that grows with device count) comfortably under the limit with margin.
-- **Aggregate queued-byte budget** — `intercore.DEFAULT_MAX_OUTBOUND_QUEUED_BYTES = 32 KiB`. Bounds total *retained* payload bytes in the FIFO, so a full queue (16 entries) cannot exhaust heap on its own during an MQTT outage. The single in-flight entry is tracked by the entry-count rule (it is in transit, not retained) and is not counted against this budget.
+- **Per-message ceiling** — `message_serializer.MAX_OUTBOUND_MESSAGE_BYTES = 16 KiB`. Bounds a single message's transient peak (graph + str + bytes ≈ 3x the payload ≈ 48 KiB) and keeps the largest legitimate message (the one-shot startup log, the only payload that grows with device count) comfortably under the limit with margin. The queue enforces it on both admission paths: `put()` via the serialization step, and `put_with_kind()` via a direct byte-length check on the pre-serialized payload, so a caller bypassing `serialize_and_validate_message()` cannot admit a larger entry.
+- **Aggregate queued-byte budget** — `intercore.DEFAULT_MAX_OUTBOUND_QUEUED_BYTES = 32 KiB`. Bounds total *retained* payload bytes — the queued FIFO **and** the in-flight entry, whose payload is retained until its PUBACK — so a full queue (16 entries, including its in-flight entry) cannot exhaust heap on its own during an MQTT outage.
 
 Admission enforces both: an entry is admitted only if it fits within the entry-count budget **and** the byte budget, evicting the oldest least-important entry only when that frees enough room. Because eviction is byte-feasibility-checked, a valid queued entry is never dropped to admit one that still would not fit. `OutboundQueue.status()` reports `queued_bytes` and `max_queued_bytes` for observability.
 
@@ -274,15 +274,16 @@ The CONNPACK advertises `mqtt_keepalive_sec` (30 s default), so the broker disco
 
 ## MQTT wire client
 
-Two invariants in `mqtt_client.py` keep the bounded-wait contract sound (every blocking broker wait must be deadline-limited, so a dead link surfaces as a failure instead of stalling the run loop):
+Three invariants in `mqtt_client.py` keep the bounded-wait contract sound (every blocking broker wait must be deadline-limited, so a dead link surfaces as a failure instead of stalling the run loop):
 
 - **One packet ID helper**: `next_packet_id()` advances the counter and wraps 65535 back to 1 (0 is reserved). QoS 1 publish, subscribe, and `Mqtt.get_next_packet_id()` (the network-probe path) all draw IDs from this single helper, so every message takes the next of 1, 2, ..., 65535, 1, 2, ... and the wrap is defined in exactly one place.
 - **Socket mode is the caller's contract**: `wait_msg()` reads in whatever socket mode it finds and never changes it, and every caller runs it in blocking-with-timeout mode — so a read always returns a full length and a link that stalls after the first frame byte surfaces as a timeout instead of blocking forever. `publish`/`ping`/`subscribe` bound their waits with their own timeouts — and `publish` installs the QoS 1 timeout *before* the first PUBLISH frame byte is written, so a blackholed link whose send stops making progress fails the publish bounded (into recovery) instead of wedging Core 0 inside `sock.write()`, where the Core 1 heartbeat check could never run. `check_msg()` is the poller: it first decides *readiness* with a non-blocking `select` poll (one readable byte means a packet has started; nothing returns `None` immediately, leaving the socket mode untouched), and only then parses the packet — that parse runs under the finite `mqtt_broker_response_timeout_sec` rather than non-blocking, because a non-blocking multi-byte read can short-read a PUBLISH split across TCP reads and deliver a corrupt frame. `check_msg()` restores normal blocking mode on the way out; in MicroPython `setblocking(True)` is identical to `settimeout(None)`, so a poll that left the socket non-blocking, or a wait that forced blocking mid-read, would silently clear the next operation's timeout.
 - **The handshake is bounded the same way**: `Mqtt.connect()` calls `MQTTClient.connect(timeout=mqtt_broker_response_timeout_sec)`, which installs the finite socket timeout that the CONNACK wait runs under. `subscribe()` does not install its own timeout — it relies on the one `connect()` left in place — so that same finite timeout carries across both SUBACK waits. A broker that accepts the TCP connection and then goes silent fails the attempt within the timeout (the reconnect backoff then retries) instead of wedging Core 0. Once both subscriptions succeed, `Mqtt.connect()` restores normal blocking mode; every later operation (PUBACK, PINGRESP) installs and restores its own timeout.
+- **Disposal of a failed client never writes**: `Mqtt._close_old_client()` runs only at the start of a `connect()` attempt, and `connect()` is only entered while the session is not connected — so the client it disposes is always failed or never established. It therefore closes the stale socket directly instead of sending an MQTT DISCONNECT frame: after a failed bounded exchange the socket's `finally` has restored it to infinite-blocking mode, and a DISCONNECT write into that already-failed, blackholed link would be an unbounded `sock.write()` that wedges Core 0 forever — and with Core 0 wedged, its Core 1 heartbeat watchdog could never run either. No write at all means nothing to wedge; the broker drops the clean session when the TCP connection closes.
 
 ## Network recovery
 
-When the run loop detects a lost link (Wi-Fi down, or MQTT down with Wi-Fi up), `_recover_network_if_needed` re-establishes it before any further processing. A blackholed broker (TCP up, but no PINGRESP or PUBACK ever arrives) is detected the same way: every blocking broker wait is bounded, so a dead link surfaces as a failed ping or publish, marks the connection disconnected, and recovery fires on the next loop iteration.
+When the run loop detects a lost link (Wi-Fi down, or MQTT down with Wi-Fi up), `_recover_network_if_needed` re-establishes it before any further processing. A blackholed broker (TCP up, but no PINGRESP or PUBACK ever arrives) is detected the same way: every blocking broker wait is bounded, so a dead link surfaces as a failed ping or publish, marks the connection disconnected, and recovery fires on the next loop iteration. Disposing of the stale client as part of that recovery is itself bounded by construction — it closes the failed socket directly instead of writing a DISCONNECT frame into the dead link, so the cleanup cannot wedge Core 0 (and thereby skip its Core 1 heartbeat watchdog) either.
 
 1. `network_stack_ready` is cleared and a forced network snapshot is published with `network_stack_ready = False`, so Core 1 health gating reflects the outage immediately.
 2. `establish_network()` re-establishes Wi-Fi and MQTT with the normal backoff and connection logs. The connection LED flashes while this happens because `establish_network()` arms it.
