@@ -825,10 +825,16 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                     next_read_ms = time.ticks_add(next_read_ms, read_loop_ms)
                 gc.collect()
 
-            # Register Core 1 activity periodically (every 5 seconds)
-            if time.ticks_diff(now_ms, next_activity_ms) >= 0:
-                intercore.state_mailboxes.set_core_1_activity_ms(now_ms)
-                next_activity_ms = time.ticks_add(now_ms, activity_interval_ms)
+            # Register Core 1 activity periodically (every 5 seconds).
+            # Re-capture the clock: now_ms is stale by however long a device
+            # read (or other processing) took this pass, and both comparing
+            # and stamping with it would let a healthy slow operation age the
+            # stamp past Core 0's watchdog bound -- the same stale-clock
+            # correction the read-boundary skip below makes with skip_now_ms.
+            activity_now_ms = time.ticks_ms()
+            if time.ticks_diff(activity_now_ms, next_activity_ms) >= 0:
+                intercore.state_mailboxes.set_core_1_activity_ms(activity_now_ms)
+                next_activity_ms = time.ticks_add(activity_now_ms, activity_interval_ms)
 
             # Health boundary reached: emit at most one current health
             # report (skipped entirely during a network outage), then advance

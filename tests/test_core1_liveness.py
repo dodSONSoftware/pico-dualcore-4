@@ -231,3 +231,114 @@ def test_core1_activity_stamp_survives_hostile_loop_phase():
     stamp = bus.state_mailboxes.get_core_1_activity_ms()
     assert stamp is not None
     assert fake_time.ticks_diff(fake_time.now_ms, stamp) <= ACTIVITY_INTERVAL_MS + LOOP_STEP_MS
+
+
+# ---------------------------------------------------------------------------
+# Test 2: a healthy-but-slow device read must not stale the heartbeat stamp
+# ---------------------------------------------------------------------------
+#
+# The loop captures now_ms BEFORE the device read, then potentially spends a
+# long time reading. The periodic heartbeat compared and stamped with that
+# pre-read clock: a heartbeat boundary falling due DURING the read was missed
+# on that pass (stamped later, with the old pre-read time) or written as a
+# stale stamp -- and with a read longer than Core 0's 30 s watchdog bound,
+# Core 0 saw a wedged Core 1 that was healthy the whole time and reset the
+# board. The read-boundary skip below it in the loop already re-captures the
+# clock for exactly this reason (skip_now_ms); the heartbeat must too.
+
+SLOW_READ_MS = 6000  # longer than the 5000 ms heartbeat interval
+
+
+class SlowReadDriver:
+    """A healthy-but-slow device: read() succeeds, but its work takes
+    SLOW_READ_MS of wall time (modeled by advancing the fake clock), enough
+    to carry the next heartbeat boundary due in flight."""
+
+    def __init__(self, fake_time, recorder):
+        self._fake_time = fake_time
+        self._recorder = recorder
+        self.reads = 0
+
+    def initialize(self, config):
+        pass
+
+    def read(self):
+        self.reads += 1
+        if self.reads > 1:
+            return {"slow": self.reads}
+        start = self._fake_time.ticks_ms()
+        self._fake_time.now_ms += SLOW_READ_MS
+        self._recorder["window"] = (start, self._fake_time.ticks_ms())
+        return {"slow": 1}
+
+
+def _core1_config_with_slow_read_device():
+    config = json.loads((ROOT / "config.json").read_text())
+    _core0, core1_config = split_config(config)
+    core1_config["devices"] = [
+        {"id": "probe", "device_type": "probe", "config": {}}
+    ]
+    return core1_config
+
+
+def test_core1_slow_read_does_not_stale_the_heartbeat_stamp():
+    """The heartbeat stamped after a slow device read must use a FRESH clock.
+
+    Geometry (verified against the hostile-phase test's anchor == boot):
+    the first telemetry read fires at anchor + read_loop_sec (22 + 20000 =
+    20022), the heartbeat boundaries sit at anchor + 5000k (7022, 12022,
+    17022, 22022, ...), so the 6000 ms read window [20022, 26022] carries
+    the 22022 boundary due in flight. Pre-fix, the loop compared against the
+    pre-read clock (20022 < 22022, no stamp that pass -- the last stamp stays
+    17022, 9000 ms stale at the read's end) and, on a read long enough, wrote
+    stamps that age past Core 0's watchdog bound. Post-fix the stamp written
+    on the read's pass is the post-read clock.
+    """
+    # 20022 (read) + 6000 (read) = 26022; stop on the loop sleep after it.
+    slow_stop_at_ms = BOOT_TICKS_MS + 20 * 1000 + SLOW_READ_MS
+    fake_time = FakeTime(BOOT_TICKS_MS, slow_stop_at_ms)
+    saved_modules = {name: sys.modules.get(name) for name in ("time", "machine", "os")}
+
+    def _restore():
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    recorder = {}
+    try:
+        _install_fakes(fake_time)
+        core1 = _reload_core1_under_fakes()
+
+        from intercore import InterCore
+        import device_manager as dm
+
+        bus = InterCore(minimum_free_heap_bytes=65536)
+        bus.state_mailboxes.set_network_snapshot(dict(_NETWORK_SNAPSHOT))
+
+        driver = SlowReadDriver(fake_time, recorder)
+        saved_create = dm.create_device
+        dm.create_device = lambda device_def, system_information: driver
+        try:
+            with pytest.raises(LoopStop):
+                core1.core1_main(
+                    bus, _core1_config_with_slow_read_device(), BOOT_TICKS_MS, "test-runtime"
+                )
+        finally:
+            dm.create_device = saved_create
+    finally:
+        _restore()
+
+    assert driver.reads == 1  # the slow read actually ran
+    window_start, window_end = recorder["window"]
+    # The scenario precondition: the read window carries a heartbeat boundary
+    # (it is longer than the 5000 ms interval and starts on the 40 ms grid).
+    assert window_end - window_start >= ACTIVITY_INTERVAL_MS
+
+    # The heartbeat boundary that fell due during the read must have been
+    # stamped AFTER the read finished -- with the fresh post-read clock --
+    # not missed on that pass or written with the stale pre-read now_ms.
+    stamp = bus.state_mailboxes.get_core_1_activity_ms()
+    assert stamp is not None
+    assert stamp >= window_end

@@ -17,6 +17,9 @@ Validation rules:
 """
 
 import json
+import math
+
+from message_protocol import is_json_safe
 
 
 # Maximum outbound MQTT payload bytes (16 KiB).
@@ -58,19 +61,6 @@ class MessageTooLargeError(SerializationError):
     pass
 
 
-def _is_finite_float(value):
-    """Check if a float value is finite (not NaN or Infinity)."""
-    if not isinstance(value, float):
-        return True
-    # Check for NaN (NaN is not equal to itself)
-    if value != value:
-        return False
-    # Check for Infinity (comparison with large float works on Pico)
-    if value == float("inf") or value == -float("inf"):
-        return False
-    return True
-
-
 def _validate_value(value, path="root"):
     """
     Recursively validate a value for JSON serialization.
@@ -95,7 +85,7 @@ def _validate_value(value, path="root"):
         return
 
     if isinstance(value, float):
-        if not _is_finite_float(value):
+        if not math.isfinite(value):
             raise NonFiniteFloatError("Non-finite float at {}: {}".format(path, value))
         return
 
@@ -150,7 +140,10 @@ def serialize_and_validate_message(message):
     Validate a message and serialize it to bytes for queue admission.
 
     This function performs all required validations before serialization:
-    1. Recursively validate all value types
+    1. Recursively validate all value types: is_json_safe() runs first as an
+       allocation-light pass (no per-node path strings), and the detailed
+       path-producing validator runs only if that pass fails, so valid
+       messages never pay for error-path strings that are never used
     2. Ensure all dict keys are strings
     3. Ensure all floats are finite
     4. Serialize to JSON
@@ -170,8 +163,13 @@ def serialize_and_validate_message(message):
         MessageTooLargeError: If the serialized message exceeds the max size
         SerializationError: If JSON serialization fails
     """
-    # Validate structure and values
-    _validate_value(message)
+    # Validate structure and values. is_json_safe() enforces the same rules
+    # as _validate_value() but without building per-node diagnostic paths, so
+    # the common valid-message case stays allocation-light. On failure the
+    # path-producing validator re-walks the message and raises the precise
+    # error (with the offending path) the caller reports.
+    if not is_json_safe(message):
+        _validate_value(message)
 
     # Serialize to bytes
     payload_bytes = _serialize_to_bytes(message)

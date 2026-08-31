@@ -372,6 +372,82 @@ def test_device_manager_refreshes_between_attempts():
     assert driver.observed[2] > driver.observed[1]  # between attempts 2 and 3
 
 
+def test_device_manager_reinitialization_refreshes_between_attempts():
+    """Runtime reinitialization uses the same progress-boundary strategy as
+    startup: the refresh fires before every initialize() attempt (so the
+    stamp is current across the whole retry sequence) and before each retry
+    sleep (so the sleep itself cannot age it past Core 0's watchdog bound).
+    A wedge inside driver.initialize() still stops the refreshes and is
+    caught, because the refreshes happen at the boundaries, not inside the
+    driver call.
+    """
+    refresh_log = []
+
+    def refresh():
+        refresh_log.append(1)
+
+    class FlakyDriver:
+        def __init__(self):
+            self.calls = 0
+            self.observed = []
+
+        def initialize(self, config):
+            self.calls += 1
+            self.observed.append(len(refresh_log))
+            if self.calls < 3:
+                raise RuntimeError("simulated transient init failure")
+
+    class RecordingTime(_HostTimeShim):
+        """Records the refresh count at each retry sleep."""
+
+        def __init__(self):
+            self.sleep_counts = []
+
+        def sleep_ms(self, ms):
+            self.sleep_counts.append(len(refresh_log))
+
+    class ManagedDeviceFake:
+        """Minimal ManagedDevice stand-in for _process_reinitialization."""
+
+        def __init__(self, driver):
+            self.driver = driver
+            self.device_id = "dev1"
+            self.device_type = "probe"
+            self.clears = 0
+
+        def clear_reinitialize_pending(self):
+            self.clears += 1
+
+    recording_time = RecordingTime()
+    dm = _host_time_device_manager()
+    driver = FlakyDriver()
+    managed = ManagedDeviceFake(driver)
+    manager = dm.DeviceManager(
+        _manager_config(attempts=3),
+        activity_refresh=refresh,
+    )
+    dm.time = recording_time
+    try:
+        result = manager._process_reinitialization(managed)
+    finally:
+        dm.time = _HostTimeShim()
+
+    # Normal reinitialization behavior is preserved.
+    assert result["status"] == dm.DEVICE_RESULT_REINITIALIZED
+    assert result["reinitialization_attempts_used"] == 3
+    assert managed.clears == 1
+
+    # Before every attempt the stamp is current (strictly increasing refresh
+    # count), and each retry sleep starts from a refresh made AFTER the
+    # failed attempt: with 3 attempts and 2 failures that is 3 (attempts) +
+    # 2 (pre-sleep) = 5 refreshes total. Without the pre-sleep refresh the
+    # counts would be [1, 2, 3] / [1, 2] -- the sleep would then run on an
+    # unrefreshed stamp.
+    assert len(refresh_log) == 5
+    assert driver.observed == [1, 3, 5]
+    assert recording_time.sleep_counts == [2, 4]
+
+
 def test_device_manager_without_refresh_callback_is_unchanged():
     """The callback is optional; default behavior is unchanged."""
     class OkDriver:

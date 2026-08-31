@@ -331,15 +331,39 @@ class MQTTClient:
                     sz, MAX_INBOUND_PACKET_BYTES
                 )
             )
+        # Validate every variable-sized read against the remaining length
+        # *before* it happens: the topic length (and packet id) are declared
+        # by the packet itself, so a corrupt stream can declare a topic
+        # length far larger than the remaining length actually carried (for
+        # example remaining length 2 with a 65535-byte topic). Trusting that
+        # declaration would request a sock.read() allocation approaching
+        # 64 KiB on a 256 KB device and drive sz negative. Treat an
+        # internally inconsistent frame the same as an oversized one: drop
+        # the connection before any payload is allocated.
+        if sz < 2:
+            self._abort_corrupt_inbound(
+                "Inbound packet too short for a topic length field"
+            )
+        remaining = sz - 2
         topic_len = self.sock.read(2)
         topic_len = (topic_len[0] << 8) | topic_len[1]
+        if topic_len > remaining:
+            self._abort_corrupt_inbound(
+                "Inbound topic length {} exceeds remaining length {}".format(
+                    topic_len, remaining
+                )
+            )
         topic = self.sock.read(topic_len)
-        sz -= topic_len + 2
+        remaining -= topic_len
         if op & 6:
+            if remaining < 2:
+                self._abort_corrupt_inbound(
+                    "Inbound packet too short for a packet identifier"
+                )
+            remaining -= 2
             pid = self.sock.read(2)
             pid = pid[0] << 8 | pid[1]
-            sz -= 2
-        msg = self.sock.read(sz)
+        msg = self.sock.read(remaining)
         self.cb(topic, msg)
         if op & 6 == 2:
             pkt = bytearray(b"\x40\x02\0\0")

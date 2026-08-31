@@ -337,7 +337,7 @@ class Core0:
         # response so a re-publish after an ambiguous QoS 1 failure keeps the
         # same (runtime_id, sequence) identity instead of shifting it.
         wire_sequence = self._claim_wire_sequence(response)
-        self._publish_core0_command_response(
+        published = self._publish_core0_command_response(
             response["command_id"],
             response["command"],
             response["success"],
@@ -347,6 +347,12 @@ class Core0:
             wire_sequence=wire_sequence,
             container=response,
         )
+        if not published:
+            # Permanent serialization failure: the response stays queued
+            # (never discarded -- the command was accepted and its
+            # acknowledgement is owed) and is retried on a later pass, the
+            # same way a failed publish (which raises) leaves it pending.
+            return
         self._pending_core0_responses.pop(0)
 
     def _handle_info_response(self, doc):
@@ -563,6 +569,13 @@ class Core0:
         logical message with the same identity AND the same wire content, the
         way the outbound queue's in-flight entry reuses its pre-serialized
         bytes. Omit it to build-and-publish with no persistent owner.
+
+        Returns True when the response was published (PUBACK received), and
+        False on a permanent (non-MemoryError) serialization failure: nothing
+        was published, and the caller must keep its logical message pending
+        rather than discarding it -- the command was accepted and its
+        acknowledgement is still owed. MemoryError propagates to the final
+        recovery boundary.
         """
         payload_bytes = container.get("_payload_bytes") if container is not None else None
         if payload_bytes is None:
@@ -595,7 +608,7 @@ class Core0:
             except Exception as err:
                 if DEBUG:
                     print("[DEBUG] Command response serialization failed: {}".format(err))
-                return
+                return False
             if container is not None:
                 # Freeze the bytes on the persistent container so a retry after
                 # an ambiguous QoS 1 failure re-publishes the same document
@@ -614,6 +627,7 @@ class Core0:
         if wire_sequence is not None:
             entry["_wire_sequence"] = wire_sequence
         self._publish_entry(entry)
+        return True
 
     def _perform_reboot(self):
         request = self._pending_reboot
@@ -626,7 +640,7 @@ class Core0:
             # Claim (or, on a retry, reuse) the wire sequence on the pending
             # reboot request so a re-publish keeps the same sequence identity.
             wire_sequence = self._claim_wire_sequence(request)
-            self._publish_core0_command_response(
+            published = self._publish_core0_command_response(
                 request["command_id"],
                 request["command"],
                 True,
@@ -640,6 +654,13 @@ class Core0:
         except Exception as err:
             if DEBUG:
                 print("[DEBUG] Reboot response publish failed; reboot remains pending: {}".format(err))
+            return False
+        if not published:
+            # The success acknowledgement was never published; resetting now
+            # would reboot without an answer. The reboot stays pending and is
+            # retried on a later pass instead of discarding the response.
+            if DEBUG:
+                print("[DEBUG] Reboot response serialization failed; reboot remains pending")
             return False
 
         self._pending_reboot = None
@@ -858,7 +879,8 @@ class Core0:
         Returns True once a valid snapshot is acquired. Returns False after
         _UTC_STARTUP_MAX_ATTEMPTS attempts without one, so the caller
         (_verify_startup_contract) can re-establish the network and retry the
-        pass. A MemoryError propagates unchanged (fail-fast).
+        pass. A MemoryError propagates unchanged (fail-fast; the recovery
+        boundary in main() turns it into a board reset).
         """
         for attempt in range(_UTC_STARTUP_MAX_ATTEMPTS):
             # The preceding startup publish (probe #2, or the drain) recorded
@@ -995,8 +1017,10 @@ class Core0:
         steps (3-7) are self-healing: a transient failure (a dropped PUBACK, a
         brief UTC-server outage) drops the session, re-establishes the network,
         and retries the whole verification pass instead of halting the device.
-        A MemoryError still propagates (fail-fast), so an out-of-memory device
-        is not looped.
+        A MemoryError still propagates (fail-fast): it escapes to the recovery
+        boundary in main(), which resets the board, so an out-of-memory device
+        restarts on a fresh heap instead of continuing to allocate on an
+        exhausted one.
 
         Returns only when a complete, clean pass of the contract has succeeded;
         Core 1 stays gated until then.
@@ -1013,7 +1037,8 @@ class Core0:
         # failure, drop the (possibly wedged) MQTT session, re-establish the
         # network, and retry the whole pass. Core 1 stays gated because
         # start() has not returned. A MemoryError propagates out of
-        # _verify_startup_contract and out of this loop (fail-fast on OOM).
+        # _verify_startup_contract and out of this loop (fail-fast on OOM;
+        # the recovery boundary in main() turns it into a board reset).
         while True:
             if self._verify_startup_contract():
                 break
@@ -1044,7 +1069,8 @@ class Core0:
         a 5 s stabilization wait, QoS 1 network probe #2, then UTC
         synchronization. Returns True only when every step succeeds; returns
         False on any probe or UTC failure so the caller can re-establish the
-        network and retry. A MemoryError propagates unchanged (fail-fast).
+        network and retry. A MemoryError propagates unchanged (fail-fast; the
+        recovery boundary in main() turns it into a board reset).
         """
         # Step 3: QoS 1 network probe #1
         if not self._perform_network_probe():

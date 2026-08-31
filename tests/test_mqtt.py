@@ -130,6 +130,10 @@ class MockSocket:
         return len(chunk)
 
     def read(self, n=None):
+        if n == 0:
+            # Real sockets return b"" for read(0); the "no data" branches
+            # below must not fire for a zero-length request.
+            return b""
         if self.buffer:
             if n is None:
                 data = bytes(self.buffer)
@@ -740,6 +744,91 @@ def test_check_msg_oversized_packet_marks_disconnected(ticks, mock_select):
     assert mqtt.is_connected() is False
     assert mqtt._disconnect_count == 1
     assert sock.closed
+
+
+# ---------------------------------------------------------------------------
+# Inbound packet internal consistency: a frame whose declared field lengths
+# exceed its own remaining length must be dropped, not read
+#
+# The remaining-length cap above bounds the *total*, but the topic length
+# (and the QoS 1/2 packet id) are declared by the frame itself. A corrupt
+# stream — no hostile broker required — can therefore carry remaining
+# length 2 with a 65535-byte topic length; the old code handed that
+# declaration straight to sock.read() (a ~64 KiB allocation on a 256 KB
+# device) and let the payload size go negative. Every variable-sized read
+# is now validated against the bytes actually left in the frame.
+# ---------------------------------------------------------------------------
+
+def test_wait_msg_rejects_topic_length_exceeding_remaining_length():
+    """A topic length larger than the frame's remaining length must abort
+    before the topic is read, not request an oversized allocation."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+
+    # Remaining length 2 declaring a 65535-byte topic: the frame claims far
+    # more topic bytes than it carries. Those bytes are never present and
+    # must never be read.
+    sock = MockSocket(incoming=b"\x30\x02\xff\xff")
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.wait_msg()
+
+    # No corrupt frame reached the callback, and the dead stream was
+    # dropped so Core 0's recovery path reconnects instead of reading it.
+    assert seen == []
+    assert sock.closed
+
+
+def test_wait_msg_rejects_qos1_publish_missing_packet_id():
+    """A QoS 1 frame with no bytes left for the packet id must abort."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+
+    # QoS 1 PUBLISH (0x32) with an empty topic: the packet id is required
+    # by the QoS level but absent from the frame.
+    sock = MockSocket(incoming=b"\x32\x02\x00\x00")
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.wait_msg()
+
+    assert sock.closed
+
+
+def test_wait_msg_rejects_frame_too_short_for_topic_length():
+    """A remaining length below the 2-byte topic field is a violation."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+
+    sock = MockSocket(incoming=b"\x30\x01")
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.wait_msg()
+
+    assert sock.closed
+
+
+def test_wait_msg_accepts_qos1_publish_with_empty_topic_and_payload():
+    """A frame whose remaining length is fully consumed by its declared
+    fields (empty topic, packet id, empty payload) is valid and delivered,
+    with the PUBACK answering the consumed packet id."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+
+    # Remaining length 4: topic length (2) + packet id (2). This is the
+    # exact boundary — zero payload bytes remain after the fields.
+    sock = MockSocket(incoming=b"\x32\x04\x00\x00\x01\x02")
+    client.sock = sock
+
+    client.wait_msg()
+
+    assert seen == [(b"", b"")]
+    assert sock.written == b"\x40\x02\x01\x02"
+    assert sock.closed is False
 
 
 # ---------------------------------------------------------------------------

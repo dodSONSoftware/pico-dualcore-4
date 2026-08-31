@@ -61,6 +61,9 @@ class _MockOutboundQueue:
         self.put_with_kind_calls.append((kind, payload_bytes, retention_priority))
         return True
 
+    def has_in_flight(self):
+        return False
+
 
 class _MockInterCore:
     def __init__(self):
@@ -229,8 +232,21 @@ def test_core0_command_response_propagates_memoryerror(monkeypatch):
         instance._publish_core0_command_response("req-1", "reboot", True)
 
 
-def test_core0_command_response_still_swallows_ordinary_errors(monkeypatch):
-    """A non-fatal serialization failure still reports and returns quietly."""
+def test_core0_command_response_returns_true_on_success():
+    """A successful publish reports True, so the caller knows it may consume
+    its logical response."""
+    core0_mod, instance = _make_core0()
+
+    published = instance._publish_core0_command_response("req-1", "reboot", True)
+
+    assert published is True
+    instance._mqtt.publish_qos1.assert_called_once()
+
+
+def test_core0_command_response_swallows_ordinary_errors_returns_false(monkeypatch):
+    """A permanent serialization failure reports False -- not None, not an
+    exception -- so a caller can distinguish it from a successful publish and
+    keep (not discard) its logical response."""
     core0_mod, instance = _make_core0()
 
     def _fail(*args, **kwargs):
@@ -238,6 +254,118 @@ def test_core0_command_response_still_swallows_ordinary_errors(monkeypatch):
 
     monkeypatch.setattr(core0_mod, "serialize_and_validate_message", _fail)
 
-    # No exception, no publish: the response is discarded and reported.
-    instance._publish_core0_command_response("req-1", "reboot", True)
+    # No exception, no publish: the failure is reported, not swallowed.
+    published = instance._publish_core0_command_response("req-1", "reboot", True)
+    assert published is False
     instance._mqtt.publish_qos1.assert_not_called()
+
+
+def test_pending_core0_response_kept_on_serialization_failure(monkeypatch):
+    """A serialization failure must not discard the response: the command was
+    accepted and its acknowledgement is owed, so the response stays queued for
+    a later pass (the pre-fix behavior popped it unconditionally)."""
+    core0_mod, instance = _make_core0()
+
+    def _fail(*args, **kwargs):
+        raise RuntimeError("malformed response")
+
+    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", _fail)
+
+    response = {
+        "command_id": "req-1",
+        "command": "reboot",
+        "success": True,
+        "targeted": False,
+        "data": {"rebooting": True},
+    }
+    instance._pending_core0_responses.append(response)
+
+    instance._service_pending_core0_response()
+
+    assert instance._pending_core0_responses == [response]  # still queued
+    instance._mqtt.publish_qos1.assert_not_called()
+
+
+def test_pending_core0_response_consumed_after_failed_attempt(monkeypatch):
+    """Once serialization succeeds, the response held by an earlier failed
+    attempt is published and consumed -- no tight retry loop, one attempt per
+    run-loop pass."""
+    core0_mod, instance = _make_core0()
+    real_serialize = core0_mod.serialize_and_validate_message
+
+    def _fail(*args, **kwargs):
+        raise RuntimeError("malformed response")
+
+    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", _fail)
+
+    response = {
+        "command_id": "req-1",
+        "command": "reboot",
+        "success": True,
+        "targeted": False,
+        "data": {"rebooting": True},
+    }
+    instance._pending_core0_responses.append(response)
+
+    instance._service_pending_core0_response()
+    assert instance._pending_core0_responses == [response]  # attempt 1: held
+
+    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", real_serialize)
+    instance._service_pending_core0_response()
+    assert instance._pending_core0_responses == []  # attempt 2: published
+    instance._mqtt.publish_qos1.assert_called_once()
+
+
+def test_reboot_held_when_response_serialization_fails(monkeypatch):
+    """A serialization failure of the reboot acknowledgement must NOT let the
+    reboot proceed: resetting would reboot without ever publishing the success
+    response (the pre-fix path fell through to machine.reset()). The reboot
+    stays pending for a later pass."""
+    core0_mod, instance = _make_core0()
+    machine = core0_mod.machine
+
+    def _fail(*args, **kwargs):
+        raise RuntimeError("malformed response")
+
+    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", _fail)
+
+    instance._pending_reboot = {
+        "command_id": "req-1",
+        "command": "reboot",
+        "targeted": False,
+    }
+
+    assert instance._perform_reboot() is False
+    assert instance._pending_reboot is not None  # still pending
+    instance._mqtt.publish_qos1.assert_not_called()
+    machine.reset.assert_not_called()
+
+
+def test_reboot_proceeds_once_serialization_recovers(monkeypatch):
+    """The held reboot is retried on a later pass and completes once the
+    response publishes: acknowledgement first, then the reset."""
+    core0_mod, instance = _make_core0()
+    machine = core0_mod.machine
+    real_serialize = core0_mod.serialize_and_validate_message
+
+    def _fail_first(*args, **kwargs):
+        test_reboot_proceeds_once_serialization_recovers.attempts += 1
+        if test_reboot_proceeds_once_serialization_recovers.attempts == 1:
+            raise RuntimeError("malformed response")
+        return real_serialize(*args, **kwargs)
+
+    test_reboot_proceeds_once_serialization_recovers.attempts = 0
+    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", _fail_first)
+
+    instance._pending_reboot = {
+        "command_id": "req-1",
+        "command": "reboot",
+        "targeted": False,
+    }
+
+    assert instance._perform_reboot() is False  # attempt 1: no ack, no reset
+    machine.reset.assert_not_called()
+
+    assert instance._perform_reboot() is True  # attempt 2: ack published
+    instance._mqtt.publish_qos1.assert_called_once()
+    machine.reset.assert_called_once()

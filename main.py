@@ -78,18 +78,41 @@ def main():
     core0_config = None
     wifi_config = None
 
-    # Core 0 establishes the network before any Core 1 module is imported.
-    core0.start()
+    # Recovery boundary for the operational phase. Everything above is
+    # deterministic startup validation (hardware, config, construction) and
+    # intentionally fails fast: a misconfigured or unsupported board must
+    # stay down with a diagnosable error, not reboot forever. From here on
+    # the firmware is in operational runtime, and the supervision is still
+    # one-directional: Core 0's heartbeat watchdog recovers a dead Core 1,
+    # but nothing supervises Core 0 itself. A Core 0 that terminates (a
+    # MemoryError, an unexpected exception escaping start()/run()) would
+    # leave the board with no networking, no Core 1 supervision, and no
+    # recovery — a transient failure turned into a permanent outage until
+    # something external resets the Pico. An unrecoverable Core 0 exception
+    # is therefore a controlled board reset, not application termination.
+    try:
+        # Core 0 establishes the network before any Core 1 module is imported.
+        core0.start()
 
-    gc.collect()
-    import _thread
-    from core1 import core1_main
+        gc.collect()
+        import _thread
+        from core1 import core1_main
 
-    _thread.start_new_thread(core1_main, (intercore, core1_config, boot_ticks_ms, runtime_id))
-    core1_config = None
-    print("[INFO] Core 1 started after Wi-Fi + MQTT")
+        _thread.start_new_thread(core1_main, (intercore, core1_config, boot_ticks_ms, runtime_id))
+        core1_config = None
+        print("[INFO] Core 1 started after Wi-Fi + MQTT")
 
-    core0.run()
+        core0.run()
+    except MemoryError:
+        # The heap is exhausted: this handler must not allocate, or the
+        # reset — the whole point of the boundary — could never run.
+        # machine.reset() is allocation-free and never returns on hardware.
+        machine.reset()
+    except Exception as err:
+        # Not a MemoryError, so the heap is serviceable and one diagnostic
+        # line before the reset is safe.
+        print("[FATAL] Core 0 unrecoverable exception in operational runtime: {} - resetting".format(err))
+        machine.reset()
 
 
 if __name__ == "__main__":

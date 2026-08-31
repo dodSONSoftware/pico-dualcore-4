@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parent
 
 # Required files for deployment (Python files and config)
 REQUIRED_FILES = {
+    "config.json",
     "main.py",
     "core0.py",
     "core1.py",
@@ -32,11 +33,6 @@ REQUIRED_FILES = {
     "hardware.py",
 }
 
-# Optional files (config files, user-provided)
-OPTIONAL_FILES = {
-    "config.json",
-}
-
 # Required package files (directories with __init__.py)
 REQUIRED_PACKAGES = {
     "devices/__init__.py",
@@ -45,7 +41,7 @@ REQUIRED_PACKAGES = {
     "devices/system_information/system_information_device.py",
 }
 
-FILES = REQUIRED_FILES | OPTIONAL_FILES | REQUIRED_PACKAGES
+FILES = REQUIRED_FILES | REQUIRED_PACKAGES
 
 
 def main():

@@ -476,6 +476,12 @@ class DeviceManager:
 
         for attempt in range(1, self._device_initialization_attempts + 1):
             attempts_used = attempt
+            # Progress boundary, the same strategy as the startup
+            # initialization path: a legitimate runtime reinitialization
+            # (attempts plus retry delays) must not age Core 1's liveness
+            # stamp past Core 0's watchdog bound, while a wedge inside
+            # driver.initialize() stops the refreshes and is still caught.
+            self._refresh_activity()
             try:
                 managed_device.driver.initialize(device_def["config"])
                 # Initialization succeeded (returns None, raises on failure)
@@ -494,6 +500,9 @@ class DeviceManager:
                 last_error = str(err)
                 # If not the final attempt, wait before retry
                 if attempt < self._device_initialization_attempts:
+                    # Progress boundary before the retry sleep: the sleep
+                    # itself must not age the liveness stamp either.
+                    self._refresh_activity()
                     time.sleep_ms(self._device_initialization_retry_delay_ms)
 
         # All reinitialization attempts exhausted
