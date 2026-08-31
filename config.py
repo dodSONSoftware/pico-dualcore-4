@@ -26,6 +26,7 @@ _REQUIRED_KEYS = (
     "mqtt_broker_ip_address",
     "mqtt_keepalive_sec",
     "mqtt_command_poll_ms",
+    "mqtt_outbound_publish_delay_ms",
     "mqtt_broker_response_timeout_sec",
     "datetime_sync_interval_min",
     "network_snapshot_interval_sec",
@@ -172,6 +173,7 @@ def load_config(path="config.json"):
         _require_positive_integer(config, key)
 
     _require_nonnegative_integer(config, "device_initialization_retry_delay_ms")
+    _require_nonnegative_integer(config, "mqtt_outbound_publish_delay_ms")
     _validate_delays(config, "wifi_reconnect_delays_sec")
     _validate_delays(config, "mqtt_reconnect_delays_sec")
     _validate_devices(config["devices"])
@@ -217,6 +219,7 @@ def split_config(config):
         "mqtt_reconnect_delays_sec": config["mqtt_reconnect_delays_sec"],
         "mqtt_keepalive_sec": config["mqtt_keepalive_sec"],
         "mqtt_command_poll_ms": config["mqtt_command_poll_ms"],
+        "mqtt_outbound_publish_delay_ms": config["mqtt_outbound_publish_delay_ms"],
         "mqtt_broker_response_timeout_sec": config["mqtt_broker_response_timeout_sec"],
         "datetime_sync_interval_min": config["datetime_sync_interval_min"],
         "network_snapshot_interval_sec": config["network_snapshot_interval_sec"],

@@ -60,6 +60,11 @@ class Core0:
         self._utc_last_attempt_ms = None
         self._utc_snapshot = None
         self._last_network_snapshot_ms = None
+        # Completion time of the most recent successful outbound application
+        # PUBLISH (the QoS 1 exchange finished, PUBACK received); None until
+        # the first publish. Drives the mqtt_outbound_publish_delay_ms pacing
+        # gate: one timestamp, one source of truth for every publish path.
+        self._last_mqtt_publish_completed_ms = None
         self._last_command_poll_ms = time.ticks_ms()
         self._next_sequence = 0
         self._network_stack_ready = False
@@ -408,6 +413,46 @@ class Core0:
             container["_wire_sequence"] = sequence
         return sequence
 
+    # --- Outbound publish pacing (mqtt_outbound_publish_delay_ms) --------
+    #
+    # A minimum quiet period between consecutive outbound application
+    # PUBLISHes, measured from the moment the previous QoS 1 publish COMPLETED
+    # (PUBACK received), not from when it started: broker latency is outside
+    # the configured interval. It exists to drain a backlogged outbound queue
+    # progressively after a reconnect instead of as a broker-speed burst.
+    #
+    # The interval is state, not a sleep: while the gate is closed Core 0
+    # keeps running its normal loop (Core 1 watchdog, command polling,
+    # keepalive, recovery) and simply does not begin another application
+    # PUBLISH. Protocol-control traffic (PINGREQ and friends) is never paced.
+
+    def _mqtt_publish_ready(self):
+        """True when another outbound MQTT application PUBLISH may begin."""
+        delay_ms = self._config["mqtt_outbound_publish_delay_ms"]
+        if delay_ms == 0:
+            return True
+        if self._last_mqtt_publish_completed_ms is None:
+            return True
+        return time.ticks_diff(
+            time.ticks_ms(),
+            self._last_mqtt_publish_completed_ms,
+        ) >= delay_ms
+
+    def _note_mqtt_publish_completed(self):
+        """Record the completion of a successful outbound QoS 1 publish."""
+        self._last_mqtt_publish_completed_ms = time.ticks_ms()
+
+    def _wait_for_mqtt_publish_slot(self):
+        """Block in 10 ms slices until a publish may begin. Startup-only.
+
+        Core0.start() is a sequential contract in which a specific publish
+        must complete before startup may continue, so a bounded wait is
+        allowed there. Never call this from the run loop: there the gate is
+        closed for this pass and the loop services its other work meanwhile.
+        """
+        while not self._mqtt_publish_ready():
+            time.sleep_ms(10)
+
     def _publish_entry(self, entry):
         """Publish one MQTT entry from its pre-serialized message bytes.
 
@@ -442,6 +487,10 @@ class Core0:
         if topic is None:
             topic = self._topic_for_kind(entry["kind"])
         self._mqtt.publish_qos1(topic, encoded)
+        # The PUBACK has been received: the publish is complete, so the
+        # pacing interval (if any) now begins. A failed publish raises before
+        # this line and records nothing.
+        self._note_mqtt_publish_completed()
         if entry.get("kind") == KIND_TELEMETRY:
             self._led_manager.telemetry_sent()
         if DEBUG:
@@ -625,6 +674,7 @@ class Core0:
                 print("[DEBUG] UTC request publish failed: {}".format(err))
             return
 
+        self._note_mqtt_publish_completed()
         self._utc_last_attempt_ms = time.ticks_ms()
         timeout_ms = self._config["mqtt_broker_response_timeout_sec"] * 1000
         self._utc_request_deadline_ms = time.ticks_add(time.ticks_ms(), timeout_ms)
@@ -687,7 +737,12 @@ class Core0:
 
         Returns True if the probe succeeds with matching PUBACK,
         False otherwise.
+
+        Startup-only (called from the startup verification contract), where a
+        specific publish must complete before startup continues: wait for the
+        pacing slot before publishing rather than bypassing the interval.
         """
+        self._wait_for_mqtt_publish_slot()
         probe_packet_id = self._mqtt.get_next_packet_id()
 
         probe_message = json.dumps({
@@ -707,6 +762,11 @@ class Core0:
                 probe_packet_id,
                 timeout_ms=timeout_ms,
             )
+            if result:
+                # A matched PUBACK is a completed outbound publish: it opens
+                # the pacing gate for the following startup publishes (drain,
+                # probe #2, UTC request) exactly like any other one.
+                self._note_mqtt_publish_completed()
             return result
         except MemoryError:
             raise
@@ -719,6 +779,13 @@ class Core0:
         """Drain any pending Core 0 MQTT work (connection logs, etc.).
 
         Returns True when no startup work remains, False if timeout reached.
+
+        Consecutive startup publishes are paced with
+        mqtt_outbound_publish_delay_ms: each iteration waits for the slot
+        opened by the preceding publish (probe #1, or the previous log), then
+        publishes one log, and that log's successful publish records its
+        completion for the next iteration. A failed publish records nothing,
+        so its wait returns immediately and the drain is not delayed by it.
         """
         timeout_ms = 2000  # 2 second max drain time
         start_ms = time.ticks_ms()
@@ -727,17 +794,15 @@ class Core0:
             if time.ticks_diff(time.ticks_ms(), start_ms) >= timeout_ms:
                 print("[WARNING] Startup MQTT work drain timeout")
                 return False
+            self._wait_for_mqtt_publish_slot()
             try:
                 self._service_pending_connection_log()
-                # Brief wait for publish to complete
-                time.sleep_ms(50)
             except MemoryError:
                 raise
             except Exception as err:
                 if DEBUG:
                     print("[DEBUG] Startup work drain failed: {}".format(err))
                 # Continue draining, don't fail the entire startup
-                time.sleep_ms(50)
 
         return True
 
@@ -750,6 +815,10 @@ class Core0:
         pass. A MemoryError propagates unchanged (fail-fast).
         """
         for attempt in range(_UTC_STARTUP_MAX_ATTEMPTS):
+            # The preceding startup publish (probe #2, or the drain) recorded
+            # its completion: respect the same pacing interval before the
+            # request's PUBLISH begins.
+            self._wait_for_mqtt_publish_slot()
             self._utc_send_request()
             self._utc_wait_response()
             if self._utc_snapshot is not None:
@@ -971,12 +1040,21 @@ class Core0:
             # resets the board before doing any other work.
             self._watch_core_1_heartbeat()
 
-            if self._pending_reboot is not None:
+            # The reboot response is an outbound PUBLISH: hold (without
+            # resetting, without blocking) until the pacing gate is open.
+            if (
+                self._pending_reboot is not None
+                and self._mqtt_publish_ready()
+            ):
                 self._perform_reboot()
 
             self._recover_network_if_needed()
 
-            if self._mqtt.is_connected() and self._pending_connection_logs:
+            if (
+                self._mqtt.is_connected()
+                and self._pending_connection_logs
+                and self._mqtt_publish_ready()
+            ):
                 try:
                     self._service_pending_connection_log()
                 except MemoryError:
@@ -996,13 +1074,19 @@ class Core0:
                         print("[DEBUG] MQTT check failed: {}".format(err))
                 self._last_command_poll_ms = now_ms
 
-            if self._pending_reboot is not None:
+            # The reboot response is an outbound PUBLISH: hold (without
+            # resetting, without blocking) until the pacing gate is open.
+            if (
+                self._pending_reboot is not None
+                and self._mqtt_publish_ready()
+            ):
                 self._perform_reboot()
 
             if (
                 self._mqtt.is_connected()
                 and self._pending_core0_responses
                 and not self._intercore.outbound_queue.has_in_flight()
+                and self._mqtt_publish_ready()
             ):
                 try:
                     self._service_pending_core0_response()
@@ -1013,7 +1097,17 @@ class Core0:
                         print("[DEBUG] Core 0 response publish failed: {}".format(err))
 
             if self._mqtt.is_connected():
-                entry = self._intercore.outbound_queue.take()
+                # Dequeue only when the pacing gate is open: take() promotes
+                # the entry to in-flight, and there is no benefit in doing that
+                # for a message Core 0 already knows it cannot transmit yet.
+                # The PINGREQ below is NOT gated on pacing: keepalive is
+                # protocol-control traffic and never waits on application
+                # publishes (and vice versa).
+                entry = (
+                    self._intercore.outbound_queue.take()
+                    if self._mqtt_publish_ready()
+                    else None
+                )
                 if entry is not None:
                     try:
                         self._publish_entry(entry)
@@ -1040,7 +1134,11 @@ class Core0:
             self._publish_network_snapshot()
 
             self._utc_request_expired()
-            if self._mqtt.is_connected() and self._utc_should_send_request():
+            if (
+                self._mqtt.is_connected()
+                and self._utc_should_send_request()
+                and self._mqtt_publish_ready()
+            ):
                 self._utc_send_request()
 
             time.sleep_ms(10)

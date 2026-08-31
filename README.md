@@ -233,7 +233,7 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 
 ### Schema Version
 
-The firmware expects `config_schema_version: 6`. Unknown top-level keys are rejected.
+The firmware expects `config_schema_version: 7`. Unknown top-level keys are rejected.
 
 ### Key Settings
 
@@ -245,6 +245,7 @@ The firmware expects `config_schema_version: 6`. Unknown top-level keys are reje
 | `device_read_failure_threshold` | Consecutive failures before reinit |
 | `mqtt_keepalive_sec` | MQTT keepalive interval (seconds) |
 | `mqtt_command_poll_ms` | MQTT receive pump interval (ms) |
+| `mqtt_outbound_publish_delay_ms` | Minimum delay (ms) after a successful outbound MQTT PUBLISH before another may begin; 0 disables pacing |
 | `mqtt_broker_response_timeout_sec` | Bounded PUBACK/UTC-response wait (seconds) |
 | `network_probe_timeout_sec` | Startup probe PUBACK wait (seconds) |
 | `datetime_sync_interval_min` | UTC sync interval (minutes) |

@@ -56,12 +56,51 @@ def test_wrong_schema_version_fails_fast(tmp_path):
 
 
 def test_removed_queue_capacity_keys_are_rejected(tmp_path):
-    """The retired bus capacity keys are unknown config keys (schema v6)."""
+    """The retired bus capacity keys are unknown config keys (schema v7)."""
     for key in ("max_outbound_queue_entries", "max_intercore_event_entries"):
         config = _base_config()
         config[key] = 16
         with pytest.raises(ConfigError, match="Unknown config key"):
             load_config(_write(tmp_path, config))
+
+
+def test_outbound_publish_delay_loaded_and_core0_owned(tmp_path):
+    """mqtt_outbound_publish_delay_ms is a required Core 0-only setting."""
+    config = _base_config()
+    assert config["mqtt_outbound_publish_delay_ms"] == 100
+
+    loaded = load_config(_write(tmp_path, config))
+    core0, core1 = split_config(loaded)
+    assert core0["mqtt_outbound_publish_delay_ms"] == 100
+    assert "mqtt_outbound_publish_delay_ms" not in core1
+
+
+def test_outbound_publish_delay_zero_disables_pacing(tmp_path):
+    """Zero is a valid value: it means pacing is disabled."""
+    config = _base_config()
+    config["mqtt_outbound_publish_delay_ms"] = 0
+
+    loaded = load_config(_write(tmp_path, config))
+    core0, _core1 = split_config(loaded)
+    assert core0["mqtt_outbound_publish_delay_ms"] == 0
+
+
+@pytest.mark.parametrize("bad_value", [-1, True, "100", 100.0, None])
+def test_outbound_publish_delay_invalid_values_rejected(tmp_path, bad_value):
+    config = _base_config()
+    config["mqtt_outbound_publish_delay_ms"] = bad_value
+
+    with pytest.raises(ConfigError, match="mqtt_outbound_publish_delay_ms"):
+        load_config(_write(tmp_path, config))
+
+
+def test_outbound_publish_delay_required_under_schema_7(tmp_path):
+    """Schema v7 makes the key required: a config missing it fails fast."""
+    config = _base_config()
+    del config["mqtt_outbound_publish_delay_ms"]
+
+    with pytest.raises(ConfigError, match="mqtt_outbound_publish_delay_ms"):
+        load_config(_write(tmp_path, config))
 
 
 def test_duplicate_device_ids_fail_fast(tmp_path):
