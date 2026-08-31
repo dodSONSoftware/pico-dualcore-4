@@ -193,12 +193,12 @@ class MQTTClient:
                     return
         finally:
             if timeout_sec is not None:
-                try:
-                    self.sock.settimeout(None)
-                except MemoryError:
-                    raise
-                except Exception:
-                    pass
+                # Restoring normal blocking mode is not best-effort: the next
+                # operation assumes the socket is back in blocking mode, so a
+                # failed restoration is a connection failure — let it
+                # propagate into Core 0's recovery (as check_msg() does for
+                # its own restoration) instead of marking the exchange done.
+                self.sock.settimeout(None)
 
     def publish(self, topic, msg, retain=False, qos=0, packet_id=None, timeout_ms=None):
         """Publish one or more application messages.
@@ -267,12 +267,12 @@ class MQTTClient:
                             return
         finally:
             if timed:
-                try:
-                    self.sock.settimeout(None)
-                except MemoryError:
-                    raise
-                except Exception:
-                    pass
+                # Restoring normal blocking mode is not best-effort: the next
+                # operation assumes the socket is back in blocking mode, so a
+                # failed restoration is a connection failure — let it
+                # propagate into Core 0's recovery (as check_msg() does for
+                # its own restoration) instead of reporting the publish done.
+                self.sock.settimeout(None)
         if qos == 2:
             assert 0
 

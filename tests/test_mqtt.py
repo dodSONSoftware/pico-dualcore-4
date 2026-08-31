@@ -101,6 +101,10 @@ class MockSocket:
         # When set, settimeout() raises this instead of installing a timeout,
         # so a test can model a socket/runtime error during timeout setup.
         self.settimeout_error = None
+        # When set, the restore of normal blocking mode (settimeout(None))
+        # raises this instead: models a runtime that fails to restore socket
+        # state after a bounded exchange, while installs still succeed.
+        self.restore_error = None
         self.closed = False
         # When set, a write attempted in infinite-blocking mode (no finite
         # timeout installed) would stall forever on a real blackholed link;
@@ -152,6 +156,8 @@ class MockSocket:
     def settimeout(self, value):
         if self.settimeout_error is not None:
             raise self.settimeout_error
+        if value is None and self.restore_error is not None:
+            raise self.restore_error
         self.timeout_value = value
         self.nonblocking = False
 
@@ -629,6 +635,40 @@ def test_ping_fails_immediately_when_settimeout_raises():
     assert sock.timeout_value is None
 
 
+def test_ping_fails_when_blocking_restore_raises():
+    """A failed restore to blocking mode must fail ping, not be swallowed.
+
+    The PINGRESP arrives (the bounded wait itself succeeds), but the socket
+    cannot be returned to blocking mode. Subsequent operations assume the
+    blocking mode, so the failure must propagate into recovery instead of
+    letting ping() report success.
+    """
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"\xd0\x00")  # ready PINGRESP: the wait succeeds
+    sock.restore_error = OSError("restore failed")
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.ping(timeout_sec=10)
+
+
+def test_publish_qos1_fails_when_blocking_restore_raises():
+    """A failed restore to blocking mode must fail the publish, not be
+    swallowed.
+
+    The PUBACK arrives (the QoS 1 exchange itself completes), but the socket
+    cannot be returned to blocking mode. The publish must surface that
+    failure into recovery instead of reporting a successful delivery.
+    """
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"\x40\x02\x00\x01")  # ready PUBACK: the exchange completes
+    sock.restore_error = OSError("restore failed")
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+
+
 def test_connect_fails_when_settimeout_raises(monkeypatch):
     """A failed connection-timeout install must terminate the attempt before
     the unbounded CONNACK wait."""
@@ -907,6 +947,32 @@ def test_mqtt_connect_subscribes_both_topics_and_restores_blocking(ticks, monkey
     # blocking mode for the run loop (each later operation bounds its own
     # wait).
     assert sock.timeout_value is None
+
+
+def test_mqtt_connect_fails_when_blocking_restore_raises(ticks, monkeypatch):
+    """A failed restore to blocking mode after the handshake must fail the
+    connection attempt, not mark a broken link healthy.
+
+    CONNACK and both SUBACKs arrive, but settimeout(None) fails: the
+    handshake cannot be treated as complete, so the attempt fails (and the
+    retry loop's cleanup closes the socket) instead of a connect success.
+    """
+    incoming = (
+        b"\x20\x02\x00\x00"       # CONNACK
+        b"\x90\x03\x00\x01\x00"   # SUBACK pid 1 (command topic)
+        b"\x90\x03\x00\x02\x00"   # SUBACK pid 2 (info response topic)
+    )
+    sock = MockSocket(incoming=incoming)
+    sock.restore_error = OSError("restore failed")
+    _mock_broker_socket(monkeypatch, sock)
+    mqtt = _mqtt(ticks)
+
+    assert mqtt.connect() is False
+    assert mqtt.is_connected() is False
+    assert mqtt._connect_count == 0
+    # The broken client is closed by the retry-loop cleanup, not kept as a
+    # healthy session in a socket mode the later bounded waits cannot assume.
+    assert sock.closed is True
 
 
 # ---------------------------------------------------------------------------

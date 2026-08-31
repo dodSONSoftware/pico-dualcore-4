@@ -34,6 +34,44 @@ class Wifi:
             self._service_wait()
             time.sleep_ms(100)
 
+    def _current_status(self):
+        """The current WLAN association state, or None if it cannot be read.
+
+        None covers every way the read can fail or come back non-int
+        (an unsupported firmware, a status API that wants a key, ...).
+        Callers treat None as "unknown" and let the existing observation
+        timeout govern -- exactly as before -- never as a failure.
+        """
+        try:
+            status = self._wlan.status()
+        except MemoryError:
+            raise
+        except Exception:
+            return None
+        return status if isinstance(status, int) else None
+
+    def _terminal_failure_statuses(self):
+        """The WLAN association states that end a connect attempt, as ints.
+
+        WRONG_PASSWORD, NO_AP_FOUND and CONNECT_FAIL are all final for the
+        current connect() call: the driver will not recover within the
+        observation window, so the attempt can stop observing immediately.
+        The values are read from the WLAN object (like PM_NONE above) and,
+        if the firmware build does not expose the names, fall back to the
+        documented MicroPython values (2, 3, 4).
+        """
+        names = ("STAT_WRONG_PASSWORD", "STAT_NO_AP_FOUND", "STAT_CONNECT_FAIL")
+        literals = (2, 3, 4)
+        statuses = []
+        for name, literal in zip(names, literals):
+            value = getattr(self._wlan, name, None)
+            if not isinstance(value, int):
+                value = getattr(network.WLAN, name, None)
+            if not isinstance(value, int):
+                value = literal
+            statuses.append(value)
+        return statuses
+
     def is_connected(self):
         try:
             return self._wlan is not None and self._wlan.isconnected()
@@ -74,11 +112,23 @@ class Wifi:
 
                 self._wlan.connect(self._ssid, self._password)
 
+                terminal_statuses = self._terminal_failure_statuses()
+                terminal_status = None
                 wait_count = 0
                 while not self._wlan.isconnected() and wait_count < 200:
                     # Service Core 0 (its Core 1 watchdog) on every 100 ms
                     # slice of the up-to-20-second observation window.
                     self._service_wait()
+                    # A terminal association state (wrong password, missing
+                    # AP, known connect failure) means the driver will not
+                    # recover within this window -- stop observing instead of
+                    # waiting out the full 20 s. A still-connecting state is
+                    # not terminal, so the loop keeps observing and the
+                    # existing timeout remains the fallback.
+                    status = self._current_status()
+                    if status is not None and status in terminal_statuses:
+                        terminal_status = status
+                        break
                     time.sleep_ms(100)
                     wait_count += 1
 
@@ -88,6 +138,11 @@ class Wifi:
                     self._was_connected = True
                     print("[INFO] Wi-Fi connected: {}".format(self._ssid))
                     return True
+
+                if DEBUG and terminal_status is not None:
+                    print("[DEBUG] Wi-Fi attempt {} ended early (WLAN status {})".format(
+                        attempt_index + 1, terminal_status
+                    ))
 
             except MemoryError:
                 raise

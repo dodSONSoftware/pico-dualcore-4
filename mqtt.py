@@ -123,14 +123,13 @@ class Mqtt:
                 self._client.connect(timeout=self._ack_timeout_ms / 1000.0)
                 self._client.subscribe(self._command_topic, qos=1)
                 self._client.subscribe(self._info_response_topic, qos=1)
-                # Handshake complete: restore normal blocking mode.
-                try:
-                    self._client.sock.settimeout(None)
-                except MemoryError:
-                    raise
-                except Exception as err:
-                    if DEBUG:
-                        print("[DEBUG] MQTT blocking-mode restore failed: {}".format(err))
+                # Handshake complete: restore normal blocking mode. This is
+                # not best-effort — a socket that cannot be put back into
+                # blocking mode is not the state the later bounded waits
+                # assume, so a failed restoration fails this attempt (the
+                # retry loop below reconnects) instead of marking a broken
+                # link healthy.
+                self._client.sock.settimeout(None)
                 self._connected = True
                 self._connect_count += 1
                 self._touch()

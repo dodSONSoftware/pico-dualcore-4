@@ -71,6 +71,17 @@ def _debug_queue_memory(prefix, queue, event, extra=None):
     print("[DEBUG] {} {}".format(prefix, " ".join(parts)))
 
 
+class OutboundMessageTooLargeError(ValueError):
+    """A serialized message beyond MAX_OUTBOUND_MESSAGE_BYTES was rejected.
+
+    A subclass of ValueError, so existing permanent-rejection handlers
+    (which catch ValueError) keep working unchanged, while a caller that
+    needs to report the actual cause -- such as Core 1's command response
+    channel -- can distinguish a size failure from the other permanent
+    ValueErrors (validation or serialization failure).
+    """
+
+
 class OutboundQueue:
     """Core 1 -> Core 0 queue for MQTT-bound messages only.
 
@@ -258,6 +269,10 @@ class OutboundQueue:
             MAX_OUTBOUND_MESSAGE_BYTES. These are permanent failures of the
             message itself, not of the queue: retrying the same message cannot
             succeed, so they are raised instead of returned as False.
+
+            OutboundMessageTooLargeError (a ValueError subclass): for the
+            oversized case specifically, so a caller can report a size
+            failure distinctly from a validation or serialization failure.
         """
         if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
@@ -290,9 +305,11 @@ class OutboundQueue:
             # Oversized is a permanent failure of the message (the ceiling is
             # a static invariant): raise, so a caller can distinguish it from
             # the False (transient, retry later) return. Queue state is
-            # untouched, as before.
+            # untouched, as before. OutboundMessageTooLargeError (a ValueError
+            # subclass) lets a caller tell this size failure apart from the
+            # other permanent ValueError rejections (validation, serialization).
             self._oversized_rejected += 1
-            raise ValueError("Message too large: {}".format(err))
+            raise OutboundMessageTooLargeError("Message too large: {}".format(err))
         except SerializationError as err:
             # A serialization failure is likewise permanent for this message.
             self._serialization_rejected += 1
@@ -320,9 +337,11 @@ class OutboundQueue:
             (heap pressure), in which case a later retry may succeed.
 
         Raises:
-            ValueError: if the payload is longer than
-            MAX_OUTBOUND_MESSAGE_BYTES: a permanent failure of the message,
-            retrying the same payload cannot succeed.
+            OutboundMessageTooLargeError (a ValueError subclass): if the
+            payload is longer than MAX_OUTBOUND_MESSAGE_BYTES: a permanent
+            failure of the message, retrying the same payload cannot succeed.
+            Raised as the size-specific type so a caller can report a size
+            failure distinctly from a validation or serialization failure.
         """
         if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
@@ -345,8 +364,10 @@ class OutboundQueue:
         if len(payload_bytes) > MAX_OUTBOUND_MESSAGE_BYTES:
             # Oversized is a permanent failure of the message: raise, the
             # same as the put() serialization path. Queue state is untouched.
+            # OutboundMessageTooLargeError (a ValueError subclass) keeps this
+            # size failure distinguishable for callers, as in put().
             self._oversized_rejected += 1
-            raise ValueError(
+            raise OutboundMessageTooLargeError(
                 "Message too large: {} bytes exceeds the {} byte per-message limit".format(
                     len(payload_bytes), MAX_OUTBOUND_MESSAGE_BYTES
                 )

@@ -7,15 +7,20 @@
 The outbound queue distinguishes a transient rejection (False: heap
 pressure, retry later) from a permanent one (ValueError: the message can
 never be admitted). The command channel must honor that distinction: a
-permanently rejected response is answered with a small "response_too_large"
-error response for the same command, so one oversized response can never
-permanently stall the command channel behind it.
+permanently rejected response is answered with a small error response for
+the same command whose code states the actual cause -- "response_too_large"
+for an oversized response, "response_invalid" for a validation or
+serialization failure -- so a response can never permanently stall the
+command channel behind it, and a firmware defect is not misreported as a
+size problem.
 """
 
 import json
 import pathlib
 import sys
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -25,21 +30,27 @@ import core1  # noqa: E402
 from intercore import (  # noqa: E402
     InterCore,
     KIND_COMMAND_RESPONSE,
+    KIND_TELEMETRY,
     RETENTION_PRIORITY_CRITICAL,
+    OutboundMessageTooLargeError,
 )
 from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES  # noqa: E402
 
 
-# Sentinel for "permanently reject" in a ScriptedQueue outcome list: the
-# queue raises ValueError, as the real queue does for an oversized message.
+# Sentinels for "permanently reject" in a ScriptedQueue outcome list: the
+# real queue raises OutboundMessageTooLargeError (a ValueError subclass) for
+# an oversized message and a plain ValueError for a validation or
+# serialization failure.
 RAISE = object()
+RAISE_TOO_LARGE = object()
 
 
 class ScriptedQueue:
     """An outbound queue that returns scripted admission outcomes in order.
 
-    Outcomes: True (admit), False (transient rejection), or RAISE (permanent
-    rejection: ValueError).
+    Outcomes: True (admit), False (transient rejection), RAISE (permanent
+    rejection: validation failure ValueError), or RAISE_TOO_LARGE (permanent
+    rejection: OutboundMessageTooLargeError).
     """
 
     def __init__(self, outcomes):
@@ -49,7 +60,9 @@ class ScriptedQueue:
     def put(self, kind, message, retention_priority):
         outcome = self._outcomes.pop(0)
         if outcome is RAISE:
-            raise ValueError("Message too large: exceeds the per-message limit")
+            raise ValueError("Message validation failed: unsupported value at data")
+        if outcome is RAISE_TOO_LARGE:
+            raise OutboundMessageTooLargeError("Message too large: exceeds the per-message limit")
         if outcome:
             self.admitted.append((kind, message, retention_priority))
         return outcome
@@ -105,8 +118,8 @@ def test_transient_rejection_keeps_the_same_response_pending():
     assert priority == RETENTION_PRIORITY_CRITICAL
 
 
-def test_permanent_rejection_is_answered_with_a_small_error_response():
-    queue = ScriptedQueue([RAISE, True])
+def test_oversized_rejection_is_answered_with_response_too_large():
+    queue = ScriptedQueue([RAISE_TOO_LARGE, True])
     intercore = FakeInterCore(queue)
     response = _success_response()
 
@@ -135,8 +148,41 @@ def test_permanent_rejection_is_answered_with_a_small_error_response():
     assert len(json.dumps(message).encode("utf-8")) <= 512
 
 
+def test_validation_failure_rejection_is_answered_with_response_invalid():
+    """A permanent rejection that is not a size problem must be reported as
+    such: a serialization/validation defect in the response must not be
+    misreported to the command sender as a size limit."""
+    queue = ScriptedQueue([RAISE, True])
+    intercore = FakeInterCore(queue)
+    response = _success_response()
+
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        pending = core1._admit_or_substitute_command_response(
+            intercore, object(), response
+        )
+
+    # The channel moved on: nothing stays pending.
+    assert pending is None
+    assert len(queue.admitted) == 1
+    kind, message, priority = queue.admitted[0]
+    assert kind == KIND_COMMAND_RESPONSE
+    assert priority == RETENTION_PRIORITY_CRITICAL
+
+    payload = message["payload"]
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "response_invalid"
+    assert "data" not in payload
+    # The command identity is preserved, and the code is not the size code.
+    assert payload["command_id"] == "details-001"
+    assert payload["command"] == "get-details"
+    assert payload["targeted"] is True
+
+    # The substitute is small by construction: far under the per-message ceiling.
+    assert len(json.dumps(message).encode("utf-8")) <= 512
+
+
 def test_substitute_that_is_transiently_rejected_stays_pending():
-    queue = ScriptedQueue([RAISE, False, True])
+    queue = ScriptedQueue([RAISE_TOO_LARGE, False, True])
     intercore = FakeInterCore(queue)
     response = _success_response()
 
@@ -226,3 +272,36 @@ def test_oversized_get_details_response_does_not_stall_the_channel(monkeypatch):
     assert wire["payload"]["command_id"] == "details-001"
     assert wire["payload"]["command"] == "get-details"
     queue.complete_in_flight(entry)
+
+
+def test_queue_raises_the_size_type_only_for_size_failures():
+    """The queue's own boundary contract: OutboundMessageTooLargeError is
+    raised only for the per-message ceiling, on both admission paths. It is
+    a ValueError subclass (existing permanent-rejection handlers keep
+    working), and a validation failure is a ValueError that is NOT a size
+    failure -- so the two causes never get collapsed back together."""
+    intercore = InterCore(64 * 1024)
+    queue = intercore.outbound_queue
+    big = {"blob": "x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1)}
+
+    with pytest.raises(OutboundMessageTooLargeError):
+        queue.put(KIND_TELEMETRY, big, 40)
+    # A size failure is still a ValueError for existing handlers.
+    with pytest.raises(ValueError):
+        queue.put(KIND_TELEMETRY, big, 40)
+
+    # A validation failure is a permanent ValueError, not a size failure.
+    try:
+        queue.put(KIND_TELEMETRY, {"bad": float("nan")}, 40)
+    except OutboundMessageTooLargeError:
+        pytest.fail("a validation failure was reported as a size failure")
+    except ValueError:
+        pass
+    else:
+        pytest.fail("a validation failure was not permanently rejected")
+
+    # The pre-serialized path enforces the same ceiling, same type.
+    with pytest.raises(OutboundMessageTooLargeError):
+        queue.put_with_kind(KIND_TELEMETRY, b"x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1), 40)
+    with pytest.raises(ValueError):
+        queue.put_with_kind(KIND_TELEMETRY, b"x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1), 40)

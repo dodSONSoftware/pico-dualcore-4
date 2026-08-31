@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flash-deploy-pico.sh - Build, flash, provision, deploy, and monitor Pico firmware
+# _deploy_to_pico.sh - Build, flash, provision, deploy, and monitor Pico firmware
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
@@ -7,14 +7,18 @@ set -Eeuo pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
 readonly REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly DEFAULT_FIRMWARE_FILE="/home/worker/Documents/code/pico-bin/pico-2-w/RPI_PICO2_W-20260406-v1.28.0.uf2"
 readonly DEFAULT_RELEASE_DIR="$(dirname "$REPO_DIR")/sensor-releases"
+readonly PICO_W_FIRMWARE_FILE="/home/worker/Documents/code/pico-bin/pico-w/RPI_PICO_W-20260406-v1.28.0.uf2"
+readonly PICO_2_W_FIRMWARE_FILE="/home/worker/Documents/code/pico-bin/pico-2-w/RPI_PICO2_W-20260406-v1.28.0.uf2"
 
 DEVICE="auto"
 RELEASE_DIR="${RELEASE_DIR:-$DEFAULT_RELEASE_DIR}"
-UF2_FILE="$DEFAULT_FIRMWARE_FILE"
-UF2_FILE_SET=false
 TEMP_DIR=""
+TARGET=""
+TARGET_NAME=""
+UF2_FILE=""
+UF2_FILE_SET=false
+FLASH_ERASE_END=""
 
 log() {
     printf '\n==> %s\n' "$*"
@@ -34,15 +38,16 @@ trap cleanup EXIT
 
 usage() {
     cat <<USAGE
+${SCRIPT_NAME} builds and deploys the sensor firmware to a Raspberry Pi Pico W
+or Pico 2 W. The target board is mandatory and determines the default
+MicroPython UF2 image and the full-flash erase range.
+
 Usage:
-  ${SCRIPT_NAME} [options] [firmware.uf2]
+  ${SCRIPT_NAME} <1|2> [options] [firmware.uf2]
 
-Builds and verifies a clean application release, erases and flashes MicroPython
-onto one Pico in BOOTSEL mode, verifies the UF2, provisions config.json and
-config-secrets.json, deploys the application, and enters the MicroPython REPL.
-
-If no firmware file is specified, defaults to:
-  ${DEFAULT_FIRMWARE_FILE}
+Targets:
+  1                     Deploy to a Raspberry Pi Pico W
+  2                     Deploy to a Raspberry Pi Pico 2 W
 
 Options:
   -d, --device DEVICE   mpremote device selector. Default: auto
@@ -51,16 +56,54 @@ Options:
                         Default: ${DEFAULT_RELEASE_DIR}
   -h, --help            Show this help.
 
-WARNING: This permanently erases the device's entire flash, including the
-MicroPython filesystem and all files stored on it. Local config.json and
-config-secrets.json are then provisioned onto the device.
+The script:
+  1. Requires a clean Git working tree.
+  2. Builds and verifies a release artifact with release.py.
+  3. Erases the selected Pico's flash while it is in BOOTSEL mode.
+  4. Flashes and verifies the selected MicroPython UF2 image.
+  5. Provisions config.json and config-secrets.json.
+  6. Deploys the application and package directories with mpremote.
+  7. Soft-resets the device and starts main.main().
 
-After deployment, the script enters the MicroPython REPL. At the >>> prompt,
-run:
-  import main
+Default firmware images:
+  Pico W:   ${PICO_W_FIRMWARE_FILE}
+  Pico 2 W: ${PICO_2_W_FIRMWARE_FILE}
 
-to start the application while keeping debug output attached to the terminal.
+WARNING: Deployment permanently erases the selected device's entire flash,
+including the MicroPython filesystem and all files stored on it.
+
+Examples:
+  ${SCRIPT_NAME} 1
+  ${SCRIPT_NAME} 2
+  ${SCRIPT_NAME} 1 --device /dev/ttyACM0
+  ${SCRIPT_NAME} 2 /path/to/RPI_PICO2_W-custom.uf2
 USAGE
+}
+
+usage_error() {
+    [[ $# -eq 0 ]] || printf 'Error: %s\n\n' "$*" >&2
+    usage >&2
+    exit 2
+}
+
+configure_target() {
+    case "$1" in
+        1)
+            TARGET="1"
+            TARGET_NAME="Raspberry Pi Pico W"
+            UF2_FILE="$PICO_W_FIRMWARE_FILE"
+            FLASH_ERASE_END="0x10200000"
+                        ;;
+        2)
+            TARGET="2"
+            TARGET_NAME="Raspberry Pi Pico 2 W"
+            UF2_FILE="$PICO_2_W_FIRMWARE_FILE"
+            FLASH_ERASE_END="0x10400000"
+            ;;
+        *)
+            usage_error "Target must be 1 (Pico W) or 2 (Pico 2 W)."
+            ;;
+    esac
 }
 
 wait_for_micropython() {
@@ -83,6 +126,52 @@ wait_for_micropython() {
 
     fail "MicroPython USB serial device did not become ready within ${timeout_sec} seconds."
 }
+
+release_query() {
+    local action="$1"
+
+    PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_DIR/release.py" "$action" <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+release_path = pathlib.Path(sys.argv[1]).resolve()
+action = sys.argv[2]
+
+# release.py imports version.py from its own directory. Ensure that directory is
+# importable even when this deployment script is launched from elsewhere.
+sys.path.insert(0, str(release_path.parent))
+
+spec = importlib.util.spec_from_file_location("sensor_release", release_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+if action == "root-files":
+    for name in sorted(module.REQUIRED_FILES):
+        if name.endswith(".py") and "/" not in name:
+            print(name)
+elif action == "package-files":
+    for name in sorted(module.REQUIRED_PACKAGES):
+        if name.endswith(".py"):
+            print(name)
+else:
+    raise SystemExit("Unknown release metadata action: {}".format(action))
+PY
+}
+
+if (($# == 0)); then
+    usage_error
+fi
+
+case "$1" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+esac
+
+configure_target "$1"
+shift
 
 while (($#)); do
     case "$1" in
@@ -160,6 +249,7 @@ if [[ -n "$GIT_STATUS" ]]; then
 fi
 
 COMMIT_HASH="$(git -C "$REPO_DIR" rev-parse HEAD)"
+log "Target: $TARGET_NAME"
 log "Source commit: $COMMIT_HASH"
 log "Provisioning mode: config.json and config-secrets.json WILL be overwritten on the Pico."
 
@@ -221,106 +311,43 @@ STAGING_DIR="$TEMP_DIR/staging"
 mkdir -p -- "$STAGING_DIR"
 tar -xzf "$ARTIFACT" -C "$STAGING_DIR"
 
-# Separate root-level files from package directories for proper deployment
-mapfile -t ROOT_FILES < <(
-    PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_DIR/release.py" <<'PY'
-import importlib.util
-import pathlib
-import sys
+mapfile -t ROOT_FILES < <(release_query root-files)
+mapfile -t PACKAGE_DIR_FILES < <(release_query package-files)
 
-release_path = pathlib.Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("sensor_release", release_path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+((${#ROOT_FILES[@]} > 0)) \
+    || fail "Could not determine root application files from release.py"
+((${#PACKAGE_DIR_FILES[@]} > 0)) \
+    || fail "Could not determine package files from release.py"
 
-# Root-level .py files only (no packages with /)
-for filename in sorted(module.REQUIRED_FILES | module.OPTIONAL_FILES):
-    if filename.endswith(".py") and "/" not in filename:
-        print(filename)
-PY
-)
-
-mapfile -t PACKAGE_DIR_FILES < <(
-    PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_DIR/release.py" <<'PY'
-import importlib.util
-import pathlib
-import sys
-
-release_path = pathlib.Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("sensor_release", release_path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-
-# Package files (containing /) - these will be copied with -r from their parent dirs
-for filename in sorted(module.REQUIRED_PACKAGES):
-    if filename.endswith(".py"):
-        print(filename)
-PY
-)
-
-((${#ROOT_FILES[@]} > 0 || ${#PACKAGE_DIR_FILES[@]} > 0)) || fail "release.py defines no deployable application files"
-
-# Build root-level file list
 ROOT_FILE_PATHS=()
+MAIN_SELECTED=false
 for filename in "${ROOT_FILES[@]}"; do
     staged="$STAGING_DIR/$filename"
-    if [[ -f "$staged" ]]; then
-        ROOT_FILE_PATHS+=("$staged")
-    else
-        # Check if required
-        if PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_DIR/release.py" "$filename" <<'PY'
-import importlib.util
-import pathlib
-import sys
-
-release_path = pathlib.Path(sys.argv[1])
-filename = sys.argv[2]
-spec = importlib.util.spec_from_file_location("sensor_release", release_path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-raise SystemExit(0 if filename in module.REQUIRED_FILES else 1)
-PY
-        then
-            fail "Required application file missing from release artifact: $filename"
-        fi
-    fi
+    [[ -f "$staged" ]] \
+        || fail "Required application file missing from release artifact: $filename"
+    ROOT_FILE_PATHS+=("$staged")
+    [[ "$filename" == "main.py" ]] && MAIN_SELECTED=true
 done
 
-# Track top-level package roots that need -r copy
-# Extract only the first path component (e.g., "devices" from "devices/device.py")
-# This prevents double-copying subpackages like "devices/system_information"
+$MAIN_SELECTED || fail "release.py did not select main.py for deployment"
+
+# Track only the first path component for package deployment. This avoids
+# recursively copying the same package through both a parent and subpackage.
 declare -A PACKAGE_ROOTS
 for filename in "${PACKAGE_DIR_FILES[@]}"; do
     staged="$STAGING_DIR/$filename"
     if [[ -f "$staged" ]]; then
-        # Extract only the first path component as the package root
         package_root="${filename%%/*}"
         PACKAGE_ROOTS["$package_root"]=1
     else
-        # Check if required
-        if PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_DIR/release.py" "$filename" <<'PY'
-import importlib.util
-import pathlib
-import sys
-
-release_path = pathlib.Path(sys.argv[1])
-filename = sys.argv[2]
-spec = importlib.util.spec_from_file_location("sensor_release", release_path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-raise SystemExit(0 if filename in module.REQUIRED_PACKAGES else 1)
-PY
-        then
-            fail "Required application file missing from release artifact: $filename"
-        fi
+        fail "Required package file missing from release artifact: $filename"
     fi
 done
 
-# Add config files to root files
+# Provision local configuration rather than the release artifact's config.json.
 ROOT_FILE_PATHS+=("$REPO_DIR/config.json" "$REPO_DIR/config-secrets.json")
 ((${#ROOT_FILE_PATHS[@]} > 0)) || fail "No root-level files selected for deployment"
 
-# Build package root list
 PACKAGE_ROOT_PATHS=()
 for dir in "${!PACKAGE_ROOTS[@]}"; do
     staged_dir="$STAGING_DIR/$dir"
@@ -339,12 +366,12 @@ picotool info "$UF2_FILE"
 printf '\nEnter the administrator password if prompted.\n'
 sudo -v
 
-log "Checking for a Pico in BOOTSEL mode"
-printf 'Connect exactly one Pico in BOOTSEL mode before continuing.\n'
+log "Checking for a $TARGET_NAME in BOOTSEL mode"
+printf 'Connect exactly one %s in BOOTSEL mode before continuing.\n' "$TARGET_NAME"
 sudo picotool info >/dev/null
 
-log "Erasing entire flash"
-sudo picotool erase --range 0x10000000 0x10400000
+log "Erasing entire flash for $TARGET_NAME"
+sudo picotool erase --range 0x10000000 "$FLASH_ERASE_END"
 
 log "Writing firmware"
 sudo picotool load --ignore-partitions "$UF2_FILE"
@@ -361,23 +388,17 @@ wait_for_micropython 15
 # Deploy immediately after the Pico becomes available, then stay attached.
 # -----------------------------------------------------------------------------
 
-# Verify all package roots exist before deployment
 for dir in "${PACKAGE_ROOT_PATHS[@]}"; do
     [[ -d "$dir" ]] || fail "Package root missing from release artifact: ${dir#$STAGING_DIR/}"
 done
 
 log "Deploying ${#ROOT_FILE_PATHS[@]} root files and ${#PACKAGE_ROOT_PATHS[@]} package roots with mpremote to '$DEVICE'"
-log "After deployment, run 'import main' at the >>> prompt to start the application."
 log "Use Ctrl-C to stop device output."
 printf '\n================================================================\n\n'
 
-# Copy root-level files to remote root
 mpremote connect "$DEVICE" \
     fs cp "${ROOT_FILE_PATHS[@]}" : +
 
-# Recursively copy package roots to the remote root.
-# mpremote preserves the local directory name.
-# mpremote creates the package directory from the local directory name.
 if ((${#PACKAGE_ROOT_PATHS[@]} > 0)); then
     for dir in "${PACKAGE_ROOT_PATHS[@]}"; do
         mpremote connect "$DEVICE" \
@@ -385,12 +406,9 @@ if ((${#PACKAGE_ROOT_PATHS[@]} > 0)); then
     done
 fi
 
-# List remote filesystem to verify deployment
 mpremote connect "$DEVICE" \
     fs ls : +
 
-# Reset device before starting the application
-# mpremote connect "$DEVICE" \
-#     soft-reset \
-#     exec "import main; main.main()"
-mpremote connect "$DEVICE" soft-reset exec "import main; main.main()" 2>&1 | tee "/home/worker/Documents/code/sensor-services/sensors-services-and-webapps/sensor-code/v3/mpremote-$(date +%Y%m%d-%H%M%S).log"
+mpremote connect "$DEVICE" \
+    soft-reset \
+    exec "import main; main.main()"

@@ -24,6 +24,7 @@ from intercore import (
     RETENTION_PRIORITY_TELEMETRY,
     RETENTION_PRIORITY_INFO,
     RETENTION_PRIORITY_HEALTH,
+    OutboundMessageTooLargeError,
 )
 from message_protocol import format_utc_epoch_ms, is_json_safe
 from system_information import SystemInformation, SYSTEM_INFORMATION_SECTIONS
@@ -265,6 +266,10 @@ def _try_queue_response(intercore, response):
         ValueError: if the response can never be admitted (serialized beyond
         the per-message ceiling, or otherwise invalid): retrying the same
         message cannot succeed, so the caller must not keep retrying it.
+
+        OutboundMessageTooLargeError (a ValueError subclass): for the
+        oversized case specifically, so the caller can report a size failure
+        distinctly from a validation or serialization failure.
     """
     return intercore.outbound_queue.put(
         response["kind"],
@@ -273,7 +278,7 @@ def _try_queue_response(intercore, response):
     )
 
 
-def _build_response_too_large(intercore, uptime_state, response):
+def _build_substitute_error_response(intercore, uptime_state, response, code, message):
     """A small error response standing in for a permanently rejected one.
 
     The rejected response's payload carries the command's identifying fields
@@ -288,10 +293,24 @@ def _build_response_too_large(intercore, uptime_state, response):
         payload,
         False,
         error={
-            "code": "response_too_large",
-            "message": "Command response exceeded the per-message size limit",
+            "code": code,
+            "message": message,
         },
     )
+
+
+def _admit_substitute(intercore, uptime_state, response, code, message, warning):
+    """Log a permanent rejection, admit the small error substitute for it.
+
+    Returns:
+        None if the substitute was admitted, or the substitute (still
+        pending) if its admission was transiently rejected.
+    """
+    print("[WARNING] {}".format(warning))
+    substitute = _build_substitute_error_response(intercore, uptime_state, response, code, message)
+    if _try_queue_response(intercore, substitute):
+        return None
+    return substitute
 
 
 def _admit_or_substitute_command_response(intercore, uptime_state, response):
@@ -300,8 +319,11 @@ def _admit_or_substitute_command_response(intercore, uptime_state, response):
     A transient rejection (heap pressure) leaves the response pending for a
     later pass. A permanent rejection -- the message can never be admitted,
     so retrying it would spin forever and stall every later command behind it
-    -- is answered with a small "response_too_large" error response for the
-    same command, then the channel moves on.
+    -- is answered with a small error response for the same command whose
+    code states the actual cause: "response_too_large" for an oversized
+    response, "response_invalid" for a validation or serialization failure
+    (reporting that as a size problem would obscure a real firmware defect).
+    Either way the channel moves on.
 
     Returns:
         the response still pending after this pass (the original on a
@@ -312,12 +334,24 @@ def _admit_or_substitute_command_response(intercore, uptime_state, response):
         if _try_queue_response(intercore, response):
             return None
         return response
+    except OutboundMessageTooLargeError as err:
+        return _admit_substitute(
+            intercore,
+            uptime_state,
+            response,
+            "response_too_large",
+            "Command response exceeded the per-message size limit",
+            "Command response too large: {}".format(err),
+        )
     except ValueError as err:
-        print("[WARNING] Command response permanently rejected: {}".format(err))
-        substitute = _build_response_too_large(intercore, uptime_state, response)
-        if _try_queue_response(intercore, substitute):
-            return None
-        return substitute
+        return _admit_substitute(
+            intercore,
+            uptime_state,
+            response,
+            "response_invalid",
+            "Command response could not be serialized for transmission",
+            "Command response invalid: {}".format(err),
+        )
 
 
 def _process_intercore_event(intercore, uptime_state, system_information=None):
