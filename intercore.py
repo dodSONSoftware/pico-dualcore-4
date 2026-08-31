@@ -5,6 +5,8 @@
 import _thread
 import gc
 
+from debug import DEBUG_QUEUE_MEMORY
+
 
 KIND_TELEMETRY = "telemetry"
 KIND_COMMAND_RESPONSE = "command_response"
@@ -26,6 +28,47 @@ RETENTION_PRIORITY_MAX = RETENTION_PRIORITY_HEALTH
 def _require_positive_integer(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("{} must be a positive integer".format(name))
+
+
+def _debug_queue_memory(prefix, queue, event, extra=None):
+    """Temporary heap-reserve validation instrumentation (DEBUG_QUEUE_MEMORY).
+
+    Reports heap and queue state at one meaningful queue event (admit, reject,
+    evict, memory-pressure entry, gc.collect() before/after, backlog drained).
+    Grep-friendly: [DEBUG] <prefix> event=<event> <extra...> heap_alloc_bytes=
+    <n> heap_free_bytes=<n> minimum_free_heap_bytes=<n> heap_headroom_bytes=<n>
+    queue_count=<n> queue_high_watermark=<n> [queued_bytes=<n>].
+
+    Gated by debug.DEBUG_QUEUE_MEMORY (production default False), so the
+    string allocation below is validation-only; remove with the
+    instrumentation after validation. Call while holding the queue's own
+    lock where the event touches queue state, so the snapshot is consistent.
+    """
+    if not DEBUG_QUEUE_MEMORY:
+        return
+    heap_free_bytes = gc.mem_free()
+    parts = ["event={}".format(event)]
+    if extra:
+        for key, value in extra:
+            parts.append("{}={}".format(key, value))
+    parts.extend(
+        (
+            "heap_alloc_bytes={}".format(gc.mem_alloc()),
+            "heap_free_bytes={}".format(heap_free_bytes),
+            "minimum_free_heap_bytes={}".format(queue._minimum_free_heap_bytes),
+            "heap_headroom_bytes={}".format(
+                heap_free_bytes - queue._minimum_free_heap_bytes
+            ),
+            "queue_count={}".format(len(queue._queue)),
+            "queue_high_watermark={}".format(queue._high_watermark),
+        )
+    )
+    # The event queue does not track retained payload bytes (events are not
+    # pre-serialized), so that field is omitted for it.
+    queued_bytes = getattr(queue, "_queued_bytes", None)
+    if queued_bytes is not None:
+        parts.append("queued_bytes={}".format(queued_bytes))
+    print("[DEBUG] {} {}".format(prefix, " ".join(parts)))
 
 
 class OutboundQueue:
@@ -81,6 +124,10 @@ class OutboundQueue:
         self._high_watermark = 0
         self._high_watermark_bytes = 0
         self._queued_bytes = 0
+        # Entries admitted since the queue last fully drained: supports the
+        # DEBUG_QUEUE_MEMORY "drained" event without logging steady-state
+        # single-entry completion (validation instrumentation only).
+        self._backlog_depth = 0
         self._messages_evicted = 0
         self._telemetry_evicted = 0
         self._messages_rejected = 0
@@ -109,6 +156,7 @@ class OutboundQueue:
         }
         self._queue.append(entry)
         self._queued_bytes += len(payload_bytes)
+        self._backlog_depth += 1
         depth = len(self._queue)
         if depth > self._high_watermark:
             self._high_watermark = depth
@@ -127,10 +175,18 @@ class OutboundQueue:
         """
         with self._heap_admission_lock:
             if not self._reserve_restored():
+                _debug_queue_memory("outbound_queue", self, "memory_pressure")
+                _debug_queue_memory("outbound_queue", self, "gc_before_admission")
                 gc.collect()
+                _debug_queue_memory("outbound_queue", self, "gc_after_admission")
             if self._reserve_restored():
                 with self._lock:
-                    return self._append_locked(kind, payload_bytes, retention_priority)
+                    admitted = self._append_locked(kind, payload_bytes, retention_priority)
+                    # Log after the append: the line reports the
+                    # post-admission state (count and bytes include the
+                    # admitted entry), matching the gc_after pair above it.
+                    _debug_queue_memory("outbound_queue", self, "admit")
+                    return admitted
 
             # Genuine retained-memory pressure: displace the least-important
             # eligible entries one at a time, reclaiming after each, until the
@@ -139,6 +195,13 @@ class OutboundQueue:
                 while True:
                     if not self._queue:
                         self._messages_rejected += 1
+                        _debug_queue_memory(
+                            "outbound_queue",
+                            self,
+                            "reject",
+                            (("reason", "memory_pressure"),
+                             ("priority", retention_priority)),
+                        )
                         return False
                     # Explicit loop: no generator/list allocation in the
                     # pressure path (MCU-safe).
@@ -150,11 +213,26 @@ class OutboundQueue:
                     # rather than evict a more important retained entry.
                     if retention_priority > worst_priority:
                         self._messages_rejected += 1
+                        _debug_queue_memory(
+                            "outbound_queue",
+                            self,
+                            "reject",
+                            (("reason", "lower_priority_than_queued"),
+                             ("priority", retention_priority)),
+                        )
                         return False
                     self._evict_oldest_by_priority_locked(worst_priority)
+                    _debug_queue_memory(
+                        "outbound_queue",
+                        self,
+                        "evict",
+                        (("evicted_priority", worst_priority),),
+                    )
                     gc.collect()
                     if self._reserve_restored():
-                        return self._append_locked(kind, payload_bytes, retention_priority)
+                        admitted = self._append_locked(kind, payload_bytes, retention_priority)
+                        _debug_queue_memory("outbound_queue", self, "admit")
+                        return admitted
 
     def put(self, kind, message, retention_priority):
         """Admit one MQTT-bound message after validation, serialization, and encoding.
@@ -296,6 +374,14 @@ class OutboundQueue:
                 # The in-flight payload is released only now (PUBACK received),
                 # so its bytes leave the retained-byte metric here.
                 self._queued_bytes -= len(entry["payload_bytes"])
+                if not self._queue:
+                    # The queue is fully drained. Log only if a backlog (more
+                    # than this one in-flight entry) flowed through since the
+                    # last drain, so steady-state single-message completion
+                    # stays quiet even with DEBUG_QUEUE_MEMORY enabled.
+                    if self._backlog_depth > 1:
+                        _debug_queue_memory("outbound_queue", self, "drained")
+                    self._backlog_depth = 0
                 return True
             return False
 
@@ -376,15 +462,27 @@ class InterCoreEventQueue:
         # After successful admission, event is immutable.
         with self._heap_admission_lock:
             if gc.mem_free() < self._minimum_free_heap_bytes:
+                _debug_queue_memory("event_queue", self, "memory_pressure")
+                _debug_queue_memory("event_queue", self, "gc_before_admission")
                 gc.collect()
+                _debug_queue_memory("event_queue", self, "gc_after_admission")
             if gc.mem_free() >= self._minimum_free_heap_bytes:
                 with self._lock:
                     self._queue.append(event)
                     depth = len(self._queue)
                     if depth > self._high_watermark:
                         self._high_watermark = depth
+                    _debug_queue_memory("event_queue", self, "admit")
                     return True
+            # Admitted events are never evicted: reject the new event and let
+            # the caller report the memory-pressure failure.
             self._rejected += 1
+            _debug_queue_memory(
+                "event_queue",
+                self,
+                "reject",
+                (("reason", "memory_pressure"),),
+            )
             return False
 
     def take(self):

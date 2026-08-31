@@ -265,6 +265,15 @@ or `"*"`. The comparison against the source name is case-insensitive —
 configured as `Test-Pico-2` — and the device always responds with its
 configured casing unchanged.
 
+## Command ID Deduplication
+
+`command_id` identifies one logical command. The device retains a short
+in-memory history of the 16 most recently accepted IDs and ignores a command
+whose ID is still present — it is not executed and no response is sent.
+Senders must generate a new ID for every new logical command, including a
+corrected retry of a malformed command. A suppressed ID is available again
+once 16 newer distinct IDs have been accepted, or after a reboot.
+
 ## Reboot Command
 
 Send to `mqtt_topic_command`:

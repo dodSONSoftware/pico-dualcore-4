@@ -23,6 +23,17 @@ _UTC_STARTUP_MAX_ATTEMPTS = 3
 _UTC_RETRY_INTERVAL_MS = 30000
 _UTC_PROMPT_RETRY_DELAY_MS = 500
 
+# Duplicate-command suppression: the number of recent accepted command IDs
+# Core 0 retains. command_id is the idempotency key -- a command is a one-shot
+# request for the lifetime of its cache entry, and a repeated command_id is
+# ignored (no execution, no event, no response) until it evicts. Fixed count,
+# FIFO eviction, RAM-only (cleared on reboot): a tiny amount of bounded
+# control metadata, deliberately not heap-governed. The first accepted use of
+# an ID owns it; a duplicate receipt does not refresh its position (the cache
+# holds the last accepted distinct IDs, not an LRU access order). Static
+# constant; not a config key.
+_RECENT_COMMAND_ID_CAPACITY = 16
+
 # Core 0 watchdog timeout for the Core 1 liveness heartbeat. Core 1 refreshes
 # core_1_activity_ms on a 5-second deadline (core1.py), so a stamp already
 # this old means the Core 1 thread is dead or wedged: no legitimate loop pass
@@ -52,6 +63,9 @@ class Core0:
         self._mqtt = Mqtt(config, self._on_mqtt_message, self._service_wait)
 
         self._pending_reboot = None
+        # Recent accepted command IDs (duplicate-command suppression; see
+        # _RECENT_COMMAND_ID_CAPACITY). Oldest first, evicted FIFO.
+        self._recent_command_ids = []
         self._pending_core0_responses = []
         self._pending_connection_logs = []
         self._utc_request_counter = 0
@@ -186,6 +200,18 @@ class Core0:
         if not isinstance(command_id, str) or not command_id:
             return
 
+        if self._is_recent_command_id(command_id):
+            # Duplicate suppression: this command_id was already accepted in
+            # this runtime. Ignore the copy -- no execution, no Core 1 event,
+            # no response, no change to a pending reboot. Expected transport
+            # behavior (broker redelivery, sender retry), so DEBUG-only: not
+            # a production warning.
+            if DEBUG:
+                print("[DEBUG] Duplicate command_id ignored: {}".format(command_id))
+            return
+
+        self._remember_command_id(command_id)
+
         if doc.get("message_schema_version") != MESSAGE_SCHEMA_VERSION:
             self._queue_core0_response({
                 "command_id": command_id,
@@ -281,6 +307,26 @@ class Core0:
                     "message": "Insufficient free heap to queue the Core 1 event",
                 },
             })
+
+    def _is_recent_command_id(self, command_id):
+        """True if command_id was already accepted in this runtime.
+
+        Exact, case-sensitive comparison: command_id is an opaque identifier
+        and is never normalized. Membership alone decides -- the command
+        name, payload, and target casing are irrelevant to the check.
+        """
+        return command_id in self._recent_command_ids
+
+    def _remember_command_id(self, command_id):
+        """Record an accepted command_id; evict the oldest once over capacity.
+
+        Append-only FIFO: a later duplicate never moves an entry toward the
+        newest end (see _RECENT_COMMAND_ID_CAPACITY). Linear scan and pop(0)
+        are intentional at this size.
+        """
+        self._recent_command_ids.append(command_id)
+        if len(self._recent_command_ids) > _RECENT_COMMAND_ID_CAPACITY:
+            self._recent_command_ids.pop(0)
 
     def _service_pending_core0_response(self):
         if not self._pending_core0_responses:

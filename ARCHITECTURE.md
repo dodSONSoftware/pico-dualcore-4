@@ -237,6 +237,16 @@ returns a current snapshot containing every entry in
 - Entries are never automatically published to MQTT.
 - Reboot never enters this lane; Core 0 owns reboot completely.
 
+#### Duplicate command suppression
+
+Core 0 owns duplicate command suppression at command ingress — before schema and payload validation, reboot handling, and event admission — so it covers Core 0 commands (reboot) and Core 1 commands (get-details) alike. Core 1 performs no deduplication.
+
+- `command_id` is the idempotency key: exact, case-sensitive, and opaque (never normalized). The command name, payload, and target casing are irrelevant to the check; a sender that wants a new logical command generates a new ID.
+- The device retains the 16 most recently accepted command IDs (`core0._RECENT_COMMAND_ID_CAPACITY`) in a fixed-size FIFO in RAM. A command whose ID is still retained is silently ignored — no execution, no event admission, no response, and no change to a pending reboot. This is duplicate suppression, not response replay: no prior response is retained or resent when a duplicate arrives.
+- The first accepted use of an ID owns it until eviction; a duplicate receipt does not refresh its position (the cache holds the last accepted distinct IDs, not an LRU access order). An ID evicted by 16 newer distinct IDs may be processed again.
+- A non-matching target is dropped before the identity check, so it never consumes an entry in this device's cache; an invalid `command` or `command_id` keeps its existing early return and creates no entry.
+- The cache is RAM-only: reboot clears it, and it is never persisted to flash. A suppressed ID emits a DEBUG-only diagnostic, not a production warning.
+
 ### 3. `state_mailboxes`
 
 Core 0 -> Core 1 latest-value state.
