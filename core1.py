@@ -145,28 +145,69 @@ def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup
 
 
 def _try_queue_startup_log(intercore, message, retention_priority):
-    """Attempt to queue the startup log message."""
+    """Attempt to queue the startup log message.
+
+    Returns:
+        bool: True if admitted; False if admission failed transiently (heap
+        pressure) and a later attempt may succeed.
+
+    Raises:
+        ValueError: if the message can never be admitted (validation failure,
+        oversized, serialization failure, or a permanent queue rejection):
+        retrying the same object cannot succeed, so the caller must fail fast
+        with the actual reason instead of retrying.
+    """
     try:
         payload_bytes = serialize_and_validate_message(message)
     except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
         print("[ERROR] Startup log validation failed: {}".format(err))
-        return False
+        raise ValueError("Startup log validation failed: {}".format(err))
     except MessageTooLargeError as err:
         print("[ERROR] Startup log too large: {}".format(err))
-        return False
+        raise ValueError("Startup log too large: {}".format(err))
     except MemoryError:
         raise
     except Exception as err:
         print("[ERROR] Startup log serialization failed: {}".format(err))
-        return False
+        raise ValueError("Startup log serialization failed: {}".format(err))
 
     # Queue under KIND_LOG: Core 0 maps the kind to the log topic at publish
-    # time. Core 1 never names MQTT topics.
+    # time. Core 1 never names MQTT topics. A permanent queue rejection
+    # (the per-message ceiling is enforced again on this path) raises
+    # ValueError, which escapes unchanged; a transient heap-pressure
+    # rejection returns False.
     return intercore.outbound_queue.put_with_kind(
         KIND_LOG,
         payload_bytes,
         retention_priority,
     )
+
+
+def _admit_startup_log(intercore, message):
+    """Admit the startup log, retrying only a transient rejection.
+
+    A transient rejection (heap pressure) is retried once after a short
+    delay, because the queue may admit the message on the next pass. A
+    permanent rejection (validation, size, serialization) is never retried:
+    retrying the same object cannot change the outcome, so the ValueError
+    escapes to the caller, which fails fast with the actual reason.
+
+    Returns:
+        bool: True if admitted; False if the single transient retry also
+        failed.
+
+    Raises:
+        ValueError: on a permanent rejection (the caller fails fast).
+    """
+    if _try_queue_startup_log(intercore, message, RETENTION_PRIORITY_INFO):
+        return True
+
+    # Transient (heap pressure): the queue may admit it on the next pass.
+    # Startup log must be admitted before telemetry can begin.
+    print("[ERROR] Startup log queue admission failed - telemetry gated")
+    # Wait for queue space and retry once
+    time.sleep_ms(100)
+    return _try_queue_startup_log(intercore, message, RETENTION_PRIORITY_INFO)
 
 
 def _current_utc_timestamp(intercore):
@@ -214,11 +255,69 @@ def _build_command_response(intercore, uptime_state, event, success, data=None, 
 
 
 def _try_queue_response(intercore, response):
+    """Queue a command response at CRITICAL retention priority.
+
+    Returns:
+        bool: True if admitted; False if admission failed transiently (heap
+        pressure) and the response should be retried on a later pass.
+
+    Raises:
+        ValueError: if the response can never be admitted (serialized beyond
+        the per-message ceiling, or otherwise invalid): retrying the same
+        message cannot succeed, so the caller must not keep retrying it.
+    """
     return intercore.outbound_queue.put(
         response["kind"],
         response["message"],
         RETENTION_PRIORITY_CRITICAL,
     )
+
+
+def _build_response_too_large(intercore, uptime_state, response):
+    """A small error response standing in for a permanently rejected one.
+
+    The rejected response's payload carries the command's identifying fields
+    (command_id, command, targeted) -- exactly what _build_command_response
+    reads from the event -- so it doubles as the descriptor here. The result
+    is a few hundred bytes by construction, far under the per-message ceiling.
+    """
+    payload = response["message"]["payload"]
+    return _build_command_response(
+        intercore,
+        uptime_state,
+        payload,
+        False,
+        error={
+            "code": "response_too_large",
+            "message": "Command response exceeded the per-message size limit",
+        },
+    )
+
+
+def _admit_or_substitute_command_response(intercore, uptime_state, response):
+    """Admit a command response, or a small error substitute for it.
+
+    A transient rejection (heap pressure) leaves the response pending for a
+    later pass. A permanent rejection -- the message can never be admitted,
+    so retrying it would spin forever and stall every later command behind it
+    -- is answered with a small "response_too_large" error response for the
+    same command, then the channel moves on.
+
+    Returns:
+        the response still pending after this pass (the original on a
+        transient rejection, the substitute if the substitute itself was
+        transiently rejected), or None if a response was admitted.
+    """
+    try:
+        if _try_queue_response(intercore, response):
+            return None
+        return response
+    except ValueError as err:
+        print("[WARNING] Command response permanently rejected: {}".format(err))
+        substitute = _build_response_too_large(intercore, uptime_state, response)
+        if _try_queue_response(intercore, substitute):
+            return None
+        return substitute
 
 
 def _process_intercore_event(intercore, uptime_state, system_information=None):
@@ -286,11 +385,20 @@ def _handle_device_result(intercore, config, uptime_state, result):
             "name": result.get("name"),
             "payload": result["telemetry"],
         }
-        admitted = intercore.outbound_queue.put(
-            KIND_TELEMETRY,
-            message,
-            RETENTION_PRIORITY_TELEMETRY,
-        )
+        try:
+            admitted = intercore.outbound_queue.put(
+                KIND_TELEMETRY,
+                message,
+                RETENTION_PRIORITY_TELEMETRY,
+            )
+        except ValueError as err:
+            # Permanent rejection (oversized or invalid): this sample can
+            # never be admitted, so discard it rather than retry it forever.
+            # Telemetry is a current sample, not a replayable record.
+            print("[WARNING] Core 1 telemetry rejected: {}: {}".format(
+                result["device_id"], err
+            ))
+            return
         if not admitted:
             print("[WARNING] Core 1 telemetry rejected: {}".format(result["device_id"]))
         elif DEBUG:
@@ -498,11 +606,18 @@ def _try_queue_health_message(intercore, message):
         return False
 
     # Queue the pre-serialized message with health kind
-    return intercore.outbound_queue.put_with_kind(
-        KIND_HEALTH,
-        payload_bytes,
-        RETENTION_PRIORITY_HEALTH,
-    )
+    try:
+        return intercore.outbound_queue.put_with_kind(
+            KIND_HEALTH,
+            payload_bytes,
+            RETENTION_PRIORITY_HEALTH,
+        )
+    except ValueError as err:
+        # Permanent rejection: health is a current-state report, so the
+        # boundary is discarded (missed health boundaries are skipped, never
+        # replayed) rather than retried forever.
+        print("[WARNING] Health message permanently rejected: {}".format(err))
+        return False
 
 
 def _try_queue_health_message_intercore(intercore, uptime_state, config, system_information):
@@ -551,6 +666,14 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
     try:
         print("[INFO] Core 1 starting")
 
+        # Register the liveness stamp before any initialization work. Core 0's
+        # heartbeat watchdog is a no-op until the first stamp exists, so
+        # without this a Core 1 wedged inside driver construction or a device
+        # initialize() call would be indistinguishable from "Core 1 has not
+        # started yet" and the watchdog could never fire. From this moment on,
+        # a wedge anywhere in startup ages the stamp and is recoverable.
+        intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
+
         # Accumulated uptime: every ticks_diff compares recent samples, so
         # uptime stays correct across a tick-counter wrap on long runs.
         # boot_ticks_ms anchors this boot-lifetime uptime only; periodic
@@ -559,7 +682,16 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         uptime_state = create_uptime_state(boot_ticks_ms)
 
         system_information = SystemInformation(intercore, config)
-        device_manager = DeviceManager(config, system_information=system_information)
+        # activity_refresh keeps the liveness stamp current at initialization
+        # progress boundaries (before each device, before each attempt), so a
+        # legitimately long multi-device initialization does not age the stamp
+        # past Core 0's 30 s watchdog bound while a wedged driver call --
+        # which stops the refresh -- is still caught.
+        device_manager = DeviceManager(
+            config,
+            system_information=system_information,
+            activity_refresh=lambda: intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms()),
+        )
         system_information.set_device_manager(device_manager)
 
         initialized, failed, attempt_logs = device_manager.initialize_devices()
@@ -580,22 +712,21 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information
         )
 
-        # Attempt to queue the startup log with INFO priority
-        startup_log_admitted = _try_queue_startup_log(
-            intercore, startup_log_message, RETENTION_PRIORITY_INFO
-        )
+        # The startup log must be admitted before telemetry can begin. A
+        # permanent rejection (validation, size, serialization) fails fast
+        # with its actual reason -- retrying the same object 100 ms later
+        # cannot change the outcome; only a genuinely transient rejection
+        # (heap pressure) is retried.
+        try:
+            startup_log_admitted = _admit_startup_log(intercore, startup_log_message)
+        except ValueError as err:
+            # Permanent: fail immediately with the actual reason
+            print("[FATAL] Startup log permanently rejected: {}".format(err))
+            raise RuntimeError("Startup log queue admission failed")
 
         if not startup_log_admitted:
-            # Startup log must be admitted before telemetry can begin
-            print("[ERROR] Startup log queue admission failed - telemetry gated")
-            # Wait for queue space and retry once
-            time.sleep_ms(100)
-            startup_log_admitted = _try_queue_startup_log(
-                intercore, startup_log_message, RETENTION_PRIORITY_INFO
-            )
-            if not startup_log_admitted:
-                print("[FATAL] Startup log queue admission failed after retry - halting")
-                raise RuntimeError("Startup log queue admission failed")
+            print("[FATAL] Startup log queue admission failed after retry - halting")
+            raise RuntimeError("Startup log queue admission failed")
 
         print("[INFO] Startup log admitted to outbound queue")
 
@@ -620,7 +751,9 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             if DEBUG:
                 print("[DEBUG] Hardware storage failed: {}".format(err))
 
-        # Register initial Core 1 activity
+        # Refresh Core 1 activity: the initial registration happened at the
+        # top of core1_main (arming Core 0's watchdog); this marks the
+        # transition into the normal runtime loop.
         intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
 
         # Health scheduler anchored to the shared normal-runtime anchor:
@@ -655,15 +788,17 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         while True:
             if pending_command_response is not None:
-                if _try_queue_response(intercore, pending_command_response):
-                    pending_command_response = None
+                pending_command_response = _admit_or_substitute_command_response(
+                    intercore, uptime_state, pending_command_response
+                )
             else:
-                pending_command_response = _process_intercore_event(
+                response = _process_intercore_event(
                     intercore, uptime_state, system_information
                 )
-                if pending_command_response is not None:
-                    if _try_queue_response(intercore, pending_command_response):
-                        pending_command_response = None
+                if response is not None:
+                    pending_command_response = _admit_or_substitute_command_response(
+                        intercore, uptime_state, response
+                    )
 
             now_ms = time.ticks_ms()
             if time.ticks_diff(now_ms, next_read_ms) >= 0:

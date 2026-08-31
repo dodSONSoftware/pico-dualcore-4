@@ -256,11 +256,15 @@ def test_put_memoryerror_from_serialization_propagates(monkeypatch):
         ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
 
 
-def test_put_rejects_oversized_message(monkeypatch):
+def test_put_oversized_message_raises(monkeypatch):
+    """Oversize is a permanent failure of the message, not a transient
+    queue rejection: put() raises ValueError so a caller can distinguish
+    it from the False (retry later) return."""
     ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
     big = {"blob": "x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1)}
-    assert queue.put(KIND_TELEMETRY, big, RETENTION_PRIORITY_TELEMETRY) is False
+    with pytest.raises(ValueError):
+        queue.put(KIND_TELEMETRY, big, RETENTION_PRIORITY_TELEMETRY)
     assert queue.get_depth() == 0
     assert queue.status()["oversized_rejected"] == 1
 
@@ -520,7 +524,10 @@ def test_put_with_kind_rejects_oversized_payload(monkeypatch):
     ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
     oversized = b"x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1)
-    assert queue.put_with_kind(KIND_TELEMETRY, oversized, RETENTION_PRIORITY_TELEMETRY) is False
+    # The same permanent-failure contract as the put() serialization path:
+    # oversize raises, False is reserved for transient (heap-pressure) rejection.
+    with pytest.raises(ValueError):
+        queue.put_with_kind(KIND_TELEMETRY, oversized, RETENTION_PRIORITY_TELEMETRY)
     assert queue.get_depth() == 0
     assert queue.status()["oversized_rejected"] == 1
 

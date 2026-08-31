@@ -310,3 +310,140 @@ def test_split_config_core1_does_not_include_source():
 
     assert "source" in core0, "core0 config should include source"
     assert "source" not in core1, "core1 config should NOT include source"
+
+
+# ---------------------------------------------------------------------------
+# Startup-log admission: permanent (ValueError) vs transient (False)
+# ---------------------------------------------------------------------------
+
+# 0.4.30 gave both admission paths one failure contract: False is the
+# transient heap-pressure rejection (retrying may succeed); permanent
+# rejections of the message itself raise ValueError (retrying can never
+# succeed). The startup log previously swallowed that distinction: every
+# failure returned False and core1_main unconditionally slept 100 ms and
+# re-submitted the exact same object -- a meaningless retry for an
+# oversized or invalid message. Now a permanent rejection fails fast with
+# its actual reason and only a genuinely transient one is retried.
+
+
+def _core1_module():
+    """The core1 module, importable on the host."""
+    if "core1" in sys.modules:
+        return sys.modules["core1"]
+    if "machine" not in sys.modules:
+        sys.modules["machine"] = MagicMock()
+    import importlib
+    return importlib.import_module("core1")
+
+
+_STARTUP_MESSAGE = {
+    "message_type": "log",
+    "uptime_ms": 1000,
+    "timestamp": None,
+    "payload": {"level": "info", "event": "system_startup_completed"},
+}
+
+
+class _ScriptedQueue:
+    """put_with_kind() outcomes scripted per call; the last one sticks."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def put_with_kind(self, kind, payload_bytes, retention_priority):
+        self.calls += 1
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class _ScriptedBus:
+    def __init__(self, queue):
+        self.outbound_queue = queue
+
+
+class _RecordingTime:
+    """time stand-in recording every sleep_ms() call."""
+
+    def __init__(self):
+        self.sleeps = []
+
+    def sleep_ms(self, ms):
+        self.sleeps.append(ms)
+
+
+def test_try_queue_startup_log_transient_rejection_returns_false():
+    """A transient (heap-pressure) rejection returns False -- retryable."""
+    core1 = _core1_module()
+    queue = _ScriptedQueue([False])
+    admitted = core1._try_queue_startup_log(_ScriptedBus(queue), _STARTUP_MESSAGE, 0)
+    assert admitted is False
+    assert queue.calls == 1
+
+
+def test_try_queue_startup_log_permanent_rejection_raises_valueerror():
+    """A permanent queue rejection raises ValueError -- not retryable."""
+    core1 = _core1_module()
+    queue = _ScriptedQueue([ValueError("Message too large: 20000 > 16384")])
+    with pytest.raises(ValueError):
+        core1._try_queue_startup_log(_ScriptedBus(queue), _STARTUP_MESSAGE, 0)
+    assert queue.calls == 1
+
+
+def test_try_queue_startup_log_serialization_failure_raises_valueerror(monkeypatch):
+    """A deterministic serialization failure is permanent: ValueError."""
+    core1 = _core1_module()
+    from message_serializer import MessageTooLargeError
+
+    def _too_large(message):
+        raise MessageTooLargeError("Message size 20000 exceeds maximum 16384")
+
+    monkeypatch.setattr(core1, "serialize_and_validate_message", _too_large)
+    queue = _ScriptedQueue([True])
+    with pytest.raises(ValueError):
+        core1._try_queue_startup_log(_ScriptedBus(queue), _STARTUP_MESSAGE, 0)
+    assert queue.calls == 0
+
+
+def test_admit_startup_log_permanent_rejection_fails_fast_without_retry(monkeypatch):
+    """A permanent rejection is never retried and never waits for queue space."""
+    core1 = _core1_module()
+    queue = _ScriptedQueue([ValueError("Startup log too large")])
+    fake_time = _RecordingTime()
+    monkeypatch.setattr(core1, "time", fake_time)
+
+    with pytest.raises(ValueError):
+        core1._admit_startup_log(_ScriptedBus(queue), _STARTUP_MESSAGE)
+
+    assert queue.calls == 1, "a permanent rejection must not be re-submitted"
+    assert fake_time.sleeps == [], "a permanent rejection must not wait for queue space"
+
+
+def test_admit_startup_log_retries_transient_rejection_once(monkeypatch):
+    """A transient rejection is retried exactly once, after a short delay."""
+    core1 = _core1_module()
+    queue = _ScriptedQueue([False, True])
+    fake_time = _RecordingTime()
+    monkeypatch.setattr(core1, "time", fake_time)
+
+    admitted = core1._admit_startup_log(_ScriptedBus(queue), _STARTUP_MESSAGE)
+
+    assert admitted is True
+    assert queue.calls == 2
+    assert fake_time.sleeps == [100]
+
+
+def test_admit_startup_log_exhausted_transient_retry_returns_false(monkeypatch):
+    """Both attempts transiently rejected: False, exactly two submissions."""
+    core1 = _core1_module()
+    queue = _ScriptedQueue([False])
+    fake_time = _RecordingTime()
+    monkeypatch.setattr(core1, "time", fake_time)
+
+    admitted = core1._admit_startup_log(_ScriptedBus(queue), _STARTUP_MESSAGE)
+
+    assert admitted is False
+    assert queue.calls == 2
+    assert fake_time.sleeps == [100]

@@ -220,7 +220,7 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 - **Anchored Scheduling**: Telemetry and health boundaries are fixed to one shared runtime anchor captured at startup; missed boundaries are skipped, never replayed
 - **Tick-Wrap-Safe Uptime**: Uptime is accumulated from recent sample deltas, staying correct on long-running devices
 - **UTC Synchronization**: Mandatory at startup; non-blocking steady-state re-sync with deadline and retry throttling
-- **Core 1 Liveness**: Deadline-based heartbeat drives the `core_1_active` health field
+- **Core 1 Liveness**: Deadline-based heartbeat drives the `core_1_active` health field; the Core 0 watchdog resets the board if Core 1 stops refreshing — including while Core 0 is stuck in network recovery
 - **Startup Log**: One-time full system startup log published before telemetry
 - **LED Status**: Flashing during connection, pulse on telemetry send
 - **Reboot Command**: JSON command triggers clean reboot with acknowledgment

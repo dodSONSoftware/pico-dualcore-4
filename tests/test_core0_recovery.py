@@ -228,6 +228,12 @@ class RecordingMailboxes:
             return self.utc_snapshots[-1]
         return None
 
+    def get_core_1_activity_ms(self):
+        # Core 1 has not started in these tests: no stamp, matching a
+        # freshly booted StateMailboxes (the Core 0 watchdog check is a
+        # no-op while none exists).
+        return None
+
 
 class MockInterCore:
     def __init__(self):

@@ -52,7 +52,7 @@ class FakeTicks:
 @pytest.fixture
 def ticks(monkeypatch):
     fake = FakeTicks()
-    for name in ("ticks_ms", "ticks_diff", "ticks_add", "sleep"):
+    for name in ("ticks_ms", "ticks_diff", "ticks_add", "sleep_ms", "sleep"):
         monkeypatch.setattr(real_time, name, getattr(fake, name), raising=False)
     return fake
 

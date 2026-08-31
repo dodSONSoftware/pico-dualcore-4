@@ -169,6 +169,17 @@ class OutboundQueue:
 
         The in-flight QoS 1 entry is retained until its PUBACK and is never an
         eviction candidate.
+
+        Returns:
+            bool: True if admitted; False if admission failed transiently
+            (heap pressure), in which case a later retry may succeed.
+
+        Raises:
+            ValueError: if the message can never be admitted -- an unsupported
+            value, a serialization failure, or a serialized size beyond
+            MAX_OUTBOUND_MESSAGE_BYTES. These are permanent failures of the
+            message itself, not of the queue: retrying the same message cannot
+            succeed, so they are raised instead of returned as False.
         """
         if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
@@ -198,14 +209,16 @@ class OutboundQueue:
             # Validation errors are raised immediately
             raise ValueError("Message validation failed: {}".format(err))
         except MessageTooLargeError as err:
-            # Oversized messages are rejected (do not affect queue state)
+            # Oversized is a permanent failure of the message (the ceiling is
+            # a static invariant): raise, so a caller can distinguish it from
+            # the False (transient, retry later) return. Queue state is
+            # untouched, as before.
             self._oversized_rejected += 1
-            return False
+            raise ValueError("Message too large: {}".format(err))
         except SerializationError as err:
-            # Other serialization errors (e.g., JSON encoding issues)
-            # are rejected without affecting queue state
+            # A serialization failure is likewise permanent for this message.
             self._serialization_rejected += 1
-            return False
+            raise ValueError("Message serialization failed: {}".format(err))
 
         return self._admit_heap_governed(kind, payload_bytes, retention_priority)
 
@@ -214,9 +227,10 @@ class OutboundQueue:
 
         The caller guarantees the bytes are pre-serialized, UTF-8 encoded JSON.
         The per-message ceiling is enforced here, not by the caller: a payload
-        longer than MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) is rejected without
-        affecting queue state, the same as the put() serialization path.
-        Admission is then heap-governed (see the class docstring).
+        longer than MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) is a permanent failure
+        of the message and is raised (ValueError), the same as the put()
+        serialization path. Admission is then heap-governed (see the class
+        docstring).
 
         Args:
             kind: Message kind (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG)
@@ -224,7 +238,13 @@ class OutboundQueue:
             retention_priority: Priority level for retention management
 
         Returns:
-            bool: True if message was admitted, False otherwise
+            bool: True if admitted; False if admission failed transiently
+            (heap pressure), in which case a later retry may succeed.
+
+        Raises:
+            ValueError: if the payload is longer than
+            MAX_OUTBOUND_MESSAGE_BYTES: a permanent failure of the message,
+            retrying the same payload cannot succeed.
         """
         if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
@@ -245,9 +265,14 @@ class OutboundQueue:
         # their length matters.
         from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
         if len(payload_bytes) > MAX_OUTBOUND_MESSAGE_BYTES:
-            # Oversized messages are rejected (do not affect queue state)
+            # Oversized is a permanent failure of the message: raise, the
+            # same as the put() serialization path. Queue state is untouched.
             self._oversized_rejected += 1
-            return False
+            raise ValueError(
+                "Message too large: {} bytes exceeds the {} byte per-message limit".format(
+                    len(payload_bytes), MAX_OUTBOUND_MESSAGE_BYTES
+                )
+            )
 
         return self._admit_heap_governed(kind, payload_bytes, retention_priority)
 

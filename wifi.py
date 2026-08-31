@@ -11,14 +11,28 @@ from debug import DEBUG
 class Wifi:
     """Original-style Wi-Fi lifecycle, owned exclusively by Core 0."""
 
-    def __init__(self, ssid, password, reconnect_delays_sec):
+    def __init__(self, ssid, password, reconnect_delays_sec, wait_service=None):
         self._ssid = ssid
         self._password = password
         self._reconnect_delays_sec = reconnect_delays_sec
+        # Optional Core 0 servicing hook (the Core 1 heartbeat watchdog),
+        # invoked at each 100 ms wait slice below so a dead Core 1 is
+        # detected while Wi-Fi is reconnecting, not after the sequence ends.
+        self._wait_service = wait_service
         self._wlan = None
         self._connect_count = 0
         self._disconnect_count = 0
         self._was_connected = False
+
+    def _service_wait(self):
+        if self._wait_service is not None:
+            self._wait_service()
+
+    def _sleep_interruptible(self, delay_sec):
+        """Sleep in 100 ms slices, servicing Core 0 between slices."""
+        for _ in range(max(int(delay_sec * 10), 1)):
+            self._service_wait()
+            time.sleep_ms(100)
 
     def is_connected(self):
         try:
@@ -62,6 +76,9 @@ class Wifi:
 
                 wait_count = 0
                 while not self._wlan.isconnected() and wait_count < 200:
+                    # Service Core 0 (its Core 1 watchdog) on every 100 ms
+                    # slice of the up-to-20-second observation window.
+                    self._service_wait()
                     time.sleep_ms(100)
                     wait_count += 1
 
@@ -85,7 +102,7 @@ class Wifi:
             if attempt_index < len(self._reconnect_delays_sec) - 1:
                 if DEBUG:
                     print("[DEBUG] Wi-Fi retry in {} sec".format(delay_sec))
-                time.sleep(delay_sec)
+                self._sleep_interruptible(delay_sec)
 
         return False
 

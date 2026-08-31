@@ -19,7 +19,10 @@ These tests pin the boundary semantics:
 * a stamp exactly at the timeout IS a reset trigger (a live Core 1 cannot
   be that late, given its 5-second refresh deadline and 20 ms loop);
 * a stale stamp resets, both when the check is driven directly and when it
-  runs inside the real ``run()`` loop.
+  runs inside the real ``run()`` loop;
+* a stale stamp also resets *during* a failed network-recovery wait (the
+  watchdog is not blind while Core 0 is stuck reconnecting): the reset
+  fires inside the first backoff sleep, before that sleep even completes.
 """
 
 import importlib
@@ -146,6 +149,28 @@ class FakeWifi:
         }
 
 
+class FailingWifi:
+    """A link that never comes up: connect() always fails, counting attempts."""
+
+    def __init__(self):
+        self.connect_calls = 0
+
+    def is_connected(self):
+        return False
+
+    def connect(self):
+        self.connect_calls += 1
+        return False
+
+    def snapshot(self, mqtt_connected):
+        return {
+            "ssid": "test-ssid",
+            "ip_address": None,
+            "rssi": None,
+            "wifi_connect_count": 0,
+        }
+
+
 class FakeMqtt:
     """A steady-state connected MQTT session; enough surface for run()."""
 
@@ -172,6 +197,26 @@ class FakeMqtt:
 
     def ping_due(self):
         return False
+
+
+class FailingMqtt:
+    """A broker that never answers: connect() always fails, counting attempts."""
+
+    def __init__(self):
+        self.connect_calls = 0
+
+    def is_connected(self):
+        return False
+
+    def connect(self):
+        self.connect_calls += 1
+        return False
+
+    def mark_disconnected(self):
+        pass
+
+    def status(self):
+        return {"connected": False, "connect_count": 0, "disconnect_count": 0}
 
 
 @pytest.fixture
@@ -285,3 +330,42 @@ def test_run_loop_stays_up_with_fresh_heartbeat(env):
         instance.run()
 
     assert machine.reset_calls == 0
+
+
+def test_stale_heartbeat_resets_during_network_recovery(env):
+    """The watchdog fires during a recovery wait, not after recovery ends.
+
+    Core 1 has already registered its stamp and a network outage drives
+    Core 0 into the recovery path, where the reconnect sequence keeps
+    failing. The first backoff sleep (40 s, the configured maximum)
+    outlasts the 30 s staleness timeout: a watchdog that were blind to
+    these waits would only reset once the whole sequence finally finished.
+    A serviced wait must reset at the 30 s mark -- inside the first
+    backoff sleep, before it has even completed.
+    """
+    instance, machine = env["instance"], env["machine"]
+    timeout_ms = env["core0_mod"]._CORE_1_HEARTBEAT_STALE_TIMEOUT_MS
+    max_backoff_ms = env["instance"]._config["wifi_reconnect_delays_sec"][-1] * 1000
+
+    # Core 1 has already started and registered its liveness stamp.
+    instance._intercore.state_mailboxes.set_core_1_activity_ms(_FAKE_TIME.now_ms)
+
+    # The network is down and stays down: recovery enters
+    # establish_network() and its connect loops keep failing.
+    failing_wifi = FailingWifi()
+    failing_mqtt = FailingMqtt()
+    instance._wifi = failing_wifi
+    instance._mqtt = failing_mqtt
+
+    with pytest.raises(_MachineReset):
+        instance.run()
+
+    assert machine.reset_calls == 1
+    # The reset fired when the stamp hit the timeout, inside the first
+    # backoff sleep -- the clock advanced past the timeout but not past
+    # the end of the sleep that contained it.
+    assert _FAKE_TIME.now_ms >= timeout_ms
+    assert _FAKE_TIME.now_ms < max_backoff_ms
+    # And we never got as far as the second recovery attempt.
+    assert failing_wifi.connect_calls == 1
+    assert failing_mqtt.connect_calls == 0

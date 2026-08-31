@@ -16,7 +16,7 @@ _MAX_PINGRESP_WAIT_SEC = 10
 class Mqtt:
     """Small MQTT lifecycle based on the original working client."""
 
-    def __init__(self, config, message_callback):
+    def __init__(self, config, message_callback, wait_service=None):
         self._broker = config["mqtt_broker_ip_address"]
         self._command_topic = config["mqtt_topic_command"]
         self._info_response_topic = config["mqtt_topic_info_response"]
@@ -27,6 +27,10 @@ class Mqtt:
         self._ack_timeout_ms = config["mqtt_broker_response_timeout_sec"] * 1000
         self._reconnect_delays = config["mqtt_reconnect_delays_sec"]
         self._message_callback = message_callback
+        # Optional Core 0 servicing hook (the Core 1 heartbeat watchdog),
+        # invoked at each 100 ms slice of the retry backoffs so a dead
+        # Core 1 is detected while the broker is being retried, not after.
+        self._wait_service = wait_service
         self._client = None
         self._connected = False
         self._connect_count = 0
@@ -48,6 +52,16 @@ class Mqtt:
     def _touch(self):
         """Record outbound MQTT activity (any sent packet resets the keepalive)."""
         self._last_activity_ms = time.ticks_ms()
+
+    def _service_wait(self):
+        if self._wait_service is not None:
+            self._wait_service()
+
+    def _sleep_interruptible(self, delay_sec):
+        """Sleep in 100 ms slices, servicing Core 0 between slices."""
+        for _ in range(max(int(delay_sec * 10), 1)):
+            self._service_wait()
+            time.sleep_ms(100)
 
     def _new_client(self):
         client = MQTTClient(
@@ -133,7 +147,7 @@ class Mqtt:
                 if attempt_index < len(self._reconnect_delays) - 1:
                     if DEBUG:
                         print("[DEBUG] MQTT retry in {} sec".format(delay_sec))
-                    time.sleep(delay_sec)
+                    self._sleep_interruptible(delay_sec)
         return False
 
     def mark_disconnected(self):

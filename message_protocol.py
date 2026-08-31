@@ -2,6 +2,7 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
+import math
 import time
 
 
@@ -18,9 +19,9 @@ def is_json_safe(value):
     if value is None or isinstance(value, (str, int, bool)):
         return True
     if isinstance(value, float):
-        if value != value:
-            return False
-        return "inf" not in str(value).lower()
+        # Numeric finite check (NaN and +/-inf rejected, as required for
+        # strict JSON) -- no per-value string conversion on the hot path.
+        return math.isfinite(value)
     if isinstance(value, (list, tuple)):
         for item in value:
             if not is_json_safe(item):

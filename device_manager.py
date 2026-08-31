@@ -122,9 +122,8 @@ class ManagedDevice:
 class DeviceManager:
     """Manages device lifecycle for Core 1."""
 
-    def __init__(self, config, system_information=None):
+    def __init__(self, config, system_information=None, activity_refresh=None):
         self._active_devices = []
-        self._devices_by_id = {}
         self._failed_devices = {}
 
         # Device configuration
@@ -134,6 +133,20 @@ class DeviceManager:
         self._devices_config = config["devices"]
 
         self._system_information = system_information
+
+        # Optional liveness-stamp refresh callback, owned by Core 1 (which
+        # constructs this manager) and invoked at initialization progress
+        # boundaries. Without it, a legitimately long initialization
+        # (several devices x attempts x retry delays) would age Core 1's
+        # liveness stamp past Core 0's watchdog bound and reset a healthy
+        # board. A wedge inside a driver call stops the refresh and is still
+        # caught. None (the default) leaves behavior unchanged.
+        self._activity_refresh = activity_refresh
+
+    def _refresh_activity(self):
+        """Refresh Core 1's liveness stamp at a progress boundary, if armed."""
+        if self._activity_refresh is not None:
+            self._activity_refresh()
 
     def _initialize_single_device(self, device_def):
         """Initialize a single device from config."""
@@ -182,6 +195,10 @@ class DeviceManager:
 
         for attempt in range(1, self._device_initialization_attempts + 1):
             attempts_used = attempt
+            # Progress boundary: covers the retry delay slept before this
+            # attempt, so a legitimate retry sequence does not age the
+            # liveness stamp past Core 0's watchdog bound.
+            self._refresh_activity()
             try:
                 # Pass config to initialize - this is the new interface
                 driver.initialize(device_config)
@@ -279,7 +296,6 @@ class DeviceManager:
         managed_device.initialization_attempts_used = attempts_used
 
         self._active_devices.append(managed_device)
-        self._devices_by_id[device_id] = managed_device
 
         return {
             "success": True,
@@ -320,6 +336,9 @@ class DeviceManager:
         all_attempt_logs = []
 
         for device_def in self._devices_config:
+            # Progress boundary: covers driver construction, which precedes
+            # the attempt loop below and could itself take long.
+            self._refresh_activity()
             result = self._initialize_single_device(device_def)
             all_attempt_logs.extend(result["attempt_logs"])
             all_failed_device_details.extend(result["failed_details"])
@@ -330,12 +349,19 @@ class DeviceManager:
 
     def get_active_devices(self):
         """
-        Get list of active managed devices in configuration order.
+        Get the active managed devices in configuration order.
+
+        Returns the internal list itself, not a copy: Core 1 exclusively
+        owns device membership (only this manager mutates it, at startup),
+        membership is fixed after initialize_devices() -- reinitialization
+        never adds or removes entries -- and the caller iterates it
+        read-only. A per-cycle copy would be needless heap churn on the
+        hot telemetry path.
 
         Returns:
-            list: ManagedDevice instances
+            list: ManagedDevice instances (the live membership list; do not mutate)
         """
-        return list(self._active_devices)
+        return self._active_devices
 
     def process_device(self, managed_device):
         """
@@ -544,7 +570,14 @@ class DeviceManager:
             if device_id in device_snapshots:
                 device_status.append(device_snapshots[device_id])
 
-        active_count = len(self._active_devices)
+        # "active" means currently READY. A device in reinitialize_pending state
+        # stays in _active_devices (it must remain eligible for reinitialization),
+        # but it is not actively producing telemetry, so it is not counted.
+        active_count = sum(
+            1
+            for managed_device in self._active_devices
+            if managed_device.state == DEVICE_STATE_READY
+        )
 
         # Count devices in each state
         initialization_failed = sum(

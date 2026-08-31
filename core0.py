@@ -47,8 +47,9 @@ class Core0:
             wifi_config["wifi_ssid"],
             wifi_config["wifi_password"],
             config["wifi_reconnect_delays_sec"],
+            self._service_wait,
         )
-        self._mqtt = Mqtt(config, self._on_mqtt_message)
+        self._mqtt = Mqtt(config, self._on_mqtt_message, self._service_wait)
 
         self._pending_reboot = None
         self._pending_core0_responses = []
@@ -779,7 +780,7 @@ class Core0:
                 break
             delay_sec = self._config["wifi_reconnect_delays_sec"][-1]
             print("[WARNING] Wi-Fi connection sequence exhausted; retrying in {} sec".format(delay_sec))
-            time.sleep(delay_sec)
+            self._sleep_and_service(delay_sec)
 
         while not self._mqtt.is_connected():
             if self._mqtt.connect():
@@ -797,7 +798,7 @@ class Core0:
                 break
             delay_sec = self._config["mqtt_reconnect_delays_sec"][-1]
             print("[WARNING] MQTT connection sequence exhausted; retrying in {} sec".format(delay_sec))
-            time.sleep(delay_sec)
+            self._sleep_and_service(delay_sec)
 
     def _recover_network_if_needed(self):
         if self._wifi.is_connected() and self._mqtt.is_connected():
@@ -837,6 +838,27 @@ class Core0:
         if age_ms >= _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS:
             print("[FATAL] Core 1 heartbeat stale ({} ms) - resetting".format(age_ms))
             machine.reset()
+
+    def _service_wait(self):
+        """Core 0 servicing hook for long network waits.
+
+        Connect and reconnect sequences (Wi-Fi attempt polling, retry
+        backoffs) used to be monolithic waits: a 40-second backoff — or a
+        multi-minute exhausted sequence — would run without the Core 1
+        heartbeat check ever firing, so a Core 1 that died together with
+        the network (the outage is the most likely common cause) would be
+        noticed only when networking eventually returned. Wifi and Mqtt
+        hold this hook and invoke it at each 100 ms wait slice. The check
+        is a no-op before Core 1's first stamp, so it is equally safe in
+        the unbounded startup connect loops.
+        """
+        self._watch_core_1_heartbeat()
+
+    def _sleep_and_service(self, delay_sec):
+        """Sleep in 100 ms slices, servicing Core 0 between slices."""
+        for _ in range(max(int(delay_sec * 10), 1)):
+            self._service_wait()
+            time.sleep_ms(100)
 
     def start(self):
         """Establish Core 0 network services before Core 1 is started.
@@ -882,7 +904,7 @@ class Core0:
                 break
             delay_sec = self._config["mqtt_reconnect_delays_sec"][-1]
             print("[WARNING] Startup verification failed; re-establishing network and retrying in {} sec".format(delay_sec))
-            time.sleep(delay_sec)
+            self._sleep_and_service(delay_sec)
             self._mqtt.mark_disconnected()
             self.establish_network()
 
