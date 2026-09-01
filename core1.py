@@ -387,6 +387,16 @@ def _handle_device_result(intercore, config, uptime_state, result):
             ))
 
 
+def _run_telemetry_read_pass(device_manager, intercore, uptime_state, config):
+    """One telemetry read pass across all active devices.
+
+    Shared by the initial at-anchor sample and the periodic read boundary, so the read path (and its gc) has a single implementation."""
+    for managed_device in device_manager.get_active_devices():
+        result = device_manager.process_device(managed_device)
+        _handle_device_result(intercore, config, uptime_state, result)
+    gc.collect()
+
+
 def _build_health_payload(intercore, uptime_state, config, system_information):
     """Build the health payload from shared state snapshots.
 
@@ -685,8 +695,8 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # fixed boundaries every health_interval_sec from normal-runtime
         # start (a 60s interval means +60s, +120s, +180s relative to the
         # anchor). Independent of the telemetry scheduler: the two share
-        # the epoch, not an execution dependency. No immediate health
-        # message is emitted at startup.
+        # the epoch, not an execution dependency. The one immediate health
+        # report at the anchor is emitted once below, before the run loop.
         health_interval_ms = config["health_interval_sec"] * 1000
         next_health_ms = time.ticks_add(normal_runtime_start_ticks_ms, health_interval_ms)
 
@@ -709,6 +719,19 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         read_loop_ms = config["read_loop_sec"] * 1000
         next_read_ms = time.ticks_add(normal_runtime_start_ticks_ms, read_loop_ms)
 
+        # Initial sample at the anchor: one telemetry read pass and one
+        # health report immediately after startup-log admission, so a
+        # subscriber that connects at boot sees current data within the
+        # startup-stabilization window instead of waiting a full
+        # read_loop_sec / health_interval_sec. The periodic schedulers above
+        # are untouched -- their boundaries stay at anchor + n * interval --
+        # so this one-shot is not a second grid and cannot accumulate drift.
+        # Telemetry first, then health, so the health report reflects queue
+        # state that already includes the fresh samples. The health path is
+        # gated as usual (skipped if the network snapshot says not ready).
+        _run_telemetry_read_pass(device_manager, intercore, uptime_state, config)
+        _try_queue_health_message_intercore(intercore, uptime_state, config, system_information)
+
         pending_command_response = None
 
         while True:
@@ -727,9 +750,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
             now_ms = time.ticks_ms()
             if time.ticks_diff(now_ms, next_read_ms) >= 0:
-                for managed_device in device_manager.get_active_devices():
-                    result = device_manager.process_device(managed_device)
-                    _handle_device_result(intercore, config, uptime_state, result)
+                _run_telemetry_read_pass(device_manager, intercore, uptime_state, config)
 
                 # Skip any boundaries that elapsed while the read ran, rather
                 # than replaying them as catch-up reads. Telemetry is a current
@@ -748,7 +769,6 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 skip_now_ms = time.ticks_ms()
                 while time.ticks_diff(skip_now_ms, next_read_ms) >= 0:
                     next_read_ms = time.ticks_add(next_read_ms, read_loop_ms)
-                gc.collect()
 
             # Register Core 1 activity periodically (every 5 seconds).
             # Re-capture the clock: now_ms is stale by however long a device

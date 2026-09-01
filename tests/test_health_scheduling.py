@@ -7,8 +7,7 @@
 The health cadence is defined relative to the normal-runtime anchor, normal_runtime_start_ticks_ms -- captured exactly once, immediately after system_startup_completed has been successfully admitted to the outbound queue:
 
 - boundaries fall at health_interval_sec multiples from the anchor;
-- with a 13s startup and a 60s interval, the first health is at ~73s uptime -- not 60s (the old boot anchor) and not a second, independently captured post-admission delay;
-- no immediate health message is generated after admission;
+- one immediate health report is emitted at the anchor (the moment startup-log admission completes), then periodic boundaries at ~73s uptime with a 13s startup and a 60s interval -- not 60s (the old boot anchor) and not a second, independently captured post-admission delay;
 - boundaries missed while the loop was stalled are skipped, never replayed;
 - a boundary due while the network is down (or MQTT disconnected) is skipped, and recovery does not trigger a catch-up health;
 - the next deadline always advances from the previous anchor-based deadline, so per-iteration delay cannot accumulate into drift;
@@ -215,10 +214,10 @@ def _drain_outbound(bus):
     return health, others
 
 
-def test_no_immediate_health_after_startup_log_admission():
-    """Startup log admission at 13s uptime must not queue a health message.
+def test_immediate_health_after_startup_log_admission():
+    """Startup log admission at 13s uptime queues exactly one immediate health.
 
-    With a 60s interval the first health boundary (anchor + 60s = 73s uptime) is still in the future -- the queue must contain only the startup log."""
+    The at-anchor health report is emitted once, right after admission, and the startup log stays first in the queue. With a 60s interval the next health boundary (anchor + 60s = 73s uptime) is still in the future."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000  # startup completes at 13s uptime
 
@@ -228,19 +227,29 @@ def test_no_immediate_health_after_startup_log_admission():
     fake_time = FakeTime(startup_at_ms, startup_at_ms + LOOP_STEP_MS)
     _run_core1(fake_time, bus, _core1_config(60), boot_ticks_ms)
 
-    health, others = _drain_outbound(bus)
-    assert health == []
-    assert len(others) == 1
-    startup_log = json.loads(others[0]["payload_bytes"].decode("utf-8"))
-    assert others[0]["kind"] == KIND_LOG
+    # Drain raw, in admission order: the startup log must precede the health.
+    entries = []
+    while True:
+        entry = bus.outbound_queue.take()
+        if entry is None:
+            break
+        entries.append(entry)
+        bus.outbound_queue.complete_in_flight(entry)
+    assert [e["kind"] for e in entries] == [KIND_LOG, KIND_HEALTH]
+
+    startup_log = json.loads(entries[0]["payload_bytes"].decode("utf-8"))
     assert startup_log["payload"]["event"] == "system_startup_completed"
     assert startup_log["uptime_ms"] == 13000
 
+    health = json.loads(entries[1]["payload_bytes"].decode("utf-8"))
+    # The immediate report lands at the anchor moment (~13s uptime)...
+    assert 13000 <= health["uptime_ms"] <= 13000 + LOOP_STEP_MS
 
-def test_first_health_at_anchor_plus_interval_not_boot_or_immediate():
-    """First health is due 60s after normal-runtime start, not after boot.
 
-    boot = 100000, interval = 60s, startup completes at 13s uptime: the first health must be at ~73000ms uptime -- not at 13000 (immediate), not at 60000 (the old boot anchor), and not at 13000 plus a second independently captured delay."""
+def test_first_health_immediate_then_anchor_plus_interval():
+    """Health is immediate at the anchor, then due 60s after normal-runtime start.
+
+    boot = 100000, interval = 60s, startup completes at 13s uptime: the first health is the immediate at-anchor report at ~13000ms uptime, and the second is at ~73000ms -- not at 60000 (the old boot anchor), and not 73000 shifted by a second independently captured post-admission delay."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
     first_boundary_ms = startup_at_ms + 60000
@@ -252,19 +261,19 @@ def test_first_health_at_anchor_plus_interval_not_boot_or_immediate():
     _run_core1(fake_time, bus, _core1_config(60), boot_ticks_ms)
 
     health, others = _drain_outbound(bus)
-    assert len(health) == 1
+    assert len(health) == 2
     assert len(others) == 1  # startup log only
-    uptime_ms = health[0]["uptime_ms"]
-    # Within one loop step of the normal-runtime-anchored boundary...
-    assert 73000 <= uptime_ms <= 73000 + LOOP_STEP_MS
-    # ...and far from the immediate (13000ms) and boot-anchored (60000ms)
-    # wrong answers.
-    assert uptime_ms > 60000 + LOOP_STEP_MS
-    assert uptime_ms > 13000 + LOOP_STEP_MS
+    # First health: the immediate at-anchor report, at ~13s uptime...
+    assert 13000 <= health[0]["uptime_ms"] <= 13000 + LOOP_STEP_MS
+    # ...second health: within one loop step of the normal-runtime-anchored
+    # boundary (13s + 60s = 73s)...
+    assert 73000 <= health[1]["uptime_ms"] <= 73000 + LOOP_STEP_MS
+    # ...and far from the boot-anchored (60000ms) wrong answer.
+    assert health[1]["uptime_ms"] > 60000 + LOOP_STEP_MS
 
 
 def test_fixed_cadence_from_normal_runtime_anchor():
-    """Health deadlines fire at exactly anchor + 60/120/180/240 seconds."""
+    """Health fires at the anchor, then exactly at anchor + 60/120/180/240 seconds."""
     boot_ticks_ms = 100000
     # Normal runtime starts at 13s uptime, off the 40ms loop grid by 0ms;
     # every boundary shares the same grid offset, so uptimes land within
@@ -280,9 +289,11 @@ def test_fixed_cadence_from_normal_runtime_anchor():
 
     health, _others = _drain_outbound(bus)
     uptimes = [p["uptime_ms"] for p in health]
-    # Four boundaries: 73s, 133s, 193s, 253s uptime (13s anchor + 60s*k).
-    assert len(uptimes) == 4
-    for expected, actual in zip((73000, 133000, 193000, 253000), uptimes):
+    # Immediate at-anchor report plus four boundaries: 13s, then
+    # 73s, 133s, 193s, 253s uptime (13s anchor + 60s*k).
+    assert len(uptimes) == 5
+    assert 13000 <= uptimes[0] <= 13000 + LOOP_STEP_MS
+    for expected, actual in zip((73000, 133000, 193000, 253000), uptimes[1:]):
         assert expected <= actual <= expected + LOOP_STEP_MS
         # And never on the old boot-anchored grid (60s, 120s, 180s, 240s).
         assert actual > expected - LOOP_STEP_MS
@@ -304,15 +315,17 @@ def test_no_cumulative_drift_across_intervals():
 
     health, _others = _drain_outbound(bus)
     uptimes = [p["uptime_ms"] for p in health]
-    assert len(uptimes) == 2
+    # Immediate at-anchor report plus the first two periodic firings.
+    assert len(uptimes) == 3
+    assert 13010 <= uptimes[0] <= 13010 + LOOP_STEP_MS
 
-    # Both firings stay within one loop step of their anchor-based
+    # Both periodic firings stay within one loop step of their anchor-based
     # boundaries...
-    assert 73010 <= uptimes[0] <= 73010 + LOOP_STEP_MS
-    assert 133010 <= uptimes[1] <= 133010 + LOOP_STEP_MS
+    assert 73010 <= uptimes[1] <= 73010 + LOOP_STEP_MS
+    assert 133010 <= uptimes[2] <= 133010 + LOOP_STEP_MS
     # ...and the interval between them is exactly the configured cadence,
     # i.e. the same boundary offset for both -- no accumulated drift.
-    assert uptimes[1] - uptimes[0] == 60000
+    assert uptimes[2] - uptimes[1] == 60000
 
 
 def test_missed_boundaries_after_stall_skipped_not_replayed():
@@ -333,12 +346,14 @@ def test_missed_boundaries_after_stall_skipped_not_replayed():
 
     health, _others = _drain_outbound(bus)
     uptimes = [p["uptime_ms"] for p in health]
-    # 73s and 133s before the stall; exactly one report after it...
-    assert 73000 <= uptimes[0] <= 73000 + LOOP_STEP_MS
-    assert 133000 <= uptimes[1] <= 133000 + LOOP_STEP_MS
+    # Immediate at-anchor report, 73s and 133s before the stall; exactly one
+    # report after it...
+    assert 13000 <= uptimes[0] <= 13000 + LOOP_STEP_MS
+    assert 73000 <= uptimes[1] <= 73000 + LOOP_STEP_MS
+    assert 133000 <= uptimes[2] <= 133000 + LOOP_STEP_MS
     # ...at the resume moment (current state, within one loop step)...
-    assert len(uptimes) == 3
-    assert 305000 <= uptimes[2] <= 305000 + LOOP_STEP_MS
+    assert len(uptimes) == 4
+    assert 305000 <= uptimes[3] <= 305000 + LOOP_STEP_MS
     # ...and none replayed at the missed 193s / 253s boundaries.
     assert all(not (193000 <= u <= 253000 + LOOP_STEP_MS) for u in uptimes)
 
@@ -347,7 +362,7 @@ def test_mqtt_outage_skips_boundaries_and_does_not_replay_on_recovery():
     """Outage behavior: due boundaries while MQTT is down are skipped; after recovery, wait for the next anchor-relative boundary (no immediate recovery health, no replay of skipped reports).
 
     Timeline (interval 60s, normal runtime starts at 13s uptime):
-      health at 73s and 133s uptime
+      immediate health at 13s uptime, then health at 73s and 133s uptime
       MQTT fails at 160s uptime
       193s boundary -> skipped
       MQTT restored at 240s uptime (no immediate health)
@@ -382,17 +397,18 @@ def test_mqtt_outage_skips_boundaries_and_does_not_replay_on_recovery():
     health, _others = _drain_outbound(bus)
     uptimes = [p["uptime_ms"] for p in health]
     # 193s was skipped, and recovery at 240s did not trigger an immediate
-    # catch-up health: next emission is at 253s.
-    assert len(uptimes) == 3
-    assert 73000 <= uptimes[0] <= 73000 + LOOP_STEP_MS
-    assert 133000 <= uptimes[1] <= 133000 + LOOP_STEP_MS
-    assert 253000 <= uptimes[2] <= 253000 + LOOP_STEP_MS
+    # catch-up health: next emission after the pre-outage reports is at 253s.
+    assert len(uptimes) == 4
+    assert 13000 <= uptimes[0] <= 13000 + LOOP_STEP_MS
+    assert 73000 <= uptimes[1] <= 73000 + LOOP_STEP_MS
+    assert 133000 <= uptimes[2] <= 133000 + LOOP_STEP_MS
+    assert 253000 <= uptimes[3] <= 253000 + LOOP_STEP_MS
 
 
 def test_new_runtime_creates_new_anchor():
     """A reboot -- a new runtime -- establishes a new normal-runtime anchor.
 
-    First runtime: boot = 100000, startup at 13s uptime, interval 60s -> first health at ~73s uptime. Second runtime (fresh process state, boot = 200000, startup at 10s uptime) -> first health at ~70s uptime of the new runtime, not a continuation of the first runtime's boundaries."""
+    First runtime: boot = 100000, startup at 13s uptime, interval 60s -> immediate health at ~13s uptime, first periodic health at ~73s uptime. Second runtime (fresh process state, boot = 200000, startup at 10s uptime) -> immediate health at ~10s uptime of the new runtime, first periodic health at ~70s uptime, not a continuation of the first runtime's boundaries."""
     def _run_once(boot_ticks_ms, startup_uptime_ms):
         startup_at_ms = boot_ticks_ms + startup_uptime_ms
         first_boundary_ms = startup_at_ms + 60000
@@ -404,8 +420,10 @@ def test_new_runtime_creates_new_anchor():
         _run_core1(fake_time, bus, _core1_config(60), boot_ticks_ms)
 
         health, _others = _drain_outbound(bus)
-        assert len(health) == 1
-        return health[0]["uptime_ms"]
+        # Immediate at-anchor report + first periodic firing.
+        assert len(health) == 2
+        assert startup_uptime_ms <= health[0]["uptime_ms"] <= startup_uptime_ms + LOOP_STEP_MS
+        return health[1]["uptime_ms"]
 
     first_runtime_health_uptime = _run_once(100000, 13000)
     # anchor = 13s + 60s interval = 73s uptime of the first runtime.

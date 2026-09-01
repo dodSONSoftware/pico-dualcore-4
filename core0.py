@@ -749,15 +749,17 @@ class Core0:
     def _drain_startup_mqtt_work(self):
         """Drain pending Core 0 MQTT work (connection logs, etc.); True when none remains, False on timeout.
 
-        Startup publishes are paced like any other outbound traffic."""
-        timeout_ms = 2000  # 2 second max drain time
-        start_ms = time.ticks_ms()
+        Each pending log is measured against its own grace window, starting when the previous log's cycle completed: one slow-but-legal QoS 1 cycle (its PUBACK wait can lawfully run to mqtt_broker_response_timeout_sec) must not consume the budget of the logs behind it. Startup publishes are paced like any other outbound traffic."""
+        grace_ms = 2000  # per-log grace before that log may begin its publish
 
         while self._pending_connection_logs:
-            if time.ticks_diff(time.ticks_ms(), start_ms) >= timeout_ms:
+            # A fresh window per log, measured from here -- i.e. from the
+            # previous log's completion, never from the drain's start.
+            deadline_ms = time.ticks_add(time.ticks_ms(), grace_ms)
+            self._wait_for_mqtt_publish_slot()
+            if time.ticks_diff(time.ticks_ms(), deadline_ms) >= 0:
                 print("[WARNING] Startup MQTT work drain timeout")
                 return False
-            self._wait_for_mqtt_publish_slot()
             try:
                 self._service_pending_connection_log()
             except MemoryError:

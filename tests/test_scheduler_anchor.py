@@ -6,6 +6,7 @@
 
 All periodic Core 1 work (telemetry and health) must derive its fixed boundaries from one anchor, normal_runtime_start_ticks_ms, captured exactly once, immediately after system_startup_completed has been successfully admitted to the outbound queue:
 
+- a one-shot initial sample is emitted at the anchor moment (one telemetry read pass and one health report, after startup-log admission, before the run loop)
 - telemetry boundaries fall at anchor + n * read_loop_sec
 - health boundaries fall at anchor + n * health_interval_sec
 - the two schedulers share the epoch but stay independent: neither deadline derives from the other, and neither scheduler is moved by the other's execution or skipping
@@ -214,17 +215,19 @@ def _run_core1(fake_time, bus, core1_config, boot_ticks_ms, pre_run=None):
         _restore()
 
 
-def _slow_first_read(fake_time, delay_ms):
-    """Return a pre_run hook making the first device read consume delay_ms."""
-    state = {"slowed": False}
+def _slow_periodic_read(fake_time, delay_ms):
+    """Return a pre_run hook making the periodic (in-loop) device read consume delay_ms.
+
+    The initial at-anchor sample is read 1 and stays fast; read 2 is the first read that fires from the run loop, which is the one under test."""
+    state = {"calls": 0}
 
     def _pre_run():
         module = sys.modules["devices.system_information.system_information_device"]
         original_read = module.SystemInformationDevice.read
 
         def _slow_read(self):
-            if not state["slowed"]:
-                state["slowed"] = True
+            state["calls"] += 1
+            if state["calls"] == 2:
                 fake_time.sleep_ms(delay_ms)
             return original_read(self)
 
@@ -258,7 +261,7 @@ def _drain_outbound(bus):
 def test_telemetry_and_health_share_the_same_anchor():
     """Both first deadlines derive from one anchor, captured at admission.
 
-    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s, health interval = 60s. The first telemetry is ~33s uptime and the first health ~73s uptime -- exactly 20s and 60s after the same anchor, whose value is observable in the startup log's uptime_ms (13000)."""
+    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s, health interval = 60s. The initial telemetry sample and initial health report land at the anchor (~13s uptime), and the first periodic deadlines are ~33s and ~73s uptime -- exactly 20s and 60s after the same anchor, whose value is observable in the startup log's uptime_ms (13000)."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -277,12 +280,16 @@ def test_telemetry_and_health_share_the_same_anchor():
     anchor_uptime = startup_log["uptime_ms"]
     assert anchor_uptime == 13000
 
-    assert len(telemetry) >= 1
-    assert len(health) == 1
-    first_telemetry_uptime = telemetry[0]["uptime_ms"]
-    first_health_uptime = health[0]["uptime_ms"]
+    assert len(telemetry) >= 2
+    assert len(health) == 2
 
-    # Each deadline is its interval after the SAME anchor...
+    # The initial sample (telemetry and health) lands at the anchor...
+    assert 0 <= telemetry[0]["uptime_ms"] - anchor_uptime <= LOOP_STEP_MS
+    assert 0 <= health[0]["uptime_ms"] - anchor_uptime <= LOOP_STEP_MS
+
+    # Each first periodic deadline is its interval after the SAME anchor...
+    first_telemetry_uptime = telemetry[1]["uptime_ms"]
+    first_health_uptime = health[1]["uptime_ms"]
     assert 20000 <= first_telemetry_uptime - anchor_uptime <= 20000 + LOOP_STEP_MS
     assert 60000 <= first_health_uptime - anchor_uptime <= 60000 + LOOP_STEP_MS
     # ...so the gap between them is exactly the interval difference.
@@ -293,9 +300,9 @@ def test_telemetry_and_health_share_the_same_anchor():
 
 
 def test_telemetry_first_deadline_from_anchor_not_boot():
-    """First telemetry is due read_loop after normal-runtime start, not boot.
+    """Telemetry is immediate at the anchor, then due read_loop after normal-runtime start.
 
-    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s: the first telemetry must be at ~33000ms uptime -- not at 20000ms (the old boot anchor)."""
+    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s: the initial telemetry sample must be at ~13000ms uptime (the anchor), and the first periodic read at ~33000ms -- not at 20000ms (the old boot anchor)."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -306,15 +313,17 @@ def test_telemetry_first_deadline_from_anchor_not_boot():
     _run_core1(fake_time, bus, _core1_config(), boot_ticks_ms)
 
     telemetry, health, _others = _drain_outbound(bus)
-    assert len(telemetry) == 1
-    assert health == []
-    uptime_ms = telemetry[0]["uptime_ms"]
-    # Within one loop step of anchor + 20s (33s uptime)...
+    assert len(telemetry) == 2
+    # The initial health sample also lands at the anchor (13s uptime)...
+    assert len(health) == 1
+    assert 13000 <= health[0]["uptime_ms"] <= 13000 + LOOP_STEP_MS
+    # ...and the initial telemetry sample is at the anchor too...
+    assert 13000 <= telemetry[0]["uptime_ms"] <= 13000 + LOOP_STEP_MS
+    # First periodic read: within one loop step of anchor + 20s (33s uptime)...
+    uptime_ms = telemetry[1]["uptime_ms"]
     assert 33000 <= uptime_ms <= 33000 + LOOP_STEP_MS
-    # ...and far from the boot-anchored (20000ms) and immediate (13000ms)
-    # wrong answers.
+    # ...and far from the boot-anchored (20000ms) wrong answer.
     assert uptime_ms > 20000 + LOOP_STEP_MS
-    assert uptime_ms > 13000 + LOOP_STEP_MS
 
 
 def test_fixed_cadence_telemetry_and_health_from_one_anchor():
@@ -335,13 +344,16 @@ def test_fixed_cadence_telemetry_and_health_from_one_anchor():
     telemetry_uptimes = [m["uptime_ms"] for m in telemetry]
     health_uptimes = [p["uptime_ms"] for p in health]
 
-    for expected, actual in zip((33000, 53000, 73000, 93000, 113000, 133000), telemetry_uptimes):
+    # Immediate at-anchor sample, then the periodic grid.
+    assert 13000 <= telemetry_uptimes[0] <= 13000 + LOOP_STEP_MS
+    for expected, actual in zip((33000, 53000, 73000, 93000, 113000, 133000), telemetry_uptimes[1:]):
         assert expected <= actual <= expected + LOOP_STEP_MS
-    assert len(telemetry_uptimes) == 6
+    assert len(telemetry_uptimes) == 7
 
-    for expected, actual in zip((73000, 133000), health_uptimes):
+    assert 13000 <= health_uptimes[0] <= 13000 + LOOP_STEP_MS
+    for expected, actual in zip((73000, 133000), health_uptimes[1:]):
         assert expected <= actual <= expected + LOOP_STEP_MS
-    assert len(health_uptimes) == 2
+    assert len(health_uptimes) == 3
 
     # Coincidence is expected: both are due at the 73s boundary.
     assert any(73000 <= u <= 73000 + LOOP_STEP_MS for u in telemetry_uptimes)
@@ -369,22 +381,26 @@ def test_health_outage_does_not_move_telemetry_deadlines():
     telemetry_uptimes = [m["uptime_ms"] for m in telemetry]
     health_uptimes = [p["uptime_ms"] for p in health]
 
-    # Every telemetry boundary is present, through the outage.
+    # The immediate at-anchor sample, plus every telemetry boundary,
+    # through the outage.
+    assert 13000 <= telemetry_uptimes[0] <= 13000 + LOOP_STEP_MS
     for expected in (33000, 53000, 73000, 93000, 113000, 133000, 153000, 173000, 193000, 213000, 233000, 253000):
-        assert any(expected <= u <= expected + LOOP_STEP_MS for u in telemetry_uptimes)
-    assert len(telemetry_uptimes) == 12
+        assert any(expected <= u <= expected + LOOP_STEP_MS for u in telemetry_uptimes[1:])
+    assert len(telemetry_uptimes) == 13
 
-    # Health kept its own boundaries; 193s skipped, no catch-up at 240s.
-    assert len(health_uptimes) == 3
+    # Health: the immediate at-anchor report, then its own boundaries;
+    # 193s skipped, no catch-up at 240s.
+    assert 13000 <= health_uptimes[0] <= 13000 + LOOP_STEP_MS
+    assert len(health_uptimes) == 4
     for expected in (73000, 133000, 253000):
-        assert any(expected <= u <= expected + LOOP_STEP_MS for u in health_uptimes)
+        assert any(expected <= u <= expected + LOOP_STEP_MS for u in health_uptimes[1:])
     assert not any(193000 <= u <= 240000 for u in health_uptimes)
 
 
 def test_telemetry_delay_does_not_move_health_deadlines():
     """A late telemetry execution leaves the health schedule untouched.
 
-    The first telemetry read (due at 33s uptime) takes 35s, stalling the loop until ~68s uptime. The scheduler skips the elapsed 33s/53s boundaries and advances directly to the next future one (73s) -- it does NOT replay the missed boundaries as catch-up reads. Health must still land exactly on its 73s and 133s anchor-based boundaries -- one per boundary, no drift, no burst."""
+    The initial at-anchor sample is fast; the first periodic telemetry read (due at 33s uptime) takes 35s, stalling the loop until ~68s uptime. The scheduler skips the elapsed 33s/53s boundaries and advances directly to the next future one (73s) -- it does NOT replay the missed boundaries as catch-up reads. Health must still land on its anchor-based grid -- the immediate report plus 73s and 133s in this window -- one per boundary, no drift, no burst."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -393,14 +409,16 @@ def test_telemetry_delay_does_not_move_health_deadlines():
 
     fake_time = FakeTime(startup_at_ms, startup_at_ms + 120000 + LOOP_STEP_MS)
     _run_core1(fake_time, bus, _core1_config(), boot_ticks_ms,
-               pre_run=_slow_first_read(fake_time, 35000))
+               pre_run=_slow_periodic_read(fake_time, 35000))
 
     telemetry, health, _others = _drain_outbound(bus)
     telemetry_uptimes = [m["uptime_ms"] for m in telemetry]
     health_uptimes = [p["uptime_ms"] for p in health]
 
-    # The delayed telemetry fired well past its 33s boundary...
-    assert telemetry_uptimes and telemetry_uptimes[0] > 33000 + LOOP_STEP_MS
+    # The immediate sample is at the anchor...
+    assert telemetry_uptimes and 13000 <= telemetry_uptimes[0] <= 13000 + LOOP_STEP_MS
+    # ...and the delayed periodic read fired well past its 33s boundary...
+    assert telemetry_uptimes[1] > 33000 + LOOP_STEP_MS
     # ...and the slow read did NOT trigger a catch-up burst: no two samples
     # land within a burst window (a replayed boundary would fire within one or
     # two loop steps of the slow read), the scheduler skipped straight ahead
@@ -410,12 +428,14 @@ def test_telemetry_delay_does_not_move_health_deadlines():
             "catch-up burst after the slow read: samples at {} and {} "
             "are nearly simultaneous".format(a, b)
         )
-    # ...but the health schedule is exactly on its anchor-based grid...
-    assert len(health_uptimes) == 2
-    assert 73000 <= health_uptimes[0] <= 73000 + LOOP_STEP_MS
-    assert 133000 <= health_uptimes[1] <= 133000 + LOOP_STEP_MS
+    # ...but the health schedule is exactly on its anchor-based grid: the
+    # immediate report at the anchor, then the 73s and 133s boundaries...
+    assert len(health_uptimes) == 3
+    assert 13000 <= health_uptimes[0] <= 13000 + LOOP_STEP_MS
+    assert 73000 <= health_uptimes[1] <= 73000 + LOOP_STEP_MS
+    assert 133000 <= health_uptimes[2] <= 133000 + LOOP_STEP_MS
     # ...with no accumulated drift from the telemetry delay.
-    assert health_uptimes[1] - health_uptimes[0] == 60000
+    assert health_uptimes[2] - health_uptimes[1] == 60000
 
 
 def test_reconnects_and_utc_resync_do_not_reset_anchor():
@@ -448,10 +468,12 @@ def test_reconnects_and_utc_resync_do_not_reset_anchor():
     telemetry_uptimes = [m["uptime_ms"] for m in telemetry]
     health_uptimes = [p["uptime_ms"] for p in health]
 
-    # Health stayed on the ORIGINAL anchor's grid: 73/133/193s uptime.
-    assert len(health_uptimes) == 3
+    # Health stayed on the ORIGINAL anchor's grid: the immediate report at
+    # the 13s anchor, then 73/133/193s uptime.
+    assert 13000 <= health_uptimes[0] <= 13000 + LOOP_STEP_MS
+    assert len(health_uptimes) == 4
     for expected in (73000, 133000, 193000):
-        assert any(expected <= u <= expected + LOOP_STEP_MS for u in health_uptimes)
+        assert any(expected <= u <= expected + LOOP_STEP_MS for u in health_uptimes[1:])
     # And no boundary anywhere a re-anchored scheduler would put one.
     for shifted in (110000, 170000, 230000):
         assert not any(shifted <= u <= shifted + LOOP_STEP_MS for u in health_uptimes)
@@ -534,16 +556,19 @@ def test_telemetry_buffers_during_outage_health_skipped():
     # (while MQTT was down) are still in the bounded queue.
     for expected in (173000, 193000, 213000, 233000):
         assert any(expected <= u <= expected + LOOP_STEP_MS for u in telemetry_uptimes)
-    # The full 13s-anchored cadence up to 253s.
+    # The immediate at-anchor sample plus the full 13s-anchored cadence up to 253s.
+    assert 13000 <= telemetry_uptimes[0] <= 13000 + LOOP_STEP_MS
     for expected in (33000, 53000, 73000, 93000, 113000, 133000, 153000, 253000):
-        assert any(expected <= u <= expected + LOOP_STEP_MS for u in telemetry_uptimes)
-    assert len(telemetry_uptimes) == 12
+        assert any(expected <= u <= expected + LOOP_STEP_MS for u in telemetry_uptimes[1:])
+    assert len(telemetry_uptimes) == 13
 
-    # Health: 73s and 133s before the outage, 253s after it -- the 193s
-    # boundary skipped, no catch-up at the 240s recovery.
-    assert len(health_uptimes) == 3
+    # Health: the immediate report at the anchor, 73s and 133s before the
+    # outage, 253s after it -- the 193s boundary skipped, no catch-up at the
+    # 240s recovery.
+    assert 13000 <= health_uptimes[0] <= 13000 + LOOP_STEP_MS
+    assert len(health_uptimes) == 4
     for expected in (73000, 133000, 253000):
-        assert any(expected <= u <= expected + LOOP_STEP_MS for u in health_uptimes)
+        assert any(expected <= u <= expected + LOOP_STEP_MS for u in health_uptimes[1:])
     assert not any(193000 <= u <= 240000 for u in health_uptimes)
 
 

@@ -561,6 +561,38 @@ def test_startup_connection_logs_are_paced(make_core0):
     assert times[1] >= 100
 
 
+def test_startup_drain_gives_each_log_its_own_window(make_core0):
+    """A slow-but-legal cycle on the first log must not consume the second log's window.
+
+    The first log's QoS 1 cycle (slot wait, frame write, PUBACK round trip) takes 3000 ms -- inside the 4 s mqtt_broker_response_timeout_sec the system allows, so it is legal. The old shared 2 s budget, measured from the drain's start, was exhausted by that one cycle and deferred the second log to the run loop with a drain-timeout warning. Each log is now measured against its own window starting when the previous log completed, so both logs are still drained here."""
+    instance = make_core0(delay_ms=100)
+    instance._queue_connection_log("wifi_connection_established", "Connected to Wi-Fi", "wifi", {})
+    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
+
+    # Slow down exactly the first log's publish cycle (a 3 s QoS 1 exchange).
+    original_publish = instance._mqtt.publish_qos1
+    calls = {"n": 0}
+
+    def slow_first_publish(topic, message):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _FAKE_TIME.sleep_ms(3000)
+        original_publish(topic, message)
+
+    instance._mqtt.publish_qos1 = slow_first_publish
+
+    assert instance._drain_startup_mqtt_work() is True
+
+    published = instance._mqtt.published
+    assert len(published) == 2
+    times = [n for _t, _m, n in published]
+    # First log's cycle consumed 3 s...
+    assert times[0] == 3000
+    # ...and the second log still got its own window: published after the
+    # pacing slot (100 ms) following the first log's completion.
+    assert times[1] >= 3100
+
+
 def test_startup_utc_request_respects_preceding_publish(make_core0):
     """The startup UTC request does not start inside the interval either."""
     instance = make_core0(delay_ms=100)

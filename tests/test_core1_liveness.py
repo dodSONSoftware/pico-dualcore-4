@@ -196,10 +196,12 @@ def test_core1_activity_stamp_survives_hostile_loop_phase():
     finally:
         _restore()
 
-    # Health kept flowing across the whole window: the periodic boot-anchored
-    # messages at 60022ms and 120022ms (no immediate post-startup health).
+    # Health kept flowing across the whole window: the immediate at-anchor
+    # report at 22ms uptime plus the periodic anchor-based messages at
+    # 60022ms and 120022ms.
     health_payloads = _drain_health_payloads(bus)
-    assert len(health_payloads) == 2
+    assert len(health_payloads) == 3
+    assert health_payloads[0]["uptime_ms"] <= LOOP_STEP_MS
 
     # The last health message is built ~120s after boot; the old phase-gated
     # code would see a 120000ms-stale stamp and flag core_1_inactive.
@@ -245,7 +247,9 @@ class SlowReadDriver:
 
     def read(self):
         self.reads += 1
-        if self.reads > 1:
+        if self.reads != 2:
+            # The initial at-anchor sample is read 1 (fast); the periodic
+            # read boundary is read 2 and is the one under test here.
             return {"slow": self.reads}
         start = self._fake_time.ticks_ms()
         self._fake_time.now_ms += SLOW_READ_MS
@@ -265,7 +269,7 @@ def _core1_config_with_slow_read_device():
 def test_core1_slow_read_does_not_stale_the_heartbeat_stamp():
     """The heartbeat stamped after a slow device read must use a FRESH clock.
 
-    Geometry: the first telemetry read fires at anchor + read_loop_sec (22 + 20000), and the 6000 ms read window carries the 22022 boundary due in flight. Pre-fix, the loop compared against the pre-read clock (no stamp that pass, the last stamp staying 9000 ms stale at the read's end). Post-fix the stamp written on the read's pass is the post-read clock."""
+    Geometry: the initial at-anchor sample (read 1, fast) runs before the loop; the periodic telemetry boundary at anchor + read_loop_sec (22 + 20000) fires read 2, whose 6000 ms window carries the 25022 activity boundary due in flight. Pre-fix, the loop compared against the pre-read clock (no stamp that pass, the last stamp staying 5000 ms stale at the read's end). Post-fix the stamp written on the read's pass is the post-read clock."""
     # 20022 (read) + 6000 (read) = 26022; stop on the loop sleep after it.
     slow_stop_at_ms = BOOT_TICKS_MS + 20 * 1000 + SLOW_READ_MS
     fake_time = FakeTime(BOOT_TICKS_MS, slow_stop_at_ms)
@@ -302,7 +306,7 @@ def test_core1_slow_read_does_not_stale_the_heartbeat_stamp():
     finally:
         _restore()
 
-    assert driver.reads == 1  # the slow read actually ran
+    assert driver.reads == 2  # initial sample + the periodic slow read
     window_start, window_end = recorder["window"]
     # The scenario precondition: the read window carries a heartbeat boundary
     # (it is longer than the 5000 ms interval and starts on the 40 ms grid).
