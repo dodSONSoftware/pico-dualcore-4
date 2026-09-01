@@ -46,13 +46,18 @@ def main():
     led_manager = LEDManager()
     led_manager.set_connecting(True)
 
-    from config import load_config, load_wifi_config, split_config
+    from config import load_wifi_config, split_config
+    from config_manager import ConfigManager
     from intercore import InterCore
     from version import FIRMWARE_VERSION
 
     print("[INFO] Rebuilt dual-core firmware {}".format(FIRMWARE_VERSION))
 
-    config = load_config("config.json")
+    # The configuration manager (Core 0-owned) settles the committed
+    # configuration -- recovering it from transaction artifacts if a write
+    # was interrupted -- before anything else runs.
+    config_manager = ConfigManager("config.json")
+    config = config_manager.recover()
     wifi_config = load_wifi_config("config-secrets.json")
     core0_config, core1_config = split_config(config)
     config = None
@@ -74,6 +79,7 @@ def main():
         runtime_id,
         boot_ticks_ms,
         led_manager,
+        config_manager,
     )
     core0_config = None
     wifi_config = None

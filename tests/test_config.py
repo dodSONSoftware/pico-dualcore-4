@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from config import ConfigError, load_config, split_config
+from config import ConfigError, load_config, split_config, validate_config
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -44,7 +44,7 @@ def test_config_loads_and_splits_ownership(tmp_path):
 def test_unknown_top_level_key_fails_fast(tmp_path):
     config = _base_config()
     config["unused_future_option"] = True
-    with pytest.raises(ConfigError, match="Unknown config key"):
+    with pytest.raises(ConfigError, match="Configuration contains unknown fields"):
         load_config(_write(tmp_path, config))
 
 
@@ -60,7 +60,7 @@ def test_removed_queue_capacity_keys_are_rejected(tmp_path):
     for key in ("max_outbound_queue_entries", "max_intercore_event_entries"):
         config = _base_config()
         config[key] = 16
-        with pytest.raises(ConfigError, match="Unknown config key"):
+        with pytest.raises(ConfigError, match="Configuration contains unknown fields"):
             load_config(_write(tmp_path, config))
 
 
@@ -108,3 +108,95 @@ def test_duplicate_device_ids_fail_fast(tmp_path):
     config["devices"].append(copy.deepcopy(config["devices"][0]))
     with pytest.raises(ConfigError, match="Duplicate device id"):
         load_config(_write(tmp_path, config))
+
+
+# ---------------------------------------------------------------------------
+# validate_config(): the pure validation path shared by startup and write-config
+# ---------------------------------------------------------------------------
+
+
+def test_validate_config_accepts_valid_config_without_any_file():
+    """validate_config() is pure: a dict that was never on disk validates."""
+    config = _base_config()
+    assert validate_config(config) is config
+
+
+@pytest.mark.parametrize(
+    "mutate,code",
+    [
+        (lambda config: config.update({"unused_future_option": True}), "unknown_config_fields"),
+        (lambda config: config.pop("source"), "missing_key"),
+        (lambda config: config.update({"config_schema_version": 999}), "invalid_config_schema_version"),
+        (lambda config: config.update({"read_loop_sec": "20"}), "invalid_value"),
+        (lambda config: config.update({"wifi_reconnect_delays_sec": []}), "invalid_value"),
+        (lambda config: config.update({"devices": []}), "invalid_value"),
+    ],
+)
+def test_validate_config_rejects_bad_configs_with_stable_codes(mutate, code):
+    config = _base_config()
+    mutate(config)
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == code
+    # str(err) still carries the human-readable message for startup prints
+    assert str(excinfo.value)
+
+
+def test_validate_config_unknown_fields_are_named_and_sorted():
+    config = _base_config()
+    config["zzz_option"] = 1
+    config["aaa_option"] = 2
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "unknown_config_fields"
+    assert excinfo.value.unknown_fields == ["aaa_option", "zzz_option"]
+
+
+def test_validate_config_unknown_device_fields_are_qualified():
+    """Unknown device-entry keys are reported together with top-level unknown
+    keys, qualified by device id."""
+    config = _base_config()
+    config["zzz_option"] = 1
+    config["devices"][0]["bad_option"] = 1
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "unknown_config_fields"
+    assert excinfo.value.unknown_fields == [
+        "devices[{}].bad_option".format(config["devices"][0]["id"]),
+        "zzz_option",
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutate,code",
+    [
+        (lambda config: config.update({"unused_future_option": True}), "unknown_config_fields"),
+        (lambda config: config.pop("source"), "missing_key"),
+        (lambda config: config.update({"config_schema_version": 999}), "invalid_config_schema_version"),
+        (lambda config: config.update({"read_loop_sec": "20"}), "invalid_value"),
+    ],
+)
+def test_load_and_validate_paths_agree_on_rejections(tmp_path, mutate, code):
+    """Startup and write-config must reject the same candidates the same way."""
+    config = _base_config()
+    mutate(config)
+
+    with pytest.raises(ConfigError) as load_err:
+        load_config(_write(tmp_path, config))
+    with pytest.raises(ConfigError) as validate_err:
+        validate_config(config)
+
+    assert load_err.value.code == validate_err.value.code == code
+    assert str(load_err.value) == str(validate_err.value)
+
+
+def test_validate_config_rejects_non_dict():
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config([1, 2, 3])
+    assert excinfo.value.code == "invalid_value"
+
+
+def test_load_config_file_errors_carry_unreadable_code(tmp_path):
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(str(tmp_path / "does-not-exist.json"))
+    assert excinfo.value.code == "unreadable_file"

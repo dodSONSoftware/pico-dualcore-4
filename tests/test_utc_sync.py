@@ -76,6 +76,7 @@ _install_mocks()
 
 import core0 as core0_module  # noqa: E402
 from config import split_config  # noqa: E402
+from config_manager import ConfigManager  # noqa: E402
 from version import MESSAGE_SCHEMA_VERSION  # noqa: E402
 
 _MQTT_INSTANCE = _MQTT_MOCK.Mqtt.return_value
@@ -127,6 +128,7 @@ def make_core0():
             "test-runtime",
             0,
             MagicMock(),
+                    ConfigManager("config.json"),
         )
 
     return _make

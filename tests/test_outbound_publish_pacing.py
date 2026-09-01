@@ -99,6 +99,7 @@ def _install_mocks():
 # time (see tests/test_core0_recovery.py for the rationale); they are
 # installed inside the fixture, which also imports/reloads core0 under them.
 from config import split_config  # noqa: E402
+from config_manager import ConfigManager  # noqa: E402
 from intercore import (  # noqa: E402
     InterCore,
     KIND_TELEMETRY,
@@ -242,6 +243,7 @@ def make_core0():
             "test-runtime",
             0,
             FakeLed(),
+                    ConfigManager("config.json"),
         )
         instance._wifi = FakeWifi()
         instance._mqtt = FakeMqtt(instance)

@@ -192,12 +192,14 @@ def test_config_rejection_stays_visible(host_boot, monkeypatch):
 
     Config loading is deterministic validation, outside the boundary: the exception escapes to the operator instead of becoming a reboot loop."""
     machine, main_mod = host_boot
-    import config
+    import config_manager
 
     def _reject(path):
         raise ValueError("unknown top-level key: 'bogus'")
 
-    monkeypatch.setattr(config, "load_config", _reject)
+    # Startup now loads the config through the configuration manager's
+    # recovery path: patch the symbol that path actually calls.
+    monkeypatch.setattr(config_manager, "load_config", _reject)
 
     with pytest.raises(ValueError):
         main_mod.main()

@@ -142,7 +142,7 @@ See `hardware.py` for implementation details.
 4. Once an object is transferred into an inter-core lane it becomes immutable. Neither producer nor consumer may mutate it.
 5. Live subsystem objects never cross cores.
 
-## Three lanes
+## Inter-core lanes
 
 ### 1. `outbound_queue`
 
@@ -231,24 +231,89 @@ Admission is heap-governed under one shared heap-admission lock (the heap is glo
 
 Core 0 -> Core 1. Contains private discrete commands/events. `get-details` is
 owned by Core 1 because the authoritative `SystemInformation` instance and
-device-manager state live there. The command requires an empty payload and
+device-manager state live there: Core 0 validates the command at the protocol
+boundary and dispatches a validated bounded event, and Core 1 executes it and
 returns a current snapshot containing every entry in
-`SYSTEM_INFORMATION_SECTIONS` as `command_response.payload.data`.
+`SYSTEM_INFORMATION_SECTIONS` as `command_response.payload.data` — unrestricted
+by the configured scheduled `system-information` device `include` list. The
+command requires an empty payload (any key is an unknown field, named sorted,
+at the Core 0 boundary — the same contract as `reboot`).
 
 - FIFO and heap-governed: the same global free-heap reserve and shared heap-admission lock as the outbound queue, but with NO eviction — an admitted event is a discrete control operation and is never displaced by a newer one. Under memory pressure the new event is rejected and the caller reports the `intercore_event_queue_memory_pressure` failure.
 - Every admitted event matters.
 - Entries are never automatically published to MQTT.
 - Reboot never enters this lane; Core 0 owns reboot completely.
+- Only supported Core 1-owned commands (currently `get-details`) are dispatched. Core 1 no longer acts as the generic fallback for arbitrary command names: a command outside the supported registry is answered by Core 0 and never crosses to Core 1 (see Supported-command registry).
 
-#### Duplicate command suppression
+#### Global inbound message-schema gate
 
-Core 0 owns duplicate command suppression at command ingress — before schema and payload validation, reboot handling, and event admission — so it covers Core 0 commands (reboot) and Core 1 commands (get-details) alike. Core 1 performs no deduplication.
+Every decoded inbound MQTT object — not only commands — passes one global gate immediately after decoding and the dictionary check: `message_schema_version` must be exactly `MESSAGE_SCHEMA_VERSION` (currently 3). A missing, wrong-typed, older, or newer version is ignored for the whole message:
 
-- `command_id` is the idempotency key: exact, case-sensitive, and opaque (never normalized). The command name, payload, and target casing are irrelevant to the check; a sender that wants a new logical command generates a new ID.
-- The device retains the 16 most recently accepted command IDs (`core0._RECENT_COMMAND_ID_CAPACITY`) in a fixed-size FIFO in RAM. A command whose ID is still retained is silently ignored — no execution, no event admission, no response, and no change to a pending reboot. This is duplicate suppression, not response replay: no prior response is retained or resent when a duplicate arrives.
-- The first accepted use of an ID owns it until eviction; a duplicate receipt does not refresh its position (the cache holds the last accepted distinct IDs, not an LRU access order). An ID evicted by 16 newer distinct IDs may be processed again.
-- A non-matching target is dropped before the identity check, so it never consumes an entry in this device's cache; an invalid `command` or `command_id` keeps its existing early return and creates no entry.
+- no response is sent — the firmware does not attempt to interpret a wire protocol version it does not support (there is no `invalid_message_schema_version` answer);
+- no command ID enters the debounce cache;
+- no UTC/request state is altered;
+- no message-type or topic-specific processing continues — inbound `info_response` is included.
+
+#### Command validation order
+
+A command is validated in one fixed staged order, and each failure point has one bounded outcome:
+
+1. the global gate above, then the command topic, then `message_type == "command"`;
+2. **target** — a non-empty string of at most 128 characters (`command_protocol.MAX_TARGET_LENGTH`) that matches this device: the configured `source` (case-insensitive), the current IP address (the same case-insensitive string comparison), or the `*` broadcast. Another device's command is ignored silently and consumes no cache entry;
+3. **command_id** — a non-empty string of at most 128 characters (`command_protocol.MAX_COMMAND_ID_LENGTH`). A missing / non-string / empty / over-long ID is dropped silently — a standard response requires a bounded `command_id` — and is never cached;
+4. **debounce** — a `command_id` already claimed in this runtime is ignored silently; otherwise the ID is claimed **before** deeper validation, so a malformed duplicate cannot generate a second validation response;
+5. **envelope** — any top-level key outside the six v3 command fields (`command_protocol.COMMAND_ENVELOPE_KEYS`) is unknown: all of them are named in one **sorted** `unknown_fields` array (`error.code: "unknown_fields"`). A `command` that is not a non-empty string is `invalid_command` (never echoed); a missing `payload` is `invalid_payload`;
+6. **command name bound** — longer than 32 characters (`command_protocol.MAX_COMMAND_LENGTH`) is a bounded `invalid_command` answer; the over-long name is not echoed into the response (not even partially). A `payload` that is not an object is `invalid_payload`;
+7. **registry** — a bounded name outside the supported set is `unsupported_command`, with the actual name preserved in the standard `payload.command` field (not duplicated inside `error`);
+8. **broadcast policy** — `write-config` for `*` is ignored silently (no configuration validation, no filesystem operation, no response); the claimed ID remains cached;
+9. **dispatch** — the command's own contract: `reboot` / `get-details` with the exactly-`{}` payload, `read-config` with `{}`, and `write-config` with the exactly-`{"config": <complete candidate configuration>}` payload (see Configuration management).
+
+#### Supported-command registry
+
+Core 0 owns the command protocol boundary and the set of commands this device answers. The registry lives in `command_protocol.py` (the constants and pure validation helpers both cores share): `CORE0_OWNED_COMMANDS` / `CORE1_OWNED_COMMANDS` / `SUPPORTED_COMMANDS`.
+
+| Command | Owner | Broadcast `*` |
+|---|---|---:|
+| `reboot` | Core 0 (executed on this core; `machine.reset()` is Core 0's) | yes |
+| `get-details` | Core 1 (dispatched as a validated bounded event) | yes |
+| `read-config` | Core 0 / configuration manager (executed on Core 0) | yes |
+| `write-config` | Core 0 / configuration manager (executed on Core 0) | **no** |
+
+- **Only `get-details` crosses.** Core 1 no longer acts as the generic fallback for arbitrary command names: a name outside the registry is answered on Core 0 and never crosses to Core 1. The configuration hot-reload handshake is internal control traffic, not an external command.
+- **Dispatched event is validated and bounded.** Core 0 sends Core 1 only `{command_id, command, payload, targeted}` where `payload` is the validated empty `{}` — the raw (possibly non-empty) request payload never crosses. Core 1 trusts the payload is `{}` and no longer re-checks it.
+- **Shared empty-payload contract.** Both `reboot` and `get-details` require an exactly-`{}` payload. Any key is unknown for the command, so a non-empty object is answered with `error.code: "unknown_fields"` carrying every offending key in a **sorted** `unknown_fields` array (the missing / non-object cases are the common contract and still get a bounded `invalid_payload`). A `get-details` with a non-empty payload no longer reaches Core 1 — Core 0 answers it before dispatch.
+- **String bounds are enforced at the protocol boundary** (independent of, and additional to, the overall per-message MQTT size ceiling): `command_id` ≤ 128 characters, `command` ≤ 32, `target` ≤ 128, all non-empty when required. A command response carries the identifying `command` field only while it is bounded and valid — the over-long-name error is bounded and never reproduces the string, so a single command can never build an oversized error substitute and stall the channel.
+
+#### Command-ID debounce cache
+
+Core 0 owns duplicate-command debouncing at command ingress — after the global gate, topic/`message_type`, target, and bounded-`command_id` checks, and before envelope, registry, payload, reboot, and event-admission validation — so it covers Core 0 commands (reboot) and Core 1 commands (get-details) alike. Core 1 performs no debouncing.
+
+The cache is a **short-lived debounce mechanism**, not durable idempotency or exactly-once execution: it stops repeated copies of the same message (broker redelivery, sender retry) from generating repeated validation responses and repeated executions.
+
+- `command_id` is the debounce key: exact, case-sensitive, and opaque (never normalized). The command name, payload, and target casing are irrelevant to the check; a sender that wants a new logical command generates a new ID.
+- The device retains the 16 most recently claimed command IDs (`core0._RECENT_COMMAND_ID_CAPACITY`) in a fixed-size FIFO in RAM. A command whose ID is still retained is silently ignored — no execution, no event admission, no response, and no change to a pending reboot. This is debouncing, not response replay: no prior response is retained or resent when a duplicate arrives.
+- The first bounded use of an ID claims it **before deeper validation** — a malformed command still claims its ID, and repeated copies of the same malformed message cannot generate repeated validation responses. A duplicate receipt does not refresh its position (the cache holds the last claimed distinct IDs, not an LRU access order). An ID evicted by 16 newer distinct IDs may be processed again.
+- Never claimed: messages failing the global version gate, traffic for another target, and missing / non-string / empty / over-long `command_id`s.
 - The cache is RAM-only: reboot clears it, and it is never persisted to flash. A suppressed ID emits a DEBUG-only diagnostic, not a production warning.
+
+#### Reboot command
+
+`reboot` is the one command Core 0 executes itself: it never crosses to Core 1, and `machine.reset()` is Core 0's. It is validated on the same ingress path as every other command — the shared protocol checks (message type, schema version, case-insensitive target, command/command_id identity, command-ID debounce, and the payload-is-an-object requirement) run first — and then the command's own contract is applied in `core0._handle_reboot_command`.
+
+- **Target** — the configured `source` (case-insensitive), the device's current IP address (case-insensitive string comparison), or `*`, like every command except `write-config`. A `*` command is handled non-targeted; a named/IP target is handled targeted.
+- **Payload** — exactly `{}`. Any key is unknown for this command, so a non-empty object is answered with `error.code: "unknown_fields"` carrying the offending keys in a sorted `unknown_fields` array. A missing payload, or one that is not an object, is the common contract and is answered with a bounded `error.code: "invalid_payload"` (rejected before the command-specific check).
+- **Single pending reboot** — one accepted request arms a pending reboot. A *distinct* valid request arriving while one is already pending is answered with `error.code: "reboot_already_pending"` and does not replace the pending one. A duplicate `command_id` never reaches this check — debounce suppresses it first.
+- **Execution** — the success acknowledgement (`success: true`, `data: { "rebooting": true }`) is published first, under the existing pacing and retry semantics (a failed publish or a permanent serialization failure holds the reboot pending rather than resetting without an answer); only once the response is out does Core 0 wait the existing 5-second grace period and call `machine.reset()`.
+- **Configuration** — there is no persistent `needs_reboot` flag or file. A reboot that follows a `reboot_required` configuration change needs no special branch: the reset clears the RAM-only debounce cache and any in-memory configuration snapshot, and startup reloads the authoritative persisted `config.json` with `reboot_required == false`.
+
+#### get-details command
+
+`get-details` is the one supported command Core 0 dispatches to Core 1 (rather than executing itself), because the authoritative `SystemInformation` instance and device-manager state live on Core 1. It is validated on the same ingress path as `reboot` — the shared protocol checks (message type, schema version, case-insensitive target, command/command_id identity, command-ID debounce, the length bounds, and the payload-is-an-object requirement) run first — and then the command's own contract is applied in `core0._handle_get_details_command`, which dispatches the validated bounded event.
+
+- **Target** — the configured `source` (case-insensitive), the device's current IP address (case-insensitive string comparison), or `*`, like every command except `write-config`. A `*` command is dispatched non-targeted; a named/IP target is dispatched targeted.
+- **Payload** — exactly `{}`, the shared empty-payload contract. Any key is unknown for this command, so a non-empty object is answered (on Core 0, before dispatch) with `error.code: "unknown_fields"` carrying the offending keys in a sorted `unknown_fields` array. No filtering/options (`include`, `sections`, `compact`) are supported — YAGNI. A missing payload, or one that is not an object, is the common contract and is answered with a bounded `error.code: "invalid_payload"`.
+- **Dispatch** — a `{}` payload dispatches `{command_id, command: "get-details", payload: {}, targeted}` to the event queue. If admission fails (heap pressure) Core 0 answers with `error.code: "intercore_event_queue_memory_pressure"`.
+- **Execution** — Core 1 executes the event and returns the full system-information snapshot (every `SYSTEM_INFORMATION_SECTIONS` entry) as `command_response.payload.data`, **unrestricted by the configured scheduled `system-information` device `include` list** (that list limits scheduled telemetry reads only). If Core 1 cannot provide the snapshot it reports the existing `error.code: "system_information_unavailable"`. The response-size handling (Core 1's `response_too_large` / `response_invalid` substitution) is preserved, and the command/ID length bounds guarantee the identifying fields themselves cannot make the substitute oversized.
 
 ### 3. `state_mailboxes`
 
@@ -260,6 +325,15 @@ Core 0 -> Core 1 latest-value state.
 - `core_1_activity_ms`: Timestamp of last Core 1 activity report (in milliseconds) — written by Core 1, read by Core 1 for health reporting and by Core 0 as the input to the liveness watchdog
 
 State is replaced, not accumulated. Core 1 keeps the latest immutable snapshot until Core 0 replaces it.
+
+### 4. `config_update_lane`
+
+Core 0 -> Core 1 -> Core 0 latest-value request/result, for the HOT_RELOADED configuration apply (see Configuration management). Internal runtime control, not a user command, and never mixed with the `event_queue`.
+
+- `request`: `{generation, read_loop_sec?, health_interval_sec?}` — only the changed Core 1-owned HOT keys, plus a monotonic `generation` so a stale result can never be read as the current one.
+- `result`: `{generation, success, code?}` — exactly one per request; `success: true`, or a bounded failure descriptor (e.g. `code: core1_apply_failed`).
+- Latest-value mailboxes (state replaces, not queues), `allocate_lock`-guarded like `state_mailboxes` — no heap admission and no busy-spin on unlocked shared state.
+- One transaction in flight at a time (Core 0 enforces it via the config manager's `transaction_active`), so the pending request and its held response are unambiguous.
 
 ## Core 0 baseline
 
@@ -500,13 +574,37 @@ Core 0 is the only UTC acquirer. Requests are published to `mqtt_topic_info_requ
 - **Timeout and retry**: a pending request whose deadline passed is discarded, and re-requests are throttled to at most one per 30 seconds until a valid response arrives. An unresponsive time server therefore cannot stall the run loop or flood the broker. A malformed-but-reachable answer gets a much shorter backoff (~0.5s) since the server demonstrably answered us.
 - **Response validation**: a response is accepted only if it matches the current schema version, is targeted at this device, carries the matching `request_id`, and contains a valid `timestamp` and positive integer `utc_epoch_ms`. A malformed answer to *our own* pending request clears that request and re-keys the retry throttle to a short ~0.5s backoff (instead of the full 30s measured from the original send); a response for any other request id is ignored without disturbing pending state (our response may still be in flight).
 
+## Configuration management
+
+`config.py` is the single source of truth for configuration **schema validation** (required/unknown keys, value checks, device-list structure) and per-core splitting; `validate_config(config)` is its pure, I/O-free validation path, shared by startup (`load_config()`) and the `write-config` command. `ConfigError` carries a stable machine-readable `code` (`unknown_config_fields`, `missing_key`, `invalid_value`, `invalid_config_schema_version`, `unsupported_device_type`, `unreadable_file`), and where applicable a sorted `unknown_fields` list (top-level keys, device-entry keys qualified as `devices[<id>].<key>`, and device-config keys qualified as `devices[<id>].config.<key>`) or a flat `details` map (e.g. the expected/received `config_schema_version`); `str(err)` remains the human-readable message.
+
+### Whole-device configuration validation
+
+A candidate device is one atomic configuration unit identified by `id`: completely valid and accepted for the next boot, or invalid and rejected. No field-level device patches. `write-config` and startup must reject an invalid device definition **before persistence**, without touching hardware.
+
+- **Registry + pure entry point** (`device_factory.py`): each supported `device_type` maps to a **pure config validator** and its **allowed config keys**. `validate_device_definition()` is the pure per-device validator — generic definition shape, unknown definition fields, supported `device_type`, then dispatch to the type's pure validator. It **never constructs or initializes a hardware resource**: a valid definition with no physical backing passes, leaving physical absence to the boot-time `initialization_failed` outcome (an operational device failure, not a schema failure).
+- **Pure device validator** (`devices/system_information/validation.py`, host-importable / no `machine`): the authoritative `system-information` rules — `include` is a non-empty list of unique strings drawn from `SYSTEM_INFORMATION_SECTIONS`, and **unknown config keys are rejected**. `SYSTEM_INFORMATION_SECTIONS` now lives here; `system_information.py` and the driver read it from there. `SystemInformationDevice.initialize()` calls the same pure validator, so startup and write-time share one rule set.
+- **Exception** (`devices.device.DeviceValidationError`, a `ValueError` with a stable `code`): the pure-validation failure type; `config.py` maps it onto `ConfigError` (preserving `code`). Because it is a `ValueError`, the device manager's per-device retry path still records it as `initialization_failed` if it ever reaches runtime.
+- **Boot semantics unchanged**: each device initializes independently; one failure does not invalidate the others; tolerant startup and the existing retry/reinit behavior continue. Any `devices` change is `REBOOT_REQUIRED` (no live `DeviceManager` mutation from `write-config`).
+
+`config_manager.py` (Core 0-owned; the manager is passed to `Core0` and **never shared with Core 1**) owns configuration **persistence and change policy**:
+
+- **PERSISTED vs ACTIVE**: `config.json` is the committed configuration — always "what the next reboot will load" — and is what `read-config` returns. ACTIVE is what the running firmware uses. `reboot_required` is **derived** from a compact serialized ACTIVE snapshot (`snapshot exists <=> ACTIVE differs from PERSISTED`); it is never a sticky flag, and a reboot clears it by clearing RAM (no persistent flag). The manager retains no second permanent full config object in the normal state (the snapshot is a serialized string, deserialized only for a classification comparison).
+- **Change policy table** (`config_manager._CHANGE_POLICY`, the single source of truth for classification): every required key except the `config_schema_version` invariant is exactly `HOT_RELOADED` or `REBOOT_REQUIRED`. HOT: `read_loop_sec`, `health_interval_sec`, `datetime_sync_interval_min`, `network_snapshot_interval_sec`, `network_probe_timeout_sec`, `mqtt_command_poll_ms`, `mqtt_outbound_publish_delay_ms`. REBOOT: `source`, `device_initialization_attempts`, `device_initialization_retry_delay_ms`, `device_read_failure_threshold`, `mqtt_broker_ip_address`, `mqtt_keepalive_sec`, `mqtt_broker_response_timeout_sec`, all eight `mqtt_topic_*`, `wifi_reconnect_delays_sec`, `mqtt_reconnect_delays_sec`, `devices`. A test asserts the table covers exactly `_REQUIRED_KEYS - {config_schema_version}`.
+- **Classification**: a candidate semantically equal to PERSISTED is `UNCHANGED` (no filesystem write, reboot state preserved); otherwise it is compared against ACTIVE (PERSISTED, or the deserialized snapshot when one exists) — any difference under reboot policy is `REBOOT_REQUIRED`, else `HOT_RELOADED`. The response `changes` summary describes **this** write: PERSISTED-before vs candidate, deterministically sorted, scalar `original_value`/`new_value` pairs, and compact whole-device entries for `devices` (`change_type` `ADDED`/`REMOVED`/`MODIFIED` with `device_id` and `device_type`; a difference no id accounts for — a list-order change — is one bounded list-level `MODIFIED` entry, never the arrays).
+- **File roles**: `config.json` committed; `config.json.tmp` fully-written uncommitted candidate; `config.json.old` previous committed config retained only while a HOT transaction awaits runtime application. Steady state after any successful boot/transaction is exactly `config.json`.
+- **Write transaction** (one at a time; a second write while one is pending is refused): `validate_config(candidate)` → load/validate PERSISTED → classify → (first reboot transition only) serialize the ACTIVE snapshot **before** any file change → write `.tmp`, close, `os.sync()` → **read `.tmp` back and re-validate** (a corrupted write aborts before promotion) → `config.json`→`.old`, `.tmp`→`config.json`, `os.sync()`. REBOOT deletes `.old` and is complete. HOT keeps `.old` until Core 0 reports the runtime application outcome: **commit** (discard any pending snapshot, delete `.old`, sync) or **rollback** (`.old`→`config.json`, sync; the pre-transaction snapshot state is restored — `begin_write` only ever *creates* a snapshot, for REBOOT). A cancelling HOT write (candidate becomes ACTIVE without reboot) discards the pending reboot on commit. `MemoryError` propagates to the fail-fast boundary, never converted into an ordinary failure.
+- **Boot recovery** (`ConfigManager.recover()`, run in `main.py` before `split_config`): a valid `config.json` is authoritative (stale `.old`/`.tmp` removed **after** that decision); else a valid `.old` is restored over the invalid current config; else a valid `.tmp` is promoted; else startup fails with `ConfigError`. Artifacts are never deleted before the recovery decision.
+- **Commands**: `read-config` (payload exactly `{}`) answers `data: {config, reboot_required}` — the committed configuration, no Wi-Fi secrets. `write-config` (payload exactly `{"config": <complete candidate configuration>}` — unknown payload keys are named together as `unknown_fields`; no patch/merge/partial-update shape; `*` broadcast silently ignored) answers `data: {configuration_changed, classification, reboot_required, changes}` on success, or a bounded error carrying the `ConfigError` code (plus sorted `unknown_fields` when the cause is unknown keys, or the expected/received schema version when it mismatches). A `REBOOT_REQUIRED` answer is published on the currently active source/MQTT session — the candidate's reboot-only networking values are not live until the caller issues `reboot` (write-config never reboots by itself).
+- **HOT_RELOADED application** (Core 0 orchestrates; the manager never touches subsystems): one logical transaction across both cores, single-flight. Core 0 updates its five live HOT settings in its own config dict (`mqtt_command_poll_ms` is read per run-loop pass so it applies immediately; when it changes, the last-poll stamp is re-anchored to the reload instant so the new cadence starts cleanly) and posts one **config-update request** on the dedicated `config_update_lane` (`{generation, read_loop_sec?, health_interval_sec?}` — only the changed Core 1 keys) — internal control traffic, not an external command, and never on the user-command event queue. Core 1 takes the request, **re-anchors** each changed interval from the reload instant (`next = now + interval` — a new scheduling boundary, deliberately not re-gridded to the boot anchor; no catch-up sample for a shortened interval), refreshes its own `config` copy (so the health activity threshold, which reads `read_loop_sec`, uses the new value), and posts exactly one result for that generation. Core 0 holds the response and the file commit until it reads the result in the run loop: **success** → commit (release the retained `.old`) and send the success response; **failure** → restore the applied Core 0 values, roll the file back (`.old`→`config.json`), and answer the bounded `error.code` Core 1 posted (default `core1_apply_failed`). A dead Core 1 never acks, but that is bounded by the existing liveness watchdog (board reset; boot recovery restores the retained `.old`), so no unbounded wait and no success response before the runtime update is complete.
+
 ## Features intentionally not carried into the baseline
 
 These should be added individually only after the baseline passes:
 
 - advanced reboot-delivery state machines;
 - advanced network recovery generations/state machines;
-- dynamic configuration;
+- full dynamic configuration (the read-config/write-config subset with the policy-table hot reload is present since 0.4.43);
 - advanced watchdog/cross-core recovery (the minimal Core 0 stale-heartbeat reset is present since 0.4.9);
 - additional Core 1 commands;
 - physical sensors.

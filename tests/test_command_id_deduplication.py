@@ -73,6 +73,7 @@ def _install_mocks():
 # collection, and mocked entries in sys.modules would shadow them. They are
 # installed inside the fixture below, which also imports/reloads core0 there.
 from config import split_config  # noqa: E402
+from config_manager import ConfigManager  # noqa: E402
 from version import MESSAGE_SCHEMA_VERSION  # noqa: E402
 
 
@@ -133,6 +134,7 @@ def make_core0():
             "test-runtime",
             0,
             MagicMock(),
+                    ConfigManager("config.json"),
         )
         instance._wifi = FakeWifi()
         instance._mqtt = MagicMock()
@@ -191,8 +193,21 @@ def test_distinct_command_ids_are_all_accepted(make_core0):
     ]
 
 
+def test_command_ids_are_case_sensitive(make_core0):
+    """Command IDs differ by case: "Cmd-01" and "cmd-01" are distinct IDs,
+    so neither debounces the other (matching and caching are exact-string)."""
+    core0 = make_core0()
+
+    _send(core0, _command("Test-Pico-2", "Cmd-Case-01"))
+    _send(core0, _command("Test-Pico-2", "cmd-case-01"))
+
+    events = core0._intercore.event_queue.events
+    assert [event["command_id"] for event in events] == ["Cmd-Case-01", "cmd-case-01"]
+    assert core0._recent_command_ids == ["Cmd-Case-01", "cmd-case-01"]
+
+
 def test_same_id_with_different_payload_is_still_duplicate(make_core0):
-    """command_id is the idempotency key; the payload is not part of it."""
+    """command_id is the debounce key; the payload is not part of it."""
     core0 = make_core0()
 
     _send(core0, _command("Test-Pico-2", "dup-payload", payload={}))
@@ -308,8 +323,9 @@ def test_duplicate_receipt_does_not_refresh_fifo_position(make_core0):
 
 
 def test_invalid_command_identity_does_not_enter_cache(make_core0):
-    """Commands that fail identity validation keep their early-return behavior
-    and create no recent-ID entries."""
+    """A command_id that is missing, empty, or over-long is dropped before the
+    debounce stage: no response (a standard response requires a bounded ID)
+    and no cache entry."""
     core0 = make_core0()
 
     missing = _command("Test-Pico-2", "n/a")
@@ -318,9 +334,8 @@ def test_invalid_command_identity_does_not_enter_cache(make_core0):
 
     _send(core0, _command("Test-Pico-2", ""))
 
-    non_string = _command("Test-Pico-2", "n/a")
-    non_string["command"] = 42
-    core0._on_mqtt_message(core0._config["mqtt_topic_command"], json.dumps(non_string))
+    import command_protocol
+    _send(core0, _command("Test-Pico-2", "y" * (command_protocol.MAX_COMMAND_ID_LENGTH + 1)))
 
     assert core0._recent_command_ids == []
     assert core0._intercore.event_queue.events == []
@@ -329,6 +344,26 @@ def test_invalid_command_identity_does_not_enter_cache(make_core0):
     # The device keeps accepting normally-sized traffic afterwards.
     _send(core0, _command("Test-Pico-2", "fresh-id"))
     assert len(core0._intercore.event_queue.events) == 1
+
+
+def test_invalid_command_claims_its_bounded_id(make_core0):
+    """A bounded command_id claims a debounce entry BEFORE deeper validation:
+    a malformed command (non-string) is answered with a bounded error once,
+    and the first response is owed by the claimed ID."""
+    core0 = make_core0()
+
+    non_string = _command("Test-Pico-2", "n/a")
+    non_string["command"] = 42
+    core0._on_mqtt_message(core0._config["mqtt_topic_command"], json.dumps(non_string))
+
+    assert core0._recent_command_ids == ["n/a"]
+    assert core0._intercore.event_queue.events == []
+    response = core0._pending_core0_responses[-1]
+    assert response["command_id"] == "n/a"
+    assert response["success"] is False
+    assert response["error"]["code"] == "invalid_command"
+    # The non-string name is never echoed into the response.
+    assert "command" not in response
 
 
 # --- Target matching --------------------------------------------------------

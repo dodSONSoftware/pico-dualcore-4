@@ -442,10 +442,60 @@ class StateMailboxes:
             return self._utc_snapshot
 
 
-class InterCore:
-    """Container exposing the three explicit communication lanes.
+class ConfigUpdateLane:
+    """A narrow request/result lane for the HOT_RELOADED configuration apply.
 
-    The two FIFO lanes are heap-governed by the same global free-heap reserve, serialized on one shared heap-admission lock (the heap is global to both cores)."""
+    This is internal runtime control, not an external command: Core 0 posts a
+    request carrying the Core 1-owned hot subset (only the keys that changed,
+    plus a monotonic ``generation``), and Core 1 posts exactly one result for
+    that generation (success, or a bounded failure descriptor). Latest-value
+    mailboxes -- state replaces rather than queues -- under the same
+    allocate_lock discipline as StateMailboxes, so a reader never spins on
+    unlocked shared state. One transaction is in flight at a time (Core 0
+    enforces it), and the generation keeps a stale result from being mistaken
+    for the current one."""
+
+    def __init__(self):
+        self._lock = _thread.allocate_lock()
+        self._request = None
+        self._result = None
+
+    def post_request(self, request):
+        if not isinstance(request, dict):
+            raise ValueError("config update request must be a dictionary")
+        with self._lock:
+            self._request = request
+
+    def take_request(self):
+        """The pending request (cleared on read), or None when none is pending."""
+        with self._lock:
+            request = self._request
+            self._request = None
+            return request
+
+    def post_result(self, result):
+        if not isinstance(result, dict):
+            raise ValueError("config update result must be a dictionary")
+        with self._lock:
+            self._result = result
+
+    def take_result_for(self, generation):
+        """The result posted for this generation (cleared on a match), else None.
+
+        A result for a different generation is left in place for its owner; a
+        match is consumed so it is read exactly once."""
+        with self._lock:
+            result = self._result
+            if result is not None and result.get("generation") == generation:
+                self._result = None
+                return result
+            return None
+
+
+class InterCore:
+    """Container exposing the explicit inter-core communication lanes.
+
+    The two FIFO lanes are heap-governed by the same global free-heap reserve, serialized on one shared heap-admission lock (the heap is global to both cores); the latest-value lanes (state snapshots, config-update request/result) are plain allocate_lock-guarded mailboxes."""
 
     def __init__(self, minimum_free_heap_bytes):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
@@ -458,3 +508,4 @@ class InterCore:
             minimum_free_heap_bytes, self._heap_admission_lock
         )
         self.state_mailboxes = StateMailboxes()
+        self.config_update_lane = ConfigUpdateLane()

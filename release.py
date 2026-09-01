@@ -16,7 +16,9 @@ REQUIRED_FILES = {
     "main.py",
     "core0.py",
     "core1.py",
+    "command_protocol.py",
     "config.py",
+    "config_manager.py",
     "intercore.py",
     "message_protocol.py",
     "message_serializer.py",
@@ -38,6 +40,7 @@ REQUIRED_PACKAGES = {
     "devices/__init__.py",
     "devices/device.py",
     "devices/system_information/__init__.py",
+    "devices/system_information/validation.py",
     "devices/system_information/system_information_device.py",
 }
 

@@ -4,11 +4,31 @@
 
 import json
 
+from device_factory import (
+    DEVICE_DEFINITION_KEYS,
+    allowed_config_keys,
+    validate_device_definition,
+)
+from devices.device import DeviceValidationError
 from version import CONFIG_SCHEMA_VERSION
 
 
 class ConfigError(Exception):
-    pass
+    """Configuration load/validation failure with a stable machine-readable code.
+
+    ``str(err)`` remains the full human-readable message (startup prints and
+    command response both read it); ``code`` and ``unknown_fields`` let the
+    command handler respond with a stable cause rather than parsing the
+    message; ``details`` is a small flat key/value map for error-specific
+    structured fields (for example, expected/received schema versions) that
+    the command handler merges as-is into the error object. ``code`` becomes
+    None only for errors raised outside this module."""
+
+    def __init__(self, message, code=None, unknown_fields=None, details=None):
+        super().__init__(message)
+        self.code = code
+        self.unknown_fields = unknown_fields
+        self.details = details
 
 
 class WifiConfigError(Exception):
@@ -47,6 +67,40 @@ _REQUIRED_KEYS = (
 _ALLOWED_KEYS = frozenset(_REQUIRED_KEYS)
 
 
+def _unknown_config_paths(config):
+    """All unknown configuration paths, sorted: top-level keys, device-definition keys, and (for a supported type) device-config keys, each qualified by device id.
+
+    ``devices[<id>].<key>`` (the index when the entry has no usable id) so a
+    caller knows exactly where each unknown field sits; device-config keys
+    are qualified ``devices[<id>].config.<key>``. The scan runs before any
+    other check, so every unknown field is reported together in one sorted
+    array rather than one at a time."""
+    unknown = set(config.keys()) - _ALLOWED_KEYS
+    devices = config.get("devices")
+    if isinstance(devices, list):
+        for index, device in enumerate(devices):
+            if not isinstance(device, dict):
+                continue
+            device_id = device.get("id")
+            qualifier = device_id if isinstance(device_id, str) and device_id else str(index)
+            unknown.update(
+                "devices[{}].{}".format(qualifier, key)
+                for key in set(device.keys()) - DEVICE_DEFINITION_KEYS
+            )
+            # The device config dict is driver-owned; only a supported type has
+            # a known allowed-key set to check its keys against (an unsupported
+            # type is a fail-fast error handled by _validate_devices).
+            device_config = device.get("config")
+            if isinstance(device_config, dict):
+                allowed = allowed_config_keys(device.get("device_type"))
+                if allowed is not None:
+                    unknown.update(
+                        "devices[{}].config.{}".format(qualifier, key)
+                        for key in set(device_config) - allowed
+                    )
+    return sorted(unknown)
+
+
 def _read_json(path, error_type):
     try:
         with open(path, "r") as handle:
@@ -64,84 +118,112 @@ def _read_json(path, error_type):
 def _require_non_empty_string(config, key):
     value = config[key]
     if not isinstance(value, str) or not value:
-        raise ConfigError("{} must be a non-empty string".format(key))
+        raise ConfigError(
+            "{} must be a non-empty string".format(key), code="invalid_value"
+        )
 
 
 def _require_positive_integer(config, key):
     value = config[key]
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ConfigError("{} must be a positive integer".format(key))
+        raise ConfigError(
+            "{} must be a positive integer".format(key), code="invalid_value"
+        )
 
 
 def _require_nonnegative_integer(config, key):
     value = config[key]
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ConfigError("{} must be a non-negative integer".format(key))
+        raise ConfigError(
+            "{} must be a non-negative integer".format(key), code="invalid_value"
+        )
 
 
 def _validate_delays(config, key):
     delays = config[key]
     if not isinstance(delays, list) or not delays:
-        raise ConfigError("{} must be a non-empty list".format(key))
+        raise ConfigError(
+            "{} must be a non-empty list".format(key), code="invalid_value"
+        )
     for index, delay in enumerate(delays):
         if isinstance(delay, bool) or not isinstance(delay, int) or delay < 0:
             raise ConfigError(
-                "{}[{}] must be a non-negative integer".format(key, index)
+                "{}[{}] must be a non-negative integer".format(key, index),
+                code="invalid_value",
             )
 
 
 def _validate_devices(devices):
     if not isinstance(devices, list) or not devices:
-        raise ConfigError("devices must be a non-empty list")
+        raise ConfigError("devices must be a non-empty list", code="invalid_value")
 
     seen_ids = set()
     for index, device in enumerate(devices):
-        prefix = "devices[{}]".format(index)
         if not isinstance(device, dict):
-            raise ConfigError("{} must be an object".format(prefix))
+            raise ConfigError(
+                "devices[{}] must be an object".format(index), code="invalid_value"
+            )
 
-        for key in ("id", "device_type", "config"):
-            if key not in device:
-                raise ConfigError("{} missing required key: {}".format(prefix, key))
+        # Duplicate ids span the whole list (a candidate-level concern), so
+        # they are checked here before the per-device pure validation.
+        device_id = device.get("id")
+        if isinstance(device_id, str) and device_id:
+            if device_id in seen_ids:
+                raise ConfigError(
+                    "Duplicate device id: {}".format(device_id), code="invalid_value"
+                )
+            seen_ids.add(device_id)
 
-        device_id = device["id"]
-        if not isinstance(device_id, str) or not device_id:
-            raise ConfigError("{}.id must be a non-empty string".format(prefix))
-        if device_id in seen_ids:
-            raise ConfigError("Duplicate device id: {}".format(device_id))
-        seen_ids.add(device_id)
-
-        device_type = device["device_type"]
-        if not isinstance(device_type, str) or not device_type:
-            raise ConfigError("{}.device_type must be a non-empty string".format(prefix))
-        if not isinstance(device["config"], dict):
-            raise ConfigError("{}.config must be an object".format(prefix))
-
-        for key in ("name", "sensor_type"):
-            value = device.get(key)
-            if value is not None and not isinstance(value, str):
-                raise ConfigError("{}.{} must be a string".format(prefix, key))
+        # Generic shape, supported device_type, and the device-specific config
+        # are all pure and live in the device registry (device_factory); a
+        # DeviceValidationError maps onto a ConfigError with its stable code.
+        try:
+            validate_device_definition(device)
+        except DeviceValidationError as err:
+            raise ConfigError(str(err), code=err.code) from err
 
 
-def load_config(path="config.json"):
-    config = _read_json(path, ConfigError)
+def validate_config(config):
+    """Pure validation of a complete configuration dict (no filesystem, no hardware).
 
-    unknown = set(config.keys()) - _ALLOWED_KEYS
+    Startup (``load_config``) and the write-config command both run
+    candidates through this single path, so a config the firmware boots from
+    and a config a command may commit are validated by exactly the same
+    rules. Returns the validated dict; raises ``ConfigError`` (with a stable
+    ``code``) on the first violation."""
+    if not isinstance(config, dict):
+        raise ConfigError("Config must be a JSON object", code="invalid_value")
+
+    unknown = _unknown_config_paths(config)
     if unknown:
         raise ConfigError(
-            "Unknown config key(s): {}".format(", ".join(sorted(unknown)))
+            "Configuration contains unknown fields",
+            code="unknown_config_fields",
+            unknown_fields=unknown,
         )
 
     for key in _REQUIRED_KEYS:
         if key not in config:
-            raise ConfigError("Missing required config key: {}".format(key))
+            raise ConfigError(
+                "Missing required config key: {}".format(key), code="missing_key"
+            )
 
     schema_version = config["config_schema_version"]
     if isinstance(schema_version, bool) or not isinstance(schema_version, int):
-        raise ConfigError("config_schema_version must be an integer")
-    if schema_version != CONFIG_SCHEMA_VERSION:
         raise ConfigError(
-            "config_schema_version must be {}".format(CONFIG_SCHEMA_VERSION)
+            "config_schema_version must be an integer", code="invalid_value"
+        )
+    if schema_version != CONFIG_SCHEMA_VERSION:
+        # The schema version is a configuration invariant, not a change
+        # policy: the mismatch is answered with both sides named so the
+        # sender can correct the candidate.
+        raise ConfigError(
+            "Unsupported config_schema_version",
+            code="invalid_config_schema_version",
+            details={
+                "expected": CONFIG_SCHEMA_VERSION,
+                "received": schema_version,
+            },
         )
 
     for key in (
@@ -179,6 +261,16 @@ def load_config(path="config.json"):
     _validate_devices(config["devices"])
 
     return config
+
+
+def load_config(path="config.json"):
+    try:
+        config = _read_json(path, ConfigError)
+    except MemoryError:
+        raise
+    except ConfigError as err:
+        raise ConfigError(str(err), code="unreadable_file") from err
+    return validate_config(config)
 
 
 def load_wifi_config(path="config-secrets.json"):

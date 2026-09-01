@@ -576,15 +576,38 @@ def test_core1_uses_one_shared_normal_runtime_anchor():
     """Structural check: exactly one anchor, captured once from
     time.ticks_ms() before the run loop, and both deadlines initialize
     from it and advance from their own previous deadline.
+
+    The deadlines live in the schedulers holder (schedulers["next_*_ms"]) so
+    a HOT_RELOADED write-config can re-anchor them in place (from the reload
+    instant, in _apply_config_update); this core1_main body only writes the
+    anchor-derived init and the in-loop advances.
     """
     tree = ast.parse((ROOT / "core1.py").read_text())
     func = next(n for n in ast.walk(tree)
                 if isinstance(n, ast.FunctionDef) and n.name == "core1_main")
 
-    def _assignments(name):
+    def _name_assignments(name):
         return [n for n in ast.walk(func)
                 if isinstance(n, ast.Assign)
                 and all(isinstance(t, ast.Name) and t.id == name for t in n.targets)]
+
+    def _holder_assignments(key):
+        return [n for n in ast.walk(func)
+                if isinstance(n, ast.Assign)
+                and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Subscript)
+                and isinstance(n.targets[0].value, ast.Name)
+                and n.targets[0].value.id == "schedulers"
+                and isinstance(n.targets[0].slice, ast.Constant)
+                and n.targets[0].slice.value == key]
+
+    def _holder_refs(node, key):
+        return [s for s in ast.walk(node)
+                if isinstance(s, ast.Subscript)
+                and isinstance(s.value, ast.Name)
+                and s.value.id == "schedulers"
+                and isinstance(s.slice, ast.Constant)
+                and s.slice.value == key]
 
     def _ticks_calls(node):
         return [c for c in ast.walk(node)
@@ -592,7 +615,7 @@ def test_core1_uses_one_shared_normal_runtime_anchor():
                 and c.func.attr == "ticks_ms"]
 
     # The anchor is captured exactly once...
-    anchor_assigns = _assignments("normal_runtime_start_ticks_ms")
+    anchor_assigns = _name_assignments("normal_runtime_start_ticks_ms")
     assert len(anchor_assigns) == 1
     # ...from time.ticks_ms()...
     assert len(_ticks_calls(anchor_assigns[0].value)) == 1
@@ -604,12 +627,13 @@ def test_core1_uses_one_shared_normal_runtime_anchor():
     assert main_loop
     assert anchor_assigns[0].lineno < main_loop.lineno
 
-    # Both schedulers initialize from the shared anchor...
+    # Both schedulers initialize from the shared anchor (the re-grid helper
+    # is called with the anchor)...
     for deadline in ("next_read_ms", "next_health_ms"):
-        inits = [a for a in _assignments(deadline)
+        inits = [a for a in _holder_assignments(deadline)
                  if isinstance(a.value, ast.Call)
-                 and isinstance(a.value.func, ast.Attribute)
-                 and a.value.func.attr == "ticks_add"
+                 and isinstance(a.value.func, ast.Name)
+                 and a.value.func.id == "_regrid_next_boundary"
                  and any(isinstance(x, ast.Name) and x.id == "normal_runtime_start_ticks_ms"
                          for x in a.value.args)]
         assert inits, "{} must initialize from normal_runtime_start_ticks_ms".format(deadline)
@@ -617,7 +641,7 @@ def test_core1_uses_one_shared_normal_runtime_anchor():
     # ...and every deadline assignment (init and in-loop advance) derives
     # from a named value -- never from a fresh time.ticks_ms() sample.
     for deadline in ("next_read_ms", "next_health_ms"):
-        for assign in _assignments(deadline):
+        for assign in _holder_assignments(deadline):
             assert not _ticks_calls(assign.value), \
                 "{} must never derive from a fresh ticks_ms() sample".format(deadline)
 
@@ -625,12 +649,12 @@ def test_core1_uses_one_shared_normal_runtime_anchor():
     # cadence), and neither scheduler reads the other's deadline.
     for deadline in ("next_read_ms", "next_health_ms"):
         other = "next_health_ms" if deadline == "next_read_ms" else "next_read_ms"
-        advances = [a for a in _assignments(deadline)
+        advances = [a for a in _holder_assignments(deadline)
                     if isinstance(a.value, ast.Call)
                     and isinstance(a.value.func, ast.Attribute)
                     and a.value.func.attr == "ticks_add"
-                    and any(isinstance(x, ast.Name) and x.id == deadline for x in a.value.args)]
+                    and _holder_refs(a.value, deadline)]
         assert advances, "{} must advance from its previous deadline".format(deadline)
-        for assign in _assignments(deadline):
-            assert not any(isinstance(x, ast.Name) and x.id == other for x in ast.walk(assign.value)), \
+        for assign in _holder_assignments(deadline):
+            assert not _holder_refs(assign.value, other), \
                 "{} must not derive from {}".format(deadline, other)

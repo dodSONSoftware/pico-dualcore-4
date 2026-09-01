@@ -91,6 +91,52 @@ def test_reinitialize_pending_device_does_not_count_as_active():
     assert snapshot["device_status"][0]["state"] == dm.DEVICE_STATE_REINITIALIZE_PENDING
 
 
+class FailingInitDriver:
+    """Driver whose initialize() always fails."""
+
+    def initialize(self, config):
+        raise RuntimeError("simulated initialization failure")
+
+
+class OkDriver:
+    """Driver whose initialize() succeeds."""
+
+    def initialize(self, config):
+        pass
+
+
+def test_one_failing_device_does_not_stop_the_others():
+    """A failed initialization is isolated to that device: the remaining
+    configured device still initializes, the failure is recorded for the
+    failing device only, and the snapshot shows configured 2 / active 1."""
+    saved = dm.create_device
+    dm.create_device = lambda device_def, system_information: (
+        FailingInitDriver() if device_def["id"] == "dev1" else OkDriver()
+    )
+    try:
+        manager = dm.DeviceManager({
+            "device_initialization_attempts": 1,
+            "device_initialization_retry_delay_ms": 10,
+            "device_read_failure_threshold": 3,
+            "devices": [
+                {"id": "dev1", "device_type": "test", "config": {}},
+                {"id": "dev2", "device_type": "test", "config": {}},
+            ],
+        })
+        initialized, failed, _ = manager.initialize_devices()
+    finally:
+        dm.create_device = saved
+
+    assert initialized == 1
+    assert len(failed) == 1
+    assert failed[0]["device_id"] == "dev1"
+    assert [m.device_id for m in manager.get_active_devices()] == ["dev2"]
+
+    snapshot = manager.get_status_snapshot()
+    assert snapshot["devices"]["configured"] == 2
+    assert snapshot["devices"]["active"] == 1
+
+
 def test_recovered_device_counts_as_active_again():
     manager = _make_manager(read_failure_threshold=1)
     managed = _add_managed_device(manager)

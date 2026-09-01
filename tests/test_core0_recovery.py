@@ -70,6 +70,7 @@ def _install_mocks():
 # makes this module's fakes authoritative at test time, regardless of which
 # test module imported core0 first.
 from config import split_config  # noqa: E402
+from config_manager import ConfigManager  # noqa: E402
 from message_protocol import format_utc_epoch_ms  # noqa: E402
 from version import MESSAGE_SCHEMA_VERSION  # noqa: E402
 
@@ -260,6 +261,7 @@ def make_core0():
             "test-runtime",
             0,
             led,
+                    ConfigManager("config.json"),
         )
         instance._wifi = FakeWifi()
         instance._mqtt = FakeMqtt(instance)

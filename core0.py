@@ -6,6 +6,22 @@ import json
 import machine
 import time
 
+from command_protocol import (
+    BROADCAST_TARGET,
+    COMMAND_ENVELOPE_KEYS,
+    COMMAND_GET_DETAILS,
+    COMMAND_READ_CONFIG,
+    COMMAND_REBOOT,
+    COMMAND_WRITE_CONFIG,
+    MAX_COMMAND_LENGTH,
+    is_bounded_command,
+    is_bounded_command_id,
+    is_bounded_target,
+    is_supported_command,
+    unknown_field_names,
+)
+from config import ConfigError
+from config_manager import CLASSIFICATION_UNCHANGED
 from debug import DEBUG
 from intercore import KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG, KIND_TELEMETRY
 from message_protocol import format_utc_epoch_ms
@@ -23,15 +39,17 @@ _UTC_STARTUP_MAX_ATTEMPTS = 3
 _UTC_RETRY_INTERVAL_MS = 30000
 _UTC_PROMPT_RETRY_DELAY_MS = 500
 
-# Duplicate-command suppression: the number of recent accepted command IDs
-# Core 0 retains. command_id is the idempotency key -- a command is a one-shot
-# request for the lifetime of its cache entry, and a repeated command_id is
-# ignored (no execution, no event, no response) until it evicts. Fixed count,
-# FIFO eviction, RAM-only (cleared on reboot): a tiny amount of bounded
-# control metadata, deliberately not heap-governed. The first accepted use of
-# an ID owns it; a duplicate receipt does not refresh its position (the cache
-# holds the last accepted distinct IDs, not an LRU access order). Static
-# constant; not a config key.
+# Command-ID debounce cache: the number of recent command IDs Core 0
+# retains. The cache is a short-lived debounce mechanism, not durable
+# idempotency or exactly-once execution: it stops repeated copies of the same
+# message (broker redelivery, sender retry) from generating repeated
+# validation responses and repeated executions. A repeated command_id is
+# silently ignored (no execution, no event, no response) until it evicts.
+# Fixed count, FIFO eviction, RAM-only (cleared on reboot): a tiny amount of
+# bounded control metadata, deliberately not heap-governed. The first bounded
+# use of an ID claims it; a duplicate receipt does not refresh its position
+# (the cache holds the last claimed distinct IDs, not an LRU access order).
+# Static constant; not a config key.
 _RECENT_COMMAND_ID_CAPACITY = 16
 
 # Core 0 watchdog timeout for the Core 1 liveness heartbeat. Core 1 refreshes
@@ -43,12 +61,34 @@ _RECENT_COMMAND_ID_CAPACITY = 16
 # quietly stopping. Static constant; not a config key.
 _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS = 30000
 
+# HOT_RELOADED settings Core 0 applies to its own live configuration when a
+# write-config transaction is about to commit. The two Core 1-owned HOT
+# settings (read_loop_sec / health_interval_sec) are not in Core 0's split
+# config; they cross to Core 1 as an internal config-update event.
+_HOT_APPLY_CORE0_KEYS = (
+    "datetime_sync_interval_min",
+    "mqtt_command_poll_ms",
+    "mqtt_outbound_publish_delay_ms",
+    "network_probe_timeout_sec",
+    "network_snapshot_interval_sec",
+)
+_HOT_APPLY_CORE1_KEYS = ("read_loop_sec", "health_interval_sec")
+
+# Reserved key in the hot-apply rollback record: when mqtt_command_poll_ms
+# changes, the last-poll stamp is re-anchored at apply time so the new cadence
+# starts cleanly; the old stamp is carried under this key for rollback.
+_POLL_STAMP_KEY = "_last_command_poll_ms"
+
 
 class Core0:
 
-    def __init__(self, intercore, config, wifi_config, runtime_id, boot_ticks_ms, led_manager):
+    def __init__(self, intercore, config, wifi_config, runtime_id, boot_ticks_ms, led_manager, config_manager):
         self._intercore = intercore
         self._config = config
+        # Core 0 owns the configuration manager (persistence, ACTIVE-vs-
+        # PERSISTED state, change classification); it is never shared with
+        # Core 1 -- Core 1 only ever sees the internal config-update event.
+        self._config_manager = config_manager
         self._runtime_id = runtime_id
         self._uptime_state = create_uptime_state(boot_ticks_ms)
         self._led_manager = led_manager
@@ -62,11 +102,22 @@ class Core0:
         self._mqtt = Mqtt(config, self._on_mqtt_message, self._service_wait)
 
         self._pending_reboot = None
-        # Recent accepted command IDs (duplicate-command suppression; see
-        # _RECENT_COMMAND_ID_CAPACITY). Oldest first, evicted FIFO.
+        # Recent command IDs (debounce cache; see _RECENT_COMMAND_ID_CAPACITY).
+        # Oldest first, evicted FIFO.
         self._recent_command_ids = []
         self._pending_core0_responses = []
         self._pending_connection_logs = []
+        # A HOT_RELOADED write-config is one logical transaction across both
+        # cores: the Core 0 subset is applied, the Core 1 subset is requested
+        # on the config-update lane, and the response + file commit are held
+        # until Core 1's acknowledgement arrives (resolved in the run loop).
+        # None when no such transaction is pending. _transaction_active (the
+        # config manager) is True for the same window, enforcing single-flight.
+        self._pending_config_update = None
+        # Monotonic generation for config-update requests/results; each
+        # transaction uses the next value so a stale result can never be read
+        # as the current one.
+        self._config_update_generation = 0
         self._utc_request_counter = 0
         self._pending_utc_request_id = None
         self._utc_request_deadline_ms = None
@@ -93,16 +144,21 @@ class Core0:
         return format_utc_epoch_ms(snapshot["utc_epoch_ms"] + elapsed_ms)
 
     def _target_matches(self, target):
-        if not isinstance(target, str):
+        # A target is a non-empty string within the protocol bound before any
+        # matching; everything below only decides whether it addresses this
+        # device.
+        if not is_bounded_target(target):
             return False
-        if target == "*":
+        if target == BROADCAST_TARGET:
             return True
-        # Target matching is case-insensitive: a casing variant of the
-        # configured source addresses this device. Only the comparison is
-        # normalized; the stored source keeps its configured casing.
+        # Source and IP matching are case-insensitive: only the comparison is
+        # normalized; the stored source keeps its configured casing, and
+        # emitted messages do too. (IPv4 strings have no case distinction;
+        # the comparison stays uniform anyway.)
         if target.lower() == self._config["source"].lower():
             return True
-        return target == self._wifi.ip_address()
+        ip_address = self._wifi.ip_address()
+        return isinstance(ip_address, str) and target.lower() == ip_address.lower()
 
     def _queue_core0_response(self, response):
         if len(self._pending_core0_responses) >= _MAX_PENDING_CORE0_RESPONSES:
@@ -175,6 +231,18 @@ class Core0:
                 print("[DEBUG] Ignoring MQTT payload that is not an object")
             return
 
+        # Global inbound message-schema gate: the firmware never interprets a
+        # wire protocol version it does not support. A missing, wrong-typed,
+        # older, or newer version is ignored for the whole message -- no
+        # response, no debounce-cache entry, no UTC state change, no
+        # message-type or topic-specific processing -- including inbound
+        # info_response.
+        version = doc.get("message_schema_version")
+        if type(version) is not int or version != MESSAGE_SCHEMA_VERSION:
+            if DEBUG:
+                print("[DEBUG] Ignoring inbound message with unsupported message_schema_version")
+            return
+
         if topic == self._config["mqtt_topic_info_response"]:
             if doc.get("message_type") == "info_response":
                 self._handle_info_response(doc)
@@ -185,119 +253,224 @@ class Core0:
         if doc.get("message_type") != "command":
             return
 
-        target = doc.get("target", "")
+        # Staged command validation: target and command_id drops are silent
+        # (no response is possible without a bounded command_id, and another
+        # device's traffic must not consume a cache entry); once the debounce
+        # cache has claimed the ID, every failure is answered.
+        target = doc.get("target")
         if not self._target_matches(target):
             return
 
-        command = doc.get("command")
         command_id = doc.get("command_id")
-        targeted = target != "*"
-
-        if not isinstance(command, str) or not command:
-            return
-        if not isinstance(command_id, str) or not command_id:
+        if not is_bounded_command_id(command_id):
+            # A standard response requires a bounded command_id, so a
+            # missing / non-string / empty / over-long one is dropped without
+            # a response and is never cached.
             return
 
         if self._is_recent_command_id(command_id):
-            # Duplicate suppression: this command_id was already accepted in
-            # this runtime. Ignore the copy -- no execution, no Core 1 event,
-            # no response, no change to a pending reboot. Expected transport
-            # behavior (broker redelivery, sender retry), so DEBUG-only: not
-            # a production warning.
+            # Debounce: this command_id was already claimed in this runtime.
+            # Ignore the copy -- no execution, no Core 1 event, no response,
+            # no change to a pending reboot. Expected transport behavior
+            # (broker redelivery, sender retry), so DEBUG-only: not a
+            # production warning.
             if DEBUG:
                 print("[DEBUG] Duplicate command_id ignored: {}".format(command_id))
             return
 
+        # The first bounded use of the ID claims it -- before deeper
+        # validation, so a malformed duplicate cannot generate a second
+        # validation response.
         self._remember_command_id(command_id)
+        targeted = target != BROADCAST_TARGET
 
-        if doc.get("message_schema_version") != MESSAGE_SCHEMA_VERSION:
-            self._queue_core0_response({
-                "command_id": command_id,
-                "command": command,
-                "success": False,
-                "targeted": targeted,
-                "error": {
-                    "code": "invalid_message_schema_version",
-                    "message": "Unsupported message_schema_version",
+        # Command envelope: every top-level key must be a known v3 envelope
+        # field. All unknown fields at this scope are named, sorted, in one
+        # error.
+        unknown = unknown_field_names(doc, COMMAND_ENVELOPE_KEYS)
+        if unknown:
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, doc.get("command"), {
+                    "code": "unknown_fields",
+                    "message": "Message contains unknown fields",
+                    "unknown_fields": unknown,
                 },
-            })
+            ))
             return
 
+        # Required envelope fields: command is a non-empty string...
+        command = doc.get("command")
+        if not isinstance(command, str) or not command:
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, command, {
+                    "code": "invalid_command",
+                    "message": "Command must be a non-empty string",
+                },
+            ))
+            return
         if "payload" not in doc:
-            self._queue_core0_response({
-                "command_id": command_id,
-                "command": command,
-                "success": False,
-                "targeted": targeted,
-                "error": {
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, command, {
                     "code": "invalid_payload",
                     "message": "command payload is required",
                 },
-            })
+            ))
+            return
+
+        # ...and within the length bound. An over-long name is answered with
+        # a bounded error and is never echoed into the response (not even
+        # partially): echoing it back would itself build the oversized
+        # response the bound exists to prevent.
+        if len(command) > MAX_COMMAND_LENGTH:
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, command, {
+                    "code": "invalid_command",
+                    "message": "Command name exceeds the {} character bound".format(MAX_COMMAND_LENGTH),
+                },
+            ))
             return
 
         payload_obj = doc["payload"]
         if not isinstance(payload_obj, dict):
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, command, {
+                    "code": "invalid_payload",
+                    "message": "command payload must be an object",
+                },
+            ))
+            return
+
+        # Ownership dispatch: only a supported command name proceeds. A
+        # bounded name outside the registry is answered here -- never routed
+        # blindly to Core 1, which is not the generic fallback -- and the
+        # actual name is preserved in the standard command field (not
+        # duplicated inside error).
+        if not is_supported_command(command):
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, command, {
+                    "code": "unsupported_command",
+                    "message": "Unsupported command",
+                },
+            ))
+            return
+
+        # Broadcast policy: write-config must never apply fleet-wide -- no
+        # configuration validation, no filesystem operation, no response.
+        # The ID remains claimed by the debounce cache above: the cache is
+        # intentionally a message-debounce mechanism.
+        if command == COMMAND_WRITE_CONFIG and target == BROADCAST_TARGET:
+            return
+
+        if command == COMMAND_REBOOT:
+            # Core 0-owned: the shared protocol validation above is done;
+            # this is the command's own contract.
+            self._handle_reboot_command(command_id, targeted, payload_obj)
+            return
+
+        if command == COMMAND_GET_DETAILS:
+            # Core 1-owned: dispatch the validated bounded event.
+            self._handle_get_details_command(command_id, targeted, payload_obj)
+            return
+
+        if command == COMMAND_READ_CONFIG:
+            self._handle_read_config_command(command_id, targeted, payload_obj)
+            return
+
+        if command == COMMAND_WRITE_CONFIG:
+            self._handle_write_config_command(command_id, targeted, payload_obj)
+            return
+
+    def _command_error(self, command_id, targeted, command, error):
+        """A bounded Core 0 command error response.
+
+        The identifying command field is carried only when it is a bounded,
+        valid string: an over-long or non-string name is never echoed into
+        the response, so the response itself can never be oversized."""
+        response = {
+            "command_id": command_id,
+            "success": False,
+            "targeted": targeted,
+            "error": error,
+        }
+        if is_bounded_command(command):
+            response["command"] = command
+        return response
+
+    def _handle_reboot_command(self, command_id, targeted, payload):
+        """Dedicated reboot validator/handler, called after the common protocol validation.
+
+        The payload contract is exactly {}: any key is unknown for this command, so a non-empty object is answered with an ``unknown_fields`` error carrying the keys sorted (the missing / non-object cases are the common contract and are rejected before this handler). Debounce already ran, so a duplicate command_id never reaches the pending check."""
+        if payload:
+            self._queue_core0_response(
+                self._unknown_fields_error(COMMAND_REBOOT, command_id, targeted, payload)
+            )
+            return
+
+        if self._pending_reboot is not None:
             self._queue_core0_response({
                 "command_id": command_id,
-                "command": command,
+                "command": COMMAND_REBOOT,
                 "success": False,
                 "targeted": targeted,
                 "error": {
-                    "code": "invalid_payload",
-                    "message": "command payload must be an object",
+                    "code": "reboot_already_pending",
+                    "message": "A reboot is already pending",
                 },
             })
             return
 
-        if command == "reboot":
-            if payload_obj:
-                self._queue_core0_response({
-                    "command_id": command_id,
-                    "command": command,
-                    "success": False,
-                    "targeted": targeted,
-                    "error": {
-                        "code": "invalid_payload",
-                        "message": "reboot payload must be {}",
-                    },
-                })
-                return
+        self._pending_reboot = {
+            "command_id": command_id,
+            "command": COMMAND_REBOOT,
+            "targeted": targeted,
+        }
 
-            if self._pending_reboot is not None:
-                self._queue_core0_response({
-                    "command_id": command_id,
-                    "command": command,
-                    "success": False,
-                    "targeted": targeted,
-                    "error": {
-                        "code": "reboot_already_pending",
-                        "message": "A reboot is already pending",
-                    },
-                })
-                return
+    def _unknown_fields_error(self, command, command_id, targeted, payload):
+        """A non-empty payload is an unknown-fields error for a command that requires {}.
 
-            self._pending_reboot = {
-                "command_id": command_id,
-                "command": command,
-                "targeted": targeted,
-            }
+        Both Core 0-owned (reboot) and Core 1-owned (get-details) commands that
+        require an empty payload share this contract: any key is unknown, and
+        every offending key is named in a sorted ``unknown_fields`` array so
+        the sender knows exactly which fields to remove."""
+        return {
+            "command_id": command_id,
+            "command": command,
+            "success": False,
+            "targeted": targeted,
+            "error": {
+                "code": "unknown_fields",
+                "message": "{} payload contains unknown fields".format(command),
+                "unknown_fields": sorted(payload.keys()),
+            },
+        }
+
+    def _handle_get_details_command(self, command_id, targeted, payload):
+        """Dedicated get-details validator/dispatcher, called after the common protocol validation.
+
+        Core 1 owns the execution because the authoritative SystemInformation
+        instance and device state live there, so Core 0 only dispatches a
+        validated bounded event. The payload contract is exactly {} (shared with
+        reboot): any key is unknown and is answered with an ``unknown_fields``
+        error naming the keys sorted. A {} dispatches the event with the
+        validated empty payload; if event admission fails the only cause is a
+        free-heap reserve that could not be restored, so the error names that
+        cause rather than a "full" queue."""
+        if payload:
+            self._queue_core0_response(
+                self._unknown_fields_error(COMMAND_GET_DETAILS, command_id, targeted, payload)
+            )
             return
 
         event = {
             "command_id": command_id,
-            "command": command,
-            "payload": payload_obj,
+            "command": COMMAND_GET_DETAILS,
+            "payload": {},
             "targeted": targeted,
         }
         if not self._intercore.event_queue.put(event):
-            # The event queue is heap-governed and has no count capacity: the
-            # only rejection cause is a free-heap reserve that could not be
-            # restored, so the error names that cause rather than a "full"
-            # queue.
             self._queue_core0_response({
                 "command_id": command_id,
-                "command": command,
+                "command": COMMAND_GET_DETAILS,
                 "success": False,
                 "targeted": targeted,
                 "error": {
@@ -306,12 +479,258 @@ class Core0:
                 },
             })
 
+    def _handle_read_config_command(self, command_id, targeted, payload):
+        """read-config: answer with the committed (PERSISTED) configuration and the derived reboot state.
+
+        The payload contract is exactly {} (shared with reboot / get-details). Wi-Fi secrets live in a separate file and never cross this path. A missing or invalid committed file is answered with the actual cause (normally unreachable: boot recovery guarantees a valid config.json)."""
+        if payload:
+            self._queue_core0_response(
+                self._unknown_fields_error(COMMAND_READ_CONFIG, command_id, targeted, payload)
+            )
+            return
+
+        try:
+            config = self._config_manager.read_persisted()
+        except MemoryError:
+            raise
+        except ConfigError as err:
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, COMMAND_READ_CONFIG, {
+                    "code": "config_unavailable",
+                    "message": str(err),
+                },
+            ))
+            return
+
+        self._queue_core0_response({
+            "command_id": command_id,
+            "command": COMMAND_READ_CONFIG,
+            "success": True,
+            "targeted": targeted,
+            "data": {
+                "config": config,
+                "reboot_required": self._config_manager.reboot_required,
+            },
+        })
+
+    def _handle_write_config_command(self, command_id, targeted, payload):
+        """write-config: the payload is exactly {"config": <complete candidate configuration>}, validated by the same validate_config() path startup uses.
+
+        The payload contract is one key, "config", whose value must be the
+        complete candidate configuration object -- there is no patch, merge,
+        or partial-update shape in this command. A changed candidate is
+        atomically promoted to config.json. UNCHANGED writes nothing;
+        REBOOT_REQUIRED commits (the active snapshot holds the running values
+        until the next reboot); HOT_RELOADED is additionally applied on both
+        cores, and the transaction is committed once that application is
+        acknowledged -- rolled back, with the file state restored, when it
+        cannot be. MemoryError propagates to the fail-fast boundary."""
+        # Unknown payload keys are all named together (sorted), whatever the
+        # rest of the payload is.
+        unknown = sorted(key for key in payload if key != "config")
+        if unknown:
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, COMMAND_WRITE_CONFIG, {
+                    "code": "unknown_fields",
+                    "message": "write-config payload contains unknown fields",
+                    "unknown_fields": unknown,
+                },
+            ))
+            return
+
+        if "config" not in payload:
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, COMMAND_WRITE_CONFIG, {
+                    "code": "missing_key",
+                    "message": "write-config payload is missing the required config key",
+                },
+            ))
+            return
+
+        candidate = payload["config"]
+        if not isinstance(candidate, dict):
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, COMMAND_WRITE_CONFIG, {
+                    "code": "invalid_value",
+                    "message": "write-config payload config must be an object",
+                },
+            ))
+            return
+
+        if self._config_manager.transaction_active:
+            # A hot transaction is pending (Core 1's acknowledgement not yet
+            # resolved): single-flight, so a second write is refused with a
+            # bounded, non-executing answer (the command ID stays governed by
+            # the debounce cache).
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, COMMAND_WRITE_CONFIG, {
+                    "code": "config_update_in_progress",
+                    "message": "A configuration update is already in progress",
+                },
+            ))
+            return
+
+        try:
+            result = self._config_manager.begin_write(candidate)
+        except MemoryError:
+            raise
+        except ConfigError as err:
+            error = {
+                "code": err.code if err.code is not None else "invalid_config",
+                "message": str(err),
+            }
+            if err.unknown_fields:
+                error["unknown_fields"] = err.unknown_fields
+            # Structured fields of the error (e.g. expected/received schema
+            # version) cross into the response as-is.
+            if err.details:
+                error.update(err.details)
+            self._queue_core0_response(self._command_error(
+                command_id, targeted, COMMAND_WRITE_CONFIG, error
+            ))
+            return
+
+        if not result["pending"]:
+            if result["classification"] == CLASSIFICATION_UNCHANGED:
+                message = ("[WARNING] write-config ignored: submitted "
+                           "configuration is identical to persisted "
+                           "configuration")
+                if self._config_manager.reboot_required:
+                    message += "; a reboot-required configuration remains pending"
+                print(message)
+            # UNCHANGED: no write, reboot state preserved. REBOOT_REQUIRED:
+            # committed, no runtime application owed.
+            self._queue_core0_response(
+                self._write_config_success(command_id, targeted, result)
+            )
+            return
+
+        # HOT_RELOADED: Core 0 and Core 1 form one logical transaction. Apply
+        # the Core 0 subset now, then ask Core 1 for its subset on the
+        # config-update lane. No success response is sent until Core 1's
+        # acknowledgement arrives (resolved in the run loop), and a failed
+        # apply rolls Core 0 and the file back so the committed configuration
+        # and the running firmware agree again.
+        old_values, core1_update = self._apply_hot_changes(result["changes"])
+        if not core1_update:
+            # Only Core 0-owned hot settings changed: Core 0 already applied
+            # them and nothing is owed to Core 1, so commit now.
+            self._config_manager.commit_hot_reload()
+            self._queue_core0_response(
+                self._write_config_success(command_id, targeted, result)
+            )
+            return
+
+        generation = self._next_config_update_generation()
+        request = {"generation": generation}
+        request.update(core1_update)
+        self._intercore.config_update_lane.post_request(request)
+        # Hold the response and the rollback state until Core 1's ack is on
+        # the lane (resolved by _resolve_pending_config_update in the run
+        # loop). While this is pending _transaction_active stays True, so a
+        # second write-config is refused with config_update_in_progress.
+        self._pending_config_update = {
+            "generation": generation,
+            "old_values": old_values,
+            "command_id": command_id,
+            "targeted": targeted,
+            "result": result,
+        }
+
+    def _write_config_success(self, command_id, targeted, result):
+        classification = result["classification"]
+        return {
+            "command_id": command_id,
+            "command": COMMAND_WRITE_CONFIG,
+            "success": True,
+            "targeted": targeted,
+            "data": {
+                # This command's effect on the persisted desired config,
+                # independent of the reboot state it left behind.
+                "configuration_changed": classification != CLASSIFICATION_UNCHANGED,
+                "classification": classification,
+                # Derived at response time: True for REBOOT_REQUIRED, False
+                # for UNCHANGED without a pending reboot, and False once a
+                # hot application has committed (cancelling any pending one).
+                "reboot_required": self._config_manager.reboot_required,
+                "changes": result["changes"],
+            },
+        }
+
+    def _apply_hot_changes(self, changes):
+        """Apply the changed Core 0-owned HOT settings to the live config.
+
+        Returns the old values (for rollback -- including the last-poll stamp
+        under _POLL_STAMP_KEY when the poll interval changed) and the Core 1
+        update (the Core 1-owned HOT settings that changed; {} when none)."""
+        old_values = {}
+        core1_update = {}
+        for change in changes:
+            setting = change["setting"]
+            if setting in _HOT_APPLY_CORE0_KEYS:
+                old_values[setting] = self._config[setting]
+                self._config[setting] = change["new_value"]
+                if setting == "mqtt_command_poll_ms":
+                    # The new poll cadence starts cleanly from the reload
+                    # instant: re-anchor the last-poll stamp so it neither
+                    # bursts a stale interval nor waits one out.
+                    old_values[_POLL_STAMP_KEY] = self._last_command_poll_ms
+                    self._last_command_poll_ms = time.ticks_ms()
+            elif setting in _HOT_APPLY_CORE1_KEYS:
+                core1_update[setting] = change["new_value"]
+        return old_values, core1_update
+
+    def _restore_hot_values(self, old_values):
+        for setting, value in old_values.items():
+            if setting == _POLL_STAMP_KEY:
+                self._last_command_poll_ms = value
+            else:
+                self._config[setting] = value
+
+    def _next_config_update_generation(self):
+        self._config_update_generation += 1
+        return self._config_update_generation
+
+    def _resolve_pending_config_update(self):
+        """Resolve a pending HOT_RELOADED apply once Core 1's acknowledgement is on the lane.
+
+        Success commits the manager (releasing the retained config.json.old)
+        and releases the held success response; a failed apply rolls Core 0 and
+        the file back and answers a bounded error. A dead Core 1 never acks,
+        but that is bounded by the existing liveness watchdog (which resets the
+        board and boot recovery restores the retained config.json.old) -- so no
+        unbounded wait is owed and no success response is sent before the
+        runtime update is complete."""
+        pending = self._pending_config_update
+        if pending is None:
+            return
+        result = self._intercore.config_update_lane.take_result_for(
+            pending["generation"]
+        )
+        if result is None:
+            return
+        self._pending_config_update = None
+        if result.get("success"):
+            self._config_manager.commit_hot_reload()
+            self._queue_core0_response(self._write_config_success(
+                pending["command_id"], pending["targeted"], pending["result"]
+            ))
+        else:
+            self._restore_hot_values(pending["old_values"])
+            self._config_manager.rollback_hot_reload()
+            self._queue_core0_response(self._command_error(
+                pending["command_id"], pending["targeted"], COMMAND_WRITE_CONFIG, {
+                    "code": result.get("code") or "core1_apply_failed",
+                    "message": "Core 1 could not apply the configuration update",
+                },
+            ))
+
     def _is_recent_command_id(self, command_id):
-        """True if command_id was already accepted in this runtime (exact, case-sensitive)."""
+        """True if command_id is still claimed in the debounce cache (exact, case-sensitive)."""
         return command_id in self._recent_command_ids
 
     def _remember_command_id(self, command_id):
-        """Record an accepted command_id; evict the oldest once over capacity (FIFO, not LRU)."""
+        """Claim an ID in the debounce cache; evict the oldest once over capacity (FIFO, not LRU)."""
         self._recent_command_ids.append(command_id)
         if len(self._recent_command_ids) > _RECENT_COMMAND_ID_CAPACITY:
             self._recent_command_ids.pop(0)
@@ -327,7 +746,7 @@ class Core0:
         wire_sequence = self._claim_wire_sequence(response)
         published = self._publish_core0_command_response(
             response["command_id"],
-            response["command"],
+            response.get("command"),
             response["success"],
             targeted=response.get("targeted", False),
             data=response.get("data"),
@@ -344,8 +763,8 @@ class Core0:
         self._pending_core0_responses.pop(0)
 
     def _handle_info_response(self, doc):
-        if doc.get("message_schema_version") != MESSAGE_SCHEMA_VERSION:
-            return
+        # The global inbound message-schema gate in _on_mqtt_message has
+        # already run: only a supported message_schema_version reaches here.
         if doc.get("source") not in ("server", self._config["source"]):
             return
         if doc.get("target") != self._config["source"]:
@@ -510,10 +929,15 @@ class Core0:
         if payload_bytes is None:
             payload = {
                 "command_id": command_id,
-                "command": command,
-                "targeted": targeted,
-                "success": success,
             }
+            # The command field is the standard location for the command
+            # name and is carried whenever it is available (bounded and
+            # valid); an error whose name failed the bound omits it rather
+            # than echoing it.
+            if command is not None:
+                payload["command"] = command
+            payload["targeted"] = targeted
+            payload["success"] = success
             if success:
                 payload["data"] = data
             else:
@@ -946,13 +1370,17 @@ class Core0:
         self._intercore.state_mailboxes.set_utc_snapshot(self._utc_snapshot)
 
     def run(self):
-        poll_ms = self._config["mqtt_command_poll_ms"]
-
         while True:
             # First each pass: a dead Core 1 wedges the whole sensor (no
             # telemetry, no health) and cannot report itself, so Core 0
             # resets the board before doing any other work.
             self._watch_core_1_heartbeat()
+
+            # Resolve a pending HOT_RELOADED apply now that the watchdog has
+            # run: if Core 1 has acknowledged, commit or roll back; if Core 1
+            # is dead the watchdog above has already reset, so no unbounded
+            # wait can accumulate here.
+            self._resolve_pending_config_update()
 
             # The reboot response is an outbound PUBLISH: hold (without
             # resetting, without blocking) until the pacing gate is open.
@@ -977,8 +1405,10 @@ class Core0:
                     if DEBUG:
                         print("[DEBUG] Connection log publish failed: {}".format(err))
 
+            # Read per pass (not captured once): a HOT_RELOADED
+            # mqtt_command_poll_ms applies from the next pass.
             now_ms = time.ticks_ms()
-            if time.ticks_diff(now_ms, self._last_command_poll_ms) >= poll_ms:
+            if time.ticks_diff(now_ms, self._last_command_poll_ms) >= self._config["mqtt_command_poll_ms"]:
                 try:
                     self._mqtt.check_msg()
                 except MemoryError:

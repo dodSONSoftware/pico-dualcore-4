@@ -26,6 +26,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 from config import split_config  # noqa: E402
+from config_manager import ConfigManager  # noqa: E402
 
 
 def _core1():
@@ -196,6 +197,7 @@ def _make_core0():
         "test-runtime",
         0,
         MagicMock(),
+            ConfigManager("config.json"),
     )
     return core0_mod, instance
 

@@ -5,6 +5,7 @@
 import gc
 import time
 
+from command_protocol import COMMAND_GET_DETAILS
 from debug import DEBUG
 from device_manager import (
     DeviceManager,
@@ -37,9 +38,6 @@ from message_serializer import (
     NonStringKeyError,
     NonFiniteFloatError,
 )
-
-
-COMMAND_GET_DETAILS = "get-details"
 
 
 def _collect_system_information_full(system_information):
@@ -282,53 +280,118 @@ def _admit_or_substitute_command_response(intercore, uptime_state, response):
         )
 
 
+def _regrid_next_boundary(anchor, now, interval_ms):
+    """The next interval-aligned scheduler boundary from the anchor that is strictly after now.
+
+    Boundaries that already passed are skipped, never replayed (same
+    missed-boundary policy as startup and the read/health skip loops)."""
+    elapsed = time.ticks_diff(now, anchor)
+    if elapsed < 0:
+        return anchor
+    return time.ticks_add(anchor, (elapsed // interval_ms + 1) * interval_ms)
+
+
+def _apply_config_update(config_update, config, schedulers):
+    """Apply a HOT_RELOADED Core 1 hot update (or its rollback): re-anchor the read/health schedulers and refresh Core 1's own config copy.
+
+    A configuration reload is a NEW scheduling boundary, deliberately re-anchored from the reload instant rather than re-gridded to the boot anchor: a changed interval means the next sample is one interval after now (next = now + interval). Only the keys present in the update are touched, and no catch-up sample is emitted for a shortened interval. Core 1's local config copy is updated too, so the health activity threshold (which reads read_loop_sec) reflects the new active value."""
+    now_ms = time.ticks_ms()
+    if "read_loop_sec" in config_update:
+        config["read_loop_sec"] = config_update["read_loop_sec"]
+        schedulers["read_loop_ms"] = config_update["read_loop_sec"] * 1000
+        schedulers["next_read_ms"] = time.ticks_add(
+            now_ms, schedulers["read_loop_ms"]
+        )
+    if "health_interval_sec" in config_update:
+        config["health_interval_sec"] = config_update["health_interval_sec"]
+        schedulers["health_interval_ms"] = config_update["health_interval_sec"] * 1000
+        schedulers["next_health_ms"] = time.ticks_add(
+            now_ms, schedulers["health_interval_ms"]
+        )
+
+
+def _process_config_update(intercore, config, schedulers):
+    """Apply one HOT_RELOADED config-update request from Core 0 and acknowledge it.
+
+    Internal runtime control on the dedicated config-update lane, not an external command: take the pending request, apply it (re-anchor the read/health schedulers from the reload instant and refresh Core 1's own config copy), then post exactly one result for the request's generation. No command response is owed on this path. On an apply failure the prior values are restored and a bounded failure result posted, so Core 1 is left unchanged. MemoryError propagates per the Core 1 recovery policy."""
+    request = intercore.config_update_lane.take_request()
+    if request is None:
+        return
+    generation = request.get("generation")
+
+    prior = (
+        config.get("read_loop_sec"),
+        config.get("health_interval_sec"),
+        schedulers["read_loop_ms"],
+        schedulers["health_interval_ms"],
+        schedulers["next_read_ms"],
+        schedulers["next_health_ms"],
+    )
+    try:
+        _apply_config_update(request, config, schedulers)
+    except MemoryError:
+        raise
+    except Exception:
+        # An apply failure must leave Core 1 unchanged: restore the prior
+        # values, then report a bounded failure so Core 0 rolls back.
+        (
+            config["read_loop_sec"],
+            config["health_interval_sec"],
+            schedulers["read_loop_ms"],
+            schedulers["health_interval_ms"],
+            schedulers["next_read_ms"],
+            schedulers["next_health_ms"],
+        ) = prior
+        intercore.config_update_lane.post_result({
+            "generation": generation,
+            "success": False,
+            "code": "core1_apply_failed",
+        })
+        return
+    intercore.config_update_lane.post_result({
+        "generation": generation,
+        "success": True,
+    })
+
+
 def _process_intercore_event(intercore, uptime_state, system_information=None):
+    """Handle a Core 1-owned command event dispatched by Core 0.
+
+    Core 0 validates the command against its supported-command registry and
+    dispatches only supported Core 1-owned events (currently get-details, with
+    a validated {} payload). Core 0 owns the unknown-command response, so Core
+    1 is not the generic fallback for arbitrary command names. (Internal
+    config-update traffic does not flow through this event queue: it uses the
+    dedicated config-update lane and is handled by _process_config_update.)"""
     event = intercore.event_queue.take()
     if event is None:
         return None
 
-    if event.get("command") == COMMAND_GET_DETAILS:
-        if event.get("payload") != {}:
-            return _build_command_response(
-                intercore,
-                uptime_state,
-                event,
-                False,
-                error={
-                    "code": "invalid_payload",
-                    "message": "get-details payload must be {}",
-                },
-            )
+    # Only supported Core 1-owned command events reach here (currently
+    # get-details, with a validated {} payload -- Core 0 already rejected a
+    # non-empty payload with unknown_fields). A command name Core 0 does not
+    # own is answered on Core 0, so there is no generic fallback here.
+    if event.get("command") != COMMAND_GET_DETAILS:
+        return None
 
-        if system_information is None:
-            return _build_command_response(
-                intercore,
-                uptime_state,
-                event,
-                False,
-                error={
-                    "code": "system_information_unavailable",
-                    "message": "System information is unavailable",
-                },
-            )
-
+    if system_information is None:
         return _build_command_response(
             intercore,
             uptime_state,
             event,
-            True,
-            data=_collect_system_information_full(system_information),
+            False,
+            error={
+                "code": "system_information_unavailable",
+                "message": "System information is unavailable",
+            },
         )
 
     return _build_command_response(
         intercore,
         uptime_state,
         event,
-        False,
-        error={
-            "code": "unsupported_command",
-            "message": "Command is not implemented in baseline firmware",
-        },
+        True,
+        data=_collect_system_information_full(system_information),
     )
 
 
@@ -691,33 +754,38 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # transition into the normal runtime loop.
         intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
 
-        # Health scheduler anchored to the shared normal-runtime anchor:
-        # fixed boundaries every health_interval_sec from normal-runtime
-        # start (a 60s interval means +60s, +120s, +180s relative to the
-        # anchor). Independent of the telemetry scheduler: the two share
-        # the epoch, not an execution dependency. The one immediate health
-        # report at the anchor is emitted once below, before the run loop.
-        health_interval_ms = config["health_interval_sec"] * 1000
-        next_health_ms = time.ticks_add(normal_runtime_start_ticks_ms, health_interval_ms)
-
+        # The read/health schedulers share the normal-runtime anchor: fixed
+        # boundaries every read_loop_sec / health_interval_sec from
+        # normal-runtime start (a 60s health interval means +60s, +120s,
+        # +180s relative to the anchor). Independent of each other: the two
+        # share the epoch, not an execution dependency. The state lives in
+        # one mutable holder -- a HOT_RELOADED write-config re-anchors a
+        # changed interval from the reload instant (next = now + interval) via
+        # the config-update lane, without touching the anchor -- and the run
+        # loop reads and writes through it. The one immediate telemetry pass
+        # and health report at the anchor are emitted once below, before the
+        # run loop.
+        schedulers = {
+            "anchor_ms": normal_runtime_start_ticks_ms,
+            "read_loop_ms": config["read_loop_sec"] * 1000,
+            "health_interval_ms": config["health_interval_sec"] * 1000,
+        }
         now_ms = time.ticks_ms()
 
         # Boundaries already passed (only possible if scheduler initialization
         # was delayed by more than a full interval) are skipped, never
-        # replayed: health is current-state data, not historical telemetry.
-        # Advance to the next future boundary.
-        while time.ticks_diff(now_ms, next_health_ms) >= 0:
-            next_health_ms = time.ticks_add(next_health_ms, health_interval_ms)
+        # replayed: telemetry and health are current-state data, not
+        # historical data. Advance both to the next future boundary.
+        schedulers["next_read_ms"] = _regrid_next_boundary(
+            normal_runtime_start_ticks_ms, now_ms, schedulers["read_loop_ms"]
+        )
+        schedulers["next_health_ms"] = _regrid_next_boundary(
+            normal_runtime_start_ticks_ms, now_ms, schedulers["health_interval_ms"]
+        )
 
         # Liveness heartbeat scheduler (deadline-based, independent of loop phase)
         activity_interval_ms = 5000
         next_activity_ms = time.ticks_add(now_ms, activity_interval_ms)
-
-        # Now that the startup log is admitted, telemetry can begin. The
-        # telemetry scheduler shares the same normal-runtime anchor as the
-        # health scheduler but keeps its own independent deadline.
-        read_loop_ms = config["read_loop_sec"] * 1000
-        next_read_ms = time.ticks_add(normal_runtime_start_ticks_ms, read_loop_ms)
 
         # Initial sample at the anchor: one telemetry read pass and one
         # health report immediately after startup-log admission, so a
@@ -735,6 +803,13 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         pending_command_response = None
 
         while True:
+            # Internal control first: a pending HOT_RELOADED config-update
+            # request from Core 0 re-anchors the read/health schedulers from
+            # the reload instant and is acknowledged on the config-update lane
+            # (Core 0 commits or rolls back when it reads the result). This is
+            # independent of, and never mixed with, the user-command event queue.
+            _process_config_update(intercore, config, schedulers)
+
             if pending_command_response is not None:
                 pending_command_response = _admit_or_substitute_command_response(
                     intercore, uptime_state, pending_command_response
@@ -749,7 +824,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                     )
 
             now_ms = time.ticks_ms()
-            if time.ticks_diff(now_ms, next_read_ms) >= 0:
+            if time.ticks_diff(now_ms, schedulers["next_read_ms"]) >= 0:
                 _run_telemetry_read_pass(device_manager, intercore, uptime_state, config)
 
                 # Skip any boundaries that elapsed while the read ran, rather
@@ -767,8 +842,10 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 # long the read took, and skipping against it would
                 # under-advance and leave a catch-up read for the next pass.
                 skip_now_ms = time.ticks_ms()
-                while time.ticks_diff(skip_now_ms, next_read_ms) >= 0:
-                    next_read_ms = time.ticks_add(next_read_ms, read_loop_ms)
+                while time.ticks_diff(skip_now_ms, schedulers["next_read_ms"]) >= 0:
+                    schedulers["next_read_ms"] = time.ticks_add(
+                        schedulers["next_read_ms"], schedulers["read_loop_ms"]
+                    )
 
             # Register Core 1 activity periodically (every 5 seconds).
             # Re-capture the clock: now_ms is stale by however long a device
@@ -788,10 +865,12 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             # to the anchor-based boundaries and avoids cumulative drift;
             # missed boundaries are skipped, never replayed as catch-up
             # reports.
-            if time.ticks_diff(now_ms, next_health_ms) >= 0:
+            if time.ticks_diff(now_ms, schedulers["next_health_ms"]) >= 0:
                 _try_queue_health_message_intercore(intercore, uptime_state, config, system_information)
-                while time.ticks_diff(now_ms, next_health_ms) >= 0:
-                    next_health_ms = time.ticks_add(next_health_ms, health_interval_ms)
+                while time.ticks_diff(now_ms, schedulers["next_health_ms"]) >= 0:
+                    schedulers["next_health_ms"] = time.ticks_add(
+                        schedulers["next_health_ms"], schedulers["health_interval_ms"]
+                    )
 
             time.sleep_ms(20)
 

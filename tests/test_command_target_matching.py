@@ -67,6 +67,7 @@ def _install_mocks():
 # collection, and mocked entries in sys.modules would shadow them. They are
 # installed inside the fixture below, which also imports/reloads core0 there.
 from config import split_config  # noqa: E402
+from config_manager import ConfigManager  # noqa: E402
 from version import MESSAGE_SCHEMA_VERSION  # noqa: E402
 import core1  # noqa: E402
 
@@ -140,6 +141,7 @@ def make_core0():
             "test-runtime",
             0,
             MagicMock(),
+                    ConfigManager("config.json"),
         )
         instance._wifi = FakeWifi()
         instance._mqtt = MagicMock()
