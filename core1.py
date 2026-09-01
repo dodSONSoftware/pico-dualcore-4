@@ -40,6 +40,15 @@ from message_serializer import (
 )
 
 
+class StartupLogTooLargeError(ValueError):
+    """The detailed startup log exceeds MAX_OUTBOUND_MESSAGE_BYTES.
+
+    Distinguished from the other permanent rejections because it is the one
+    a different object -- the bounded fallback summary -- can answer, while
+    a validation or serialization failure cannot be fixed by re-submitting a
+    changed object."""
+
+
 def _collect_system_information_full(system_information):
     system_info = {}
     for section in SYSTEM_INFORMATION_SECTIONS:
@@ -57,14 +66,13 @@ def _collect_system_information_full(system_information):
     return system_info
 
 
-def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information=None):
-    """Build the system_startup_completed log message.
+def _startup_summary(device_status, startup_duration_ms):
+    """Startup statuses and device counts, shared by the detailed startup log and its bounded fallback.
 
-    Carries only Core 1's own fields -- the Core 0 envelope keys are injected at publish time and must not be repeated."""
-    # Build startup summary. Subscription readiness is reported without topic
-    # names: topic ownership belongs to Core 0 (message kind only crosses cores).
-    # The startup duration is named explicitly (duration_ms) so it carries its
-    # units and is not confused with the envelope's device-uptime (uptime_ms).
+    Subscription readiness is reported without topic
+    names: topic ownership belongs to Core 0 (message kind only crosses cores).
+    The startup duration is named explicitly (duration_ms) so it carries its
+    units and is not confused with the envelope's device-uptime (uptime_ms)."""
     startup_summary = {
         "duration_ms": startup_duration_ms,
         "hardware": {"status": "ready"},
@@ -79,10 +87,42 @@ def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup
     }
 
     # Add device status
-    device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
     startup_summary["devices_configured"] = device_status["devices"]["configured"]
     startup_summary["devices_ready"] = device_status["devices"]["active"]
     startup_summary["devices_failed"] = device_status["devices"].get("initialization_failed", 0)
+    return startup_summary
+
+
+def _startup_log_message(intercore, startup_duration_ms, startup_summary, system_information=None):
+    """Message envelope shared by the detailed startup log and its bounded fallback.
+
+    Core 0 injects the envelope (sequence, runtime_id,
+    source, firmware_version, message_schema_version) at publish time.
+    The `system_information` key is omitted entirely when None -- that is
+    exactly what the bounded fallback drops."""
+    data = {"startup": startup_summary}
+    if system_information is not None:
+        data["system_information"] = system_information
+    return {
+        "message_type": "log",
+        "uptime_ms": startup_duration_ms,
+        "timestamp": _current_utc_timestamp(intercore),
+        "payload": {
+            "level": "info",
+            "event": "system_startup_completed",
+            "module": "system",
+            "message": "System startup completed",
+            "data": data,
+        },
+    }
+
+
+def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information=None):
+    """Build the detailed system_startup_completed log message.
+
+    Carries only Core 1's own fields -- the Core 0 envelope keys are injected at publish time and must not be repeated."""
+    device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
+    startup_summary = _startup_summary(device_status, startup_duration_ms)
 
     # Add lists of detailed device info for ready and failed devices
     ready_devices = []
@@ -108,31 +148,32 @@ def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup
         system_information = SystemInformation(intercore, config)
     system_info = _collect_system_information_full(system_information)
 
-    # Build the message. Core 0 injects the envelope (sequence, runtime_id,
-    # source, firmware_version, message_schema_version) at publish time.
-    payload = {
-        "message_type": "log",
-        "uptime_ms": startup_duration_ms,
-        "timestamp": _current_utc_timestamp(intercore),
-        "payload": {
-            "level": "info",
-            "event": "system_startup_completed",
-            "module": "system",
-            "message": "System startup completed",
-            "data": {
-                "startup": startup_summary,
-                "system_information": system_info,
-            },
-        },
-    }
+    return _startup_log_message(intercore, startup_duration_ms, startup_summary, system_info)
 
-    return payload
+
+def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms):
+    """Build the bounded startup-log fallback.
+
+    Device definitions carry no practical length or count bound for id, name,
+    or sensor_type, so the detailed startup log can exceed
+    MAX_OUTBOUND_MESSAGE_BYTES on an otherwise valid configuration. This
+    fallback keeps only the startup statuses and device counts -- no
+    per-device lists, no system_information -- and stays far under the
+    ceiling. Losing the verbose diagnostics must not keep the device from
+    entering normal operation."""
+    device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
+    return _startup_log_message(
+        intercore,
+        startup_duration_ms,
+        _startup_summary(device_status, startup_duration_ms),
+        None,
+    )
 
 
 def _try_queue_startup_log(intercore, message, retention_priority):
     """Attempt to queue the startup log message.
 
-    True if admitted; False if admission failed transiently (heap pressure). Raises ValueError on a permanent rejection: retrying the same object cannot succeed, so the caller fails fast with the actual reason."""
+    True if admitted; False if admission failed transiently (heap pressure). Raises ValueError on a permanent rejection: retrying the same object cannot succeed, so the caller fails fast with the actual reason. The oversized case raises StartupLogTooLargeError (a ValueError subclass) so the caller can answer it with the bounded fallback instead of failing startup."""
     try:
         payload_bytes = serialize_and_validate_message(message)
     except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
@@ -140,7 +181,7 @@ def _try_queue_startup_log(intercore, message, retention_priority):
         raise ValueError("Startup log validation failed: {}".format(err))
     except MessageTooLargeError as err:
         print("[ERROR] Startup log too large: {}".format(err))
-        raise ValueError("Startup log too large: {}".format(err))
+        raise StartupLogTooLargeError("Startup log too large: {}".format(err))
     except MemoryError:
         raise
     except Exception as err:
@@ -172,6 +213,17 @@ def _admit_startup_log(intercore, message):
     # Wait for queue space and retry once
     time.sleep_ms(100)
     return _try_queue_startup_log(intercore, message, RETENTION_PRIORITY_INFO)
+
+
+def _admit_startup_log_with_fallback(intercore, message, fallback_builder):
+    """Admit the startup log; if the detailed message is rejected for exceeding the outbound ceiling only, admit the bounded fallback summary instead.
+
+    Failure to emit the verbose diagnostics must not keep an otherwise valid configuration from entering normal operation: the oversized rejection is permanent for the detailed object, but a bounded fallback -- no per-device lists, no system_information -- is admitted even by the configuration that made the detailed message too large. Every other permanent rejection escapes with its actual reason so the caller fails fast. Each admission keeps _admit_startup_log's retry discipline (the single transient retry)."""
+    try:
+        return _admit_startup_log(intercore, message)
+    except StartupLogTooLargeError:
+        print("[WARN] Startup log exceeds the outbound ceiling; admitting the bounded summary instead")
+        return _admit_startup_log(intercore, fallback_builder())
 
 
 def _current_utc_timestamp(intercore):
@@ -711,12 +763,21 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         )
 
         # The startup log must be admitted before telemetry can begin. A
-        # permanent rejection (validation, size, serialization) fails fast
-        # with its actual reason -- retrying the same object 100 ms later
-        # cannot change the outcome; only a genuinely transient rejection
-        # (heap pressure) is retried.
+        # permanent rejection (validation, serialization) fails fast with its
+        # actual reason -- retrying the same object 100 ms later cannot change
+        # the outcome; only a genuinely transient rejection (heap pressure) is
+        # retried. The oversized case is the one permanent rejection a
+        # different object can answer: the bounded fallback summary, so a
+        # failure to emit the verbose diagnostics never keeps an otherwise
+        # valid configuration from reaching normal operation.
         try:
-            startup_log_admitted = _admit_startup_log(intercore, startup_log_message)
+            startup_log_admitted = _admit_startup_log_with_fallback(
+                intercore,
+                startup_log_message,
+                lambda: _build_startup_log_bounded(
+                    intercore, device_manager, startup_duration_ms
+                ),
+            )
         except ValueError as err:
             # Permanent: fail immediately with the actual reason
             print("[FATAL] Startup log permanently rejected: {}".format(err))

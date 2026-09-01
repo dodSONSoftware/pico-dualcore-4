@@ -444,3 +444,187 @@ def test_admit_startup_log_exhausted_transient_retry_returns_false(monkeypatch):
     assert admitted is False
     assert queue.calls == 2
     assert fake_time.sleeps == [100]
+
+
+# ---------------------------------------------------------------------------
+# Bounded fallback when the detailed startup log exceeds the outbound ceiling
+# ---------------------------------------------------------------------------
+#
+# Device definitions carry no practical length or count bound for id, name,
+# or sensor_type, so the detailed startup log can exceed the 16 KiB outbound
+# ceiling on an otherwise valid configuration. The invariant this protects:
+# failure to emit the verbose diagnostics must not keep the device from
+# entering normal operation. Only the size rejection is answered by a
+# different object -- the bounded fallback summary (statuses and device
+# counts only, no ready_devices/failed_devices, no system_information);
+# every other permanent rejection still fails fast with its actual reason.
+
+
+_DETAIL_MESSAGE = {
+    "message_type": "log",
+    "uptime_ms": 1000,
+    "timestamp": None,
+    "payload": {
+        "level": "info",
+        "event": "system_startup_completed",
+        "data": {
+            "startup": {
+                "duration_ms": 1000,
+                "devices_configured": 1,
+                "devices_ready": 1,
+                "devices_failed": 0,
+                "ready_devices": [
+                    {"device": "d", "name": "n" * 5000, "sensor_type": "s"}
+                ],
+                "failed_devices": [],
+            },
+            "system_information": {"network": {"ssid": "test"}},
+        },
+    },
+}
+
+
+class _RecordingQueue:
+    """Admits everything and records the decoded payload bytes."""
+
+    def __init__(self):
+        self.entries = []
+
+    def put_with_kind(self, kind, payload_bytes, retention_priority):
+        import json
+
+        self.entries.append(json.loads(bytes(payload_bytes).decode("utf-8")))
+        return True
+
+
+def _too_large_for_detailed(message):
+    """Serialization contract for the fallback tests: the detailed message (with per-device lists) exceeds the ceiling; the bounded fallback serializes."""
+    import json
+
+    from message_serializer import MessageTooLargeError
+
+    startup = message.get("payload", {}).get("data", {}).get("startup", {})
+    if "ready_devices" in startup:
+        raise MessageTooLargeError("Message size 20000 exceeds maximum 16384")
+    return json.dumps(message).encode("utf-8")
+
+
+def test_build_startup_log_bounded_omits_unbounded_sections():
+    """The bounded fallback keeps only statuses and counts -- no device names, no system_information."""
+    core1 = _core1_module()
+
+    class MockDeviceManager:
+        def get_status_snapshot(self, now_ms=None):
+            return {
+                "devices": {"configured": 3, "active": 2, "initialization_failed": 1},
+                "device_status": [
+                    {"device": "a", "name": "x" * 5000, "sensor_type": "t", "state": "ready"},
+                    {"device": "b", "name": "y" * 5000, "sensor_type": "t", "state": "init_failed"},
+                ],
+            }
+
+    class MockInterCore:
+        def __init__(self):
+            # No UTC snapshot: the builder must leave the timestamp null
+            # rather than failing on a missing snapshot.
+            self.state_mailboxes = MagicMock()
+            self.state_mailboxes.get_utc_snapshot = lambda: None
+
+    saved_time = core1.time
+    core1.time = MagicMock(ticks_ms=lambda: 1000)
+    try:
+        payload = core1._build_startup_log_bounded(MockInterCore(), MockDeviceManager(), 4321)
+    finally:
+        core1.time = saved_time
+
+    data = payload["payload"]["data"]
+    startup = data["startup"]
+    assert startup["duration_ms"] == 4321
+    assert startup["devices_configured"] == 3
+    assert startup["devices_ready"] == 2
+    assert startup["devices_failed"] == 1
+    assert "ready_devices" not in startup
+    assert "failed_devices" not in startup
+    assert "system_information" not in data
+    assert payload["message_type"] == "log"
+    assert payload["payload"]["event"] == "system_startup_completed"
+
+
+def test_try_queue_startup_log_too_large_raises_typed_error(monkeypatch):
+    """The oversized case raises StartupLogTooLargeError (a ValueError subclass) so the caller can answer it with the bounded fallback."""
+    core1 = _core1_module()
+    from message_serializer import MessageTooLargeError
+
+    def _too_large(message):
+        raise MessageTooLargeError("Message size 20000 exceeds maximum 16384")
+
+    monkeypatch.setattr(core1, "serialize_and_validate_message", _too_large)
+    queue = _ScriptedQueue([True])
+    with pytest.raises(core1.StartupLogTooLargeError) as excinfo:
+        core1._try_queue_startup_log(_ScriptedBus(queue), _DETAIL_MESSAGE, 0)
+    assert isinstance(excinfo.value, ValueError)
+    assert queue.calls == 0, "an oversized message must never reach the queue"
+
+
+def test_admit_with_fallback_admits_bounded_summary_when_detailed_too_large(monkeypatch):
+    """A size-only rejection is answered by the bounded fallback, which is then admitted."""
+    core1 = _core1_module()
+
+    monkeypatch.setattr(core1, "serialize_and_validate_message", _too_large_for_detailed)
+    queue = _RecordingQueue()
+    fallback = {
+        "message_type": "log",
+        "uptime_ms": 1000,
+        "timestamp": None,
+        "payload": {
+            "level": "info",
+            "event": "system_startup_completed",
+            "data": {"startup": {"duration_ms": 1000, "devices_configured": 1}},
+        },
+    }
+
+    admitted = core1._admit_startup_log_with_fallback(
+        _ScriptedBus(queue), _DETAIL_MESSAGE, lambda: fallback
+    )
+
+    assert admitted is True
+    assert queue.entries == [fallback], "the admitted entry must be the bounded summary, not the detailed log"
+
+
+def test_admit_with_fallback_non_size_permanent_rejection_escapes_without_fallback(monkeypatch):
+    """A non-size permanent rejection cannot be answered by any fallback: it escapes and the fallback is never built."""
+    core1 = _core1_module()
+    from message_serializer import NonStringKeyError
+
+    def _invalid(message):
+        raise NonStringKeyError("dict key is not a string")
+
+    monkeypatch.setattr(core1, "serialize_and_validate_message", _invalid)
+    built = []
+    queue = _RecordingQueue()
+
+    with pytest.raises(ValueError):
+        core1._admit_startup_log_with_fallback(
+            _ScriptedBus(queue), _DETAIL_MESSAGE, lambda: built.append(1) or _STARTUP_MESSAGE
+        )
+
+    assert built == [], "the fallback must not be built for a non-size rejection"
+    assert queue.entries == [], "nothing is admitted when the rejection is not size-only"
+
+
+def test_admit_with_fallback_transient_rejection_on_fallback_retried_once(monkeypatch):
+    """A transient rejection of the bounded fallback keeps the normal single transient retry."""
+    core1 = _core1_module()
+
+    monkeypatch.setattr(core1, "serialize_and_validate_message", _too_large_for_detailed)
+    queue = _ScriptedQueue([False, True])
+    fake_time = _RecordingTime()
+    monkeypatch.setattr(core1, "time", fake_time)
+
+    admitted = core1._admit_startup_log_with_fallback(
+        _ScriptedBus(queue), _DETAIL_MESSAGE, lambda: _STARTUP_MESSAGE
+    )
+
+    assert admitted is True
+    assert queue.calls == 2, "the fallback gets its own single transient retry"
+    assert fake_time.sleeps == [100]
