@@ -5,11 +5,7 @@
 """
 Host-side tests for the inter-core bus.
 
-Both FIFO lanes are heap-governed: admission is decided against the global
-minimum free-heap reserve, with gc.collect() run only on the pressure path and
-(only the outbound queue) evicting the least-important eligible entries.
-These tests exercise that policy through a fake heap standing in for
-gc.mem_free()/gc.collect(), which CPython does not provide.
+Both FIFO lanes are heap-governed: admission is decided against the global minimum free-heap reserve, with gc.collect() run only on the pressure path and (only the outbound queue) evicting the least-important eligible entries. The tests exercise that policy through a fake heap standing in for gc.mem_free()/gc.collect(), which CPython does not provide.
 """
 
 import gc
@@ -49,11 +45,7 @@ KB = 1024
 class FakeHeap:
     """Host-side stand-in for the MicroPython heap seen through gc.
 
-    ``garbage_bytes`` models collectable garbage: the first gc.collect() that
-    runs while garbage remains releases it. Evicted queue entries release their
-    payload bytes immediately (reference counting), which install() wires in so
-    the reserve check sees them, matching MicroPython's refcounted heap.
-    """
+    garbage_bytes models collectable garbage: the first gc.collect() that runs while garbage remains releases it. Evicted queue entries release their payload bytes immediately (reference counting), matching MicroPython's refcounted heap."""
 
     def __init__(self, free_bytes, garbage_bytes=0):
         self.free_bytes = free_bytes

@@ -4,25 +4,15 @@
 
 """Host-side regression tests for the Core 0 stale-heartbeat watchdog.
 
-Core 1 is the producer of the ``core_1_activity_ms`` stamp and the only
-consumer that used to read it was Core 1 itself, when building its own
-health message. A dead Core 1 therefore could never report itself dead:
-it no longer builds the health message that would carry
-``core_1_inactive``, and Core 0 kept running with telemetry and health
-permanently stopped. The watchdog makes Core 0 the independent consumer:
-an established stamp that goes stale beyond the timeout resets the MCU.
+Core 1 is the producer of the core_1_activity_ms stamp; a dead Core 1 cannot report itself (it no longer builds the health message that would carry core_1_inactive), so Core 0 is the independent consumer: an established stamp that goes stale beyond the timeout resets the MCU.
 
 These tests pin the boundary semantics:
 
 * no stamp (Core 1 not started) is never a reset trigger;
 * a fresh stamp is never a reset trigger;
-* a stamp exactly at the timeout IS a reset trigger (a live Core 1 cannot
-  be that late, given its 5-second refresh deadline and 20 ms loop);
-* a stale stamp resets, both when the check is driven directly and when it
-  runs inside the real ``run()`` loop;
-* a stale stamp also resets *during* a failed network-recovery wait (the
-  watchdog is not blind while Core 0 is stuck reconnecting): the reset
-  fires inside the first backoff sleep, before that sleep even completes.
+* a stamp exactly at the timeout IS a reset trigger (a live Core 1 cannot be that late, given its 5-second refresh deadline and 20 ms loop);
+* a stale stamp resets, both when driven directly and inside the real run() loop;
+* a stale stamp also resets *during* a failed network-recovery wait: the reset fires inside the first backoff sleep, before it even completes.
 """
 
 import importlib
@@ -46,9 +36,7 @@ class LoopStop(Exception):
 class FakeTime:
     """Controllable stand-in for MicroPython's time module.
 
-    sleep_ms advances the clock by exactly the requested amount so loop
-    steps are deterministic. stop_after_ms (when set) ends the loop.
-    """
+    sleep_ms advances the clock by exactly the requested amount so loop steps are deterministic; stop_after_ms (when set) ends the loop."""
 
     def __init__(self):
         self.now_ms = 0
@@ -335,14 +323,7 @@ def test_run_loop_stays_up_with_fresh_heartbeat(env):
 def test_stale_heartbeat_resets_during_network_recovery(env):
     """The watchdog fires during a recovery wait, not after recovery ends.
 
-    Core 1 has already registered its stamp and a network outage drives
-    Core 0 into the recovery path, where the reconnect sequence keeps
-    failing. The first backoff sleep (40 s, the configured maximum)
-    outlasts the 30 s staleness timeout: a watchdog that were blind to
-    these waits would only reset once the whole sequence finally finished.
-    A serviced wait must reset at the 30 s mark -- inside the first
-    backoff sleep, before it has even completed.
-    """
+    The first backoff sleep (40 s, the configured maximum) outlasts the 30 s staleness timeout: a watchdog blind to these waits would only reset once the whole sequence finished. A serviced wait must reset at the 30 s mark -- inside the first backoff sleep, before it has even completed."""
     instance, machine = env["instance"], env["machine"]
     timeout_ms = env["core0_mod"]._CORE_1_HEARTBEAT_STALE_TIMEOUT_MS
     max_backoff_ms = env["instance"]._config["wifi_reconnect_delays_sec"][-1] * 1000

@@ -4,11 +4,7 @@
 
 """Host-side tests for reinitialization-failure warning suppression.
 
-Drives the real device_manager decision and the real core1 warning path
-together: the first failed reinit logs a warning, repeats for the same device
-are suppressed, a successful reinit clears the suppression, and a later
-independent failure logs the warning again.
-"""
+Drives the real device_manager decision and the real core1 warning path together: the first failed reinit logs a warning, repeats for the same device are suppressed, a successful reinit clears the suppression, and a later independent failure logs the warning again."""
 
 import importlib
 import json
@@ -89,9 +85,7 @@ def _install_fakes(fake_time):
 def _reload_core1_under_fakes():
     """Import/reload the core1 chain with the fakes authoritative.
 
-    core1 (and its imports) bind time/machine/os from sys.modules at import
-    time, so any cached module is reloaded in dependency order first.
-    """
+    core1 (and its imports) bind time/machine/os from sys.modules at import time, so any cached module is reloaded in dependency order first."""
     names = (
         "hardware",
         "system_information",
@@ -133,9 +127,7 @@ class FakeDriver:
 class ReinitEnv:
     """Builds the real DeviceManager + ManagedDevice and a core1 to route results.
 
-    Uses ``device_initialization_attempts=1`` so a failed reinit does not sleep
-    between retries, keeping the host test deterministic.
-    """
+    Uses device_initialization_attempts=1 so a failed reinit does not sleep between retries, keeping the host test deterministic."""
 
     def __init__(self):
         self._fake_time = FakeTime()

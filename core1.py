@@ -43,7 +43,6 @@ COMMAND_GET_DETAILS = "get-details"
 
 
 def _collect_system_information_full(system_information):
-    """Collect full system information snapshot including all sections."""
     system_info = {}
     for section in SYSTEM_INFORMATION_SECTIONS:
         try:
@@ -63,20 +62,7 @@ def _collect_system_information_full(system_information):
 def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information=None):
     """Build the system_startup_completed log message.
 
-    The message carries only Core 1's own fields (message_type, uptime_ms,
-    timestamp, payload). It must NOT carry the envelope keys (sequence,
-    runtime_id, source, firmware_version, message_schema_version): those are
-    owned by Core 0, which injects them at publish time, and repeating a name
-    in the wire document would violate the JSON object contract.
-
-    Args:
-        intercore: InterCore bus instance
-        boot_ticks_ms: Monotonic timestamp at firmware boot
-        device_manager: DeviceManager instance
-        config: Core 1 configuration
-        startup_duration_ms: Duration of startup in milliseconds
-        system_information: Optional SystemInformation instance with device_manager set
-    """
+    Carries only Core 1's own fields -- the Core 0 envelope keys are injected at publish time and must not be repeated."""
     # Build startup summary. Subscription readiness is reported without topic
     # names: topic ownership belongs to Core 0 (message kind only crosses cores).
     # The startup duration is named explicitly (duration_ms) so it carries its
@@ -148,16 +134,7 @@ def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup
 def _try_queue_startup_log(intercore, message, retention_priority):
     """Attempt to queue the startup log message.
 
-    Returns:
-        bool: True if admitted; False if admission failed transiently (heap
-        pressure) and a later attempt may succeed.
-
-    Raises:
-        ValueError: if the message can never be admitted (validation failure,
-        oversized, serialization failure, or a permanent queue rejection):
-        retrying the same object cannot succeed, so the caller must fail fast
-        with the actual reason instead of retrying.
-    """
+    True if admitted; False if admission failed transiently (heap pressure). Raises ValueError on a permanent rejection: retrying the same object cannot succeed, so the caller fails fast with the actual reason."""
     try:
         payload_bytes = serialize_and_validate_message(message)
     except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
@@ -187,19 +164,7 @@ def _try_queue_startup_log(intercore, message, retention_priority):
 def _admit_startup_log(intercore, message):
     """Admit the startup log, retrying only a transient rejection.
 
-    A transient rejection (heap pressure) is retried once after a short
-    delay, because the queue may admit the message on the next pass. A
-    permanent rejection (validation, size, serialization) is never retried:
-    retrying the same object cannot change the outcome, so the ValueError
-    escapes to the caller, which fails fast with the actual reason.
-
-    Returns:
-        bool: True if admitted; False if the single transient retry also
-        failed.
-
-    Raises:
-        ValueError: on a permanent rejection (the caller fails fast).
-    """
+    A permanent rejection is never retried: the ValueError escapes to the caller, which fails fast. True if admitted, False if the single transient retry also failed."""
     if _try_queue_startup_log(intercore, message, RETENTION_PRIORITY_INFO):
         return True
 
@@ -214,12 +179,7 @@ def _admit_startup_log(intercore, message):
 def _current_utc_timestamp(intercore):
     """Current UTC timestamp from the shared snapshot, or None if unsynchronized.
 
-    Core 1 reads the snapshot Core 0 publishes to the state mailboxes and
-    advances it by the elapsed local ticks so it tracks the clock between
-    refreshes. When no snapshot exists the value is None (null on the wire),
-    which is the same value Core 0 would have published from the same
-    snapshot state.
-    """
+    The snapshot is advanced by the elapsed local ticks so it tracks the clock between refreshes."""
     snapshot = intercore.state_mailboxes.get_utc_snapshot()
     if snapshot is None:
         return None
@@ -258,19 +218,7 @@ def _build_command_response(intercore, uptime_state, event, success, data=None, 
 def _try_queue_response(intercore, response):
     """Queue a command response at CRITICAL retention priority.
 
-    Returns:
-        bool: True if admitted; False if admission failed transiently (heap
-        pressure) and the response should be retried on a later pass.
-
-    Raises:
-        ValueError: if the response can never be admitted (serialized beyond
-        the per-message ceiling, or otherwise invalid): retrying the same
-        message cannot succeed, so the caller must not keep retrying it.
-
-        OutboundMessageTooLargeError (a ValueError subclass): for the
-        oversized case specifically, so the caller can report a size failure
-        distinctly from a validation or serialization failure.
-    """
+    True if admitted; False if transiently rejected (retry on a later pass). Raises ValueError on a permanent rejection; the oversized case raises OutboundMessageTooLargeError (a ValueError subclass)."""
     return intercore.outbound_queue.put(
         response["kind"],
         response["message"],
@@ -281,11 +229,7 @@ def _try_queue_response(intercore, response):
 def _build_substitute_error_response(intercore, uptime_state, response, code, message):
     """A small error response standing in for a permanently rejected one.
 
-    The rejected response's payload carries the command's identifying fields
-    (command_id, command, targeted) -- exactly what _build_command_response
-    reads from the event -- so it doubles as the descriptor here. The result
-    is a few hundred bytes by construction, far under the per-message ceiling.
-    """
+    The rejected response's payload carries the command's identifying fields, so it doubles as the descriptor; the result is far under the per-message ceiling."""
     payload = response["message"]["payload"]
     return _build_command_response(
         intercore,
@@ -302,10 +246,7 @@ def _build_substitute_error_response(intercore, uptime_state, response, code, me
 def _admit_substitute(intercore, uptime_state, response, code, message, warning):
     """Log a permanent rejection, admit the small error substitute for it.
 
-    Returns:
-        None if the substitute was admitted, or the substitute (still
-        pending) if its admission was transiently rejected.
-    """
+    None if the substitute was admitted; the substitute (still pending) if its admission was transiently rejected."""
     print("[WARNING] {}".format(warning))
     substitute = _build_substitute_error_response(intercore, uptime_state, response, code, message)
     if _try_queue_response(intercore, substitute):
@@ -314,22 +255,9 @@ def _admit_substitute(intercore, uptime_state, response, code, message, warning)
 
 
 def _admit_or_substitute_command_response(intercore, uptime_state, response):
-    """Admit a command response, or a small error substitute for it.
+    """Admit a command response, or a small error substitute for it; either way the channel moves on.
 
-    A transient rejection (heap pressure) leaves the response pending for a
-    later pass. A permanent rejection -- the message can never be admitted,
-    so retrying it would spin forever and stall every later command behind it
-    -- is answered with a small error response for the same command whose
-    code states the actual cause: "response_too_large" for an oversized
-    response, "response_invalid" for a validation or serialization failure
-    (reporting that as a size problem would obscure a real firmware defect).
-    Either way the channel moves on.
-
-    Returns:
-        the response still pending after this pass (the original on a
-        transient rejection, the substitute if the substitute itself was
-        transiently rejected), or None if a response was admitted.
-    """
+    A transient rejection leaves the response pending. A permanent rejection is answered with a small error response whose code states the cause: "response_too_large" for oversized, "response_invalid" for a validation/serialization failure. Returns the response still pending after this pass, or None if one was admitted."""
     try:
         if _try_queue_response(intercore, response):
             return None
@@ -462,21 +390,7 @@ def _handle_device_result(intercore, config, uptime_state, result):
 def _build_health_payload(intercore, uptime_state, config, system_information):
     """Build the health payload from shared state snapshots.
 
-    The message carries only Core 1's own fields (message_type, uptime_ms,
-    timestamp, payload). The envelope keys (sequence, runtime_id, source,
-    firmware_version, message_schema_version) are owned by Core 0, which
-    injects them at publish time; repeating them here would duplicate a name
-    in the wire document.
-
-    Args:
-        intercore: InterCore bus instance
-        uptime_state: Accumulated uptime state (see uptime.py)
-        config: Core 1 configuration
-        system_information: SystemInformation instance for device status
-
-    Returns:
-        dict: Health message payload with status and diagnostic fields
-    """
+    Carries only Core 1's own fields -- the Core 0 envelope keys are injected at publish time. None if no network snapshot exists yet."""
     now_ms = time.ticks_ms()
     uptime_ms = current_uptime_ms(uptime_state)
 
@@ -615,15 +529,7 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
 
 
 def _try_queue_health_message(intercore, message):
-    """Attempt to queue a health message.
-
-    Args:
-        intercore: InterCore bus instance
-        message: Health message payload dict
-
-    Returns:
-        bool: True if message was admitted, False otherwise
-    """
+    """Attempt to queue a health message; True if admitted, False otherwise."""
     try:
         payload_bytes = serialize_and_validate_message(message)
     except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
@@ -657,15 +563,7 @@ def _try_queue_health_message(intercore, message):
 def _try_queue_health_message_intercore(intercore, uptime_state, config, system_information):
     """Build health payload and attempt to queue it.
 
-    Only generates health message if network stack is ready.
-    This prevents health messages from accumulating during MQTT outages.
-
-    Args:
-        intercore: InterCore bus instance
-        uptime_state: Accumulated uptime state (see uptime.py)
-        config: Core 1 configuration
-        system_information: SystemInformation instance for device status
-    """
+    Only when the network stack is ready and MQTT is connected, so health messages don't accumulate during outages."""
     # Check if network stack is ready before generating health
     network_snapshot = intercore.state_mailboxes.get_network_snapshot()
     if network_snapshot is None:
@@ -689,14 +587,7 @@ def _try_queue_health_message_intercore(intercore, uptime_state, config, system_
 
 
 def core1_main(intercore, config, boot_ticks_ms, runtime_id):
-    """Core 1 entry point. This core never imports or touches network/MQTT.
-
-    Args:
-        intercore: InterCore bus instance
-        config: Core 1 configuration
-        boot_ticks_ms: Monotonic timestamp at firmware boot
-        runtime_id: Unique runtime identifier
-    """
+    """Core 1 entry point; this core never imports or touches network/MQTT."""
     try:
         print("[INFO] Core 1 starting")
 

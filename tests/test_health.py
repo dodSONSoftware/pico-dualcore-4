@@ -4,12 +4,7 @@
 
 """Host-side regression tests for Core 1 health payload generation.
 
-These tests drive the PRODUCTION builder ``core1._build_health_payload`` (not a
-copy) under a controllable clock and minimal MicroPython stand-ins, and assert
-on the externally observable payload values: Core-1 liveness, runtime/uptime,
-queue/state info, device state, and the conditional fields. A deliberate change
-to the production builder must fail the corresponding test.
-"""
+These tests drive the PRODUCTION builder core1._build_health_payload (not a copy) under a controllable clock and minimal MicroPython stand-ins, and assert on the externally observable payload values: Core-1 liveness, runtime/uptime, queue/state info, device state, and the conditional fields. A deliberate change to the production builder must fail the corresponding test."""
 
 import gc
 import importlib
@@ -109,9 +104,7 @@ def _install_fakes(fake_time):
 def _reload_core1_under_fakes():
     """Import/reload the core1 chain with the fakes authoritative.
 
-    core1 binds time/machine/os (and uptime) from sys.modules at import time,
-    so any cached module is reloaded in dependency order before core1 itself.
-    """
+    core1 binds time/machine/os (and uptime) from sys.modules at import time, so any cached module is reloaded in dependency order before core1 itself."""
     names = (
         "hardware",
         "system_information",
@@ -145,11 +138,7 @@ def _valid_utc_snapshot(age_ms=10000):
 class HealthEnv:
     """Runs the production health builder under host fakes and shims.
 
-    Installs controllable time/machine/os stand-ins, reloads the core1 chain so
-    they are authoritative, and exposes a small API to drive the builder's
-    inputs (state mailboxes, device status, free heap, clock). Fakes and the
-    ``gc.mem_free`` shim are restored on close().
-    """
+    Installs controllable time/machine/os stand-ins, reloads the core1 chain so they are authoritative, and exposes a small API to drive the builder's inputs (state mailboxes, device status, free heap, clock). Fakes and the gc.mem_free shim are restored on close()."""
 
     def __init__(self):
         self._fake_time = FakeTime(NOW_MS)
@@ -365,10 +354,7 @@ def test_retained_queue_metrics_in_payload(health):
 def test_admission_rejections_are_visible_in_payload(health):
     """A rejection under memory pressure is counted and reported in health.
 
-    The heap is below the reserve with nothing to collect, so admission is
-    rejected (the queue has no capacity to give up). The health payload
-    reflects both the pressure (low_free_heap) and the rejection counter.
-    """
+    The heap is below the reserve with nothing to collect, so admission is rejected; the health payload reflects both the pressure (low_free_heap) and the rejection counter."""
     health.set_healthy_baseline()
     health.set_utc(_valid_utc_snapshot())
     health.set_free_heap(40000)  # below the 65536 reserve

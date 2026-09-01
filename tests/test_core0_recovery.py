@@ -19,9 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class FakeTime:
     """Controllable stand-in for MicroPython's time module.
 
-    sleep_ms advances the clock so bounded wait loops terminate
-    deterministically in tests.
-    """
+    sleep_ms advances the clock so bounded wait loops terminate deterministically in tests."""
 
     def __init__(self):
         self.now_ms = 0
@@ -359,11 +357,7 @@ def test_start_delegates_to_establish_network_and_stops_led(make_core0):
 def test_start_recovers_from_transient_probe_failure(make_core0):
     """A transient probe failure must be re-established and retried, not fatal.
 
-    Previously a single failed probe raised and halted startup (Core 1 never
-    started until a reset). Now the network is re-established and the whole
-    verification pass retried; start() returns once a clean pass succeeds and
-    Core 1 gating (network_stack_ready, UTC snapshot) still holds.
-    """
+    Previously a single failed probe raised and halted startup (Core 1 never started until a reset). Now the network is re-established and the whole verification pass retried; start() returns once a clean pass succeeds and Core 1 gating still holds."""
     instance = make_core0()
     mqtt = instance._mqtt
     mqtt.fail_probes_times = 1  # first probe publish fails, then succeeds
@@ -420,11 +414,7 @@ def _real_outbound_queue(instance):
 def test_publish_entry_splices_core0_envelope_and_keeps_body_intact(make_core0):
     """The wire frame is the queued message with Core 0's envelope spliced in.
 
-    Core 0 must not decode, parse, or re-serialize the payload: the message
-    body must appear in the published frame exactly as the sender queued it,
-    and the five envelope members must be Core 0's own values (its runtime_id
-    and configured source, not anything a sender might have embedded).
-    """
+    Core 0 must not decode, parse, or re-serialize the payload: the body appears in the published frame exactly as the sender queued it, and the five envelope members must be Core 0's own values, not anything a sender might have embedded."""
     from intercore import KIND_HEALTH, RETENTION_PRIORITY_HEALTH
     from message_serializer import serialize_and_validate_message
     from version import FIRMWARE_VERSION
@@ -499,17 +489,9 @@ def test_publish_entry_rejects_payload_that_is_not_a_json_object(make_core0):
 
 
 def test_sequence_not_reused_across_ambiguous_qos1_failure_and_reconnect(make_core0):
-    """A PUBACK lost after delivery must not let a different message reuse the
-    in-flight entry's sequence, and a retry must keep it.
+    """A PUBACK lost after delivery must not let a different message reuse the in-flight entry's sequence, and a retry must keep it.
 
-    Reproduces the field capture: telemetry A publishes, the PUBACK is lost so
-    the entry stays in flight, the link drops and reconnects (publishing an
-    mqtt_connection_established log), and telemetry A is then retried. Before
-    the fix the connection log took telemetry A's sequence (a collision) and the
-    retry took a new one. Now the connection log gets a fresh number and the
-    retry reuses the in-flight entry's number, so two different logical messages
-    never share a sequence and a retry preserves its logical identity.
-    """
+    Telemetry A publishes, the PUBACK is lost so the entry stays in flight, the link drops and reconnects (publishing a connection log), and telemetry A is retried. The connection log gets a fresh number and the retry reuses the in-flight entry's number, so two different logical messages never share a sequence."""
     from intercore import KIND_TELEMETRY, RETENTION_PRIORITY_TELEMETRY
     from message_serializer import serialize_and_validate_message
 
@@ -571,17 +553,9 @@ def test_sequence_not_reused_across_ambiguous_qos1_failure_and_reconnect(make_co
 
 
 def test_command_response_retry_preserves_sequence_across_intervening_message(make_core0):
-    """A Core 0 command response re-published after an ambiguous failure keeps
-    the sequence it first claimed, even when an intervening message consumed a
-    number -- instead of silently shifting to a new one.
+    """A Core 0 command response re-published after an ambiguous failure keeps the sequence it first claimed, even when an intervening message consumed a number.
 
-    And, because (runtime_id, sequence) is now a unique event identity, the
-    retry must be the SAME document, not just the same identity: the serialized
-    bytes are frozen on the first attempt and re-published verbatim, so two
-    frames carrying one logical message are byte-identical. (Before the fix the
-    retry rebuilt the message with a newer uptime_ms/timestamp, so a deduplicator
-    keying on (runtime_id, sequence) could drop one of two differing documents.)
-    """
+    Because (runtime_id, sequence) is a unique event identity, the retry must be the SAME document: the serialized bytes are frozen on the first attempt and re-published verbatim, so two frames carrying one logical message are byte-identical."""
     instance = make_core0()
     mqtt = instance._mqtt
     # fail (response attempt 1), ok (intervening connection log), ok (retry).

@@ -4,24 +4,12 @@
 
 """Host-side regression tests for Core 1 startup heartbeat coverage.
 
-Before the fix, ``core1_main()`` registered ``core_1_activity_ms`` only
-AFTER device initialization and startup-log admission, and Core 0's
-watchdog (``_watch_core_1_heartbeat``) is a no-op until the first stamp
-exists. A Core 1 that started its thread and then wedged inside a driver
-constructor or a device ``initialize()`` call was therefore
-indistinguishable from a Core 1 that had not started at all, and the
-watchdog could never fire.
+Before the fix, core1_main() registered core_1_activity_ms only AFTER device initialization and startup-log admission, and Core 0's watchdog (_watch_core_1_heartbeat) is a no-op until the first stamp exists. A Core 1 that wedged inside a driver constructor or a device initialize() call was therefore indistinguishable from one that had not started at all, and the watchdog could never fire.
 
 The fix:
 
-1. ``core1_main()`` stamps the activity mailbox at the top of its body,
-   before ``SystemInformation``/``DeviceManager`` construction and before
-   ``initialize_devices()``.
-2. Core 1 passes ``DeviceManager`` an optional ``activity_refresh``
-   callback, invoked at each initialization progress boundary (before
-   each device, before each ``initialize()`` attempt), so a legitimate
-   long initialization does not age the stamp past the watchdog bound
-   while a wedged driver call -- which stops the refresh -- is caught.
+1. core1_main() stamps the activity mailbox at the top of its body, before SystemInformation/DeviceManager construction and initialize_devices().
+2. Core 1 passes DeviceManager an optional activity_refresh callback, invoked at each initialization progress boundary (before each device, before each initialize() attempt), so a legitimate long initialization does not age the stamp past the watchdog bound while a wedged driver call stops the refresh and is caught.
 """
 
 import importlib
@@ -159,10 +147,7 @@ def _reload_core1_under_fakes():
 class ProbeDriver:
     """Driver that records the activity stamp as Core 1 sees it.
 
-    ``stamp_at_initialize`` is None when the liveness stamp has not been
-    registered yet at the moment initialize() runs -- exactly the
-    pre-fix gap this test guards.
-    """
+    stamp_at_initialize is None when the liveness stamp has not been registered yet at the moment initialize() runs -- exactly the pre-fix gap this test guards."""
 
     def __init__(self, bus):
         self._bus = bus
@@ -178,11 +163,7 @@ class ProbeDriver:
 def _capturing_system_information(core1_mod, bus):
     """Wrap core1's SystemInformation to record the stamp at construction.
 
-    A wedge inside the SystemInformation/DeviceManager constructors is the
-    pre-fix gap that ONLY the early core1_main stamp covers (the
-    DeviceManager refresh callback cannot fire before the manager is
-    constructed), so the test captures the stamp there as well.
-    """
+    A wedge inside the SystemInformation/DeviceManager constructors is the pre-fix gap that ONLY the early core1_main stamp covers (the DeviceManager refresh callback cannot fire before the manager is constructed)."""
     real_system_information = core1_mod.SystemInformation
     stamp_at_construction = ["UNSET"]
 
@@ -208,13 +189,7 @@ def _core1_config_with_probe():
 def test_core1_registers_activity_stamp_before_device_initialization():
     """The liveness stamp must exist before any initialization work runs.
 
-    Drives the real core1_main and captures the stamp (1) at
-    SystemInformation construction and (2) inside the probe device's
-    initialize(). Pre-fix, the stamp was registered only after
-    initialize_devices() and startup-log admission, so both captures were
-    None and a wedge anywhere in startup was invisible to Core 0's
-    watchdog.
-    """
+    Drives the real core1_main and captures the stamp (1) at SystemInformation construction and (2) inside the probe device's initialize(). Pre-fix, both captures were None and a wedge anywhere in startup was invisible to Core 0's watchdog."""
     fake_time = FakeTime(BOOT_TICKS_MS, STOP_AT_MS)
     saved_modules = {name: sys.modules.get(name) for name in ("time", "machine", "os")}
 
@@ -282,10 +257,7 @@ if "machine" not in sys.modules:
 class _HostTimeShim:
     """time stand-in for host-side DeviceManager tests.
 
-    The firmware targets MicroPython, whose time module provides sleep_ms;
-    CPython's does not. Provide a no-op sleep_ms (the retry delay is not
-    under test) and delegate everything else to the real host time module.
-    """
+    CPython's time module has no sleep_ms; provide a no-op sleep_ms (the retry delay is not under test) and delegate everything else to the real host time module."""
 
     def sleep_ms(self, ms):
         pass
@@ -297,13 +269,7 @@ class _HostTimeShim:
 def _host_time_device_manager():
     """device_manager bound to a host-safe time module.
 
-    Test 1 reloads the core1 chain (including device_manager) while
-    sys.modules["time"] is the FakeTime above, which binds the fake into
-    the module's ``import time`` for the rest of the session; the plain
-    host time module has no sleep_ms at all. Either way these tests need
-    a deterministic time with a working sleep_ms, so bind one explicitly.
-    (Rebinding dm's namespace attribute does not mutate any shared module.)
-    """
+    An earlier test reloads the core1 chain while sys.modules["time"] is FakeTime, which binds the fake into device_manager's import time for the rest of the session; the plain host time module has no sleep_ms. Either way these tests need a deterministic time with a working sleep_ms, so bind one explicitly (rebinding dm's namespace attribute mutates no shared module)."""
     if "device_manager" in sys.modules:
         dm = importlib.reload(sys.modules["device_manager"])
     else:
@@ -324,12 +290,7 @@ def _manager_config(attempts=3, retry_delay_ms=10):
 def test_device_manager_refreshes_between_attempts():
     """The refresh callback must fire at each progress boundary.
 
-    A driver that fails twice then succeeds must observe a STRICTLY
-    INCREASING refresh count at each attempt: the stamp is refreshed
-    before the first attempt (arming the watchdog before driver work) and
-    again between attempts (covering the retry delay), not just once up
-    front.
-    """
+    A driver that fails twice then succeeds must observe a STRICTLY INCREASING refresh count at each attempt: the stamp is refreshed before the first attempt and again between attempts (covering the retry delay), not just once up front."""
     refresh_log = []
 
     def refresh():
@@ -373,14 +334,9 @@ def test_device_manager_refreshes_between_attempts():
 
 
 def test_device_manager_reinitialization_refreshes_between_attempts():
-    """Runtime reinitialization uses the same progress-boundary strategy as
-    startup: the refresh fires before every initialize() attempt (so the
-    stamp is current across the whole retry sequence) and before each retry
-    sleep (so the sleep itself cannot age it past Core 0's watchdog bound).
-    A wedge inside driver.initialize() still stops the refreshes and is
-    caught, because the refreshes happen at the boundaries, not inside the
-    driver call.
-    """
+    """Runtime reinitialization uses the same progress-boundary strategy as startup.
+
+    The refresh fires before every initialize() attempt and before each retry sleep (so the sleep itself cannot age the stamp past Core 0's watchdog bound); a wedge inside driver.initialize() still stops the refreshes and is caught."""
     refresh_log = []
 
     def refresh():

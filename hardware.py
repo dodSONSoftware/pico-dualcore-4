@@ -27,16 +27,7 @@ _PICO_2_W_MACHINE_PATTERNS = (
 
 
 def classify_machine(machine_name):
-    """
-    Classify a machine string into its canonical board result.
-
-    This is the single source of truth for mapping a machine string to a
-    hardware type and the board-specific minimum free-heap reserve.
-
-    Returns a dict with:
-        hardware_type: canonical type ("pico_w", "pico_2_w", or "unknown")
-        minimum_free_heap_bytes: board reserve, or None when unknown
-    """
+    """Classify a machine string into {hardware_type, minimum_free_heap_bytes} -- the single source of truth for the mapping."""
     if machine_name in _PICO_W_MACHINE_PATTERNS:
         return {
             "hardware_type": HARDWARE_TYPE_PICO_W,
@@ -54,17 +45,7 @@ def classify_machine(machine_name):
 
 
 def detect_hardware():
-    """
-    Detect the hardware type at runtime.
-
-    Returns a dict with:
-        hardware_type: canonical hardware type ("pico_w" or "pico_2_w")
-        machine: raw machine string from os.uname().machine
-        minimum_free_heap_bytes: board-specific minimum free-heap reserve
-
-    Raises:
-        RuntimeError: if the hardware is not supported
-    """
+    """Detect the hardware type at runtime; returns {hardware_type, machine, minimum_free_heap_bytes}. Raises RuntimeError on unsupported hardware."""
     try:
         machine_name = os.uname().machine
     except MemoryError:
@@ -85,11 +66,7 @@ def detect_hardware():
 
 
 def is_supported_hardware():
-    """
-    Check if the current hardware is supported.
-
-    Returns True if hardware is Pico W or Pico 2 W, False otherwise.
-    """
+    """Check if the current hardware is supported (Pico W or Pico 2 W)."""
     try:
         detect_hardware()
         return True
@@ -98,18 +75,7 @@ def is_supported_hardware():
 
 
 def get_minimum_free_heap(hardware_type):
-    """
-    Get the minimum free-heap reserve for a given hardware type.
-
-    Args:
-        hardware_type: canonical hardware type ("pico_w" or "pico_2_w")
-
-    Returns:
-        minimum free-heap reserve in bytes
-
-    Raises:
-        ValueError: if hardware_type is not recognized
-    """
+    """Get the minimum free-heap reserve (bytes) for a canonical hardware type. Raises ValueError if unrecognized."""
     if hardware_type == HARDWARE_TYPE_PICO_W:
         return PICO_W_MIN_FREE_HEAP_BYTES
     elif hardware_type == HARDWARE_TYPE_PICO_2_W:

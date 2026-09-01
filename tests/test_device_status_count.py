@@ -4,21 +4,9 @@
 
 """Host-side tests for the status snapshot's active-count semantics.
 
-The documented contract (README/CLAUDE health fields) is:
+The documented contract: devices_configured = number of configured devices, devices_active = number of active/ready devices, device_failures = devices_configured - devices_active.
 
-    devices_configured: number of configured devices
-    devices_active:     number of active/ready devices
-    device_failures:    devices_configured - devices_active
-
-A device that has accumulated enough read failures is marked
-``reinitialize_pending`` and intentionally remains in
-``DeviceManager._active_devices`` (it must stay eligible for
-reinitialization). It is NOT currently ready, however, so the status
-snapshot must not count it as active: with one configured device that is
-reinit-pending, the snapshot must report ``active == 0`` so the derived
-``device_failures`` is 1 and the ``device_count_mismatch`` degradation
-reason can fire.
-"""
+A device that has accumulated enough read failures is marked reinitialize_pending and intentionally remains in DeviceManager._active_devices (it must stay eligible for reinitialization). It is NOT currently ready, however, so the status snapshot must not count it as active: with one configured device that is reinit-pending, the snapshot must report active == 0 so the derived device_failures is 1 and the device_count_mismatch degradation reason can fire."""
 
 import pathlib
 import sys

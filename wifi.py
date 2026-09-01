@@ -29,7 +29,6 @@ class Wifi:
             self._wait_service()
 
     def _sleep_interruptible(self, delay_sec):
-        """Sleep in 100 ms slices, servicing Core 0 between slices."""
         for _ in range(max(int(delay_sec * 10), 1)):
             self._service_wait()
             time.sleep_ms(100)
@@ -37,11 +36,7 @@ class Wifi:
     def _current_status(self):
         """The current WLAN association state, or None if it cannot be read.
 
-        None covers every way the read can fail or come back non-int
-        (an unsupported firmware, a status API that wants a key, ...).
-        Callers treat None as "unknown" and let the existing observation
-        timeout govern -- exactly as before -- never as a failure.
-        """
+        Callers treat None as "unknown" and let the observation timeout govern -- never as a failure."""
         try:
             status = self._wlan.status()
         except MemoryError:
@@ -53,13 +48,7 @@ class Wifi:
     def _terminal_failure_statuses(self):
         """The WLAN association states that end a connect attempt, as ints.
 
-        WRONG_PASSWORD, NO_AP_FOUND and CONNECT_FAIL are all final for the
-        current connect() call: the driver will not recover within the
-        observation window, so the attempt can stop observing immediately.
-        The values are read from the WLAN object (like PM_NONE above) and,
-        if the firmware build does not expose the names, fall back to the
-        documented MicroPython values (2, 3, 4).
-        """
+        WRONG_PASSWORD, NO_AP_FOUND, CONNECT_FAIL are final for the current connect() call; the values are read from the WLAN object, falling back to the documented MicroPython literals (2, 3, 4)."""
         names = ("STAT_WRONG_PASSWORD", "STAT_NO_AP_FOUND", "STAT_CONNECT_FAIL")
         literals = (2, 3, 4)
         statuses = []

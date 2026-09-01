@@ -45,7 +45,6 @@ _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS = 30000
 
 
 class Core0:
-    """Own the complete network stack and all MQTT operations."""
 
     def __init__(self, intercore, config, wifi_config, runtime_id, boot_ticks_ms, led_manager):
         self._intercore = intercore
@@ -158,7 +157,6 @@ class Core0:
             self._pending_connection_logs.pop(0)
 
     def _on_mqtt_message(self, topic, payload):
-        """Handle subscribed MQTT traffic on Core 0."""
         try:
             if isinstance(topic, bytes):
                 topic = topic.decode()
@@ -309,21 +307,11 @@ class Core0:
             })
 
     def _is_recent_command_id(self, command_id):
-        """True if command_id was already accepted in this runtime.
-
-        Exact, case-sensitive comparison: command_id is an opaque identifier
-        and is never normalized. Membership alone decides -- the command
-        name, payload, and target casing are irrelevant to the check.
-        """
+        """True if command_id was already accepted in this runtime (exact, case-sensitive)."""
         return command_id in self._recent_command_ids
 
     def _remember_command_id(self, command_id):
-        """Record an accepted command_id; evict the oldest once over capacity.
-
-        Append-only FIFO: a later duplicate never moves an entry toward the
-        newest end (see _RECENT_COMMAND_ID_CAPACITY). Linear scan and pop(0)
-        are intentional at this size.
-        """
+        """Record an accepted command_id; evict the oldest once over capacity (FIFO, not LRU)."""
         self._recent_command_ids.append(command_id)
         if len(self._recent_command_ids) > _RECENT_COMMAND_ID_CAPACITY:
             self._recent_command_ids.pop(0)
@@ -426,14 +414,9 @@ class Core0:
         raise ValueError("Unsupported outbound message kind: {}".format(kind))
 
     def _envelope_fragment(self, sequence):
-        """Serialize the five envelope members Core 0 owns on the wire.
+        """Serialize the five Core-0-owned envelope members as a braceless fragment.
 
-        Returns them as JSON members without the outer braces, ready to be
-        spliced into a queued message before its closing brace. ``json.dumps``
-        escapes the string values (runtime_id, source). Senders must not carry
-        any of these keys at the top level of their message, or the wire
-        document would repeat a name.
-        """
+        Senders must not carry any of these keys at the top level of their message."""
         fragment = json.dumps({
             "sequence": sequence,
             "runtime_id": self._runtime_id,
@@ -444,20 +427,9 @@ class Core0:
         return fragment[1:-1].encode("utf-8")
 
     def _claim_wire_sequence(self, container):
-        """Claim the next wire sequence number and stamp it on ``container``.
+        """Claim the next wire sequence and stamp it on ``container``; never rolled back.
 
-        QoS 1 has an ambiguous failure mode: the PUBLISH frame can reach the
-        broker while the PUBACK is lost, so a failed publish attempt may still
-        have been delivered. A number handed to such an attempt can therefore
-        never be given to a different logical message -- that is the
-        (runtime_id, sequence) collision this avoids. The claim is made before
-        the first transmission attempt, stamped on the logical object (the
-        queue entry, or the persistent response/reboot dict for Core 0's own
-        retryable messages), and never rolled back: a retry of the SAME logical
-        message finds the stamp and reuses the number (both copies identify one
-        message -- legitimate QoS 1 duplicate delivery), while a DIFFERENT
-        message always gets a fresh number.
-        """
+        A retry of the same logical message reuses the stamped number; a different message always gets a fresh one, so a (runtime_id, sequence) pair never collides."""
         sequence = container.get("_wire_sequence")
         if sequence is None:
             sequence = self._next_sequence
@@ -479,7 +451,6 @@ class Core0:
     # PUBLISH. Protocol-control traffic (PINGREQ and friends) is never paced.
 
     def _mqtt_publish_ready(self):
-        """True when another outbound MQTT application PUBLISH may begin."""
         delay_ms = self._config["mqtt_outbound_publish_delay_ms"]
         if delay_ms == 0:
             return True
@@ -491,37 +462,17 @@ class Core0:
         ) >= delay_ms
 
     def _note_mqtt_publish_completed(self):
-        """Record the completion of a successful outbound QoS 1 publish."""
         self._last_mqtt_publish_completed_ms = time.ticks_ms()
 
     def _wait_for_mqtt_publish_slot(self):
-        """Block in 10 ms slices until a publish may begin. Startup-only.
-
-        Core0.start() is a sequential contract in which a specific publish
-        must complete before startup may continue, so a bounded wait is
-        allowed there. Never call this from the run loop: there the gate is
-        closed for this pass and the loop services its other work meanwhile.
-        """
+        """Block in 10 ms slices until a publish may begin. Startup-only: never call from the run loop."""
         while not self._mqtt_publish_ready():
             time.sleep_ms(10)
 
     def _publish_entry(self, entry):
-        """Publish one MQTT entry from its pre-serialized message bytes.
+        """Publish one MQTT entry from its pre-serialized bytes, envelope spliced in before the closing brace.
 
-        The queue stores the message as final, pre-serialized bytes: the wire
-        frame is that same JSON object with the five Core-0-owned envelope
-        members (sequence, runtime_id, source, firmware_version,
-        message_schema_version) spliced in before its closing brace. The
-        payload is never decoded, parsed, or re-serialized here, so publishing
-        allocates only the small envelope fragment and the assembled frame
-        instead of a full decode + dict graph + re-encode of the message.
-
-        Sequence: claimed once, before the first transmission attempt (see
-        _claim_wire_sequence). An attempt that fails the object check above has
-        transmitted nothing, so it consumes no number; a frame that is
-        transmitted is always bound to a number that no other logical message
-        can ever receive.
-        """
+        The payload is never decoded or re-serialized here; the wire sequence is claimed once, before the first transmission attempt."""
         payload = entry["payload_bytes"]
         if not isinstance(payload, (bytes, bytearray)) or bytes(payload[-1:]) != b"}":
             raise ValueError("queued payload must be a serialized JSON object")
@@ -552,31 +503,9 @@ class Core0:
         self, command_id, command, success, targeted=True, data=None, error=None,
         wire_sequence=None, container=None
     ):
-        """Build and publish a Core 0 command response.
+        """Build and publish a Core 0 command response (pre-serialized).
 
-        The command response is serialized before publishing to honor the
-        pre-serialized outbound-message contract.
-
-        ``wire_sequence`` carries a sequence already claimed for this logical
-        response (by a retrying caller), so the re-publish keeps that identity.
-        Omit it on a first attempt: _publish_entry then claims a fresh number.
-
-        ``container`` is the persistent logical object for this response (the
-        pending response or reboot dict). When given, the serialized bytes are
-        built once, on the first attempt, and frozen on it; a retry after an
-        ambiguous QoS 1 failure re-publishes those SAME bytes. Combined with the
-        sequence being claimed on the same container, a retry is now the same
-        logical message with the same identity AND the same wire content, the
-        way the outbound queue's in-flight entry reuses its pre-serialized
-        bytes. Omit it to build-and-publish with no persistent owner.
-
-        Returns True when the response was published (PUBACK received), and
-        False on a permanent (non-MemoryError) serialization failure: nothing
-        was published, and the caller must keep its logical message pending
-        rather than discarding it -- the command was accepted and its
-        acknowledgement is still owed. MemoryError propagates to the final
-        recovery boundary.
-        """
+        ``wire_sequence``/``container`` let a retry keep the claimed identity and the same bytes. Returns True on publish, False on a permanent serialization failure (the caller keeps the message pending); MemoryError propagates."""
         payload_bytes = container.get("_payload_bytes") if container is not None else None
         if payload_bytes is None:
             payload = {
@@ -690,12 +619,7 @@ class Core0:
         self._utc_request_deadline_ms = None
 
     def _utc_note_reachable_failure(self):
-        """Clear a pending request answered with a malformed payload.
-
-        The server reached us, so the full retry interval does not apply:
-        re-key the throttle so the resend is allowed after a short delay
-        instead of up to _UTC_RETRY_INTERVAL_MS after the original send.
-        """
+        """Clear a malformed-payload pending request; re-key the throttle for a prompt retry."""
         self._utc_clear_pending()
         self._utc_last_attempt_ms = time.ticks_add(
             time.ticks_ms(),
@@ -703,16 +627,9 @@ class Core0:
         )
 
     def _utc_send_request(self):
-        """Send a UTC time request without blocking.
+        """Send a UTC time request without blocking; deadline tracked for the run loop.
 
-        The response arrives through the normal MQTT pump; the deadline is
-        tracked so the run loop can give up on a request that never answers.
-
-        The pending request ID is armed before publishing: the client
-        delivers broker messages while awaiting the PUBACK, so a fast
-        response can arrive inside the publish call itself and must find
-        the request ID already set.
-        """
+        The pending request ID is armed before publishing: a fast response can arrive inside the PUBACK wait."""
         self._utc_request_counter += 1
         request_id = "{}_{}".format(self._runtime_id, self._utc_request_counter)
         request = {
@@ -747,10 +664,7 @@ class Core0:
         self._utc_request_deadline_ms = time.ticks_add(time.ticks_ms(), timeout_ms)
 
     def _utc_wait_response(self):
-        """Pump MQTT until the pending UTC response arrives or its deadline.
-
-        Used only during startup, when no other Core 0 work is in flight.
-        """
+        """Pump MQTT until the pending UTC response arrives or its deadline (startup-only)."""
         while self._pending_utc_request_id is not None:
             if time.ticks_diff(
                 time.ticks_ms(), self._utc_request_deadline_ms
@@ -768,7 +682,6 @@ class Core0:
         self._utc_clear_pending()
 
     def _utc_request_expired(self):
-        """Clear a pending UTC request whose deadline has passed."""
         if self._pending_utc_request_id is None:
             return
         if time.ticks_diff(
@@ -779,7 +692,6 @@ class Core0:
                 print("[DEBUG] UTC request timed out")
 
     def _utc_should_send_request(self):
-        """True when a new UTC request is due and retry throttling allows it."""
         if self._pending_utc_request_id is not None:
             return False
         if not self._utc_sync_due():
@@ -800,15 +712,7 @@ class Core0:
         )
 
     def _perform_network_probe(self):
-        """Perform a QoS 1 network probe and verify matching PUBACK.
-
-        Returns True if the probe succeeds with matching PUBACK,
-        False otherwise.
-
-        Startup-only (called from the startup verification contract), where a
-        specific publish must complete before startup continues: wait for the
-        pacing slot before publishing rather than bypassing the interval.
-        """
+        """Perform a QoS 1 network probe and verify matching PUBACK (startup-only, paced)."""
         self._wait_for_mqtt_publish_slot()
         probe_packet_id = self._mqtt.get_next_packet_id()
 
@@ -843,17 +747,9 @@ class Core0:
             return False
 
     def _drain_startup_mqtt_work(self):
-        """Drain any pending Core 0 MQTT work (connection logs, etc.).
+        """Drain pending Core 0 MQTT work (connection logs, etc.); True when none remains, False on timeout.
 
-        Returns True when no startup work remains, False if timeout reached.
-
-        Consecutive startup publishes are paced with
-        mqtt_outbound_publish_delay_ms: each iteration waits for the slot
-        opened by the preceding publish (probe #1, or the previous log), then
-        publishes one log, and that log's successful publish records its
-        completion for the next iteration. A failed publish records nothing,
-        so its wait returns immediately and the drain is not delayed by it.
-        """
+        Startup publishes are paced like any other outbound traffic."""
         timeout_ms = 2000  # 2 second max drain time
         start_ms = time.ticks_ms()
 
@@ -876,12 +772,7 @@ class Core0:
     def _synchronize_utc_required(self):
         """Run one bounded pass of startup UTC synchronization.
 
-        Returns True once a valid snapshot is acquired. Returns False after
-        _UTC_STARTUP_MAX_ATTEMPTS attempts without one, so the caller
-        (_verify_startup_contract) can re-establish the network and retry the
-        pass. A MemoryError propagates unchanged (fail-fast; the recovery
-        boundary in main() turns it into a board reset).
-        """
+        Returns True once a valid snapshot is acquired, False after _UTC_STARTUP_MAX_ATTEMPTS so the caller re-establishes and retries. MemoryError propagates."""
         for attempt in range(_UTC_STARTUP_MAX_ATTEMPTS):
             # The preceding startup publish (probe #2, or the drain) recorded
             # its completion: respect the same pacing interval before the
@@ -958,16 +849,7 @@ class Core0:
     def _watch_core_1_heartbeat(self):
         """Watch Core 1's liveness heartbeat and reset the MCU when stale.
 
-        Core 1 is the heartbeat producer; Core 0 is its independent consumer.
-        A dead or wedged Core 1 cannot report its own death -- it no longer
-        builds the health message that would carry core_1_inactive -- so Core
-        0 must detect the silence and recover the whole board.
-
-        Before the first stamp exists (Core 1 has not started yet) the check
-        is a no-op, so the unbounded startup connect loops are unaffected.
-        Once a stamp exists, age beyond _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS
-        means the thread stopped refreshing and the only recovery is a reset.
-        """
+        No-op before Core 1's first stamp, so the unbounded startup connect loops are unaffected."""
         last_activity_ms = self._intercore.state_mailboxes.get_core_1_activity_ms()
         if last_activity_ms is None:
             return
@@ -977,54 +859,20 @@ class Core0:
             machine.reset()
 
     def _service_wait(self):
-        """Core 0 servicing hook for long network waits.
+        """Core 0 servicing hook invoked at each 100 ms slice of long network waits.
 
-        Connect and reconnect sequences (Wi-Fi attempt polling, retry
-        backoffs) used to be monolithic waits: a 40-second backoff — or a
-        multi-minute exhausted sequence — would run without the Core 1
-        heartbeat check ever firing, so a Core 1 that died together with
-        the network (the outage is the most likely common cause) would be
-        noticed only when networking eventually returned. Wifi and Mqtt
-        hold this hook and invoke it at each 100 ms wait slice. The check
-        is a no-op before Core 1's first stamp, so it is equally safe in
-        the unbounded startup connect loops.
-        """
+        Keeps the Core 1 heartbeat check firing through connect/reconnect backoffs."""
         self._watch_core_1_heartbeat()
 
     def _sleep_and_service(self, delay_sec):
-        """Sleep in 100 ms slices, servicing Core 0 between slices."""
         for _ in range(max(int(delay_sec * 10), 1)):
             self._service_wait()
             time.sleep_ms(100)
 
     def start(self):
-        """Establish Core 0 network services before Core 1 is started.
+        """Establish Core 0 network services before Core 1 starts (the deterministic startup contract).
 
-        This method performs the complete deterministic startup contract:
-        1. Establish Wi-Fi
-        2. Establish MQTT + subscriptions
-        3. Run QoS 1 network probe #1
-        4. Drain startup MQTT work
-        5. Wait 5 seconds
-        6. Run QoS 1 network probe #2
-        7. Acquire UTC
-        8. Publish initial UTC snapshot
-        9. Mark the network stack ready
-        10. Publish initial network snapshot
-        11. Stop connection LED
-
-        The connection steps (1-2) are unbounded by design. The verification
-        steps (3-7) are self-healing: a transient failure (a dropped PUBACK, a
-        brief UTC-server outage) drops the session, re-establishes the network,
-        and retries the whole verification pass instead of halting the device.
-        A MemoryError still propagates (fail-fast): it escapes to the recovery
-        boundary in main(), which resets the board, so an out-of-memory device
-        restarts on a fresh heap instead of continuing to allocate on an
-        exhausted one.
-
-        Returns only when a complete, clean pass of the contract has succeeded;
-        Core 1 stays gated until then.
-        """
+        Connect steps are unbounded; the verification steps (probes, drain, UTC) are self-healing -- a failed pass re-establishes the network and retries. Returns only on a clean pass; Core 1 stays gated until then. A MemoryError propagates to the recovery boundary in main()."""
         self._led_manager.set_connecting(True)
 
         # Steps 1-2: Establish Wi-Fi, then MQTT + subscriptions.
@@ -1063,15 +911,9 @@ class Core0:
         print("[INFO] Core 0 startup complete - network stack verified and ready")
 
     def _verify_startup_contract(self):
-        """Run one full pass of the startup verification contract.
+        """Run one full pass of the startup verification contract (probe #1, drain, stabilization, probe #2, UTC).
 
-        Contract, in order: QoS 1 network probe #1, drain startup MQTT work,
-        a 5 s stabilization wait, QoS 1 network probe #2, then UTC
-        synchronization. Returns True only when every step succeeds; returns
-        False on any probe or UTC failure so the caller can re-establish the
-        network and retry. A MemoryError propagates unchanged (fail-fast; the
-        recovery boundary in main() turns it into a board reset).
-        """
+        Returns True only when every step succeeds, False on any failure so the caller re-establishes and retries. MemoryError propagates."""
         # Step 3: QoS 1 network probe #1
         if not self._perform_network_probe():
             print("[WARNING] Startup verification: network probe #1 failed")
@@ -1097,13 +939,11 @@ class Core0:
         return True
 
     def _publish_utc_snapshot(self):
-        """Publish the current UTC snapshot to the state mailbox."""
         if self._utc_snapshot is None:
             return
         self._intercore.state_mailboxes.set_utc_snapshot(self._utc_snapshot)
 
     def run(self):
-        """Run the Core 0 network/MQTT service loop."""
         poll_ms = self._config["mqtt_command_poll_ms"]
 
         while True:

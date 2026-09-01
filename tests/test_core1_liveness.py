@@ -4,18 +4,9 @@
 
 """Host-side regression tests for the Core 1 liveness heartbeat.
 
-Core 1 must refresh the activity stamp on a deadline so health messages
-report ``core_1_active: true`` no matter which phase the ~20ms main loop
-lands in on absolute tick time. An earlier implementation gated the refresh
-on ``now_ms % 5000 < 20``: with a loop step that is not an exact divisor of
-that grid (e.g. 20ms sleep + 20ms of processing = 40ms step, boot offset
-22ms) the stamps land at ``{22 + 40k} mod 5000``, a coset that never
-enters ``[0, 20)``. The stamp then starves even while Core 1 is actively
-running, and healthy firmware reports ``core_1_inactive`` after the 60s
-threshold. This test drives the real ``core1_main`` loop under exactly that
-phase geometry and asserts the health messages keep reporting Core 1 as
-active.
-"""
+Core 1 must refresh the activity stamp on a deadline so health messages report core_1_active: true no matter which phase the ~20ms main loop lands in on absolute tick time. An earlier implementation gated the refresh on now_ms % 5000 < 20: with a loop step that is not an exact divisor of that grid the stamps land in a coset that never enters [0, 20), starve, and healthy firmware reports core_1_inactive after the 60s threshold.
+
+This test drives the real core1_main loop under exactly that phase geometry and asserts the health messages keep reporting Core 1 as active."""
 
 import importlib
 import json
@@ -70,11 +61,7 @@ class LoopStop(Exception):
 class FakeTime:
     """Controllable clock for driving the Core 1 loop on the host.
 
-    ``sleep_ms`` adds PROCESSING_MS to model the ~20ms of per-iteration
-    work the loop does between sleeps, so the loop advances 40ms per
-    iteration -- a step that is not a divisor of the 5000ms window and
-    therefore exposed the phase-dependent ``now_ms % 5000 < 20`` gate.
-    """
+    sleep_ms adds PROCESSING_MS to model the ~20ms of per-iteration work, so the loop advances 40ms per iteration -- a step that is not a divisor of the 5000ms window and therefore exposed the phase-dependent now_ms % 5000 < 20 gate."""
 
     def __init__(self, start_ms, stop_after_ms):
         self.now_ms = start_ms
@@ -135,10 +122,7 @@ def _install_fakes(fake_time):
 def _reload_core1_under_fakes():
     """Import/reload the core1 chain with the fakes authoritative.
 
-    core1 binds time/machine/os from sys.modules at import time, so any
-    module already cached (possibly imported under host or other-test
-    stand-ins) is reloaded in dependency order before core1 itself.
-    """
+    core1 binds time/machine/os from sys.modules at import time, so any cached module (possibly imported under host or other-test stand-ins) is reloaded in dependency order before core1 itself."""
     # Reload order follows the import dependency chain (a module must be
     # reloaded before the module that binds from it, or the binder keeps a
     # stale reference -- e.g. device_manager would keep an old create_device
@@ -189,10 +173,7 @@ def _drain_health_payloads(bus):
 def test_core1_activity_stamp_survives_hostile_loop_phase():
     """The liveness stamp must refresh on deadline regardless of loop phase.
 
-    Drives the real core1_main loop for ~120s of simulated time with a
-    40ms loop step and a 22ms boot offset -- the geometry in which the old
-    phase-gated registration never fired after boot.
-    """
+    Drives the real core1_main loop for ~120s of simulated time with a 40ms loop step and a 22ms boot offset -- the geometry in which the old phase-gated registration never fired after boot."""
     fake_time = FakeTime(BOOT_TICKS_MS, STOP_AT_MS)
     saved_modules = {name: sys.modules.get(name) for name in ("time", "machine", "os")}
 
@@ -284,16 +265,7 @@ def _core1_config_with_slow_read_device():
 def test_core1_slow_read_does_not_stale_the_heartbeat_stamp():
     """The heartbeat stamped after a slow device read must use a FRESH clock.
 
-    Geometry (verified against the hostile-phase test's anchor == boot):
-    the first telemetry read fires at anchor + read_loop_sec (22 + 20000 =
-    20022), the heartbeat boundaries sit at anchor + 5000k (7022, 12022,
-    17022, 22022, ...), so the 6000 ms read window [20022, 26022] carries
-    the 22022 boundary due in flight. Pre-fix, the loop compared against the
-    pre-read clock (20022 < 22022, no stamp that pass -- the last stamp stays
-    17022, 9000 ms stale at the read's end) and, on a read long enough, wrote
-    stamps that age past Core 0's watchdog bound. Post-fix the stamp written
-    on the read's pass is the post-read clock.
-    """
+    Geometry: the first telemetry read fires at anchor + read_loop_sec (22 + 20000), and the 6000 ms read window carries the 22022 boundary due in flight. Pre-fix, the loop compared against the pre-read clock (no stamp that pass, the last stamp staying 9000 ms stale at the read's end). Post-fix the stamp written on the read's pass is the post-read clock."""
     # 20022 (read) + 6000 (read) = 26022; stop on the loop sleep after it.
     slow_stop_at_ms = BOOT_TICKS_MS + 20 * 1000 + SLOW_READ_MS
     fake_time = FakeTime(BOOT_TICKS_MS, slow_stop_at_ms)

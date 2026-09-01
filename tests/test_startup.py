@@ -141,22 +141,9 @@ def test_core0_config_has_network_probe():
 
 
 def test_startup_order_preserved():
-    """Verify startup sequence order is maintained.
+    """Verify startup sequence order is maintained: Wi-Fi connects, MQTT connects, network probe #1 with PUBACK, startup work drained, 5-second wait, network probe #2 with PUBACK, UTC sync, initial snapshots published, LED stops flashing, Core 1 starts.
 
-    The startup contract must follow this order:
-    1. Wi-Fi connects
-    2. MQTT connects
-    3. Network probe #1 with PUBACK
-    4. Startup work drained
-    5. 5-second wait
-    6. Network probe #2 with PUBACK
-    7. UTC sync
-    8. Initial snapshots published
-    9. LED stops flashing
-    10. Core 1 starts
-
-    This test verifies the config supports all required steps.
-    """
+    This test verifies the config supports all required steps."""
     config = _base_config()
 
     # Verify required config properties exist

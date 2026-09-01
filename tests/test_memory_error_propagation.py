@@ -4,21 +4,13 @@
 
 """Host-side regression tests for the MemoryError propagation contract.
 
-Heap exhaustion is a fatal condition, not a failed optional diagnostic: a
-generic ``except Exception`` handler on an allocation-heavy path (message
-serialization/queuing, snapshot collection) must re-raise ``MemoryError``
-instead of swallowing it, so the core stops with a diagnosable error rather
-than continuing to allocate on top of an exhausted heap or discarding a
-message as if serialization had merely failed. Ordinary errors (malformed
-data, a failed serialization) must still be swallowed and reported by the
-handler.
+Heap exhaustion is a fatal condition, not a failed optional diagnostic: a generic except-Exception handler on an allocation-heavy path (message serialization/queuing, snapshot collection) must re-raise MemoryError instead of swallowing it, so the core stops with a diagnosable error rather than continuing to allocate on an exhausted heap or discarding a message as if serialization had merely failed. Ordinary errors (malformed data, a failed serialization) must still be swallowed and reported by the handler.
 
 Covers the fixed paths:
 - core1._try_queue_startup_log
 - core1._try_queue_health_message
 - core1._collect_system_information_full
-- core0.Core0._publish_core0_command_response
-"""
+- core0.Core0._publish_core0_command_response"""
 
 import importlib
 import json
@@ -39,11 +31,7 @@ from config import split_config  # noqa: E402
 def _core1():
     """The core1 module, importable on the host.
 
-    The core1 chain imports MicroPython-only modules, so core1 cannot be
-    imported at collection time. If an earlier test already imported/reloaded
-    it under its fakes, reuse that module object (the functions tested here do
-    not depend on which fakes are bound).
-    """
+    The core1 chain imports MicroPython-only modules, so core1 cannot be imported at collection time; if an earlier test already imported/reloaded it under its fakes, reuse that module object."""
     if "core1" in sys.modules:
         return sys.modules["core1"]
     if "machine" not in sys.modules:
@@ -215,12 +203,7 @@ def _make_core0():
 def test_core0_command_response_propagates_memoryerror(monkeypatch):
     """A MemoryError serializing a command response must escape.
 
-    Before the fix the handler was ``except (MessageTooLargeError, Exception)``
-    -- effectively ``except Exception`` -- so a MemoryError was swallowed and
-    the response silently discarded as if serialization had merely failed, and
-    the caller's ``except MemoryError: raise`` clause (e.g. _perform_reboot)
-    could never fire.
-    """
+    Before the fix the handler was effectively except-Exception, so a MemoryError was swallowed and the response silently discarded as if serialization had merely failed, and the caller's except-MemoryError clause (e.g. _perform_reboot) could never fire."""
     core0_mod, instance = _make_core0()
 
     def _exhaust(*args, **kwargs):

@@ -20,9 +20,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class FakeTime:
     """Controllable stand-in for MicroPython's time module.
 
-    sleep_ms advances the clock so bounded wait loops terminate
-    deterministically in tests.
-    """
+    sleep_ms advances the clock so bounded wait loops terminate deterministically in tests."""
 
     def __init__(self):
         self.now_ms = 0

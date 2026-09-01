@@ -12,7 +12,6 @@ class SystemInformationDevice(Device):
     """Device that collects and publishes system information."""
 
     def __init__(self, system_information):
-        """Initialize the system information device."""
         self._system_information = system_information
         self._include = None
         self._initialized = False

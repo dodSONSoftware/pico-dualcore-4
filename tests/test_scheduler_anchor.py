@@ -4,27 +4,18 @@
 
 """Host-side regression tests for the shared normal-runtime scheduling anchor.
 
-All periodic Core 1 work (telemetry and health) must derive its fixed
-boundaries from one anchor, ``normal_runtime_start_ticks_ms``, captured
-exactly once, immediately after ``system_startup_completed`` has been
-successfully admitted to the outbound queue:
+All periodic Core 1 work (telemetry and health) must derive its fixed boundaries from one anchor, normal_runtime_start_ticks_ms, captured exactly once, immediately after system_startup_completed has been successfully admitted to the outbound queue:
 
-- telemetry boundaries fall at ``anchor + n * read_loop_sec``
-- health boundaries fall at ``anchor + n * health_interval_sec``
-- the two schedulers share the epoch but stay independent: neither
-  deadline derives from the other, and neither scheduler is moved by the
-  other's execution or skipping
-- the anchor is captured only after successful startup-log admission; an
-  admission failure creates no anchor and no periodic work
+- telemetry boundaries fall at anchor + n * read_loop_sec
+- health boundaries fall at anchor + n * health_interval_sec
+- the two schedulers share the epoch but stay independent: neither deadline derives from the other, and neither scheduler is moved by the other's execution or skipping
+- the anchor is captured only after successful startup-log admission; an admission failure creates no anchor and no periodic work
 - Wi-Fi/MQTT reconnects and UTC resynchronization do not reset the anchor
 - a new runtime (reboot) creates a new anchor
 - telemetry outage buffering (bounded queue, retention) is unchanged
-- ``boot_ticks_ms`` remains the boot-lifetime reference only
+- boot_ticks_ms remains the boot-lifetime reference only
 
-These tests drive the real ``core1_main`` loop under a controllable clock,
-the same way ``test_core1_liveness.py`` does. Health-only cadence tests
-live in ``test_health_scheduling.py``.
-"""
+These tests drive the real core1_main loop under a controllable clock; health-only cadence tests live in test_health_scheduling.py."""
 
 import ast
 import gc
@@ -94,14 +85,9 @@ class LoopStop(Exception):
 class FakeTime:
     """Controllable clock for driving the Core 1 loop on the host.
 
-    ``sleep_ms`` adds PROCESSING_MS to model the ~20ms of per-iteration
-    work the loop does between sleeps, so the loop advances 40ms per
-    iteration.
+    sleep_ms adds PROCESSING_MS to model the ~20ms of per-iteration work, so the loop advances 40ms per iteration.
 
-    ``events`` is an ascending list of (tick_ms, callable) pairs. When the
-    clock crosses a tick, the callable runs once -- used to inject outages,
-    recoveries, or UTC resynchronizations into the state mailboxes mid-run.
-    """
+    events is an ascending list of (tick_ms, callable) pairs; when the clock crosses a tick the callable runs once -- used to inject outages, recoveries, or UTC resynchronizations into the state mailboxes mid-run."""
 
     def __init__(self, start_ms, stop_after_ms, events=None):
         self.now_ms = start_ms
@@ -169,10 +155,7 @@ def _install_fakes(fake_time):
 def _reload_core1_under_fakes():
     """Import/reload the core1 chain with the fakes authoritative.
 
-    core1 binds time/machine/os from sys.modules at import time, so any
-    module already cached (possibly imported under host or other-test
-    stand-ins) is reloaded in dependency order before core1 itself.
-    """
+    core1 binds time/machine/os from sys.modules at import time, so any cached module (possibly imported under host or other-test stand-ins) is reloaded in dependency order before core1 itself."""
     # Reload order follows the import dependency chain (a module must be
     # reloaded before the module that binds from it, or the binder keeps a
     # stale reference -- e.g. device_manager would keep an old create_device
@@ -209,9 +192,7 @@ def _core1_config():
 def _run_core1(fake_time, bus, core1_config, boot_ticks_ms, pre_run=None):
     """Drive core1_main under the fakes until FakeTime stops the loop.
 
-    ``pre_run``, if given, runs after the fake imports are in place and
-    before core1_main -- used to patch a device read mid-harness.
-    """
+    pre_run, if given, runs after the fake imports are in place and before core1_main -- used to patch a device read mid-harness."""
     saved_modules = {name: sys.modules.get(name) for name in ("time", "machine", "os")}
 
     def _restore():
@@ -277,11 +258,7 @@ def _drain_outbound(bus):
 def test_telemetry_and_health_share_the_same_anchor():
     """Both first deadlines derive from one anchor, captured at admission.
 
-    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s,
-    health interval = 60s. The first telemetry is ~33s uptime and the first
-    health ~73s uptime -- exactly 20s and 60s after the same anchor, whose
-    value is observable in the startup log's uptime_ms (13000).
-    """
+    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s, health interval = 60s. The first telemetry is ~33s uptime and the first health ~73s uptime -- exactly 20s and 60s after the same anchor, whose value is observable in the startup log's uptime_ms (13000)."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -318,10 +295,7 @@ def test_telemetry_and_health_share_the_same_anchor():
 def test_telemetry_first_deadline_from_anchor_not_boot():
     """First telemetry is due read_loop after normal-runtime start, not boot.
 
-    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s.
-    The first telemetry must be at ~33000ms uptime -- not at 20000ms
-    (the old boot anchor).
-    """
+    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s: the first telemetry must be at ~33000ms uptime -- not at 20000ms (the old boot anchor)."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -346,11 +320,7 @@ def test_telemetry_first_deadline_from_anchor_not_boot():
 def test_fixed_cadence_telemetry_and_health_from_one_anchor():
     """Telemetry at 33/53/73/93/113/133s and health at 73/133s uptime.
 
-    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s,
-    health interval = 60s. Both schedules stay on their anchor-based
-    grids; at 73s uptime both are due together and both are processed
-    (no artificial offset between them).
-    """
+    boot = 100000, normal runtime starts at 13s uptime, read_loop = 20s, health interval = 60s. Both schedules stay on their anchor-based grids; at 73s uptime both are due together and both are processed (no artificial offset between them)."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
     last_boundary_ms = startup_at_ms + 120000  # health boundary at 133s uptime
@@ -381,11 +351,7 @@ def test_fixed_cadence_telemetry_and_health_from_one_anchor():
 def test_health_outage_does_not_move_telemetry_deadlines():
     """A skipped health interval leaves the telemetry schedule untouched.
 
-    MQTT outage 160s -> 240s uptime skips the 193s health boundary.
-    Telemetry must still land on every 33+20k boundary through the outage
-    (telemetry may queue during outages), and health resumes at its own
-    253s boundary -- nothing moved, nothing replayed.
-    """
+    MQTT outage 160s -> 240s uptime skips the 193s health boundary. Telemetry must still land on every 33+20k boundary through the outage (telemetry may queue during outages), and health resumes at its own 253s boundary -- nothing moved, nothing replayed."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -418,13 +384,7 @@ def test_health_outage_does_not_move_telemetry_deadlines():
 def test_telemetry_delay_does_not_move_health_deadlines():
     """A late telemetry execution leaves the health schedule untouched.
 
-    The first telemetry read (due at 33s uptime) takes 35s, stalling the
-    loop until ~68s uptime. The scheduler skips the elapsed 33s/53s
-    boundaries and advances directly to the next future one (73s) -- it does
-    NOT replay the missed boundaries as catch-up reads. Health must still
-    land exactly on its 73s and 133s anchor-based boundaries -- one per
-    boundary, no drift, no burst.
-    """
+    The first telemetry read (due at 33s uptime) takes 35s, stalling the loop until ~68s uptime. The scheduler skips the elapsed 33s/53s boundaries and advances directly to the next future one (73s) -- it does NOT replay the missed boundaries as catch-up reads. Health must still land exactly on its 73s and 133s anchor-based boundaries -- one per boundary, no drift, no burst."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -461,11 +421,7 @@ def test_telemetry_delay_does_not_move_health_deadlines():
 def test_reconnects_and_utc_resync_do_not_reset_anchor():
     """Wi-Fi reconnect, MQTT reconnect, and UTC resync keep the anchor.
 
-    Normal runtime starts at 13s uptime, health interval = 60s. With the
-    anchor fixed at 13s, the health boundaries are 73s, 133s, and 193s
-    uptime. Re-anchoring on any recovery would shift them (e.g. a 50s
-    recovery would produce 110s, 170s, 230s).
-    """
+    Normal runtime starts at 13s uptime, health interval = 60s: with the anchor fixed at 13s, the health boundaries are 73s, 133s, and 193s uptime. Re-anchoring on any recovery would shift them (e.g. a 50s recovery would produce 110s, 170s, 230s)."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -506,16 +462,9 @@ def test_reconnects_and_utc_resync_do_not_reset_anchor():
 
 
 def test_startup_log_admission_failure_blocks_normal_runtime():
-    """If the startup log is never admitted, no anchor exists and no
-    periodic scheduling begins.
+    """If the startup log is never admitted, no anchor exists and no periodic scheduling begins.
 
-    The free heap is below the reserve with nothing to collect (memory
-    pressure), and the queue holds only CRITICAL entries (command
-    responses), so the less-important INFO-priority startup log cannot be
-    admitted -- no eviction is permitted -- and is rejected on both
-    attempts; core1_main must halt and the queue must contain no
-    telemetry or health.
-    """
+    The free heap is below the reserve with nothing to collect (memory pressure), and the queue holds only CRITICAL entries (command responses), so the less-important INFO-priority startup log cannot be admitted -- no eviction is permitted -- and is rejected on both attempts; core1_main must halt and the queue must contain no telemetry or health."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -563,11 +512,7 @@ def test_startup_log_admission_failure_blocks_normal_runtime():
 def test_telemetry_buffers_during_outage_health_skipped():
     """Outage semantics are preserved under the shared anchor.
 
-    MQTT outage 160s -> 240s uptime: telemetry keeps entering the bounded
-    queue (existing retention/eviction rules), the 193s health boundary is
-    skipped, and recovery at 240s triggers no immediate health -- the next
-    health is at its own 253s boundary.
-    """
+    MQTT outage 160s -> 240s uptime: telemetry keeps entering the bounded queue (existing retention/eviction rules), the 193s health boundary is skipped, and recovery at 240s triggers no immediate health -- the next health is at its own 253s boundary."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 

@@ -4,16 +4,7 @@
 
 """Host-side tests for the Core 1 command response admission contract.
 
-The outbound queue distinguishes a transient rejection (False: heap
-pressure, retry later) from a permanent one (ValueError: the message can
-never be admitted). The command channel must honor that distinction: a
-permanently rejected response is answered with a small error response for
-the same command whose code states the actual cause -- "response_too_large"
-for an oversized response, "response_invalid" for a validation or
-serialization failure -- so a response can never permanently stall the
-command channel behind it, and a firmware defect is not misreported as a
-size problem.
-"""
+The outbound queue distinguishes a transient rejection (False: heap pressure, retry later) from a permanent one (ValueError: the message can never be admitted). The command channel must honor that distinction: a permanently rejected response is answered with a small error response for the same command whose code states the actual cause -- "response_too_large" for an oversized response, "response_invalid" for a validation or serialization failure -- so a response can never permanently stall the command channel behind it."""
 
 import json
 import pathlib
@@ -48,10 +39,7 @@ RAISE_TOO_LARGE = object()
 class ScriptedQueue:
     """An outbound queue that returns scripted admission outcomes in order.
 
-    Outcomes: True (admit), False (transient rejection), RAISE (permanent
-    rejection: validation failure ValueError), or RAISE_TOO_LARGE (permanent
-    rejection: OutboundMessageTooLargeError).
-    """
+    Outcomes: True (admit), False (transient rejection), RAISE (permanent rejection: ValueError), or RAISE_TOO_LARGE (OutboundMessageTooLargeError)."""
 
     def __init__(self, outcomes):
         self._outcomes = list(outcomes)
@@ -275,11 +263,9 @@ def test_oversized_get_details_response_does_not_stall_the_channel(monkeypatch):
 
 
 def test_queue_raises_the_size_type_only_for_size_failures():
-    """The queue's own boundary contract: OutboundMessageTooLargeError is
-    raised only for the per-message ceiling, on both admission paths. It is
-    a ValueError subclass (existing permanent-rejection handlers keep
-    working), and a validation failure is a ValueError that is NOT a size
-    failure -- so the two causes never get collapsed back together."""
+    """The queue's own boundary contract: OutboundMessageTooLargeError is raised only for the per-message ceiling, on both admission paths.
+
+    It is a ValueError subclass (existing permanent-rejection handlers keep working), and a validation failure is a ValueError that is NOT a size failure -- so the two causes never get collapsed back together."""
     intercore = InterCore(64 * 1024)
     queue = intercore.outbound_queue
     big = {"blob": "x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1)}

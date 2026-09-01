@@ -58,7 +58,6 @@ class Mqtt:
             self._wait_service()
 
     def _sleep_interruptible(self, delay_sec):
-        """Sleep in 100 ms slices, servicing Core 0 between slices."""
         for _ in range(max(int(delay_sec * 10), 1)):
             self._service_wait()
             time.sleep_ms(100)
@@ -101,15 +100,7 @@ class Mqtt:
     def connect(self):
         """Connect and subscribe, with the whole handshake time-bounded.
 
-        The CONNACK wait and both SUBACK waits run under
-        mqtt_broker_response_timeout_sec: MQTTClient.connect(timeout=...)
-        installs the finite socket timeout, and subscribe() relies on the
-        timeout connect() leaves in place. A broker that accepts the TCP
-        connection and then stops responding therefore fails the attempt
-        (retried with the reconnect backoff) instead of wedging Core 0.
-        On success the socket returns to normal blocking mode; every later
-        operation (PUBACK, PINGRESP) installs and restores its own timeout.
-        """
+        The CONNACK/SUBACK waits run under mqtt_broker_response_timeout_sec, so an unresponsive broker fails the attempt (retried with backoff) instead of wedging Core 0. On success the socket returns to normal blocking mode; every later operation installs and restores its own timeout."""
         for attempt_index, delay_sec in enumerate(self._reconnect_delays):
             try:
                 self._close_old_client()
@@ -157,11 +148,7 @@ class Mqtt:
     def check_msg(self):
         """Poll for one pending inbound packet and deliver it to the callback.
 
-        The parse of a ready packet runs under the broker response timeout (a
-        finite bound), so a link that stalls after the first frame byte fails
-        this poll instead of hanging the run loop or short-reading a corrupt
-        frame.
-        """
+        The parse of a ready packet runs under the broker response timeout, so a link that stalls after the first frame byte fails this poll instead of hanging the run loop or short-reading a corrupt frame."""
         if not self.is_connected():
             return
         try:
@@ -175,10 +162,7 @@ class Mqtt:
     def publish_qos1(self, topic, message):
         """Publish one application message and wait for its matching PUBACK.
 
-        The PUBACK wait is bounded by mqtt_broker_response_timeout_sec so a
-        blackholed link fails fast and the run loop's network recovery can
-        fire, instead of blocking here forever.
-        """
+        The PUBACK wait is bounded by mqtt_broker_response_timeout_sec, so a blackholed link fails fast and network recovery can fire."""
         if not self.is_connected():
             raise OSError("MQTT is not connected")
         try:
@@ -193,16 +177,7 @@ class Mqtt:
         self._touch()
 
     def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):
-        """Publish one QoS 1 message with a specific packet ID and wait for matching PUBACK.
-
-        Args:
-            topic: MQTT topic
-            message: Message body
-            packet_id: Specific packet ID to use
-            timeout_ms: Optional timeout in milliseconds
-
-        Returns True if PUBACK received with matching ID, False on timeout/error.
-        """
+        """Publish one QoS 1 message with a specific packet ID; True if PUBACK received with matching ID, False on timeout/error."""
         if not self.is_connected():
             raise OSError("MQTT is not connected")
 
@@ -220,11 +195,7 @@ class Mqtt:
             return False
 
     def _ping_interval_sec(self):
-        """Time between keepalive traffic and the mandatory PINGREQ.
-
-        The broker tolerates 1.5 x keepalive, so pinging at keepalive / 2
-        leaves a full interval of margin for jitter.
-        """
+        """Time between keepalive traffic and the mandatory PINGREQ (keepalive / 2, leaving a full interval of jitter margin)."""
         return max(self._keepalive // 2, 1)
 
     def ping_due(self):
@@ -254,10 +225,7 @@ class Mqtt:
     def get_next_packet_id(self):
         """Advance and return the next packet ID to use for a QoS 1 message.
 
-        Delegates to the client's single increment helper so the 1..65535 wrap
-        is defined in exactly one place. Advancing (not peeking) means the ID
-        is consumed, so the next auto-increment cannot reuse it.
-        """
+        Delegates to the client's single increment helper so the 1..65535 wrap is defined in one place; advancing means the ID is consumed and cannot be reused."""
         if self._client is None:
             return 1
         return self._client.next_packet_id()

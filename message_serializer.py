@@ -5,15 +5,7 @@
 """
 Outbound message validation and serialization for the inter-core bus.
 
-This module provides pre-admission validation of messages that will be
-serialized, UTF-8 encoded, and stored as immutable bytes in the outbound
-queue.
-
-Validation rules:
-- Only JSON-safe values are permitted (dict, list, tuple, str, int, float, bool, None)
-- Dictionary keys must be strings
-- Float values must be finite (no NaN, Infinity, -Infinity)
-- Messages must not exceed MAX_OUTBOUND_MESSAGE_BYTES when serialized
+Only JSON-safe values, string dict keys, and finite floats; the serialized message must not exceed MAX_OUTBOUND_MESSAGE_BYTES.
 """
 
 import json
@@ -62,18 +54,7 @@ class MessageTooLargeError(SerializationError):
 
 
 def _validate_value(value, path="root"):
-    """
-    Recursively validate a value for JSON serialization.
-
-    Args:
-        value: The value to validate
-        path: Current path in the data structure (for error messages)
-
-    Raises:
-        UnsupportedValueError: If the value type is not supported
-        NonStringKeyError: If a dict key is not a string
-        NonFiniteFloatError: If a float is NaN or Infinity
-    """
+    """Recursively validate a value (path is reported in errors); raises UnsupportedValueError, NonStringKeyError, or NonFiniteFloatError."""
     if value is None:
         return
 
@@ -114,18 +95,7 @@ def _validate_value(value, path="root"):
 
 
 def _serialize_to_bytes(message):
-    """
-    Serialize a validated message to UTF-8 bytes.
-
-    Args:
-        message: A validated message dictionary
-
-    Returns:
-        UTF-8 encoded JSON bytes
-
-    Raises:
-        SerializationError: If serialization fails
-    """
+    """Serialize a validated message to UTF-8 bytes; raises SerializationError on failure."""
     try:
         serialized = json.dumps(message)
         return serialized.encode("utf-8")
@@ -137,31 +107,9 @@ def _serialize_to_bytes(message):
 
 def serialize_and_validate_message(message):
     """
-    Validate a message and serialize it to bytes for queue admission.
+    Validate a message and serialize it to UTF-8 bytes for queue admission.
 
-    This function performs all required validations before serialization:
-    1. Recursively validate all value types: is_json_safe() runs first as an
-       allocation-light pass (no per-node path strings), and the detailed
-       path-producing validator runs only if that pass fails, so valid
-       messages never pay for error-path strings that are never used
-    2. Ensure all dict keys are strings
-    3. Ensure all floats are finite
-    4. Serialize to JSON
-    5. Encode to UTF-8
-    6. Check size against MAX_OUTBOUND_MESSAGE_BYTES
-
-    Args:
-        message: A message dictionary to validate and serialize
-
-    Returns:
-        UTF-8 encoded JSON bytes ready for queue admission
-
-    Raises:
-        UnsupportedValueError: If the message contains unsupported value types
-        NonStringKeyError: If the message contains non-string dict keys
-        NonFiniteFloatError: If the message contains NaN or Infinity floats
-        MessageTooLargeError: If the serialized message exceeds the max size
-        SerializationError: If JSON serialization fails
+    is_json_safe() runs first as an allocation-light pass; the path-producing validator runs only on failure. Raises UnsupportedValueError, NonStringKeyError, NonFiniteFloatError, MessageTooLargeError, or SerializationError.
     """
     # Validate structure and values. is_json_safe() enforces the same rules
     # as _validate_value() but without building per-node diagnostic paths, so

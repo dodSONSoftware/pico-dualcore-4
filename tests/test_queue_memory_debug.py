@@ -3,15 +3,9 @@
 # SPDX-License-Identifier: MIT
 
 """
-Host-side tests for the temporary DEBUG_QUEUE_MEMORY instrumentation in
-intercore.py.
+Host-side tests for the temporary DEBUG_QUEUE_MEMORY instrumentation in intercore.py.
 
-The instrumentation is a validation aid for the heap-reserve queues: it must
-be silent by default (the production gate stays False) and, when enabled,
-emit one grep-friendly line per meaningful queue event (admit, reject, evict,
-memory-pressure entry, gc.collect() before/after, backlog drained) in the
-documented field order. No fixed-capacity behavior is asserted here; those
-contracts live in test_intercore.py.
+The instrumentation is a validation aid for the heap-reserve queues: it must be silent by default (the production gate stays False) and, when enabled, emit one grep-friendly line per meaningful queue event in the documented field order. No fixed-capacity behavior is asserted here; those contracts live in test_intercore.py.
 """
 
 import gc
@@ -152,13 +146,9 @@ def _events(lines, prefix):
 
 
 def test_instrumentation_gate_defaults_off():
-    """Production default: debug.py ships DEBUG_QUEUE_MEMORY = False, so the
-    debug path never runs in production.
+    """Production default: debug.py ships DEBUG_QUEUE_MEMORY = False, so the debug path never runs in production.
 
-    Asserted from the source file: other test modules replace
-    sys.modules["debug"] with a mock, so the imported binding is a test-order
-    artifact, not the shipped default.
-    """
+    Asserted from the source file: other test modules replace sys.modules["debug"] with a mock, so the imported binding is a test-order artifact, not the shipped default."""
     import re
 
     debug_path = pathlib.Path(__file__).resolve().parents[1] / "debug.py"

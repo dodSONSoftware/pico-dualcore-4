@@ -31,19 +31,9 @@ def _require_positive_integer(value, name):
 
 
 def _debug_queue_memory(prefix, queue, event, extra=None):
-    """Temporary heap-reserve validation instrumentation (DEBUG_QUEUE_MEMORY).
+    """Temporary heap-reserve validation instrumentation (DEBUG_QUEUE_MEMORY); remove after validation.
 
-    Reports heap and queue state at one meaningful queue event (admit, reject,
-    evict, memory-pressure entry, gc.collect() before/after, backlog drained).
-    Grep-friendly: [DEBUG] <prefix> event=<event> <extra...> heap_alloc_bytes=
-    <n> heap_free_bytes=<n> minimum_free_heap_bytes=<n> heap_headroom_bytes=<n>
-    queue_count=<n> queue_high_watermark=<n> [queued_bytes=<n>].
-
-    Gated by debug.DEBUG_QUEUE_MEMORY (production default False), so the
-    string allocation below is validation-only; remove with the
-    instrumentation after validation. Call while holding the queue's own
-    lock where the event touches queue state, so the snapshot is consistent.
-    """
+    One grep-friendly line of heap and queue state at a meaningful queue event; call while holding the queue's lock where the event touches queue state."""
     if not DEBUG_QUEUE_MEMORY:
         return
     heap_free_bytes = gc.mem_free()
@@ -74,55 +64,13 @@ def _debug_queue_memory(prefix, queue, event, extra=None):
 class OutboundMessageTooLargeError(ValueError):
     """A serialized message beyond MAX_OUTBOUND_MESSAGE_BYTES was rejected.
 
-    A subclass of ValueError, so existing permanent-rejection handlers
-    (which catch ValueError) keep working unchanged, while a caller that
-    needs to report the actual cause -- such as Core 1's command response
-    channel -- can distinguish a size failure from the other permanent
-    ValueErrors (validation or serialization failure).
-    """
+    A ValueError subclass so permanent-rejection handlers keep working, while a caller can tell a size failure apart from validation/serialization failures."""
 
 
 class OutboundQueue:
     """Core 1 -> Core 0 queue for MQTT-bound messages only.
 
-    Hard ownership rule:
-    Once put() succeeds, the message bytes are immutable. The queue stores
-    pre-serialized, UTF-8 encoded payload bytes.
-
-    Envelope rule:
-    payload_bytes must be a serialized JSON object. The sender carries only its
-    own message fields, including uptime_ms and timestamp (the latter null when
-    UTC is unsynchronized). The envelope keys (sequence, runtime_id, source,
-    firmware_version, message_schema_version) are owned by Core 0, which
-    injects them at publish time; a queued message must not carry any of them
-    at the top level, or the wire document would repeat a member name.
-
-    Capacity rule (heap-governed):
-    The queue has NO fixed entry-count or retained-byte capacity. Admission is
-    governed by the global minimum free-heap reserve (a board property owned
-    by hardware.py): an entry may be retained only while gc.mem_free() is at
-    or above the reserve. The queue tracks depth, retained payload bytes
-    (queued FIFO plus in-flight entry), and high watermarks for observability
-    -- they are metrics, not capacity limits.
-
-    Admission rule (heap-governed):
-    Fast path: if gc.mem_free() >= the reserve, the entry is admitted with no
-    garbage collection. Pressure path: if the heap is below the reserve,
-    gc.collect() runs once; if the reserve is still not restored, the oldest
-    entry in the least-important queued priority class is evicted (only when
-    the incoming entry is at least as important), gc.collect() runs again, and
-    the heap is rechecked. Eviction repeats until the reserve is restored or
-    no eligible lower-priority entry remains, then the incoming entry is
-    admitted or rejected. The in-flight QoS 1 entry is retained until its
-    PUBACK and is never an eviction candidate.
-
-    Concurrency rule:
-    The heap, and therefore the reserve, is global to both cores. The
-    heap measurement, pressure-path gc.collect(), eviction decisions, and
-    admission all run while the shared heap-admission lock (owned by InterCore
-    and shared with the event queue) is held, so the two queues cannot both
-    admit against the same stale free-heap reading.
-    """
+    Once put() succeeds the payload bytes are immutable (pre-serialized UTF-8 JSON); the Core 0 envelope keys are injected at publish time and must not be carried at the top level. No fixed capacity: admission is governed by the global minimum free-heap reserve, evicting the least-important eligible entries under pressure (never the in-flight QoS 1 entry), all under the shared heap-admission lock."""
 
     def __init__(self, minimum_free_heap_bytes, heap_admission_lock):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
@@ -178,12 +126,7 @@ class OutboundQueue:
     def _admit_heap_governed(self, kind, payload_bytes, retention_priority):
         """Apply the heap-reserve admission decision. No locks are held on entry.
 
-        Fast path: reserve satisfied -> admit, no garbage collection.
-        Pressure path: gc.collect() once; if the reserve is still not restored,
-        evict the oldest entry in the least-important eligible queued class,
-        gc.collect(), and recheck -- repeating until the reserve is restored or
-        no eligible lower-priority entry remains, then admit or reject.
-        """
+        Fast path: admit, no gc.collect(). Pressure path: gc.collect() once, then evict the least-important eligible entries one at a time until the reserve is restored, then admit or reject."""
         with self._heap_admission_lock:
             if not self._reserve_restored():
                 _debug_queue_memory("outbound_queue", self, "memory_pressure")
@@ -246,34 +189,9 @@ class OutboundQueue:
                         return admitted
 
     def put(self, kind, message, retention_priority):
-        """Admit one MQTT-bound message after validation, serialization, and encoding.
+        """Admit one MQTT-bound message after validation, serialization, encoding, and size check.
 
-        The message is validated, serialized to JSON, UTF-8 encoded, and
-        size-checked before admission. The queue stores the final payload
-        bytes, not the original dictionary.
-
-        Admission is heap-governed (see the class docstring): the entry is
-        retained only while the global free-heap reserve is satisfied, evicting
-        the least-important eligible entries under memory pressure.
-
-        The in-flight QoS 1 entry is retained until its PUBACK and is never an
-        eviction candidate.
-
-        Returns:
-            bool: True if admitted; False if admission failed transiently
-            (heap pressure), in which case a later retry may succeed.
-
-        Raises:
-            ValueError: if the message can never be admitted -- an unsupported
-            value, a serialization failure, or a serialized size beyond
-            MAX_OUTBOUND_MESSAGE_BYTES. These are permanent failures of the
-            message itself, not of the queue: retrying the same message cannot
-            succeed, so they are raised instead of returned as False.
-
-            OutboundMessageTooLargeError (a ValueError subclass): for the
-            oversized case specifically, so a caller can report a size
-            failure distinctly from a validation or serialization failure.
-        """
+        Returns True if admitted, False on transient heap pressure (a later retry may succeed). Raises ValueError on a permanent failure of the message itself (unsupported value, serialization, or size beyond MAX_OUTBOUND_MESSAGE_BYTES); the oversized case raises OutboundMessageTooLargeError, a ValueError subclass."""
         if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(message, dict):
@@ -318,31 +236,9 @@ class OutboundQueue:
         return self._admit_heap_governed(kind, payload_bytes, retention_priority)
 
     def put_with_kind(self, kind, payload_bytes, retention_priority):
-        """Admit one MQTT-bound message with a specific kind (e.g., health, log).
+        """Admit one MQTT-bound message from pre-serialized, UTF-8 encoded JSON bytes.
 
-        The caller guarantees the bytes are pre-serialized, UTF-8 encoded JSON.
-        The per-message ceiling is enforced here, not by the caller: a payload
-        longer than MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) is a permanent failure
-        of the message and is raised (ValueError), the same as the put()
-        serialization path. Admission is then heap-governed (see the class
-        docstring).
-
-        Args:
-            kind: Message kind (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG)
-            payload_bytes: Pre-serialized, UTF-8 encoded payload
-            retention_priority: Priority level for retention management
-
-        Returns:
-            bool: True if admitted; False if admission failed transiently
-            (heap pressure), in which case a later retry may succeed.
-
-        Raises:
-            OutboundMessageTooLargeError (a ValueError subclass): if the
-            payload is longer than MAX_OUTBOUND_MESSAGE_BYTES: a permanent
-            failure of the message, retrying the same payload cannot succeed.
-            Raised as the size-specific type so a caller can report a size
-            failure distinctly from a validation or serialization failure.
-        """
+        The per-message ceiling is enforced here, not by the caller: a payload beyond MAX_OUTBOUND_MESSAGE_BYTES raises OutboundMessageTooLargeError (a ValueError subclass). Returns True if admitted, False on transient heap pressure."""
         if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(payload_bytes, (bytes, bytearray)):
@@ -411,15 +307,9 @@ class OutboundQueue:
             return self._in_flight is not None
 
     def status(self):
-        """Return the queue's observability metrics.
+        """Return the queue's observability metrics (metrics, not capacity limits).
 
-        depth/pending are the entry view (the in-flight entry counts toward
-        depth); queued_bytes is the retained-payload view (the queued FIFO plus
-        the in-flight entry, retained until its PUBACK). Both include the
-        in-flight entry and are read under the same lock so the snapshot is
-        consistent. None of these are capacity limits -- admission is governed
-        by the global free-heap reserve.
-        """
+        depth/pending are the entry view, queued_bytes the retained-payload view; both include the in-flight entry, read under one lock."""
         with self._lock:
             in_flight = self._in_flight is not None
             return {
@@ -437,28 +327,14 @@ class OutboundQueue:
             }
 
     def get_depth(self):
-        """Return current queue depth (queued + in-flight entries)."""
         with self._lock:
             return len(self._queue) + (1 if self._in_flight is not None else 0)
 
 
 class InterCoreEventQueue:
-    """Private FIFO for discrete Core 0 -> Core 1 events.
+    """Private FIFO for discrete Core 0 -> Core 1 events (never MQTT-bound by queue membership).
 
-    These events are never MQTT-bound merely because they are in this queue.
-
-    Capacity rule (heap-governed):
-    The queue has NO fixed entry-count capacity. Admission is governed by the
-    same global minimum free-heap reserve the outbound queue uses, under the
-    same shared heap-admission lock: an event may be retained only while
-    gc.mem_free() is at or above the reserve.
-
-    No-eviction rule:
-    An admitted event is a discrete control operation and is never evicted to
-    make room for a newer one. When the reserve cannot be satisfied (even
-    after gc.collect()), the new event is rejected and the caller reports the
-    memory-pressure failure; already-admitted events are untouched.
-    """
+    No fixed capacity: admission is governed by the same global free-heap reserve under the same shared heap-admission lock. Admitted events are never evicted -- under pressure the new event is rejected instead."""
 
     def __init__(self, minimum_free_heap_bytes, heap_admission_lock):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
@@ -470,13 +346,7 @@ class InterCoreEventQueue:
         self._rejected = 0
 
     def put(self, event):
-        """Admit one event, or reject it under memory pressure.
-
-        Fast path: reserve satisfied -> admit, no garbage collection.
-        Pressure path: gc.collect() once; if the reserve is still not
-        restored, the new event is rejected -- never at the cost of an
-        already-admitted event.
-        """
+        """Admit one event, or reject it under memory pressure (never evicting an admitted event)."""
         if not isinstance(event, dict):
             raise ValueError("inter-core event must be a dictionary")
 
@@ -522,12 +392,7 @@ class InterCoreEventQueue:
 
 
 class StateMailboxes:
-    """Latest-value immutable snapshots shared between cores.
-
-    State replaces rather than queues. Core 0 creates a new snapshot object,
-    publishes it, and never mutates that object again. Core 1 holds the latest
-    reference until Core 0 replaces it with a newer immutable snapshot.
-    """
+    """Latest-value immutable snapshots shared between cores; state replaces rather than queues."""
 
     def __init__(self):
         self._lock = _thread.allocate_lock()
@@ -553,7 +418,6 @@ class StateMailboxes:
             self._utc_snapshot = snapshot
 
     def set_core_1_activity_ms(self, activity_ms):
-        """Record Core 1 activity timestamp in milliseconds."""
         if isinstance(activity_ms, bool) or not isinstance(activity_ms, int):
             raise ValueError("activity_ms must be an integer")
         with self._lock:
@@ -564,7 +428,6 @@ class StateMailboxes:
             return self._core_1_activity_ms
 
     def set_hardware(self, hardware):
-        """Set hardware detection result."""
         if not isinstance(hardware, dict):
             raise ValueError("hardware must be a dictionary")
         with self._lock:
@@ -582,13 +445,7 @@ class StateMailboxes:
 class InterCore:
     """Container exposing the three explicit communication lanes.
 
-    The two FIFO lanes are heap-governed: both admit only while gc.mem_free()
-    stays at or above the board-specific minimum free-heap reserve (single
-    source of truth: hardware.py), and they serialize that check -- together
-    with the pressure-path gc.collect() and the outbound eviction decisions --
-    on one shared heap-admission lock, because the MicroPython heap (and its
-    reserve) is global to both cores.
-    """
+    The two FIFO lanes are heap-governed by the same global free-heap reserve, serialized on one shared heap-admission lock (the heap is global to both cores)."""
 
     def __init__(self, minimum_free_heap_bytes):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")

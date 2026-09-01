@@ -4,22 +4,11 @@
 
 """Host-side regression tests: the Core 1 watchdog fires *inside* network waits.
 
-Wifi.connect() and Mqtt.connect() contain the longest monolithic waits on
-Core 0 (a 20 s per-attempt Wi-Fi observation window, retry backoffs of up
-to 40 s, whole sequences repeated forever). They now invoke an optional
-Core 0 servicing hook at every 100 ms wait slice. These tests pin the
-module-level contract, where the hook models the Core 1 heartbeat
-watchdog:
+Wifi.connect() and Mqtt.connect() contain the longest monolithic waits on Core 0 (a 20 s per-attempt Wi-Fi observation window, retry backoffs of up to 40 s, whole sequences repeated forever). They now invoke an optional Core 0 servicing hook at every 100 ms wait slice; the hook models the Core 1 heartbeat watchdog. These tests pin:
 
 * the hook is invoked repeatedly during the waits (not skipped);
-* a stale heartbeat -- modeled as an exception, since on hardware
-  machine.reset() never returns -- propagates out of connect() *inside*
-  the first backoff cycle, long before the reconnect sequence has been
-  exhausted;
-* the exception is a BaseException so the connect loops' own
-  ``except Exception`` handlers cannot swallow it (the same modeling
-  test_mqtt.py uses for HangDetected).
-"""
+* a stale heartbeat -- modeled as an exception, since on hardware machine.reset() never returns -- propagates out of connect() inside the first backoff cycle, long before the reconnect sequence has been exhausted;
+* the exception is a BaseException so the connect loops' own except-Exception handlers cannot swallow it (the same modeling test_mqtt.py uses for HangDetected)."""
 
 import pathlib
 import sys
@@ -35,11 +24,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 class StaleHeartbeatReset(BaseException):
     """Stand-in for machine.reset(): on hardware it never returns.
 
-    Deriving from BaseException -- like HangDetected in test_mqtt.py --
-    means the code under test's ``except Exception`` handlers (the Wi-Fi
-    and MQTT connect retry loops) cannot swallow it: a regression that
-    stops servicing the wait fails here instead of looping on.
-    """
+    Deriving from BaseException means the code under test's except-Exception handlers (the Wi-Fi and MQTT connect retry loops) cannot swallow it: a regression that stops servicing the wait fails here instead of looping on."""
     pass
 
 
@@ -96,14 +81,7 @@ class _FakeWLAN:
 class _StatusWLAN:
     """A Wi-Fi radio whose no-arg status() reports a fixed association state.
 
-    isconnected() never becomes True, so the only thing that can end the
-    20 s observation window early is the association state status() reports.
-    The class attribute `status_value` lets a test drive any state -- a
-    terminal failure (WRONG_PASSWORD / NO_AP_FOUND / CONNECT_FAIL), a still
-    connecting one (CONNECTING), ... -- and assert whether the attempt bails
-    early or waits the full window. Exposes the STAT_* names the firmware
-    reads (like PM_NONE).
-    """
+    isconnected() never becomes True, so the only thing that can end the 20 s observation window early is the association state status() reports. The status_value attribute lets a test drive any state (terminal failure, still connecting, ...) and assert whether the attempt bails early or waits the full window; it also exposes the STAT_* names the firmware reads."""
 
     IF_STA = 0
     PM_NONE = 0
@@ -141,11 +119,7 @@ class _StatusWLAN:
 class _BareStatusWLAN:
     """A radio that reports a status() value but exposes no STAT_* names.
 
-    `status_value` is expected to be a documented MicroPython association
-    state (e.g. 2 = WRONG_PASSWORD). Exercises the firmware's fallback to the
-    documented values when the firmware build does not expose the STAT_*
-    names on the WLAN object or class.
-    """
+    status_value is expected to be a documented MicroPython association state (e.g. 2 = WRONG_PASSWORD); exercises the firmware's fallback to the documented values."""
 
     IF_STA = 0
     PM_NONE = 0

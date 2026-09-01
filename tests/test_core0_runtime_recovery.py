@@ -4,33 +4,14 @@
 
 """Host-side tests for the Core 0 runtime recovery boundary in main().
 
-Core 0's fail-fast policy (a ``MemoryError`` re-raised through every generic
-handler) is local: continuing to allocate on an exhausted heap is unsafe.
-Without a system-level policy the direction of supervision was one-way — Core
-0's heartbeat watchdog recovers a dead Core 1, but nothing supervises Core
-0 — so a Core 0 that terminated (a ``MemoryError``, an unexpected exception
-escaping ``start()``/``run()``) left the board with no networking, no Core 1
-supervision, and no recovery: a transient failure turned into a permanent
-outage until something external reset the Pico.
+Core 0's fail-fast policy (a MemoryError re-raised through every generic handler) is local: continuing to allocate on an exhausted heap is unsafe. Without a system-level policy, a Core 0 that terminated (a MemoryError, an unexpected exception escaping start()/run()) left the board with no networking, no Core 1 supervision, and no recovery.
 
-The boundary in ``main()`` splits startup into two phases with different
-contracts:
+The boundary in main() splits startup into two phases with different contracts:
 
-- **Deterministic startup validation** (hardware detection, config
-  loading, Core 0 construction) fails fast and stays visible: a
-  misconfigured or unsupported board must stay down with a diagnosable
-  error, not reboot forever.
-- **Operational runtime** (``Core0.start()`` through ``Core0.run()``)
-  converts an unrecoverable Core 0 exception into a controlled
-  ``machine.reset()`` instead of application termination.
+- Deterministic startup validation (hardware, config, Core 0 construction) fails fast and stays visible: a misconfigured or unsupported board must stay down with a diagnosable error, not reboot forever.
+- Operational runtime (Core0.start() through Core0.run()) converts an unrecoverable Core 0 exception into a controlled machine.reset() instead of application termination.
 
-Covers:
-- MemoryError from Core0.start()      → board reset, no exception escapes
-- MemoryError from Core0.run()        → board reset, no exception escapes
-- ordinary Exception from Core0.run() → board reset, no exception escapes
-- Core 1 never starts when start() fails (gating preserved)
-- deterministic startup failure       → exception stays visible, NO reset
-"""
+Covers: MemoryError from start() and run() (board reset, no exception escapes), ordinary Exception from run() (board reset), Core 1 never starts when start() fails (gating preserved), and deterministic startup failure (exception stays visible, NO reset)."""
 
 import importlib
 import pathlib
@@ -84,17 +65,9 @@ def _fake_core1_module(core1_main=None):
 def host_boot(monkeypatch):
     """Boot main() on the host with deterministic startup passing.
 
-    Installs the MicroPython stand-ins (machine/time/wifi/mqtt/debug),
-    reloads core0 and main under them so their module-level bindings point
-    at the fakes, and fakes detect_hardware() to a supported Pico W so the
-    validation phase passes. Deterministic-failure tests re-patch
-    detect_hardware / load_config to raise.
+    Installs the MicroPython stand-ins, reloads core0 and main under them, and fakes detect_hardware() to a supported Pico W so the validation phase passes. Deterministic-failure tests re-patch detect_hardware / load_config to raise.
 
-    The stand-ins are installed inside the fixture (not at collection time):
-    later-collected modules import the real wifi/mqtt/time at collection, and
-    mocked entries in sys.modules would shadow them. The pattern mirrors
-    tests/test_core0_recovery.py.
-    """
+    The stand-ins are installed inside the fixture (not at collection time): later-collected modules import the real wifi/mqtt/time at collection, and mocked sys.modules entries would shadow them."""
     machine = MagicMock(name="machine")
     sys.modules["time"] = _FAKE_TIME
     sys.modules["machine"] = machine
@@ -200,10 +173,7 @@ def test_core1_never_starts_when_core0_start_fails(host_boot, monkeypatch):
 def test_deterministic_startup_failure_stays_visible(host_boot, monkeypatch):
     """Unsupported hardware must stay down with a diagnosable error, not reboot.
 
-    Hardware detection is deterministic startup validation: it runs before
-    the operational phase and therefore OUTSIDE the recovery boundary.
-    Rebooting here would loop a misconfigured board forever.
-    """
+    Hardware detection is deterministic startup validation, OUTSIDE the recovery boundary; rebooting here would loop a misconfigured board forever."""
     machine, main_mod = host_boot
 
     def _unsupported():
@@ -220,9 +190,7 @@ def test_deterministic_startup_failure_stays_visible(host_boot, monkeypatch):
 def test_config_rejection_stays_visible(host_boot, monkeypatch):
     """A fail-fast config rejection must stay visible, not reboot forever.
 
-    Config loading is deterministic validation, outside the boundary: the
-    exception escapes to the operator instead of becoming a reboot loop.
-    """
+    Config loading is deterministic validation, outside the boundary: the exception escapes to the operator instead of becoming a reboot loop."""
     machine, main_mod = host_boot
     import config
 

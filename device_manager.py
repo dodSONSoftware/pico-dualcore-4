@@ -51,27 +51,22 @@ class ManagedDevice:
         self.reinit_failure_logged = False  # Suppress duplicate ERROR logs
 
     def mark_reinitialize_pending(self):
-        """Mark this device for reinitialization on the next cycle."""
         self.reinitialize_pending = True
         self.state = DEVICE_STATE_REINITIALIZE_PENDING
 
     def clear_reinitialize_pending(self):
-        """Clear reinitialize pending state after successful reinit."""
         self.reinitialize_pending = False
         self.state = DEVICE_STATE_READY
         self.consecutive_read_failures = 0
         self.reinit_failure_logged = False  # Reset suppression flag on success
 
     def set_reinit_failure_logged(self):
-        """Mark that a reinitialization failure has been logged (for suppression)."""
         self.reinit_failure_logged = True
 
     def should_suppress_reinit_failure(self):
-        """Check if reinitialization failure logging should be suppressed."""
         return self.reinit_failure_logged
 
     def record_read_failure(self):
-        """Record a read failure for this device."""
         self.consecutive_read_failures += 1
         self.total_read_failures += 1
 
@@ -80,15 +75,7 @@ class ManagedDevice:
         self.consecutive_read_failures = 0
 
     def get_status_snapshot(self, now_ms=None):
-        """
-        Get a JSON-safe status snapshot of this device.
-
-        Args:
-            now_ms: Optional monotonic timestamp in milliseconds for age calculations
-
-        Returns:
-            dict: Device status for telemetry reporting
-        """
+        """Get a JSON-safe status snapshot of this device (age fields when now_ms is given)."""
         snapshot = {
             "id": self.device_id,
             "device": self.device_type,
@@ -149,7 +136,6 @@ class DeviceManager:
             self._activity_refresh()
 
     def _initialize_single_device(self, device_def):
-        """Initialize a single device from config."""
         device_id = device_def["id"]
         device_type = device_def["device_type"]
         sensor_type = device_def.get("sensor_type", "unknown")
@@ -177,7 +163,6 @@ class DeviceManager:
         )
 
     def _create_driver(self, device_def):
-        """Create device driver from config."""
         try:
             driver = create_device(device_def, self._system_information)
             return driver, None
@@ -187,7 +172,6 @@ class DeviceManager:
             return None, err
 
     def _initialize_driver_with_retries(self, driver, device_def, device_id, device_type, attempt_logs):
-        """Initialize driver with retry logic."""
         attempts_used = 0
         last_error = None
         initialized = False
@@ -230,7 +214,6 @@ class DeviceManager:
         return attempts_used, initialized
 
     def _record_driver_failure(self, device_id, device_type, error):
-        """Record driver construction failure."""
         attempt_logs = [{
             "device_id": device_id,
             "device_type": device_type,
@@ -260,7 +243,6 @@ class DeviceManager:
         }
 
     def _record_initialization_failure(self, device_id, device_type, attempts_used, attempt_logs):
-        """Record driver initialization failure."""
         last_error = attempt_logs[-1]["error"] if attempt_logs else "Unknown error"
 
         failed_details = [{
@@ -285,7 +267,6 @@ class DeviceManager:
         }
 
     def _record_success(self, device_id, device_type, sensor_type, driver, attempts_used, attempt_logs, name=None):
-        """Record successful device initialization."""
         managed_device = ManagedDevice(
             device_id=device_id,
             device_type=device_type,
@@ -306,31 +287,9 @@ class DeviceManager:
         }
 
     def initialize_devices(self):
-        """
-        Initialize all configured devices.
+        """Initialize all configured devices, in configuration order.
 
-        For every configured device, in configuration order:
-        1. Construct the driver through DeviceFactory (once per device)
-        2. Attempt initialization up to device_initialization_attempts
-        3. Wait device_initialization_retry_delay_ms between failed attempts
-        4. On success: add to active devices
-        5. On final failure: record as failed, continue to next device
-
-        This method must be called on Core 1.
-
-        Returns:
-            tuple: (initialized_count, failed_device_details, attempt_logs)
-                   where failed_device_details is a list of dicts with:
-                       - device_id: str
-                       - device_type: str
-                       - initialization_attempts_used: int
-                   and attempt_logs is a list of dicts with:
-                       - device_id: str
-                       - device_type: str
-                       - attempt: int (1-indexed)
-                       - success: bool
-                       - error: str or None
-        """
+        Construct the driver once per device, then attempt initialization up to device_initialization_attempts (retry delay between attempts); on final failure record the device and continue. Must be called on Core 1. Returns (initialized_count, failed_device_details, attempt_logs)."""
         initialized_count = 0
         all_failed_device_details = []
         all_attempt_logs = []
@@ -348,51 +307,20 @@ class DeviceManager:
         return initialized_count, all_failed_device_details, all_attempt_logs
 
     def get_active_devices(self):
-        """
-        Get the active managed devices in configuration order.
+        """Get the active managed devices in configuration order.
 
-        Returns the internal list itself, not a copy: Core 1 exclusively
-        owns device membership (only this manager mutates it, at startup),
-        membership is fixed after initialize_devices() -- reinitialization
-        never adds or removes entries -- and the caller iterates it
-        read-only. A per-cycle copy would be needless heap churn on the
-        hot telemetry path.
-
-        Returns:
-            list: ManagedDevice instances (the live membership list; do not mutate)
-        """
+        Returns the internal list itself, not a copy: membership is fixed after initialize_devices() and a per-cycle copy would be needless heap churn on the hot telemetry path (do not mutate)."""
         return self._active_devices
 
     def process_device(self, managed_device):
-        """
-        Process one device for the current cycle.
-
-        Handles:
-        - Normal read (if reinitialize_pending is False)
-        - Reinitialization (if reinitialize_pending is True)
-        - Failure tracking
-
-        Args:
-            managed_device: ManagedDevice instance to process
-
-        Returns:
-            dict: Result with status and metadata
-        """
+        """Process one device for the current cycle (normal read, or reinitialization if pending)."""
         if managed_device.reinitialize_pending:
             return self._process_reinitialization(managed_device)
 
         return self._process_normal_read(managed_device)
 
     def _process_normal_read(self, managed_device):
-        """
-        Process a normal read for a device.
-
-        Args:
-            managed_device: ManagedDevice instance
-
-        Returns:
-            dict: Result with telemetry or failure info
-        """
+        """Process a normal read for a device; validate the telemetry and record the outcome."""
         try:
             # Record read attempt
             managed_device.read_count += 1
@@ -449,19 +377,9 @@ class DeviceManager:
             }
 
     def _process_reinitialization(self, managed_device):
-        """
-        Process reinitialization for a device.
+        """Process reinitialization for a device, reusing the configured initialization retry policy.
 
-        Reuses the configured initialization retry policy to handle
-        transient failures during runtime recovery. A single failed
-        attempt does not permanently remove the device.
-
-        Args:
-            managed_device: ManagedDevice instance
-
-        Returns:
-            dict: Result with reinitialization status
-        """
+        A single failed attempt does not remove the device: it stays reinitialize_pending for the next cycle."""
         # Resolve the device definition once, before the retry loop
         device_def = None
         for d in self._devices_config:
@@ -530,19 +448,9 @@ class DeviceManager:
         }
 
     def get_status_snapshot(self, now_ms=None):
-        """
-        Get a JSON-safe status snapshot of all devices (active + failed).
+        """Get a JSON-safe status snapshot of all devices (active + failed), in deterministic configuration order.
 
-        Args:
-            now_ms: Optional monotonic timestamp in milliseconds for age calculations
-
-        Failed devices are included in the status array with their final state
-        and diagnostic information. The order is deterministic: devices appear
-        in configuration order.
-
-        Returns:
-            dict: Device status for telemetry reporting
-        """
+        Failed devices carry their final state and diagnostic info; now_ms (optional) enables the age fields."""
         # Build a map of device_id -> status snapshot for all devices
         device_snapshots = {}
 

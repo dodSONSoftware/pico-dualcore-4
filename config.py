@@ -202,10 +202,7 @@ def load_wifi_config(path="config-secrets.json"):
 def split_config(config):
     """Create the immutable-by-convention per-core startup configuration.
 
-    The inter-core bus carries no configuration: its heap-reserve admission
-    bound is a board property owned by hardware.py and passed to InterCore
-    directly, so there is no bus_config to split out.
-    """
+    The bus carries no configuration: its heap-reserve admission bound is a board property owned by hardware.py and passed to InterCore directly."""
     core0 = {
         "source": config["source"],
         "mqtt_broker_ip_address": config["mqtt_broker_ip_address"],

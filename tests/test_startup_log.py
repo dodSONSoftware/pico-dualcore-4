@@ -250,12 +250,9 @@ def test_build_startup_log_structure():
 
 
 def test_startup_summary_uses_explicit_duration_ms():
-    """The startup summary names its duration explicitly (duration_ms).
+    """The startup summary names its duration explicitly (duration_ms), not the ambiguous 'uptime' key, while the envelope keeps device uptime as 'uptime_ms'.
 
-    Drives the real _build_startup_log and verifies the ambiguous 'uptime' key
-    is gone from the startup summary, while the envelope keeps device uptime as
-    'uptime_ms'.
-    """
+    Drives the real _build_startup_log and verifies both."""
     sys.modules['machine'] = MagicMock()
     sys.modules['gc'] = MagicMock()
     sys.modules['os'] = MagicMock()

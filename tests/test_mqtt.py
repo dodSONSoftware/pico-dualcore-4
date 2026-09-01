@@ -70,28 +70,14 @@ def mock_select(monkeypatch):
 class HangDetected(BaseException):
     """A read would block forever (infinite blocking, no data available).
 
-    Models a MicroPython socket left in blocking mode with no timeout (the
-    state ``setblocking(True)`` produces) while the peer stalls: in production
-    that read never returns. The host suite cannot actually hang, so the mock
-    raises a distinctive error, deliberately NOT an ``OSError``. It derives
-    from ``BaseException`` so the code under test's ``except Exception``
-    handlers (e.g. Mqtt.connect()'s retry loop) cannot swallow it: a test
-    that expects a bounded timeout fails hard when the code under test
-    regresses to infinite blocking, even through a retry loop.
-    """
+    Models a MicroPython socket left in blocking mode while the peer stalls. Deliberately NOT an OSError: it derives from BaseException so the code under test's except-Exception handlers cannot swallow it -- a test expecting a bounded timeout fails hard on a regression to infinite blocking."""
     pass
 
 
 class MockSocket:
     """In-memory broker socket with MicroPython blocking/timeout semantics.
 
-    Records writes and serves scripted incoming bytes. ``setblocking(True)``
-    is equivalent to ``settimeout(None)`` (infinite blocking) and
-    ``setblocking(False)`` to non-blocking, matching MicroPython. A read with
-    no data available returns b"" when non-blocking, raises OSError when a
-    finite timeout is set (the timeout fired), and raises HangDetected when the
-    socket is in infinite-blocking mode (how the production hang surfaces).
-    """
+    setblocking(True) == settimeout(None) (infinite blocking); a read with no data returns b"" when non-blocking, raises OSError on a finite timeout, and raises HangDetected in infinite-blocking mode (how the production hang surfaces)."""
 
     def __init__(self, incoming=b""):
         self.buffer = bytearray(incoming)
@@ -180,16 +166,7 @@ class MockSocket:
 class MockPoller:
     """Models MicroPython's select.poll(): register a stream, poll non-blocking.
 
-    Readiness is modeled from the MockSocket's buffer: a stream is readable
-    exactly when it still has bytes to serve — the same "a packet has started
-    arriving" condition check_msg() tests for. (The real socket object is what
-    check_msg() registers; MockSocket has no fd, so it is modeled here.)
-
-    Class-level counters let a test assert that check_msg() builds one poller
-    per socket and reuses it (created_count), and that it polls through the
-    allocation-free ipoll() path (ipoll_calls) rather than the list-returning
-    poll() path (poll_calls).
-    """
+    Readiness is modeled from the MockSocket's buffer (readable exactly when bytes remain). Class-level counters let a test assert one poller per socket (created_count) and the allocation-free ipoll() path (ipoll_calls) over the list-returning poll() path (poll_calls)."""
 
     created_count = 0
     poll_calls = 0
@@ -333,14 +310,7 @@ def test_publish_qos1_times_out_when_puback_never_arrives():
 def test_publish_qos1_timeout_active_before_first_publish_byte():
     """The QoS 1 timeout must be active before byte 1 of the PUBLISH frame.
 
-    A link that stalls on a write in infinite-blocking mode would wedge
-    Core 0 inside sock.write() forever — and with Core 0 wedged, its Core 1
-    heartbeat check never runs, so no recovery path remains. The mock stalls
-    any write attempted without a finite timeout (HangDetected, a
-    BaseException that escapes the code under test's handlers), so the
-    publish completing at all proves the timeout was installed before the
-    first write and restored after the exchange.
-    """
+    The mock stalls any write attempted without a finite timeout (HangDetected), so the publish completing at all proves the timeout was installed before the first write and restored after the exchange."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket(incoming=b"\x40\x02\x00\x01")  # PUBACK for pid 1
     sock.write_requires_timeout = True
@@ -356,13 +326,7 @@ def test_publish_qos1_timeout_active_before_first_publish_byte():
 def test_publish_qos1_write_stall_surfaces_as_bounded_error():
     """A stalled PUBLISH write must fail bounded, not wedge Core 0.
 
-    A blackholed link whose send buffer stops draining wedges Core 0 inside
-    sock.write() unless a finite timeout is active: with the timeout in place
-    the failure is a bounded OSError that propagates through
-    Mqtt.publish_qos1's disconnect into network recovery. The old code
-    (timeout installed only after the writes) surfaces this as HangDetected
-    instead.
-    """
+    With a finite timeout the failure is a bounded OSError that propagates through Mqtt.publish_qos1's disconnect into network recovery; the old code (timeout installed only after the writes) surfaces this as HangDetected."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket(incoming=b"")
     sock.write_stalls = True
@@ -517,11 +481,7 @@ def test_check_msg_returns_none_when_no_packet_started(mock_select):
 def test_check_msg_times_out_on_stalled_packet_instead_of_short_reading(mock_select):
     """A packet that has started but stalled must time out, not short-read.
 
-    In non-blocking mode (the old behavior) the remaining reads return b"" and
-    a corrupt empty frame is delivered to the callback. Under a finite timeout
-    (the fix) the stalled read raises a bounded error instead, surfacing into
-    network recovery.
-    """
+    In non-blocking mode (the old behavior) a corrupt empty frame is delivered to the callback; under a finite timeout the stalled read raises a bounded error instead, surfacing into network recovery."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     seen = []
     client.set_callback(lambda topic, msg: seen.append((topic, msg)))
@@ -543,12 +503,7 @@ def test_check_msg_times_out_on_stalled_packet_instead_of_short_reading(mock_sel
 def test_check_msg_reuses_one_poller_and_uses_ipoll(mock_select):
     """check_msg() builds the readiness poller once per socket and reuses it.
 
-    Rebuilding select.poll() (and a result list) on every ~100 ms call was
-    pure GC churn on the hot path — ~350,000 poll objects over a 10-hour run.
-    The fix creates the poller once and polls through the allocation-free
-    ipoll() where available (MicroPython), so a whole connection produces a
-    single poller and never the list-returning poll() path.
-    """
+    Rebuilding select.poll() on every ~100 ms call was GC churn on the hot path; the fix polls through the allocation-free ipoll() where available, so a whole connection produces a single poller."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     client.set_callback(lambda topic, msg: None)
     sock = MockSocket(incoming=b"")
@@ -567,10 +522,7 @@ def test_check_msg_reuses_one_poller_and_uses_ipoll(mock_select):
 def test_check_msg_recreates_poller_when_socket_changes(mock_select):
     """A reconnect installs a new socket object, so the poller is rebuilt.
 
-    A poller still registered on the old (closed) socket would poll the wrong
-    stream. When client.sock is replaced, check_msg() must build a fresh
-    poller bound to the new socket instead of reusing the stale one.
-    """
+    A poller still registered on the old (closed) socket would poll the wrong stream."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     client.set_callback(lambda topic, msg: None)
 
@@ -638,11 +590,7 @@ def test_ping_fails_immediately_when_settimeout_raises():
 def test_ping_fails_when_blocking_restore_raises():
     """A failed restore to blocking mode must fail ping, not be swallowed.
 
-    The PINGRESP arrives (the bounded wait itself succeeds), but the socket
-    cannot be returned to blocking mode. Subsequent operations assume the
-    blocking mode, so the failure must propagate into recovery instead of
-    letting ping() report success.
-    """
+    The PINGRESP arrives, but the socket cannot be returned to blocking mode, which subsequent operations assume -- the failure must propagate into recovery."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket(incoming=b"\xd0\x00")  # ready PINGRESP: the wait succeeds
     sock.restore_error = OSError("restore failed")
@@ -653,13 +601,9 @@ def test_ping_fails_when_blocking_restore_raises():
 
 
 def test_publish_qos1_fails_when_blocking_restore_raises():
-    """A failed restore to blocking mode must fail the publish, not be
-    swallowed.
+    """A failed restore to blocking mode must fail the publish, not be swallowed.
 
-    The PUBACK arrives (the QoS 1 exchange itself completes), but the socket
-    cannot be returned to blocking mode. The publish must surface that
-    failure into recovery instead of reporting a successful delivery.
-    """
+    The PUBACK arrives, but the socket cannot be returned to blocking mode: the publish must surface that failure into recovery instead of reporting success."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket(incoming=b"\x40\x02\x00\x01")  # ready PUBACK: the exchange completes
     sock.restore_error = OSError("restore failed")
@@ -950,13 +894,9 @@ def test_mqtt_connect_subscribes_both_topics_and_restores_blocking(ticks, monkey
 
 
 def test_mqtt_connect_fails_when_blocking_restore_raises(ticks, monkeypatch):
-    """A failed restore to blocking mode after the handshake must fail the
-    connection attempt, not mark a broken link healthy.
+    """A failed restore to blocking mode after the handshake must fail the connection attempt, not mark a broken link healthy.
 
-    CONNACK and both SUBACKs arrive, but settimeout(None) fails: the
-    handshake cannot be treated as complete, so the attempt fails (and the
-    retry loop's cleanup closes the socket) instead of a connect success.
-    """
+    CONNACK and both SUBACKs arrive, but settimeout(None) fails: the attempt fails (and the retry loop's cleanup closes the socket) instead of reporting a connect success."""
     incoming = (
         b"\x20\x02\x00\x00"       # CONNACK
         b"\x90\x03\x00\x01\x00"   # SUBACK pid 1 (command topic)
@@ -994,13 +934,7 @@ def test_mqtt_connect_fails_when_blocking_restore_raises(ticks, monkeypatch):
 def test_reconnect_cleanup_closes_stalled_socket_without_writing(ticks, monkeypatch):
     """After a publish failure, the reconnect cleanup must close without writing.
 
-    write_stalls models the blackholed link: any send attempted in
-    infinite-blocking mode (the state the failed socket is in after the
-    publish's bounded exchange unwinds its timeout) raises HangDetected.
-    HangDetected is a BaseException that escapes Mqtt.connect()'s
-    ``except Exception``, so a regression to a DISCONNECT write fails this
-    test hard instead of returning a silent connect failure.
-    """
+    write_stalls models the blackholed link: any send in infinite-blocking mode raises HangDetected, a BaseException that escapes Mqtt.connect()'s except-Exception, so a regression to a DISCONNECT write fails this test hard."""
     mqtt = _mqtt(ticks)
 
     # An established session on a blackholed link.

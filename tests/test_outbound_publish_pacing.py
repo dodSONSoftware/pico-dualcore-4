@@ -4,20 +4,9 @@
 
 """Host-side regression tests for mqtt_outbound_publish_delay_ms.
 
-Core 0 paces its outbound *application* PUBLISHes: after one QoS 1 publish
-completes (PUBACK received), no other application PUBLISH may begin until
-the configured interval has elapsed; the first publish after idle is
-immediate; 0 disables pacing. The interval is state, not a sleep: while the
-gate is closed the run loop keeps servicing the Core 1 watchdog, MQTT command
-polling, and the normal 10 ms step, and only begins the next PUBLISH when
-the gate reopens. Protocol-control traffic (PINGREQ) is never paced, and
-startup (a sequential contract) may wait for the slot it needs.
+Core 0 paces its outbound application PUBLISHes: after one QoS 1 publish completes (PUBACK received), no other application PUBLISH may begin until the configured interval elapses; the first publish after idle is immediate; 0 disables pacing. The interval is state, not a sleep: while the gate is closed the run loop keeps servicing the Core 1 watchdog and command polling. PINGREQ is never paced, and startup may wait for its slot.
 
-The tests drive the real Core 0 code with a controllable tick clock (which
-wraps at MicroPython's 31-bit tick boundary, so the gate's ticks_diff
-handling is exercised), fake wifi/mqtt that record the clock time of every
-publish, and the real heap-governed outbound queue.
-"""
+The tests drive the real Core 0 code with a controllable wrapping tick clock, fake wifi/mqtt that record the clock time of every publish, and the real heap-governed outbound queue."""
 
 import importlib
 import json
@@ -57,10 +46,7 @@ class ResettingMachine:
 class FakeTime:
     """Controllable MicroPython time stand-in with 31-bit tick wrap.
 
-    sleep_ms advances the clock (and records every sleep), so loop steps are
-    deterministic and any blocking sleep the implementation inserted would
-    show up in sleep_calls.
-    """
+    sleep_ms advances the clock (and records every sleep), so any blocking sleep the implementation inserted would show up in sleep_calls."""
 
     def __init__(self):
         self._abs_ms = 0
@@ -413,10 +399,7 @@ def test_backlog_drains_progressively_fifo_not_in_a_burst(make_core0):
 def test_run_loop_stays_responsive_while_gate_closed(make_core0):
     """A closed gate holds back publishes; it must not stall Core 0.
 
-    Pins the anti-pattern: a blocking sleep for the configured delay would
-    show up as a >10 ms sleep and would stop the watchdog and command
-    polling for the duration.
-    """
+    A blocking sleep for the configured delay would show up as a >10 ms sleep and would stop the watchdog and command polling for the duration."""
     instance = make_core0(delay_ms=100)
     _queue_telemetry(instance, 1)
     _utc_synchronized(instance)
@@ -512,10 +495,7 @@ def test_queued_message_then_utc_request_paced(make_core0):
 def test_reboot_holds_for_publish_slot_then_resets(make_core0):
     """A pending reboot waits for its response slot: no early reset, no bypass.
 
-    While the gate is closed the reboot stays pending and Core 0 keeps
-    looping; once the gate opens the response publishes and the existing
-    reboot sequence (5 s grace + reset) proceeds.
-    """
+    While the gate is closed the reboot stays pending and Core 0 keeps looping; once it opens the response publishes and the reboot sequence proceeds."""
     instance = make_core0(delay_ms=100)
     _utc_synchronized(instance)
     instance._pending_reboot = {
@@ -567,9 +547,7 @@ def test_startup_probe_waits_for_publish_slot(make_core0):
 def test_startup_connection_logs_are_paced(make_core0):
     """Consecutive startup connection logs are paced by the interval.
 
-    This replaces the old fixed 50 ms post-publish assumption: the drain
-    waits for the slot the preceding publish (probe #1) just closed.
-    """
+    The drain waits for the slot the preceding publish (probe #1) just closed."""
     instance = make_core0(delay_ms=100)
     instance._queue_connection_log("wifi_connection_established", "Connected to Wi-Fi", "wifi", {})
     instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
@@ -602,9 +580,7 @@ def test_startup_utc_request_respects_preceding_publish(make_core0):
 def test_startup_contract_keeps_five_second_stabilization(make_core0):
     """The contract order and the 5 s stabilization step are unchanged.
 
-    Pacing only constrains WHEN a publish may begin: probe #1, the drained
-    log, the 5 s stabilization, probe #2, then the UTC request.
-    """
+    Pacing only constrains WHEN a publish may begin: probe #1, the drained log, the 5 s stabilization, probe #2, then the UTC request."""
     instance = make_core0(delay_ms=100)
     instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
     instance._mqtt._utc_deliver = True

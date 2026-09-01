@@ -62,11 +62,7 @@ class MQTTClient:
     def _abort_corrupt_inbound(self, reason):
         """Drop the connection over a corrupt inbound stream and raise.
 
-        A protocol violation or an oversized packet leaves the byte stream
-        unreadable from here on, so the socket is closed (rather than the
-        frame being buffered or drained) and the failure propagates: Mqtt
-        marks the disconnect and Core 0's recovery path reconnects.
-        """
+        The byte stream is unreadable from here on: the socket is closed and the failure propagates (Core 0's recovery path reconnects)."""
         try:
             self.sock.close()
         except MemoryError:
@@ -96,12 +92,7 @@ class MQTTClient:
     def next_packet_id(self):
         """Advance the packet ID and return it, wrapping 65535 back to 1.
 
-        MQTT packet IDs are 1..65535 (0 is reserved), so the counter wraps
-        from 65535 to 1 instead of growing unbounded. QoS 1 publish,
-        subscribe, and the network-probe path all draw from this one helper so
-        every message takes the next of 1, 2, ..., 65535, 1, 2, ... and never
-        0 or a value above 65535.
-        """
+        IDs are 1..65535 (0 is reserved); the QoS 1, subscribe, and probe paths all draw from this one helper."""
         self.pid += 1
         if self.pid > 65535:
             self.pid = 1
@@ -170,16 +161,9 @@ class MQTTClient:
         self.sock.close()
 
     def ping(self, timeout_sec=None):
-        """Send PINGREQ and wait for the matching PINGRESP.
+        """Send PINGREQ and wait for the matching PINGRESP (optionally timeout-bounded).
 
-        Args:
-            timeout_sec: Optional timeout in seconds for the PINGRESP wait.
-                When the link is dead, a bounded wait surfaces the failure
-                instead of blocking until the next publish. If the timeout
-                cannot be installed, that failure propagates into the
-                recovery path rather than falling through to an unbounded
-                PINGRESP wait.
-        """
+        A failed timeout installation propagates into recovery rather than falling through to an unbounded wait."""
         if timeout_sec is not None:
             # The bounded wait depends on this timeout being active, so a
             # failed installation must not be swallowed: let it propagate
@@ -201,17 +185,7 @@ class MQTTClient:
                 self.sock.settimeout(None)
 
     def publish(self, topic, msg, retain=False, qos=0, packet_id=None, timeout_ms=None):
-        """Publish one or more application messages.
-
-        Args:
-            topic: Topic string
-            msg: Message bytes or string
-            retain: Retain flag
-            qos: Quality of Service (0, 1, or 2)
-            packet_id: Optional packet ID for QoS 1/2. If None, auto-increment.
-            timeout_ms: Optional timeout in milliseconds for the QoS 1
-                exchange (the PUBLISH frame writes and the PUBACK wait).
-        """
+        """Publish an application message; optional packet_id (else auto-increment) and timeout_ms bound the QoS 1 exchange."""
         pkt = bytearray(b"\x30\0\0\0")
         pkt[0] |= qos << 1 | retain
         sz = 2 + len(topic) + len(msg)
@@ -376,15 +350,7 @@ class MQTTClient:
     def _ready_poller(self):
         """Return a poller registered on the current socket, building it once.
 
-        The poller is created the first time a readiness check runs after the
-        socket is established and then reused for the life of the connection,
-        instead of building a fresh select.poll() + register() on every
-        ~100 ms check_msg() call. That per-call construction was ~350,000 poll
-        objects (plus a result list each) over a 10-hour run — pure GC churn
-        on the hot path. A reconnect installs a *new* socket object, so a
-        poller still bound to the old socket is discarded and a fresh one is
-        made; within a single connection the poller is shared.
-        """
+        Created at the first readiness check and reused for the life of the connection -- avoiding per-poll select construction churn on the hot path. A reconnect (new socket object) discards the old poller."""
         if self.poller is None or self._poller_sock is not self.sock:
             self.poller = select.poll()
             self.poller.register(self.sock, select.POLLIN)
@@ -394,12 +360,7 @@ class MQTTClient:
     def _socket_ready(self, poller):
         """Non-blocking readiness: True iff the socket has a packet started.
 
-        Prefers MicroPython's allocation-free poller.ipoll() — it polls and
-        yields a reused (obj, event) tuple per ready stream rather than
-        materializing a result list — and falls back to poll() where ipoll is
-        not available (the CPython host suite has no ipoll). Both take a
-        zero timeout, so the check returns immediately either way.
-        """
+        Prefers the allocation-free ipoll() with a zero timeout, falling back to poll() where ipoll is unavailable (the CPython host suite)."""
         ipoll = getattr(poller, "ipoll", None)
         if ipoll is not None:
             return any(ipoll(0))

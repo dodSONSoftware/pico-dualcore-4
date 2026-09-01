@@ -4,29 +4,17 @@
 
 """Host-side regression tests for normal-runtime-anchored health scheduling.
 
-The health cadence is defined relative to the normal-runtime anchor,
-``normal_runtime_start_ticks_ms`` -- captured exactly once, immediately
-after ``system_startup_completed`` has been successfully admitted to the
-outbound queue:
+The health cadence is defined relative to the normal-runtime anchor, normal_runtime_start_ticks_ms -- captured exactly once, immediately after system_startup_completed has been successfully admitted to the outbound queue:
 
-- boundaries fall at ``health_interval_sec`` multiples from the anchor
-  (a 60s interval means anchor + 60s, + 120s, + 180s, ...);
-- with a 13s startup and a 60s interval, the first health is at
-  ~73s uptime -- not 60s (the old boot anchor) and not a second,
-  independently captured post-admission delay;
+- boundaries fall at health_interval_sec multiples from the anchor;
+- with a 13s startup and a 60s interval, the first health is at ~73s uptime -- not 60s (the old boot anchor) and not a second, independently captured post-admission delay;
 - no immediate health message is generated after admission;
 - boundaries missed while the loop was stalled are skipped, never replayed;
-- a boundary due while the network is down (or MQTT disconnected) is
-  skipped, and recovery does not trigger a catch-up health;
-- the next deadline always advances from the previous anchor-based
-  deadline, so per-iteration processing delay cannot accumulate into
-  drift;
+- a boundary due while the network is down (or MQTT disconnected) is skipped, and recovery does not trigger a catch-up health;
+- the next deadline always advances from the previous anchor-based deadline, so per-iteration delay cannot accumulate into drift;
 - a new runtime (reboot) gets a new anchor; mid-run events do not.
 
-These tests drive the real ``core1_main`` loop under a controllable clock,
-the same way ``test_core1_liveness.py`` does. The shared-anchor and
-telemetry-side tests live in ``test_scheduler_anchor.py``.
-"""
+These tests drive the real core1_main loop under a controllable clock; the shared-anchor and telemetry-side tests live in test_scheduler_anchor.py."""
 
 import importlib
 import json
@@ -76,17 +64,11 @@ class LoopStop(Exception):
 class FakeTime:
     """Controllable clock for driving the Core 1 loop on the host.
 
-    ``sleep_ms`` adds PROCESSING_MS to model the ~20ms of per-iteration
-    work the loop does between sleeps, so the loop advances 40ms per
-    iteration.
+    sleep_ms adds PROCESSING_MS to model the ~20ms of per-iteration work, so the loop advances 40ms per iteration.
 
-    ``events`` is an ascending list of (tick_ms, callable) pairs. When the
-    clock crosses a tick, the callable runs once -- used to inject an MQTT
-    outage or recovery into the state mailboxes mid-run.
+    events is an ascending list of (tick_ms, callable) pairs; when the clock crosses a tick the callable runs once -- used to inject an MQTT outage or recovery into the state mailboxes mid-run.
 
-    ``advance`` models a stalled loop: the clock jumps forward without a
-    normal loop iteration.
-    """
+    advance models a stalled loop: the clock jumps forward without a normal loop iteration."""
 
     def __init__(self, start_ms, stop_after_ms, events=None):
         self.now_ms = start_ms
@@ -157,10 +139,7 @@ def _install_fakes(fake_time):
 def _reload_core1_under_fakes():
     """Import/reload the core1 chain with the fakes authoritative.
 
-    core1 binds time/machine/os from sys.modules at import time, so any
-    module already cached (possibly imported under host or other-test
-    stand-ins) is reloaded in dependency order before core1 itself.
-    """
+    core1 binds time/machine/os from sys.modules at import time, so any cached module (possibly imported under host or other-test stand-ins) is reloaded in dependency order before core1 itself."""
     # Reload order follows the import dependency chain (a module must be
     # reloaded before the module that binds from it, or the binder keeps a
     # stale reference -- e.g. device_manager would keep an old create_device
@@ -239,10 +218,7 @@ def _drain_outbound(bus):
 def test_no_immediate_health_after_startup_log_admission():
     """Startup log admission at 13s uptime must not queue a health message.
 
-    With a 60s interval the first health boundary (anchor + 60s = 73s
-    uptime) is still in the future -- the queue must contain only the
-    startup log.
-    """
+    With a 60s interval the first health boundary (anchor + 60s = 73s uptime) is still in the future -- the queue must contain only the startup log."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000  # startup completes at 13s uptime
 
@@ -264,11 +240,7 @@ def test_no_immediate_health_after_startup_log_admission():
 def test_first_health_at_anchor_plus_interval_not_boot_or_immediate():
     """First health is due 60s after normal-runtime start, not after boot.
 
-    boot = 100000, interval = 60s, startup completes at 13s uptime
-    (normal runtime starts at 13s). The first health must be at ~73000ms
-    uptime -- not at 13000 (immediate), not at 60000 (the old boot anchor),
-    and not at 13000 plus a second independently captured delay.
-    """
+    boot = 100000, interval = 60s, startup completes at 13s uptime: the first health must be at ~73000ms uptime -- not at 13000 (immediate), not at 60000 (the old boot anchor), and not at 13000 plus a second independently captured delay."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
     first_boundary_ms = startup_at_ms + 60000
@@ -319,12 +291,7 @@ def test_fixed_cadence_from_normal_runtime_anchor():
 def test_no_cumulative_drift_across_intervals():
     """A late firing does not push the next deadline later.
 
-    Normal runtime starts at 13.01s uptime, off the 40ms loop grid. Each
-    health firing lands 10ms after its boundary (the first grid tick past
-    the deadline); the second firing must land 10ms after *anchor + 120s*,
-    not anchor + 120s plus another 10ms of drift. Inter-arrival must be
-    exactly the configured interval.
-    """
+    Each health firing lands 10ms after its boundary (the first grid tick past the deadline); the second firing must land 10ms after anchor + 120s, not anchor + 120s plus another 10ms of drift. Inter-arrival must be exactly the configured interval."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13010  # 13.01s uptime, off-grid
     second_boundary_ms = startup_at_ms + 120000
@@ -349,15 +316,9 @@ def test_no_cumulative_drift_across_intervals():
 
 
 def test_missed_boundaries_after_stall_skipped_not_replayed():
-    """Boundaries missed while the loop is stalled are skipped, never
-    replayed.
+    """Boundaries missed while the loop is stalled are skipped, never replayed.
 
-    interval = 60s, normal runtime starts at 13s. The loop stalls at
-    185s uptime and resumes at 305s uptime (boundaries 193s and 253s
-    missed). Exactly one health must be emitted after the stall, at the
-    resume moment (current state) -- not a burst of catch-up reports for
-    the missed boundaries.
-    """
+    The loop stalls at 185s uptime and resumes at 305s (boundaries 193s and 253s missed). Exactly one health must be emitted after the stall, at the resume moment (current state) -- not a burst of catch-up reports."""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
     stall_at_ms = boot_ticks_ms + 185000
@@ -383,17 +344,14 @@ def test_missed_boundaries_after_stall_skipped_not_replayed():
 
 
 def test_mqtt_outage_skips_boundaries_and_does_not_replay_on_recovery():
-    """Outage behavior: due boundaries while MQTT is down are skipped; after
-    recovery, wait for the next anchor-relative boundary (no immediate
-    recovery health, no replay of skipped reports).
+    """Outage behavior: due boundaries while MQTT is down are skipped; after recovery, wait for the next anchor-relative boundary (no immediate recovery health, no replay of skipped reports).
 
     Timeline (interval 60s, normal runtime starts at 13s uptime):
       health at 73s and 133s uptime
       MQTT fails at 160s uptime
       193s boundary -> skipped
       MQTT restored at 240s uptime (no immediate health)
-      next health at 253s uptime
-    """
+      next health at 253s uptime"""
     boot_ticks_ms = 100000
     startup_at_ms = boot_ticks_ms + 13000
 
@@ -434,12 +392,7 @@ def test_mqtt_outage_skips_boundaries_and_does_not_replay_on_recovery():
 def test_new_runtime_creates_new_anchor():
     """A reboot -- a new runtime -- establishes a new normal-runtime anchor.
 
-    First runtime: boot = 100000, startup at 13s uptime, interval 60s ->
-    first health at ~73s uptime.
-    Second runtime (fresh process state, boot = 200000, startup at 10s
-    uptime) -> first health at anchor2 + 60s = ~70s uptime of the new
-    runtime, not a continuation of the first runtime's boundaries.
-    """
+    First runtime: boot = 100000, startup at 13s uptime, interval 60s -> first health at ~73s uptime. Second runtime (fresh process state, boot = 200000, startup at 10s uptime) -> first health at ~70s uptime of the new runtime, not a continuation of the first runtime's boundaries."""
     def _run_once(boot_ticks_ms, startup_uptime_ms):
         startup_at_ms = boot_ticks_ms + startup_uptime_ms
         first_boundary_ms = startup_at_ms + 60000

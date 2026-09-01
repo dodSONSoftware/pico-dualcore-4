@@ -19,9 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class FakeTime:
     """Controllable stand-in for MicroPython's time module.
 
-    sleep_ms advances the clock so bounded wait loops terminate
-    deterministically in tests.
-    """
+    sleep_ms advances the clock so bounded wait loops terminate deterministically in tests."""
 
     def __init__(self):
         self.now_ms = 0
@@ -364,12 +362,7 @@ def test_valid_response_completes_sync(make_core0):
 def test_fast_response_delivered_during_publish_is_accepted(make_core0):
     """A response that overtakes the PUBACK must not be dropped.
 
-    MQTTClient.publish delivers broker messages while awaiting the PUBACK,
-    so a fast UTC response can arrive inside the publish call itself. The
-    pending request ID must be armed before publishing; otherwise every
-    startup attempt loses its response and start() fails with
-    'UTC synchronization failed'.
-    """
+    MQTTClient.publish delivers broker messages while awaiting the PUBACK, so a fast UTC response can arrive inside the publish call itself. The pending request ID must be armed before publishing; otherwise every startup attempt loses its response and start() fails."""
     instance = make_core0(4)
     epoch_ms = 1767225600000
 
@@ -396,9 +389,7 @@ def test_fast_response_delivered_during_publish_is_accepted(make_core0):
 def test_failed_publish_rolls_back_armed_request(make_core0):
     """A failed publish must clear the armed request ID so a retry can arm.
 
-    Without the rollback the pending ID would stay set with no deadline:
-    _utc_should_send_request() would then refuse to retry forever.
-    """
+    Without the rollback the pending ID would stay set with no deadline: _utc_should_send_request() would then refuse to retry forever."""
     instance = make_core0(4)
     _MQTT_INSTANCE.publish_qos1.side_effect = OSError("PUBACK timeout")
 

@@ -4,13 +4,7 @@
 
 """Host-side regression tests for the outbound message serializer.
 
-The serializer's hot path is the common case of a VALID message: it must not
-allocate per-node diagnostic path strings for errors that never occur. The
-allocation-light ``is_json_safe()`` fast pass therefore gates the detailed
-path-producing validator, and the two must accept and reject exactly the same
-values -- if the fast pass ever disagreed, a valid message would be misreported
-(or an invalid one would reach ``json.dumps`` and emit non-strict JSON).
-"""
+The serializer's hot path is the common case of a VALID message: it must not allocate per-node diagnostic path strings for errors that never occur. The allocation-light is_json_safe() fast pass therefore gates the detailed path-producing validator, and the two must accept and reject exactly the same values -- if the fast pass ever disagreed, a valid message would be misreported (or an invalid one would reach json.dumps and emit non-strict JSON)."""
 
 import json
 import pathlib

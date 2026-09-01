@@ -3,14 +3,7 @@
 # SPDX-License-Identifier: MIT
 """Accumulated boot-relative uptime.
 
-MicroPython's ``time.ticks_diff`` is only guaranteed correct when the two
-samples are less than half a tick period apart. Firmware therefore never
-diffs the original boot tick against the current tick: each core accumulates
-deltas between consecutive samples into a running total. Every individual
-``ticks_diff`` compares two recent ticks, so uptime stays correct and
-monotonically increasing across a tick-counter wrap on a long-running
-device.
-"""
+time.ticks_diff is only guaranteed correct between ticks less than half a tick period apart, so each core accumulates deltas between consecutive samples; every individual diff compares two recent ticks, which stays correct across a tick-counter wrap."""
 
 import time
 

@@ -5,14 +5,7 @@
 """
 Host-side tests for Core 0's duplicate command_id suppression.
 
-Core 0 owns command ingress end to end (topic, target matching, identity
-validation, reboot, Core 1 event forwarding), and that is where duplicate
-suppression belongs: it protects Core 0 commands (reboot) and Core 1 commands
-(get-details) alike. The device retains the _RECENT_COMMAND_ID_CAPACITY most
-recently accepted command IDs in a RAM-only FIFO and ignores any command whose
-ID is still present. A duplicate receipt re-executes nothing, queues no
-response, changes no pending reboot, and does not refresh the entry's FIFO
-position.
+Core 0 owns command ingress end to end, and that is where duplicate suppression belongs: it protects Core 0 commands (reboot) and Core 1 commands (get-details) alike. The device retains the _RECENT_COMMAND_ID_CAPACITY most recently accepted command IDs in a RAM-only FIFO and ignores any command whose ID is still present; a duplicate receipt re-executes nothing, queues no response, changes no pending reboot, and does not refresh the entry's FIFO position.
 """
 
 import importlib
@@ -33,9 +26,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 class FakeTime:
     """Controllable stand-in for MicroPython's time module.
 
-    sleep_ms advances the clock so bounded wait loops terminate
-    deterministically in tests.
-    """
+    sleep_ms advances the clock so bounded wait loops terminate deterministically in tests."""
 
     def __init__(self):
         self.now_ms = 0
