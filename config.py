@@ -4,6 +4,7 @@
 
 import json
 
+from command_protocol import MAX_SOURCE_LENGTH
 from device_factory import (
     DEVICE_DEFINITION_KEYS,
     allowed_config_keys,
@@ -239,6 +240,16 @@ def validate_config(config):
         "mqtt_topic_health",
     ):
         _require_non_empty_string(config, key)
+
+    # source is the device identity on the wire: it is spliced into every
+    # Core 0 outbound envelope, so it carries a protocol-scale length bound
+    # rather than an open-ended string (a huge identity would make even a
+    # tiny envelope fail the outbound wire ceiling).
+    if len(config["source"]) > MAX_SOURCE_LENGTH:
+        raise ConfigError(
+            "source must be at most {} characters".format(MAX_SOURCE_LENGTH),
+            code="invalid_value",
+        )
 
     for key in (
         "read_loop_sec",

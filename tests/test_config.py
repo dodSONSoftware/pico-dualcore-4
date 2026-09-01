@@ -11,6 +11,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from command_protocol import MAX_SOURCE_LENGTH
 from config import ConfigError, load_config, split_config, validate_config
 
 
@@ -130,6 +131,7 @@ def test_validate_config_accepts_valid_config_without_any_file():
         (lambda config: config.update({"read_loop_sec": "20"}), "invalid_value"),
         (lambda config: config.update({"wifi_reconnect_delays_sec": []}), "invalid_value"),
         (lambda config: config.update({"devices": []}), "invalid_value"),
+        (lambda config: config.update({"source": "S" * 16384}), "invalid_value"),
     ],
 )
 def test_validate_config_rejects_bad_configs_with_stable_codes(mutate, code):
@@ -140,6 +142,23 @@ def test_validate_config_rejects_bad_configs_with_stable_codes(mutate, code):
     assert excinfo.value.code == code
     # str(err) still carries the human-readable message for startup prints
     assert str(excinfo.value)
+
+
+def test_validate_config_source_is_bounded_at_protocol_scale():
+    """source is spliced into every Core 0 outbound envelope, so it carries
+    an inclusive protocol-scale bound instead of an open-ended string length."""
+    config = _base_config()
+    config["source"] = "S" * MAX_SOURCE_LENGTH
+    assert validate_config(config) is config
+
+    config = _base_config()
+    config["source"] = "S" * (MAX_SOURCE_LENGTH + 1)
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "source must be at most {} characters".format(
+        MAX_SOURCE_LENGTH
+    )
 
 
 def test_validate_config_unknown_fields_are_named_and_sorted():
@@ -174,6 +193,7 @@ def test_validate_config_unknown_device_fields_are_qualified():
         (lambda config: config.pop("source"), "missing_key"),
         (lambda config: config.update({"config_schema_version": 999}), "invalid_config_schema_version"),
         (lambda config: config.update({"read_loop_sec": "20"}), "invalid_value"),
+        (lambda config: config.update({"source": "S" * (MAX_SOURCE_LENGTH + 1)}), "invalid_value"),
     ],
 )
 def test_load_and_validate_paths_agree_on_rejections(tmp_path, mutate, code):

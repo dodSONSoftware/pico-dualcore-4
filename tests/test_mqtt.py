@@ -1163,3 +1163,143 @@ def test_ping_failure_marks_disconnected(ticks):
 
     assert mqtt.is_connected() is False
     assert mqtt._disconnect_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Explicit protocol checks — MicroPython strips assert statements at bytecode
+# optimization >= 1, so no protocol behavior may depend on them. Each of the
+# old runtime asserts in mqtt_client.py must now raise the same failure
+# explicitly, in both the default build and an optimized one.
+# ---------------------------------------------------------------------------
+
+def test_connect_rejects_malformed_connack(monkeypatch):
+    """A CONNACK with the wrong opcode or length fails the attempt.
+
+    The old `assert resp[0] == 0x20 and resp[1] == 0x02` vanished under
+    bytecode optimization and the handshake would continue on a corrupt
+    stream; it must now raise."""
+    sock = MockSocket(incoming=b"\x30\x02\x00\x00")  # wrong opcode
+    _mock_broker_socket(monkeypatch, sock)
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+
+    with pytest.raises(MQTTException):
+        client.connect(timeout=4.0)
+
+
+def test_connect_rejects_keepalive_above_maximum(monkeypatch):
+    """A keepalive over the 65535-second MQTT maximum is rejected, not silently
+    encoded (the old assert was invisible under bytecode optimization)."""
+    _mock_broker_socket(monkeypatch, MockSocket(incoming=b""))
+    client = MQTTClient("pico_test", "broker", keepalive=65536)
+
+    with pytest.raises(MQTTException):
+        client.connect(timeout=4.0)
+
+
+def test_subscribe_rejects_suback_with_wrong_packet_id():
+    """A SUBACK carrying a different packet id fails the subscribe."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    # SUBACK for pid 0x99, but the client drew pid 1.
+    sock = MockSocket(incoming=b"\x90\x03\x99\x00\x00")
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.subscribe(b"t", qos=1)
+
+
+def test_subscribe_without_callback_raises():
+    """Subscribing with no callback set fails instead of relying on an assert."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket()
+    client.sock = sock
+
+    with pytest.raises(MQTTException, match="callback"):
+        client.subscribe(b"t", qos=1)
+
+    assert sock.written == b""
+
+
+def test_publish_qos1_rejects_puback_with_bad_length():
+    """A PUBACK whose remaining length is not 2 aborts the exchange and closes
+    the socket (the stream is corrupt from there on)."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"\x40\x03\x01\x02\x03")  # length 3, not 2
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+
+    assert sock.closed is True
+
+
+def test_publish_qos2_is_rejected_before_any_write():
+    """QoS 2 is not supported: the rejection must happen before a single byte
+    is transmitted, in every build (the old `assert 0` was unreachable under
+    bytecode optimization and the frame would simply go out unacked)."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket()
+    client.sock = sock
+
+    with pytest.raises(MQTTException, match="QoS 2"):
+        client.publish(b"t", b"x", qos=2)
+
+    assert sock.written == b""
+
+
+def test_ping_rejects_pingresp_with_payload():
+    """A PINGRESP is exactly 2 bytes; a non-zero remaining length is a corrupt
+    stream and must fail the ping, not continue."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"\xd0\x01\x00")
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.ping(timeout_sec=10)
+
+    assert sock.closed is True
+
+
+def test_wait_msg_rejects_inbound_qos2():
+    """An inbound QoS 2 PUBLISH is outside this client's protocol profile and
+    must be rejected explicitly (the old `assert 0` was build-dependent)."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    # QoS 2 PUBLISH (op 0x34): topic "t", packet id 1, empty payload.
+    # Remaining length 5 = topic length (2) + topic (1) + packet id (2).
+    sock = MockSocket(incoming=b"\x34\x05\x00\x01t\x01\x00")
+    client.sock = sock
+
+    with pytest.raises(MQTTException, match="QoS 2"):
+        client.wait_msg()
+
+
+def test_publish_size_above_remaining_length_maximum_is_rejected():
+    """A publish whose frame exceeds MQTT's 2097151-byte remaining length is
+    rejected instead of underflowing the length encoding loop."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket()
+    client.sock = sock
+    # sz = 2 + len(topic) + len(msg); with an empty topic, 2097150 payload
+    # bytes puts sz exactly over the maximum.
+    msg = b"x" * 2097150
+
+    with pytest.raises(MQTTException):
+        client.publish(b"", msg, qos=0)
+
+    assert sock.written == b""
+
+
+def test_set_last_will_validates_parameters():
+    """Last-will parameter validation is explicit: QoS 2 (unsupported by this
+    profile) and an empty topic are rejected; QoS 0/1 still configure."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+
+    with pytest.raises(ValueError):
+        client.set_last_will(b"t", b"m", qos=2)
+    with pytest.raises(ValueError):
+        client.set_last_will(b"", b"m", qos=0)
+
+    client.set_last_will(b"lwt", b"offline", qos=1)
+    assert client.lw_topic == b"lwt"
+    assert client.lw_qos == 1

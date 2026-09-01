@@ -102,8 +102,13 @@ class MQTTClient:
         self.cb = f
 
     def set_last_will(self, topic, msg, retain=False, qos=0):
-        assert 0 <= qos <= 2
-        assert topic
+        # Parameter validation, not an invariant: MicroPython omits assert
+        # statements at bytecode optimization >= 1, so protocol behavior
+        # must never depend on them.
+        if not (0 <= qos <= 1):
+            raise ValueError("Last-will qos must be 0 or 1 (QoS 2 is not supported)")
+        if not topic:
+            raise ValueError("Last-will topic is required")
         self.lw_topic = topic
         self.lw_msg = msg
         self.lw_qos = qos
@@ -125,7 +130,8 @@ class MQTTClient:
             sz += 2 + len(self.user) + 2 + len(self.pswd)
             msg[6] |= 0xC0
         if self.keepalive:
-            assert self.keepalive < 65536
+            if self.keepalive > 65535:
+                raise MQTTException("Keepalive exceeds the 65535-second MQTT maximum")
             msg[7] |= self.keepalive >> 8
             msg[8] |= self.keepalive & 0x00FF
         if self.lw_topic:
@@ -151,7 +157,11 @@ class MQTTClient:
             self._send_str(self.user)
             self._send_str(self.pswd)
         resp = self.sock.read(4)
-        assert resp[0] == 0x20 and resp[1] == 0x02
+        if resp[0] != 0x20 or resp[1] != 0x02:
+            # A malformed CONNACK means the byte stream is not what the
+            # handshake assumed; failing here (asserts are omitted under
+            # MicroPython bytecode optimization) is the only behavior.
+            raise MQTTException("Invalid CONNACK")
         if resp[3] != 0:
             raise MQTTException(resp[3])
         return resp[2] & 1
@@ -186,12 +196,20 @@ class MQTTClient:
 
     def publish(self, topic, msg, retain=False, qos=0, packet_id=None, timeout_ms=None):
         """Publish an application message; optional packet_id (else auto-increment) and timeout_ms bound the QoS 1 exchange."""
+        if qos == 2:
+            # Unsupported protocol level: reject before a single frame byte
+            # is transmitted (an assert here would vanish under MicroPython
+            # bytecode optimization and the frame would go out unacked).
+            raise MQTTException("QoS 2 is not supported")
         pkt = bytearray(b"\x30\0\0\0")
         pkt[0] |= qos << 1 | retain
         sz = 2 + len(topic) + len(msg)
         if qos > 0:
             sz += 2
-        assert sz < 2097152
+        if sz > 2097151:
+            # MQTT's remaining-length field tops out at 2097151; beyond it
+            # the frame could not be encoded at all.
+            raise MQTTException("Publish size exceeds the MQTT remaining-length maximum")
         i = 1
         while sz > 0x7F:
             pkt[i] = (sz & 0x7F) | 0x80
@@ -234,7 +252,12 @@ class MQTTClient:
                     op = self.wait_msg()
                     if op == 0x40:
                         sz = self.sock.read(1)
-                        assert sz == b"\x02"
+                        if sz != b"\x02":
+                            # A PUBACK is exactly a 2-byte packet id; any
+                            # other length corrupts the stream from here on.
+                            self._abort_corrupt_inbound(
+                                "PUBACK with unexpected remaining length"
+                            )
                         rcv_pid = self.sock.read(2)
                         rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
                         if pid == rcv_pid:
@@ -247,11 +270,10 @@ class MQTTClient:
                 # propagate into Core 0's recovery (as check_msg() does for
                 # its own restoration) instead of reporting the publish done.
                 self.sock.settimeout(None)
-        if qos == 2:
-            assert 0
 
     def subscribe(self, topic, qos=0):
-        assert self.cb is not None, "Subscribe callback is not set"
+        if self.cb is None:
+            raise MQTTException("Subscribe callback is not set")
         pkt = bytearray(b"\x82\0\0\0")
         pid = self.next_packet_id()
         struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, pid)
@@ -264,7 +286,8 @@ class MQTTClient:
             if op == 0x90:
                 resp = self.sock.read(4)
                 # print(resp)
-                assert resp[1] == pkt[2] and resp[2] == pkt[3]
+                if resp[1] != pkt[2] or resp[2] != pkt[3]:
+                    raise MQTTException("Invalid SUBACK packet identifier")
                 if resp[3] == 0x80:
                     raise MQTTException(resp[3])
                 return
@@ -289,7 +312,12 @@ class MQTTClient:
             raise OSError(-1)
         if res == b"\xd0":  # PINGRESP
             sz = self.sock.read(1)[0]
-            assert sz == 0
+            if sz != 0:
+                # PINGRESP carries no payload; anything else is a corrupt
+                # stream and the leftover bytes make it unreadable.
+                self._abort_corrupt_inbound(
+                    "PINGRESP with non-zero remaining length"
+                )
             return None
         op = res[0]
         if op & 0xF0 != 0x30:
@@ -344,7 +372,10 @@ class MQTTClient:
             struct.pack_into("!H", pkt, 2, pid)
             self.sock.write(pkt)
         elif op & 6 == 4:
-            assert 0
+            # Inbound QoS 2 is not supported by this protocol profile; reject
+            # explicitly rather than with an assert that bytecode
+            # optimization would remove.
+            raise MQTTException("Inbound QoS 2 is not supported")
         return op
 
     def _ready_poller(self):

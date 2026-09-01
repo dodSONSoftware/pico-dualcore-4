@@ -23,18 +23,36 @@ from command_protocol import (
 from config import ConfigError
 from config_manager import CLASSIFICATION_UNCHANGED
 from debug import DEBUG
-from intercore import KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG, KIND_TELEMETRY
+from intercore import (
+    KIND_COMMAND_RESPONSE,
+    KIND_HEALTH,
+    KIND_LOG,
+    KIND_TELEMETRY,
+    OutboundMessageTooLargeError,
+)
 from message_protocol import format_utc_epoch_ms
 from mqtt import Mqtt
 from uptime import create_uptime_state, current_uptime_ms
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 from wifi import Wifi
 
-from message_serializer import serialize_and_validate_message
+from message_serializer import (
+    MAX_OUTBOUND_MESSAGE_BYTES,
+    MessageTooLargeError,
+    serialize_and_validate_message,
+)
 
 
 _MAX_PENDING_CORE0_RESPONSES = 4
 _MAX_PENDING_CONNECTION_LOGS = 4
+
+# Bounded substitutes for a command response that can never be published
+# as-is (the pending queue is FIFO, so holding it would stall every
+# response behind it -- the same policy Core 1 applies at admission).
+_SUBSTITUTE_ERROR_MESSAGES = {
+    "response_too_large": "Command response exceeded the per-message size limit",
+    "response_invalid": "Command response could not be serialized for transmission",
+}
 _UTC_STARTUP_MAX_ATTEMPTS = 3
 _UTC_RETRY_INTERVAL_MS = 30000
 _UTC_PROMPT_RETRY_DELAY_MS = 500
@@ -204,6 +222,12 @@ class Core0:
             self._publish_entry(entry)
         except MemoryError:
             raise
+        except OutboundMessageTooLargeError as err:
+            # The log body passed the admission ceiling but the spliced
+            # envelope pushed it over the wire limit: permanent, and a log has
+            # no command to answer, so it is dropped (the entries behind it
+            # keep moving) instead of retried.
+            print("[WARNING] Connection log dropped, envelope splice exceeded the per-message ceiling: {}".format(err))
         except Exception as err:
             # Log serialization failures but still remove the log from the queue
             # to prevent infinite retry loop
@@ -276,6 +300,28 @@ class Core0:
             # production warning.
             if DEBUG:
                 print("[DEBUG] Duplicate command_id ignored: {}".format(command_id))
+            return
+
+        # Admission is conditioned on being able to acknowledge: a command
+        # must be able to reserve a response slot before it is claimed and
+        # executed. Otherwise it could execute -- write-config promotes
+        # config.json, reboot arms _pending_reboot -- and then lose its
+        # acknowledgement to a full response queue, after which the sender's
+        # retry hits the debounce cache above and is silently dropped: the
+        # command ran, the answer never arrived, and no retry can recover it.
+        # Refusing here (before the ID is claimed) leaves the side effects
+        # unapplied and the ID unclaimed, so an application-level retry
+        # redelivers the command once capacity frees up.
+        #
+        # The single-flight pending HOT_RELOADED update holds one slot too:
+        # its response is queued later (at Core 1's acknowledgement, in
+        # _resolve_pending_config_update), so it must not be overrun by a
+        # new admission -- or that deferred acknowledgement is the one lost.
+        reserved = 1 if self._pending_config_update is not None else 0
+        if (
+            len(self._pending_core0_responses) + reserved
+            >= _MAX_PENDING_CORE0_RESPONSES
+        ):
             return
 
         # The first bounded use of the ID claims it -- before deeper
@@ -395,6 +441,15 @@ class Core0:
         if is_bounded_command(command):
             response["command"] = command
         return response
+
+    def _is_response_substitute(self, response):
+        """True if the response is already one of the bounded substitutes (a failed response carrying a substitute error code)."""
+        error = response.get("error")
+        return (
+            response.get("success") is False
+            and isinstance(error, dict)
+            and error.get("code") in _SUBSTITUTE_ERROR_MESSAGES
+        )
 
     def _handle_reboot_command(self, command_id, targeted, payload):
         """Dedicated reboot validator/handler, called after the common protocol validation.
@@ -755,12 +810,38 @@ class Core0:
             container=response,
         )
         if not published:
-            # Permanent serialization failure: the response stays queued
-            # (never discarded -- the command was accepted and its
-            # acknowledgement is owed) and is retried on a later pass, the
-            # same way a failed publish (which raises) leaves it pending.
+            failure = response.get("_permanent_failure")
+            if failure is None or self._is_response_substitute(response):
+                # No recorded cause, or the response is already the bounded
+                # substitute: hold it for a later pass, the same way a failed
+                # publish (which raises) leaves it pending.
+                return
+            # A permanent serialization failure can never succeed by
+            # retrying the same bytes, and the queue is FIFO -- so instead of
+            # blocking every response behind it (the same policy Core 1
+            # applies at admission), the command is answered with a small
+            # bounded error substitute whose code states the cause. The
+            # substitute publishes on a later pass.
+            print("[WARNING] Core 0 command response {}: answering with a "
+                  "bounded error response".format(failure))
+            self._pending_core0_responses[0] = self._command_error(
+                response["command_id"],
+                response.get("targeted", False),
+                response.get("command"),
+                {
+                    "code": failure,
+                    "message": _SUBSTITUTE_ERROR_MESSAGES[failure],
+                },
+            )
             return
         self._pending_core0_responses.pop(0)
+        # A substitute that answered a permanently unsendable reboot
+        # acknowledgement has now been published: the command was reported
+        # failed, so release the held reboot. The device keeps running, and a
+        # later reboot command is admissible instead of hitting
+        # reboot_already_pending forever.
+        if response.get("_clears_pending_reboot"):
+            self._pending_reboot = None
 
     def _handle_info_response(self, doc):
         # The global inbound message-schema gate in _on_mqtt_message has
@@ -891,7 +972,7 @@ class Core0:
     def _publish_entry(self, entry):
         """Publish one MQTT entry from its pre-serialized bytes, envelope spliced in before the closing brace.
 
-        The payload is never decoded or re-serialized here; the wire sequence is claimed once, before the first transmission attempt."""
+        The payload is never decoded or re-serialized here; the wire sequence is claimed once, before the first transmission attempt. The spliced wire length must stay within MAX_OUTBOUND_MESSAGE_BYTES: a body the envelope pushes over the ceiling raises OutboundMessageTooLargeError instead of publishing (permanent for the entry, never retried)."""
         payload = entry["payload_bytes"]
         if not isinstance(payload, (bytes, bytearray)) or bytes(payload[-1:]) != b"}":
             raise ValueError("queued payload must be a serialized JSON object")
@@ -904,7 +985,22 @@ class Core0:
         # ambiguous QoS 1 failure left it in flight) reuses the stamped number,
         # while a different message is never handed it.
         sequence = self._claim_wire_sequence(entry)
-        encoded = b"".join((body[:-1], b",", self._envelope_fragment(sequence), b"}"))
+        fragment = self._envelope_fragment(sequence)
+        # The body was admitted at or under MAX_OUTBOUND_MESSAGE_BYTES, but the
+        # spliced envelope is added on top of it (the comma and fragment
+        # replace the body's closing brace): enforce the ceiling against the
+        # FINAL wire length, before the joined frame is allocated. Permanent
+        # for this entry (its bytes are fixed), so raise the size error the
+        # admission paths raise; the callers answer command responses with the
+        # bounded substitute and discard the other kinds instead of retrying.
+        wire_length = len(body) + len(fragment) + 1
+        if wire_length > MAX_OUTBOUND_MESSAGE_BYTES:
+            raise OutboundMessageTooLargeError(
+                "Outbound message too large after envelope splice: {} > {}".format(
+                    wire_length, MAX_OUTBOUND_MESSAGE_BYTES
+                )
+            )
+        encoded = b"".join((body[:-1], b",", fragment, b"}"))
         topic = entry.get("topic")
         if topic is None:
             topic = self._topic_for_kind(entry["kind"])
@@ -918,13 +1014,47 @@ class Core0:
         if DEBUG:
             print("[DEBUG] QoS 1 published: seq={}".format(sequence))
 
+    def _answer_discarded_command_response(self, entry):
+        """Queue the bounded substitute for a discarded oversized command response.
+
+        The command was accepted and its acknowledgement is owed, so the channel moves on with a small error response for the same command (code "response_too_large"), serviced by the normal Core 0 response path. The body carries the command's identifying fields; only a bounded subset is read back (an over-long name or ID is never echoed). A body that cannot be read back has no identity to answer with: the discard stands."""
+        body = entry["payload_bytes"]
+        if isinstance(body, bytearray):
+            body = bytes(body)
+        try:
+            doc = json.loads(body.decode("utf-8"))
+        except MemoryError:
+            raise
+        except Exception as err:
+            print("[WARNING] Discarded command response could not be read back; no substitute: {}".format(err))
+            return
+        payload = doc.get("payload") if isinstance(doc, dict) else None
+        if not isinstance(payload, dict):
+            return
+        command_id = payload.get("command_id")
+        if not is_bounded_command_id(command_id):
+            return
+        command = payload.get("command")
+        targeted = payload.get("targeted") is True
+        self._queue_core0_response(
+            self._command_error(
+                command_id,
+                targeted,
+                command,
+                {
+                    "code": "response_too_large",
+                    "message": _SUBSTITUTE_ERROR_MESSAGES["response_too_large"],
+                },
+            )
+        )
+
     def _publish_core0_command_response(
         self, command_id, command, success, targeted=True, data=None, error=None,
         wire_sequence=None, container=None
     ):
         """Build and publish a Core 0 command response (pre-serialized).
 
-        ``wire_sequence``/``container`` let a retry keep the claimed identity and the same bytes. Returns True on publish, False on a permanent serialization failure (the caller keeps the message pending); MemoryError propagates."""
+        ``wire_sequence``/``container`` let a retry keep the claimed identity and the same bytes. Returns True on publish, False on a permanent serialization failure or a splice-time size failure (its cause is recorded on the container, when there is one, so the servicing path can answer with the matching bounded substitute); MemoryError propagates."""
         payload_bytes = container.get("_payload_bytes") if container is not None else None
         if payload_bytes is None:
             payload = {
@@ -958,9 +1088,17 @@ class Core0:
                 payload_bytes = serialize_and_validate_message(message)
             except MemoryError:
                 raise
+            except MessageTooLargeError as err:
+                if DEBUG:
+                    print("[DEBUG] Command response exceeded the size limit: {}".format(err))
+                if container is not None:
+                    container["_permanent_failure"] = "response_too_large"
+                return False
             except Exception as err:
                 if DEBUG:
                     print("[DEBUG] Command response serialization failed: {}".format(err))
+                if container is not None:
+                    container["_permanent_failure"] = "response_invalid"
                 return False
             if container is not None:
                 # Freeze the bytes on the persistent container so a retry after
@@ -979,7 +1117,19 @@ class Core0:
         # _publish_entry claims a fresh number.
         if wire_sequence is not None:
             entry["_wire_sequence"] = wire_sequence
-        self._publish_entry(entry)
+        try:
+            self._publish_entry(entry)
+        except OutboundMessageTooLargeError as err:
+            # The body passed the admission ceiling but the spliced envelope
+            # pushed the final wire length over it: permanent for these bytes,
+            # the same cause class as an oversized serialization. Record the
+            # cause so the servicing path answers with the matching bounded
+            # substitute instead of retrying the same entry forever.
+            if DEBUG:
+                print("[DEBUG] Command response too large after envelope splice: {}".format(err))
+            if container is not None:
+                container["_permanent_failure"] = "response_too_large"
+            return False
         return True
 
     def _perform_reboot(self):
@@ -987,6 +1137,13 @@ class Core0:
         if request is None:
             return True
         if self._intercore.outbound_queue.has_in_flight():
+            return False
+        # The success acknowledgement was permanently unsendable and the
+        # command was answered with the bounded substitute: the request is
+        # terminal. Never re-attempt the unsendable bytes and never queue the
+        # same substitute a second time; the held reboot is released by the
+        # servicing path once the substitute is published.
+        if request.get("_permanent_failure_answer_queued"):
             return False
 
         try:
@@ -1009,6 +1166,34 @@ class Core0:
                 print("[DEBUG] Reboot response publish failed; reboot remains pending: {}".format(err))
             return False
         if not published:
+            failure = request.get("_permanent_failure")
+            if failure is not None:
+                # A permanent failure (the recorded cause names it) can never
+                # publish by retrying the same bytes: answer the command with
+                # the bounded substitute instead of spinning. Hold the reboot
+                # (a reset with no acknowledgement at all is worse) until the
+                # substitute is published, then release it -- the command has
+                # been reported failed and the device keeps running.
+                print("[WARNING] Reboot response {}: answering with a "
+                      "bounded error response".format(failure))
+                substitute = self._command_error(
+                    request["command_id"],
+                    request.get("targeted", False),
+                    request.get("command"),
+                    {
+                        "code": failure,
+                        "message": _SUBSTITUTE_ERROR_MESSAGES[failure],
+                    },
+                )
+                # When the servicing path publishes it, release the held
+                # reboot (see _service_pending_core0_response).
+                substitute["_clears_pending_reboot"] = True
+                if self._queue_core0_response(substitute):
+                    # Only now is the request terminal: a full queue left the
+                    # answer unsent, so a later pass must retry the answer
+                    # rather than treating it as already given.
+                    request["_permanent_failure_answer_queued"] = True
+                return False
             # The success acknowledgement was never published; resetting now
             # would reboot without an answer. The reboot stays pending and is
             # retried on a later pass instead of discarding the response.
@@ -1457,6 +1642,19 @@ class Core0:
                         self._publish_entry(entry)
                     except MemoryError:
                         raise
+                    except OutboundMessageTooLargeError as err:
+                        # The spliced wire length exceeds the per-message
+                        # ceiling: permanent for this entry (its bytes are
+                        # fixed), so retrying it would only re-fail and stall
+                        # the in-flight slot. Discard it -- and answer a
+                        # command response with the bounded substitute, so the
+                        # command channel never stalls behind it either.
+                        self._intercore.outbound_queue.complete_in_flight(
+                            entry, discarded=True
+                        )
+                        print("[WARNING] Outbound entry dropped, envelope splice exceeded the per-message ceiling: {}".format(err))
+                        if entry["kind"] == KIND_COMMAND_RESPONSE:
+                            self._answer_discarded_command_response(entry)
                     except Exception as err:
                         # Keep the entry in flight so the next take() retries it:
                         # QoS 1 must not drop a message the broker has not PUBACKed.

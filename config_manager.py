@@ -329,7 +329,13 @@ class ConfigManager:
             self._transaction_active = False
             if snapshot_created_here:
                 self._active_snapshot = None
-            self._remove_if_exists(self._tmp_path())
+            try:
+                self._restore_committed()
+            except OSError:
+                # A failed restoration still leaves every recovery
+                # artifact in place for boot recovery; the original
+                # failure below propagates unchanged.
+                pass
             raise
 
         if classification == CLASSIFICATION_REBOOT_REQUIRED:
@@ -370,6 +376,20 @@ class ConfigManager:
         os.rename(self._old_path(), self._config_path)
         os.sync()
         self._transaction_active = False
+
+    def _restore_committed(self):
+        """Restore the pre-write committed config after a failed promotion.
+
+        If the first promotion rename has already moved config.json into
+        .old, the previous committed config is there: put it back BEFORE
+        releasing the failed candidate, so config.json is never missing
+        when the caller regains control. A failure here is an OSError
+        for the caller to preserve (artifacts stay for boot recovery)."""
+        if self._path_exists(self._old_path()):
+            self._remove_if_exists(self._config_path)
+            os.rename(self._old_path(), self._config_path)
+        self._remove_if_exists(self._tmp_path())
+        os.sync()
 
     def _write_candidate_tmp(self, candidate):
         """Fully write the candidate to .tmp (closed) -- a crash after this leaves a promotable artifact."""

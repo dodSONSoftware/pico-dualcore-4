@@ -9,7 +9,7 @@ Before the fix, core1_main() registered core_1_activity_ms only AFTER device ini
 The fix:
 
 1. core1_main() stamps the activity mailbox at the top of its body, before SystemInformation/DeviceManager construction and initialize_devices().
-2. Core 1 passes DeviceManager an optional activity_refresh callback, invoked at each initialization progress boundary (before each device, before each initialize() attempt), so a legitimate long initialization does not age the stamp past the watchdog bound while a wedged driver call stops the refresh and is caught.
+2. Core 1 passes DeviceManager an optional activity_refresh callback, invoked at each initialization progress boundary (before each device, before each initialize() attempt, and at each step boundary inside each retry sleep — the delay is unbounded in config and is slept in steps of at most 100 ms), so a legitimate long initialization does not age the stamp past the watchdog bound while a wedged driver call stops the refresh and is caught.
 """
 
 import importlib
@@ -394,14 +394,75 @@ def test_device_manager_reinitialization_refreshes_between_attempts():
     assert managed.clears == 1
 
     # Before every attempt the stamp is current (strictly increasing refresh
-    # count), and each retry sleep starts from a refresh made AFTER the
-    # failed attempt: with 3 attempts and 2 failures that is 3 (attempts) +
-    # 2 (pre-sleep) = 5 refreshes total. Without the pre-sleep refresh the
-    # counts would be [1, 2, 3] / [1, 2] -- the sleep would then run on an
-    # unrefreshed stamp.
+    # count), and each retry sleep (10 ms here, one 100-ms-bounded step) ends
+    # in a refresh: with 3 attempts and 2 failures that is 3 (attempts) +
+    # 2 (one per sleep step) = 5 refreshes total, and each sleep runs after
+    # the attempt-boundary refresh of the failed attempt.
     assert len(refresh_log) == 5
     assert driver.observed == [1, 3, 5]
-    assert recording_time.sleep_counts == [2, 4]
+    assert recording_time.sleep_counts == [1, 3]
+
+
+def test_device_manager_retry_sleep_refreshes_in_steps():
+    """A long configured retry delay must not run as one monolithic sleep.
+
+    device_initialization_retry_delay_ms is a non-negative config value with no upper bound: a delay at or past Core 0's 30 s watchdog bound would previously age the liveness stamp into a false machine.reset() during a legitimate retry backoff. The delay is now slept in steps of at most 100 ms, the liveness stamp is refreshed at each step boundary, and the total slept is exactly the configured delay."""
+    refresh_log = []
+
+    def refresh():
+        refresh_log.append(1)
+
+    class FlakyDriver:
+        def __init__(self):
+            self.calls = 0
+
+        def initialize(self, config):
+            self.calls += 1
+            if self.calls < 2:
+                raise RuntimeError("simulated transient init failure")
+
+    class StepTime(_HostTimeShim):
+        """Records each sleep step and the refresh count at that moment."""
+
+        def __init__(self):
+            self.steps = []
+            self.refresh_at_step = []
+
+        def sleep_ms(self, ms):
+            self.steps.append(ms)
+            self.refresh_at_step.append(len(refresh_log))
+
+    delay_ms = 2500
+    step_time = StepTime()
+    dm = _host_time_device_manager()
+    driver = FlakyDriver()
+    saved_create = dm.create_device
+    dm.create_device = lambda device_def, system_information: driver
+    dm.time = step_time
+    try:
+        manager = dm.DeviceManager(
+            _manager_config(attempts=2, retry_delay_ms=delay_ms),
+            activity_refresh=refresh,
+        )
+        initialized, failed, _ = manager.initialize_devices()
+    finally:
+        dm.create_device = saved_create
+        dm.time = _HostTimeShim()
+
+    # Normal initialization behavior is preserved.
+    assert initialized == 1
+    assert failed == []
+
+    # The delay is split into steps of at most 100 ms summing to the delay.
+    assert len(step_time.steps) == delay_ms // 100
+    assert all(step <= 100 for step in step_time.steps)
+    assert sum(step_time.steps) == delay_ms
+
+    # A refresh at each step boundary: 1 (device) + 1 (attempt 1) + 25 (sleep
+    # steps) + 1 (attempt 2) = 28, with each step's refresh strictly after the
+    # last recorded count -- no refresh goes missing inside the sleep.
+    assert step_time.refresh_at_step == list(range(2, 2 + len(step_time.steps)))
+    assert len(refresh_log) == 28
 
 
 def test_device_manager_without_refresh_callback_is_unchanged():

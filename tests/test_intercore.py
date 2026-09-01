@@ -46,12 +46,13 @@ KB = 1024
 class FakeHeap:
     """Host-side stand-in for the MicroPython heap seen through gc.
 
-    garbage_bytes models collectable garbage: the first gc.collect() that runs while garbage remains releases it. Evicted queue entries release their payload bytes immediately (reference counting), matching MicroPython's refcounted heap."""
+    garbage_bytes models collectable garbage: the first gc.collect() that runs while garbage remains releases it. Evicted queue entries release their payload bytes immediately (reference counting), matching MicroPython's refcounted heap. alloc_per_entry models the append's own allocations (the entry dict and list growth), so a mem_free() measured after an append sees them."""
 
-    def __init__(self, free_bytes, garbage_bytes=0):
+    def __init__(self, free_bytes, garbage_bytes=0, alloc_per_entry=0):
         self.free_bytes = free_bytes
         self._garbage = garbage_bytes
         self.collects = 0
+        self.alloc_per_entry = alloc_per_entry
 
     def mem_free(self):
         return self.free_bytes
@@ -64,7 +65,10 @@ class FakeHeap:
 
     def install(self, monkeypatch, queue):
         # gc.mem_free does not exist on the CPython host; add it for the test.
-        monkeypatch.setattr(gc, "mem_free", self.mem_free, raising=False)
+        def mem_free():
+            return self.mem_free() - self.alloc_per_entry * len(queue._queue)
+
+        monkeypatch.setattr(gc, "mem_free", mem_free, raising=False)
         monkeypatch.setattr(gc, "collect", self.collect)
         original_evict = queue._evict_oldest_by_priority_locked
 
@@ -78,10 +82,10 @@ class FakeHeap:
         monkeypatch.setattr(queue, "_evict_oldest_by_priority_locked", evict_and_release)
 
 
-def _queue(monkeypatch, free_bytes=HEAPY, garbage_bytes=0):
-    """An InterCore bus whose fake heap starts at free_bytes."""
+def _queue(monkeypatch, free_bytes=HEAPY, garbage_bytes=0, alloc_per_entry=0):
+    """An InterCore bus whose fake heap starts at free_bytes (each retained entry optionally costing alloc_per_entry)."""
     ic = InterCore(RESERVE)
-    heap = FakeHeap(free_bytes, garbage_bytes)
+    heap = FakeHeap(free_bytes, garbage_bytes, alloc_per_entry)
     heap.install(monkeypatch, ic.outbound_queue)
     return ic, heap
 
@@ -329,6 +333,67 @@ def test_rejected_when_reserve_cannot_be_restored(monkeypatch):
     assert status["pending"] == 0
     assert status["messages_rejected"] == 1
     assert status["messages_evicted"] == 0
+
+
+def test_post_admission_invariant_undoes_a_crossing_append(monkeypatch):
+    """The reserve is a post-admission invariant: the append itself allocates
+    (the entry dict, list growth), and if that crosses the reserve the
+    admission is undone and rejected -- not admitted at a pre-admission check."""
+    # 512 B of headroom, but the append costs 1 KiB: below the reserve
+    # before the append, under it once the entry is retained.
+    ic, heap = _queue(monkeypatch, free_bytes=RESERVE + 512, alloc_per_entry=1024)
+    queue = ic.outbound_queue
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is False
+    )
+    status = queue.status()
+    assert status["pending"] == 0
+    assert status["queued_bytes"] == 0
+    assert status["high_watermark"] == 0
+    assert status["high_watermark_bytes"] == 0
+    assert status["messages_rejected"] == 1
+    assert status["messages_evicted"] == 0
+    # The undo was reclaimed, so the heap is measurable and back above the
+    # reserve with nothing retained by the queue.
+    assert heap.collects == 1
+    assert gc.mem_free() >= RESERVE
+
+
+def test_post_admission_invariant_admits_at_the_reserve(monkeypatch):
+    """Boundary control: the append allocates, but the reserve holds with the
+    entry retained (at, not above, the reserve) -- admitted."""
+    ic, heap = _queue(monkeypatch, free_bytes=RESERVE + 1024, alloc_per_entry=1024)
+    queue = ic.outbound_queue
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is True
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["high_watermark"] == 1
+    assert status["messages_rejected"] == 0
+
+
+def test_post_admission_invariant_holds_after_eviction(monkeypatch):
+    """The invariant also governs the pressure path: an admission whose own
+    allocations cross the reserve is undone even though eviction just
+    restored it -- the heap cannot retain the evicted entry either."""
+    # 6 KiB short of the reserve; the queued HEALTH entry releases 8 KiB on
+    # eviction (+2 KiB of headroom), but the append costs 4 KiB and crosses.
+    ic, heap = _queue(monkeypatch, alloc_per_entry=4 * KB)
+    queue = ic.outbound_queue
+    assert (
+        queue.put_with_kind(KIND_HEALTH, b"h" * 8 * KB, RETENTION_PRIORITY_HEALTH) is True
+    )
+    heap.free_bytes = RESERVE - 6 * KB
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b"t" * 1 * KB, RETENTION_PRIORITY_TELEMETRY) is False
+    )
+    status = queue.status()
+    assert status["pending"] == 0
+    assert status["queued_bytes"] == 0
+    assert status["messages_evicted"] == 1
+    assert status["messages_rejected"] == 1
+    assert gc.mem_free() >= RESERVE
 
 
 def test_critical_evicts_lower_priority_until_reserve_restored(monkeypatch):
@@ -589,6 +654,42 @@ def test_event_queue_never_evicts_admitted_events(monkeypatch):
     assert ic.event_queue.take() == {"seq": 1}
     assert ic.event_queue.status()["pending"] == 0
     assert ic.event_queue.status()["rejected"] == 1
+
+
+def test_event_post_admission_invariant_undoes_a_crossing_append(monkeypatch):
+    """Same post-admission invariant on the event queue: the append itself may
+    allocate (list growth), and an admission that crosses the reserve with the
+    event retained is undone and rejected."""
+    ic, heap = _queue(monkeypatch)
+    eq = ic.event_queue
+    # 512 B of headroom, but retaining an event costs 1 KiB.
+    base = RESERVE + 512
+    alloc_per_event = 1024
+    monkeypatch.setattr(
+        gc, "mem_free", lambda: base - alloc_per_event * len(eq._queue), raising=False
+    )
+    assert eq.put({"seq": 1}) is False
+    status = eq.status()
+    assert status["pending"] == 0
+    assert status["high_watermark"] == 0
+    assert status["rejected"] == 1
+    assert heap.collects == 1
+    assert gc.mem_free() >= RESERVE
+
+
+def test_event_post_admission_invariant_admits_at_the_reserve(monkeypatch):
+    """Boundary control: the reserve holds with the event retained (at, not
+    above) -- admitted."""
+    ic, _ = _queue(monkeypatch)
+    eq = ic.event_queue
+    alloc_per_event = 1024
+    monkeypatch.setattr(
+        gc, "mem_free", lambda: RESERVE + alloc_per_event * len(eq._queue), raising=False
+    )
+    assert eq.put({"seq": 1}) is True
+    status = eq.status()
+    assert status["pending"] == 1
+    assert status["rejected"] == 0
 
 
 def test_event_queue_memoryerror_propagates(monkeypatch):

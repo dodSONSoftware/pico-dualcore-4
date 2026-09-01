@@ -12,6 +12,7 @@ files, exactly like the flash VFS it will drive on hardware.
 
 import copy
 import json
+import os
 import pathlib
 import sys
 
@@ -356,6 +357,63 @@ def test_corrupted_tmp_write_aborts_before_promotion(config_dir, monkeypatch):
     assert manager.read_persisted() == _base_config()
     assert manager.reboot_required is False
     assert manager.transaction_active is False
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_failed_second_promotion_rename_restores_committed_config(config_dir, monkeypatch):
+    """A second-promotion rename failure (after config.json has already
+    moved to .old) must restore the pre-write config SYNCHRONOUSLY, before
+    begin_write re-raises -- config.json may never be missing once the
+    caller regains control."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    real_rename = os.rename
+
+    def fail_promotion_rename(src, dst):
+        if dst == str(config_dir / "config.json") and src.endswith("config.json.tmp"):
+            raise OSError("simulated second-promotion rename failure")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", fail_promotion_rename)
+
+    with pytest.raises(OSError, match="simulated second-promotion"):
+        manager.begin_write(_reboot_candidate())
+
+    # Pre-write state restored in place: the committed config is the
+    # original, no .old/.tmp left behind, no reboot left pending.
+    assert manager.read_persisted() == _base_config()
+    assert _names(config_dir) == ["config.json"]
+    assert manager.transaction_active is False
+    assert manager.reboot_required is False
+
+
+def test_failed_restoration_preserves_artifacts_and_propagates(config_dir, monkeypatch):
+    """If the restoration itself fails, every recovery artifact is
+    preserved for boot recovery and the ORIGINAL failure propagates."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    real_rename = os.rename
+
+    def fail_promotion_and_restore(src, dst):
+        if dst == str(config_dir / "config.json"):
+            if src.endswith("config.json.tmp"):
+                raise OSError("simulated second-promotion rename failure")
+            raise OSError("simulated restoration failure")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", fail_promotion_and_restore)
+
+    with pytest.raises(OSError, match="simulated second-promotion"):
+        manager.begin_write(_reboot_candidate())
+
+    # config.json is missing, but the previous committed config survives in
+    # .old: exactly the state boot recovery settles.
+    assert not (config_dir / "config.json").exists()
+    assert (config_dir / "config.json.old").exists()
+    assert manager.transaction_active is False
+
+    monkeypatch.undo()
+    # A fresh manager recovers this state on the next boot.
+    recovered = ConfigManager(str(config_dir / "config.json")).recover()
+    assert recovered == _base_config()
     assert _names(config_dir) == ["config.json"]
 
 

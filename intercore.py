@@ -70,7 +70,7 @@ class OutboundMessageTooLargeError(ValueError):
 class OutboundQueue:
     """Core 1 -> Core 0 queue for MQTT-bound messages only.
 
-    Once put() succeeds the payload bytes are immutable (pre-serialized UTF-8 JSON); the Core 0 envelope keys are injected at publish time and must not be carried at the top level. No fixed capacity: admission is governed by the global minimum free-heap reserve, evicting the least-important eligible entries under pressure (never the in-flight QoS 1 entry), all under the shared heap-admission lock."""
+    Once put() succeeds the payload bytes are immutable (pre-serialized UTF-8 JSON); the Core 0 envelope keys are injected at publish time and must not be carried at the top level. No fixed capacity: admission is governed by the global minimum free-heap reserve, evicting the least-important eligible entries under pressure (never the in-flight QoS 1 entry), all under the shared heap-admission lock. The reserve is a post-admission invariant: an entry may be retained only while gc.mem_free() is at or above it, re-measured after the append's own allocations."""
 
     def __init__(self, minimum_free_heap_bytes, heap_admission_lock):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
@@ -92,6 +92,11 @@ class OutboundQueue:
         self._messages_rejected = 0
         self._serialization_rejected = 0
         self._oversized_rejected = 0
+        # Discarded at publish time: the body was admitted at or under the
+        # ceiling, but the spliced Core 0 envelope pushed the final wire
+        # length over it. Permanent for the entry (retrying re-fails), so it
+        # is discarded instead of held in flight.
+        self._oversized_discarded = 0
 
     def _reserve_restored(self):
         return gc.mem_free() >= self._minimum_free_heap_bytes
@@ -108,12 +113,22 @@ class OutboundQueue:
         return False
 
     def _append_locked(self, kind, payload_bytes, retention_priority):
+        """Append under the queue lock; return False (having undone the append) if the append's own allocations cross the reserve.
+
+        The documented invariant is post-admission -- an entry may be retained only while gc.mem_free() is at or above the reserve -- so the heap is measured after the append (which allocates the entry dict and any list growth), not only before it."""
         entry = {
             "kind": kind,
             "retention_priority": retention_priority,
             "payload_bytes": payload_bytes,
         }
         self._queue.append(entry)
+        if not self._reserve_restored():
+            # The append crossed the reserve: undo it (counters above are
+            # untouched, so the admission is fully reversed) and reclaim, so
+            # the heap is measurable again for the next admission decision.
+            self._queue.pop()
+            gc.collect()
+            return False
         self._queued_bytes += len(payload_bytes)
         self._backlog_depth += 1
         depth = len(self._queue)
@@ -126,7 +141,7 @@ class OutboundQueue:
     def _admit_heap_governed(self, kind, payload_bytes, retention_priority):
         """Apply the heap-reserve admission decision. No locks are held on entry.
 
-        Fast path: admit, no gc.collect(). Pressure path: gc.collect() once, then evict the least-important eligible entries one at a time until the reserve is restored, then admit or reject."""
+        Fast path: admit, no gc.collect(). Pressure path: gc.collect() once, then evict the least-important eligible entries one at a time until the reserve is restored, then admit or reject. On either path the reserve is re-measured after the append itself; an admission whose own allocations cross it is undone and rejected (transient, as any heap-pressure rejection)."""
         with self._heap_admission_lock:
             if not self._reserve_restored():
                 _debug_queue_memory("outbound_queue", self, "memory_pressure")
@@ -135,12 +150,23 @@ class OutboundQueue:
                 _debug_queue_memory("outbound_queue", self, "gc_after_admission")
             if self._reserve_restored():
                 with self._lock:
-                    admitted = self._append_locked(kind, payload_bytes, retention_priority)
-                    # Log after the append: the line reports the
-                    # post-admission state (count and bytes include the
-                    # admitted entry), matching the gc_after pair above it.
-                    _debug_queue_memory("outbound_queue", self, "admit")
-                    return admitted
+                    if self._append_locked(kind, payload_bytes, retention_priority):
+                        # Log after the append: the line reports the
+                        # post-admission state (count and bytes include the
+                        # admitted entry), matching the gc_after pair above it.
+                        _debug_queue_memory("outbound_queue", self, "admit")
+                        return True
+                    # The append's own allocations crossed the reserve and
+                    # were undone: a transient rejection, as before.
+                    self._messages_rejected += 1
+                    _debug_queue_memory(
+                        "outbound_queue",
+                        self,
+                        "reject",
+                        (("reason", "post_admission_reserve"),
+                         ("priority", retention_priority)),
+                    )
+                    return False
 
             # Genuine retained-memory pressure: displace the least-important
             # eligible entries one at a time, reclaiming after each, until the
@@ -184,9 +210,22 @@ class OutboundQueue:
                     )
                     gc.collect()
                     if self._reserve_restored():
-                        admitted = self._append_locked(kind, payload_bytes, retention_priority)
-                        _debug_queue_memory("outbound_queue", self, "admit")
-                        return admitted
+                        if self._append_locked(kind, payload_bytes, retention_priority):
+                            _debug_queue_memory("outbound_queue", self, "admit")
+                            return True
+                        # The append's own allocations crossed the reserve and
+                        # were undone. The evicted entries are not restored:
+                        # the heap cannot retain them either, and the
+                        # post-admission invariant wins.
+                        self._messages_rejected += 1
+                        _debug_queue_memory(
+                            "outbound_queue",
+                            self,
+                            "reject",
+                            (("reason", "post_admission_reserve"),
+                             ("priority", retention_priority)),
+                        )
+                        return False
 
     def put(self, kind, message, retention_priority):
         """Admit one MQTT-bound message after validation, serialization, encoding, and size check.
@@ -284,13 +323,17 @@ class OutboundQueue:
             # counted in the retained-byte metric.
             return self._in_flight
 
-    def complete_in_flight(self, entry):
+    def complete_in_flight(self, entry, discarded=False):
+        """Release the in-flight entry: a completed publish, or a permanent publish-time discard (``discarded=True``, counted separately)."""
         with self._lock:
             if self._in_flight is entry:
                 self._in_flight = None
-                # The in-flight payload is released only now (PUBACK received),
-                # so its bytes leave the retained-byte metric here.
+                # The in-flight payload is released only now (PUBACK received,
+                # or the entry is discarded), so its bytes leave the
+                # retained-byte metric here.
                 self._queued_bytes -= len(entry["payload_bytes"])
+                if discarded:
+                    self._oversized_discarded += 1
                 if not self._queue:
                     # The queue is fully drained. Log only if a backlog (more
                     # than this one in-flight entry) flowed through since the
@@ -324,6 +367,7 @@ class OutboundQueue:
                 "messages_rejected": self._messages_rejected,
                 "serialization_rejected": self._serialization_rejected,
                 "oversized_rejected": self._oversized_rejected,
+                "oversized_discarded": self._oversized_discarded,
             }
 
     def get_depth(self):
@@ -334,7 +378,7 @@ class OutboundQueue:
 class InterCoreEventQueue:
     """Private FIFO for discrete Core 0 -> Core 1 events (never MQTT-bound by queue membership).
 
-    No fixed capacity: admission is governed by the same global free-heap reserve under the same shared heap-admission lock. Admitted events are never evicted -- under pressure the new event is rejected instead."""
+    No fixed capacity: admission is governed by the same global free-heap reserve under the same shared heap-admission lock, and the reserve is the same post-admission invariant as on the outbound queue (re-measured after the append's own allocations). Admitted events are never evicted -- under pressure, the new event is rejected instead."""
 
     def __init__(self, minimum_free_heap_bytes, heap_admission_lock):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
@@ -360,6 +404,21 @@ class InterCoreEventQueue:
             if gc.mem_free() >= self._minimum_free_heap_bytes:
                 with self._lock:
                     self._queue.append(event)
+                    # Post-admission invariant, as on the outbound queue: the
+                    # append itself may allocate (list growth), so the
+                    # reserve must hold with the event retained, not only
+                    # before the append.
+                    if gc.mem_free() < self._minimum_free_heap_bytes:
+                        self._queue.pop()
+                        gc.collect()
+                        self._rejected += 1
+                        _debug_queue_memory(
+                            "event_queue",
+                            self,
+                            "reject",
+                            (("reason", "post_admission_reserve"),),
+                        )
+                        return False
                     depth = len(self._queue)
                     if depth > self._high_watermark:
                         self._high_watermark = depth

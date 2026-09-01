@@ -135,6 +135,19 @@ class DeviceManager:
         if self._activity_refresh is not None:
             self._activity_refresh()
 
+    # One liveness-refresh step inside a long retry sleep.
+    _ACTIVITY_REFRESH_STEP_MS = 100
+
+    def _sleep_with_activity_refresh(self, delay_ms):
+        """Sleep in small steps, refreshing the liveness stamp at each step boundary.
+
+        ``device_initialization_retry_delay_ms`` is a non-negative config value with no upper bound; a monolithic sleep would age the stamp past Core 0's watchdog bound for a sufficiently long configured delay. Stepping the sleep keeps the stamp fresh for the whole delay while a driver wedged inside a call still stops the refreshes and is caught."""
+        while delay_ms > 0:
+            step_ms = min(delay_ms, self._ACTIVITY_REFRESH_STEP_MS)
+            time.sleep_ms(step_ms)
+            self._refresh_activity()
+            delay_ms -= step_ms
+
     def _initialize_single_device(self, device_def):
         device_id = device_def["id"]
         device_type = device_def["device_type"]
@@ -208,8 +221,11 @@ class DeviceManager:
                     "error": last_error,
                 })
                 if attempt < self._device_initialization_attempts:
-                    # Not the final attempt - wait before retry
-                    time.sleep_ms(self._device_initialization_retry_delay_ms)
+                    # Not the final attempt - wait before retry; the sleep
+                    # refreshes the liveness stamp at each step boundary, so
+                    # a long configured delay does not age the stamp past
+                    # Core 0's watchdog bound.
+                    self._sleep_with_activity_refresh(self._device_initialization_retry_delay_ms)
 
         return attempts_used, initialized
 
@@ -418,10 +434,11 @@ class DeviceManager:
                 last_error = str(err)
                 # If not the final attempt, wait before retry
                 if attempt < self._device_initialization_attempts:
-                    # Progress boundary before the retry sleep: the sleep
-                    # itself must not age the liveness stamp either.
-                    self._refresh_activity()
-                    time.sleep_ms(self._device_initialization_retry_delay_ms)
+                    # Wait before retry; the sleep refreshes the liveness
+                    # stamp at each step boundary, so a long configured
+                    # delay does not age the stamp past Core 0's watchdog
+                    # bound (the stamp was current before the attempt).
+                    self._sleep_with_activity_refresh(self._device_initialization_retry_delay_ms)
 
         # All reinitialization attempts exhausted
         # The device remains in reinitialize_pending state for retry on next cycle

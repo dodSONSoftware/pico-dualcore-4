@@ -20,6 +20,12 @@ MAX_COMMAND_ID_LENGTH = 128
 MAX_COMMAND_LENGTH = 32
 MAX_TARGET_LENGTH = 128
 
+# The configured source is spliced into every Core 0 outbound envelope, so it
+# is a protocol-scale identity (matched against a bounded target), not an
+# open-ended string: a multi-kilobyte identity would push even a tiny envelope
+# past the outbound wire ceiling.
+MAX_SOURCE_LENGTH = 64
+
 BROADCAST_TARGET = "*"
 
 # A version-3 command has exactly these top-level fields; any other key

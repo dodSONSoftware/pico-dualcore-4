@@ -230,8 +230,9 @@ def test_core0_command_response_returns_true_on_success():
 
 def test_core0_command_response_swallows_ordinary_errors_returns_false(monkeypatch):
     """A permanent serialization failure reports False -- not None, not an
-    exception -- so a caller can distinguish it from a successful publish and
-    keep (not discard) its logical response."""
+    exception -- so a caller can distinguish it from a successful publish;
+    with a container, the failure cause is recorded on it so the servicing
+    path can answer with the matching bounded substitute."""
     core0_mod, instance = _make_core0()
 
     def _fail(*args, **kwargs):
@@ -245,10 +246,12 @@ def test_core0_command_response_swallows_ordinary_errors_returns_false(monkeypat
     instance._mqtt.publish_qos1.assert_not_called()
 
 
-def test_pending_core0_response_kept_on_serialization_failure(monkeypatch):
-    """A serialization failure must not discard the response: the command was
-    accepted and its acknowledgement is owed, so the response stays queued for
-    a later pass (the pre-fix behavior popped it unconditionally)."""
+def test_pending_core0_response_substituted_on_serialization_failure(monkeypatch):
+    """A deterministic serialization failure can never succeed by retrying the
+    same bytes, and the queue is FIFO -- so the response is not held for a
+    later pass: it is answered with the bounded error substitute (the same
+    policy Core 1 applies at admission), preserving the command identity, so
+    the responses behind it keep moving."""
     core0_mod, instance = _make_core0()
 
     def _fail(*args, **kwargs):
@@ -267,12 +270,20 @@ def test_pending_core0_response_kept_on_serialization_failure(monkeypatch):
 
     instance._service_pending_core0_response()
 
-    assert instance._pending_core0_responses == [response]  # still queued
+    # The unsendable original is gone; the bounded substitute holds its slot.
+    substitute = instance._pending_core0_responses[0]
+    assert substitute is not response
+    assert substitute["success"] is False
+    assert substitute["error"]["code"] == "response_invalid"
+    assert "data" not in substitute
+    assert substitute["command_id"] == "req-1"
+    assert substitute["command"] == "reboot"
+    assert substitute["targeted"] is False
     instance._mqtt.publish_qos1.assert_not_called()
 
 
-def test_pending_core0_response_consumed_after_failed_attempt(monkeypatch):
-    """Once serialization succeeds, the response held by an earlier failed
+def test_pending_core0_response_substitute_consumed_after_failed_attempt(monkeypatch):
+    """Once serialization succeeds again, the substitute held by the failed
     attempt is published and consumed -- no tight retry loop, one attempt per
     run-loop pass."""
     core0_mod, instance = _make_core0()
@@ -293,7 +304,7 @@ def test_pending_core0_response_consumed_after_failed_attempt(monkeypatch):
     instance._pending_core0_responses.append(response)
 
     instance._service_pending_core0_response()
-    assert instance._pending_core0_responses == [response]  # attempt 1: held
+    assert instance._pending_core0_responses[0] is not response  # attempt 1: substituted
 
     monkeypatch.setattr(core0_mod, "serialize_and_validate_message", real_serialize)
     instance._service_pending_core0_response()
@@ -326,21 +337,21 @@ def test_reboot_held_when_response_serialization_fails(monkeypatch):
     machine.reset.assert_not_called()
 
 
-def test_reboot_proceeds_once_serialization_recovers(monkeypatch):
-    """The held reboot is retried on a later pass and completes once the
-    response publishes: acknowledgement first, then the reset."""
+def test_reboot_answered_invalid_and_released_when_the_answer_publishes(monkeypatch):
+    """A non-MemoryError serialization failure of the reboot acknowledgement
+    is permanent for those bytes -- the same class the servicing path
+    answers: the command is answered with the bounded ``response_invalid``
+    substitute exactly once, the reboot is held until the substitute
+    publishes, and then released. Never a reset with the answer still out
+    the door."""
     core0_mod, instance = _make_core0()
     machine = core0_mod.machine
     real_serialize = core0_mod.serialize_and_validate_message
 
-    def _fail_first(*args, **kwargs):
-        test_reboot_proceeds_once_serialization_recovers.attempts += 1
-        if test_reboot_proceeds_once_serialization_recovers.attempts == 1:
-            raise RuntimeError("malformed response")
-        return real_serialize(*args, **kwargs)
+    def _fail(*args, **kwargs):
+        raise RuntimeError("malformed response")
 
-    test_reboot_proceeds_once_serialization_recovers.attempts = 0
-    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", _fail_first)
+    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", _fail)
 
     instance._pending_reboot = {
         "command_id": "req-1",
@@ -348,9 +359,23 @@ def test_reboot_proceeds_once_serialization_recovers(monkeypatch):
         "targeted": False,
     }
 
-    assert instance._perform_reboot() is False  # attempt 1: no ack, no reset
+    assert instance._perform_reboot() is False  # no ack, no reset
+    assert instance._pending_reboot is not None  # held until the answer is out
+    instance._mqtt.publish_qos1.assert_not_called()
     machine.reset.assert_not_called()
+    # The command is answered with the bounded substitute...
+    assert len(instance._pending_core0_responses) == 1
+    assert instance._pending_core0_responses[0]["success"] is False
+    assert instance._pending_core0_responses[0]["error"]["code"] == "response_invalid"
+    # ...and a later pass does not queue a second one.
+    assert instance._perform_reboot() is False
+    assert len(instance._pending_core0_responses) == 1
 
-    assert instance._perform_reboot() is True  # attempt 2: ack published
+    # Once the substitute publishes, the failed command is done and the
+    # held reboot is released (the device keeps running).
+    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", real_serialize)
+    instance._service_pending_core0_response()
     instance._mqtt.publish_qos1.assert_called_once()
-    machine.reset.assert_called_once()
+    assert instance._pending_core0_responses == []
+    assert instance._pending_reboot is None
+    machine.reset.assert_not_called()
