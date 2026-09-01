@@ -308,6 +308,35 @@ def test_run_loop_resets_on_stale_heartbeat(env):
     assert machine.reset_calls == 1
 
 
+def test_zero_delay_sleeps_nothing_and_services_nothing(env):
+    """A configured zero delay is an immediate retry: no 100 ms slice, no watchdog check.
+
+    A stale stamp is armed so any servicing would reset; a zero-delay wait that services nothing leaves the machine untouched and the clock unadvanced."""
+    instance, machine = env["instance"], env["machine"]
+    timeout_ms = env["core0_mod"]._CORE_1_HEARTBEAT_STALE_TIMEOUT_MS
+    instance._intercore.state_mailboxes.set_core_1_activity_ms(-timeout_ms)
+    _FAKE_TIME.now_ms = 0
+
+    instance._sleep_and_service(0)
+
+    assert _FAKE_TIME.now_ms == 0
+    assert machine.reset_calls == 0
+
+
+def test_positive_delay_still_services_each_slice(env):
+    """The zero-delay fix must not have removed servicing from real waits.
+
+    With a stale stamp armed, the first 100 ms slice of any positive delay resets."""
+    instance, machine = env["instance"], env["machine"]
+    timeout_ms = env["core0_mod"]._CORE_1_HEARTBEAT_STALE_TIMEOUT_MS
+    instance._intercore.state_mailboxes.set_core_1_activity_ms(-timeout_ms)
+
+    with pytest.raises(_MachineReset):
+        instance._sleep_and_service(1)
+
+    assert machine.reset_calls == 1
+
+
 def test_run_loop_stays_up_with_fresh_heartbeat(env):
     """A live Core 1 stamp keeps the run loop running across iterations."""
     instance, machine = env["instance"], env["machine"]

@@ -1476,7 +1476,10 @@ class Core0:
         self._watch_core_1_heartbeat()
 
     def _sleep_and_service(self, delay_sec):
-        for _ in range(max(int(delay_sec * 10), 1)):
+        if delay_sec <= 0:
+            return
+
+        for _ in range(int(delay_sec * 10)):
             self._service_wait()
             time.sleep_ms(100)
 

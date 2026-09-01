@@ -258,6 +258,48 @@ def test_mqtt_connect_services_wait_and_watchdog_fires_inside_wait(ticks, monkey
     assert len(service.calls) > 50
 
 
+# --- Zero-delay waits --------------------------------------------------------
+#
+# Configuration validation permits zero-valued reconnect delays. A zero delay
+# is a configured *immediate* retry: it must wait nothing. The previous
+# implementation's max(int(delay * 10), 1) floor made it wait 100 ms and
+# service the hook once anyway, disagreeing with the configuration.
+
+
+def test_wifi_zero_delay_waits_nothing_and_services_nothing(ticks):
+    """A zero-second delay sleeps no slice and drops no watchdog check."""
+    service = _counting_service(ticks)
+    wifi = wifi_mod.Wifi("test-ssid", "test-password", [0, 0], service)
+
+    wifi._sleep_interruptible(0)
+
+    assert ticks.now_ms == 0
+    assert service.calls == []
+
+
+def test_mqtt_zero_delay_waits_nothing_and_services_nothing(ticks, monkeypatch):
+    """A zero-second delay sleeps no slice and drops no watchdog check."""
+    monkeypatch.setattr(mqtt_mod, "MQTTClient", _FailingClient)
+    service = _counting_service(ticks)
+    mqtt = mqtt_mod.Mqtt(
+        {
+            "mqtt_broker_ip_address": "10.0.0.1",
+            "mqtt_topic_command": "iot/v3/command",
+            "mqtt_topic_info_response": "iot/v3/info-response",
+            "mqtt_keepalive_sec": 30,
+            "mqtt_broker_response_timeout_sec": 4,
+            "mqtt_reconnect_delays_sec": [0, 0],
+        },
+        lambda message: None,
+        service,
+    )
+
+    mqtt._sleep_interruptible(0)
+
+    assert ticks.now_ms == 0
+    assert service.calls == []
+
+
 # --- Wi-Fi terminal-failure early-exit -------------------------------------
 #
 # Wifi.connect() should stop observing a wrong password, a missing AP, or a

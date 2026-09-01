@@ -29,6 +29,7 @@ from intercore import (  # noqa: E402
     ConfigUpdateLane,
     InterCore,
     InterCoreEventQueue,
+    KIND_COMMAND_RESPONSE,
     KIND_HEALTH,
     KIND_TELEMETRY,
     OutboundQueue,
@@ -88,6 +89,14 @@ def _queue(monkeypatch, free_bytes=HEAPY, garbage_bytes=0, alloc_per_entry=0):
     heap = FakeHeap(free_bytes, garbage_bytes, alloc_per_entry)
     heap.install(monkeypatch, ic.outbound_queue)
     return ic, heap
+
+
+def _assert_watermark_at_least_depth(queue):
+    """Peak-depth invariant: the high watermark and the depth use the same
+    retained-entry definition (queued + in-flight), so the historical peak
+    can never be below the current depth."""
+    status = queue.status()
+    assert status["high_watermark"] >= status["depth"]
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +298,7 @@ def test_fifo_order(monkeypatch):
         entry = queue.take()
         assert json.loads(entry["payload_bytes"]) == {"i": i}
         assert queue.complete_in_flight(entry) is True
+        _assert_watermark_at_least_depth(queue)
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +406,52 @@ def test_post_admission_invariant_holds_after_eviction(monkeypatch):
     assert gc.mem_free() >= RESERVE
 
 
+def test_append_crossing_displaces_lower_priority_entry(monkeypatch):
+    """An append-induced reserve crossing is memory pressure too: a CRITICAL
+    admission whose own allocations cross the reserve displaces the queued
+    lower-priority entry instead of being rejected while it stays retained
+    (pre-admission heap above the reserve)."""
+    # Headroom covers the queued HEALTH entry, but not the incoming entry's
+    # own allocations as well: the fast-path append crosses and is undone.
+    ic, heap = _queue(monkeypatch, free_bytes=RESERVE + 1536, alloc_per_entry=1024)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_HEALTH, b"h" * 8 * KB, RETENTION_PRIORITY_HEALTH) is True
+    assert (
+        queue.put_with_kind(
+            KIND_COMMAND_RESPONSE, b'{"r":1}', RETENTION_PRIORITY_CRITICAL
+        )
+        is True
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == len(b'{"r":1}')
+    assert status["messages_evicted"] == 1
+    assert status["telemetry_evicted"] == 0
+    assert status["messages_rejected"] == 0
+    taken = queue.take()
+    assert taken["payload_bytes"] == b'{"r":1}'
+    # The displacement restored the post-admission invariant.
+    assert gc.mem_free() >= RESERVE
+
+
+def test_append_crossing_still_rejects_lower_priority_incoming(monkeypatch):
+    """The displacement path keeps its priority rule on the append-crossing
+    fallthrough: an incoming entry less important than everything queued is
+    rejected, and nothing more important is evicted."""
+    ic, heap = _queue(monkeypatch, free_bytes=RESERVE + 1536, alloc_per_entry=1024)
+    queue = ic.outbound_queue
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b"t" * 8 * KB, RETENTION_PRIORITY_TELEMETRY)
+        is True
+    )
+    assert queue.put_with_kind(KIND_HEALTH, b'{"h":1}', RETENTION_PRIORITY_HEALTH) is False
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == len(b"t" * 8 * KB)
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 1
+
+
 def test_critical_evicts_lower_priority_until_reserve_restored(monkeypatch):
     ic, heap = _queue(monkeypatch)
     queue = ic.outbound_queue
@@ -418,6 +474,7 @@ def test_critical_evicts_lower_priority_until_reserve_restored(monkeypatch):
     assert queue.complete_in_flight(first) is True
     second = queue.take()
     assert second["payload_bytes"] == incoming
+    _assert_watermark_at_least_depth(queue)
 
 
 def test_multiple_evictions_allowed(monkeypatch):
@@ -437,6 +494,7 @@ def test_multiple_evictions_allowed(monkeypatch):
     assert status["messages_evicted"] == 2
     assert status["telemetry_evicted"] == 1  # only the TELEMETRY-kind one
     assert status["messages_rejected"] == 0
+    _assert_watermark_at_least_depth(queue)
 
 
 def test_less_important_cannot_evict_more_important(monkeypatch):
@@ -492,6 +550,7 @@ def test_in_flight_entry_is_never_evicted(monkeypatch):
     assert queue.put_with_kind(KIND_TELEMETRY, b"t" * 16 * KB, RETENTION_PRIORITY_TELEMETRY) is True
     in_flight = queue.take()
     assert queue.has_in_flight() is True
+    _assert_watermark_at_least_depth(queue)
     # Unrecoverable pressure and an empty FIFO: only the in-flight entry
     # exists, and it is not an eviction candidate.
     heap.free_bytes = 0
@@ -501,8 +560,10 @@ def test_in_flight_entry_is_never_evicted(monkeypatch):
     assert queue.has_in_flight() is True
     assert queue.status()["messages_evicted"] == 0
     assert queue.status()["messages_rejected"] == 1
+    _assert_watermark_at_least_depth(queue)
     assert queue.complete_in_flight(in_flight) is True
     assert in_flight["payload_bytes"] == b"t" * 16 * KB
+    _assert_watermark_at_least_depth(queue)
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +582,7 @@ def test_take_returns_in_flight_again(monkeypatch):
     assert queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is True
     entry = queue.take()
     assert queue.take() is entry
+    _assert_watermark_at_least_depth(queue)
 
 
 def test_complete_in_flight_releases_retained_bytes(monkeypatch):
@@ -532,9 +594,11 @@ def test_complete_in_flight_releases_retained_bytes(monkeypatch):
     # Retained in flight: still counted.
     assert queue.status()["queued_bytes"] == len(payload)
     assert queue.get_depth() == 1
+    _assert_watermark_at_least_depth(queue)
     assert queue.complete_in_flight(entry) is True
     assert queue.status()["queued_bytes"] == 0
     assert queue.get_depth() == 0
+    _assert_watermark_at_least_depth(queue)
 
 
 def test_complete_in_flight_wrong_entry_rejected(monkeypatch):
@@ -560,10 +624,29 @@ def test_high_watermark_tracks_peak(monkeypatch):
     for i in range(5):
         assert queue.put_with_kind(KIND_TELEMETRY, b"p", RETENTION_PRIORITY_TELEMETRY) is True
     assert queue.status()["high_watermark"] == 5
+    _assert_watermark_at_least_depth(queue)
     for _ in range(5):
         queue.complete_in_flight(queue.take())
     assert queue.status()["high_watermark"] == 5  # watermark is a peak, not current
     assert queue.status()["high_watermark_bytes"] >= 5
+    _assert_watermark_at_least_depth(queue)
+
+
+def test_high_watermark_counts_in_flight_like_depth(monkeypatch):
+    """The high watermark uses the same retained-entry definition as depth
+    (queued + in-flight): an admission made while an entry is in flight
+    counts both, so the runtime state depth=2 with a peak of 1 cannot occur."""
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is True
+    in_flight = queue.take()
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"b":2}', RETENTION_PRIORITY_TELEMETRY) is True
+    status = queue.status()
+    assert status["depth"] == 2
+    assert status["high_watermark"] == 2
+    _assert_watermark_at_least_depth(queue)
+    assert queue.complete_in_flight(in_flight) is True
+    _assert_watermark_at_least_depth(queue)
 
 
 # ---------------------------------------------------------------------------
