@@ -208,18 +208,22 @@ class Core0:
         # For connection logs, we use the pre-serialized message approach
         from message_serializer import serialize_and_validate_message
         message = self._pending_connection_logs[0]
-        # The message is final at this point: uptime and timestamp are the
-        # sender's to carry, and the envelope is spliced in at publish time.
-        message["uptime_ms"] = self._uptime_ms()
-        message["timestamp"] = self._current_utc_timestamp()
-        try:
-            payload_bytes = serialize_and_validate_message(message)
+        # The pending container is the persistent identity, the same way a
+        # Core 0 response container is: uptime and timestamp are the sender's
+        # to carry and are stamped once, the body is serialized once, and the
+        # wire sequence is claimed once (by _publish_entry, on the container).
+        # A transport retry of the same event reuses all three, so a PUBACK
+        # lost after delivery redelivers ONE (runtime_id, sequence) pair with
+        # the same document instead of a second apparent application message
+        # with a fresh sequence and a newer uptime/timestamp.
+        if "payload_bytes" not in message:
+            message["uptime_ms"] = self._uptime_ms()
+            message["timestamp"] = self._current_utc_timestamp()
+            message["payload_bytes"] = serialize_and_validate_message(message)
             # KIND_LOG: _publish_entry resolves the log topic via _topic_for_kind
-            entry = {
-                "payload_bytes": payload_bytes,
-                "kind": KIND_LOG,
-            }
-            self._publish_entry(entry)
+            message["kind"] = KIND_LOG
+        try:
+            self._publish_entry(message)
             self._pending_connection_logs.pop(0)
         except MemoryError:
             raise

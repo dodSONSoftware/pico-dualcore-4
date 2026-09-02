@@ -626,10 +626,26 @@ def test_transient_publish_failure_keeps_connection_log_pending(make_core0):
     instance._service_pending_connection_log()
     assert len(instance._pending_connection_logs) == 1
     assert instance._pending_connection_logs[0]["payload"]["event"] == "mqtt_connection_established"
+    first_frame = mqtt.published[-1][1]
+    first = json.loads(first_frame)
+
+    # Advance the clock before the retry so a rebuild WOULD change the
+    # document: the retry must NOT pick up the newer uptime or timestamp,
+    # which is only possible if it reuses the frozen bytes from attempt 1
+    # instead of re-serializing.
+    _FAKE_TIME.now_ms = 5000
 
     # Attempt 2: the link has recovered; the SAME event is delivered and only
-    # now is the pending entry consumed.
+    # now is the pending entry consumed. The retry reuses attempt 1's wire
+    # sequence and document verbatim -- one (runtime_id, sequence) identity
+    # for the logical event, not a second apparent message with a fresh
+    # sequence and regenerated uptime/timestamp.
     instance._service_pending_connection_log()
     assert instance._pending_connection_logs == []
-    frame = json.loads(mqtt.published[-1][1])
-    assert frame["payload"]["event"] == "mqtt_connection_established"
+    retry_frame = mqtt.published[-1][1]
+    retry = json.loads(retry_frame)
+    assert retry["payload"]["event"] == "mqtt_connection_established"
+    assert retry["sequence"] == first["sequence"]
+    assert retry["uptime_ms"] == first["uptime_ms"]
+    assert retry["timestamp"] == first["timestamp"]
+    assert first_frame == retry_frame  # same logical event: byte-identical frame
