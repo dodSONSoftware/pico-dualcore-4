@@ -87,7 +87,6 @@ _HOT_APPLY_CORE0_KEYS = (
     "datetime_sync_interval_min",
     "mqtt_command_poll_ms",
     "mqtt_outbound_publish_delay_ms",
-    "network_probe_timeout_sec",
     "network_snapshot_interval_sec",
 )
 _HOT_APPLY_CORE1_KEYS = ("read_loop_sec", "health_interval_sec")

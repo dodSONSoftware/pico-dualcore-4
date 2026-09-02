@@ -54,7 +54,10 @@ _CHANGE_POLICY = {
     "device_initialization_retry_delay_ms": CHANGE_POLICY_REBOOT_REQUIRED,
     "device_read_failure_threshold": CHANGE_POLICY_REBOOT_REQUIRED,
     "network_snapshot_interval_sec": CHANGE_POLICY_HOT_RELOADED,
-    "network_probe_timeout_sec": CHANGE_POLICY_HOT_RELOADED,
+    # Only consumed by the startup verification contract's network probes;
+    # no steady-state probe reads it, so a live change would have no effect
+    # until the next boot -- HOT_RELOADED would be a false promise.
+    "network_probe_timeout_sec": CHANGE_POLICY_REBOOT_REQUIRED,
     "mqtt_broker_ip_address": CHANGE_POLICY_REBOOT_REQUIRED,
     "mqtt_keepalive_sec": CHANGE_POLICY_REBOOT_REQUIRED,
     "mqtt_command_poll_ms": CHANGE_POLICY_HOT_RELOADED,

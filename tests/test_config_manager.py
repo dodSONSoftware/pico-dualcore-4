@@ -17,6 +17,7 @@ import pathlib
 import sys
 
 import pytest
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -27,6 +28,7 @@ from config_manager import (
     CLASSIFICATION_UNCHANGED,
     ConfigManager,
     _CHANGE_POLICY,
+    _classify_change,
 )
 
 
@@ -82,6 +84,44 @@ def test_policy_values_are_the_two_classifications():
         CLASSIFICATION_HOT_RELOADED,
         CLASSIFICATION_REBOOT_REQUIRED,
     }
+
+
+def test_hot_policy_set_matches_the_live_apply_sets():
+    """A key may be HOT_RELOADED only if a live runtime actually applies it.
+
+    Classification promises the change takes effect in the running system
+    (reboot_required=false); a policy that says HOT for a key no runtime
+    consumes in steady state would report success for a value that only
+    takes effect on the next boot. The classified-HOT set must therefore be
+    exactly the two apply sets (this is how network_probe_timeout_sec
+    regressed: HOT policy, but consumed only by the startup probes)."""
+    # core0 binds MicroPython's machine/network at import time; the host has
+    # neither, so stub them (setdefault can only add — CPython has no such
+    # modules) and read core0's apply-set constants.
+    sys.modules.setdefault("machine", MagicMock())
+    sys.modules.setdefault("network", MagicMock())
+    import core0
+    hot_policy = {
+        key for key, policy in _CHANGE_POLICY.items()
+        if policy == CLASSIFICATION_HOT_RELOADED
+    }
+    assert hot_policy == (
+        set(core0._HOT_APPLY_CORE0_KEYS) | set(core0._HOT_APPLY_CORE1_KEYS)
+    )
+
+
+def test_network_probe_timeout_sec_is_reboot_required():
+    """The network probe timeout is consumed only by the startup verification
+    contract's probes; no steady-state probe exists, so a live change has no
+    effect on the running system and must ask for a reboot."""
+    assert (
+        _CHANGE_POLICY["network_probe_timeout_sec"]
+        == CLASSIFICATION_REBOOT_REQUIRED
+    )
+    active = _base_config()
+    candidate = _base_config()
+    candidate["network_probe_timeout_sec"] = 99
+    assert _classify_change(active, candidate) == CLASSIFICATION_REBOOT_REQUIRED
 
 
 # ---------------------------------------------------------------------------
