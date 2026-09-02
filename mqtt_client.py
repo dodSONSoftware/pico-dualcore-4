@@ -322,6 +322,16 @@ class MQTTClient:
         op = res[0]
         if op & 0xF0 != 0x30:
             return op
+        # Validate the QoS bits before the payload is read and before the
+        # callback runs: QoS 2 is outside this client's protocol profile and
+        # QoS 3 is invalid for PUBLISH by the MQTT spec. The callback feeds
+        # the command protocol, so a nonconforming frame must be dropped at
+        # the wire layer, never delivered to the application and rejected
+        # afterward (and the old assert was build-dependent anyway).
+        if op & 6 == 4:
+            self._abort_corrupt_inbound("Inbound QoS 2 is not supported")
+        if op & 6 == 6:
+            self._abort_corrupt_inbound("Invalid PUBLISH QoS")
         sz = self._recv_len()
         if sz > MAX_INBOUND_PACKET_BYTES:
             # An oversized inbound packet is a broker-side fault, not a
@@ -371,11 +381,6 @@ class MQTTClient:
             pkt = bytearray(b"\x40\x02\0\0")
             struct.pack_into("!H", pkt, 2, pid)
             self.sock.write(pkt)
-        elif op & 6 == 4:
-            # Inbound QoS 2 is not supported by this protocol profile; reject
-            # explicitly rather than with an assert that bytecode
-            # optimization would remove.
-            raise MQTTException("Inbound QoS 2 is not supported")
         return op
 
     def _ready_poller(self):

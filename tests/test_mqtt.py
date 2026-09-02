@@ -1260,11 +1260,14 @@ def test_ping_rejects_pingresp_with_payload():
     assert sock.closed is True
 
 
-def test_wait_msg_rejects_inbound_qos2():
-    """An inbound QoS 2 PUBLISH is outside this client's protocol profile and
-    must be rejected explicitly (the old `assert 0` was build-dependent)."""
+def test_wait_msg_rejects_inbound_qos2_before_callback():
+    """An inbound QoS 2 PUBLISH is outside this client's protocol profile: it
+    must be rejected at the wire layer, before the callback (which feeds the
+    command protocol) ever sees the frame, and in every build (the old
+    `assert 0` was build-dependent and the callback had already run)."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
-    client.set_callback(lambda topic, msg: None)
+    callback_calls = []
+    client.set_callback(lambda topic, msg: callback_calls.append((topic, msg)))
     # QoS 2 PUBLISH (op 0x34): topic "t", packet id 1, empty payload.
     # Remaining length 5 = topic length (2) + topic (1) + packet id (2).
     sock = MockSocket(incoming=b"\x34\x05\x00\x01t\x01\x00")
@@ -1272,6 +1275,27 @@ def test_wait_msg_rejects_inbound_qos2():
 
     with pytest.raises(MQTTException, match="QoS 2"):
         client.wait_msg()
+
+    assert callback_calls == []
+    assert sock.closed is True
+
+
+def test_wait_msg_rejects_invalid_qos3_publish_before_callback():
+    """QoS 3 is invalid for PUBLISH by the MQTT spec: it must be rejected at
+    the wire layer, before the callback (the old code delivered the frame and
+    only noticed nothing to reject)."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    callback_calls = []
+    client.set_callback(lambda topic, msg: callback_calls.append((topic, msg)))
+    # QoS 3 PUBLISH (op 0x36): same frame shape as the QoS 2 case.
+    sock = MockSocket(incoming=b"\x36\x05\x00\x01t\x01\x00")
+    client.sock = sock
+
+    with pytest.raises(MQTTException, match="Invalid PUBLISH QoS"):
+        client.wait_msg()
+
+    assert callback_calls == []
+    assert sock.closed is True
 
 
 def test_publish_size_above_remaining_length_maximum_is_rejected():

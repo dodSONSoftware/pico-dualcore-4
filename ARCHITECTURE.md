@@ -246,6 +246,10 @@ at the Core 0 boundary — the same contract as `reboot`).
 - Reboot never enters this lane; Core 0 owns reboot completely.
 - Only supported Core 1-owned commands (currently `get-details`) are dispatched. Core 1 no longer acts as the generic fallback for arbitrary command names: a command outside the supported registry is answered by Core 0 and never crosses to Core 1 (see Supported-command registry).
 
+#### Inbound QoS profile
+
+Below the application gates, `wait_msg()` (`mqtt_client.py`) accepts inbound PUBLISH only at QoS 0 and QoS 1: QoS 2 is outside this client's protocol profile and QoS 3 is invalid for PUBLISH by the MQTT spec. Both are rejected from the opcode byte, **before the payload is read and before the application callback runs** — `_abort_corrupt_inbound` closes the socket and raises, and Core 0's recovery reconnects. The ordering is a security property, not a style choice: the callback is not passive — it feeds the command protocol — so a nonconforming peer must not be able to deliver a `write-config` / `reboot` / `get-details` frame that the application executes before the MQTT layer announces the rejection. QoS 1 inbound is acknowledged with a PUBACK; the firmware subscribes at QoS 1, so a conforming broker never sends QoS 2 in the first place.
+
 #### Global inbound message-schema gate
 
 Every decoded inbound MQTT object — not only commands — passes one global gate immediately after decoding and the dictionary check: `message_schema_version` must be exactly `MESSAGE_SCHEMA_VERSION` (currently 3). A missing, wrong-typed, older, or newer version is ignored for the whole message:
