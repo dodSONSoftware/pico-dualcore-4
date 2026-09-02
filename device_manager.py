@@ -340,6 +340,8 @@ class DeviceManager:
             previous_failures = managed_device.consecutive_read_failures
             managed_device.record_read_success()
 
+            self._refresh_system_information_self_status(managed_device, telemetry)
+
             return {
                 "status": DEVICE_RESULT_TELEMETRY,
                 "device_id": managed_device.device_id,
@@ -370,6 +372,25 @@ class DeviceManager:
                 "reinitialize_pending": managed_device.reinitialize_pending,
                 "remove": False,
             }
+
+    def _refresh_system_information_self_status(self, managed_device, telemetry):
+        """Refresh this system-information device's own status after read success.
+
+        A system-information read that includes the ``device_status`` section captures the manager's snapshot while this device's own success is not yet committed (read_count has been incremented, successful_read_count has not), so the telemetry would otherwise carry a one-read-stale self-entry. After the success is committed, replace only this device's own entry with a fresh snapshot; every other device's entry keeps exactly what the original read captured. A no-op for other device types and when ``device_status`` was not in the read's payload (the configured include list stays authoritative)."""
+        if managed_device.device_type != "system-information":
+            return
+
+        device_status = telemetry.get("device_status")
+        if not isinstance(device_status, list):
+            return
+
+        now_ms = time.ticks_ms()
+        fresh_status = managed_device.get_status_snapshot(now_ms=now_ms)
+
+        for index, status in enumerate(device_status):
+            if isinstance(status, dict) and status.get("id") == managed_device.device_id:
+                device_status[index] = fresh_status
+                return
 
     def _process_reinitialization(self, managed_device):
         """Process reinitialization for a device, reusing the configured initialization retry policy.
