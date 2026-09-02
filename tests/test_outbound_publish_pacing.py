@@ -21,7 +21,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-TICKS_LIMIT = 2 ** 31  # MicroPython time.ticks_ms() wraps at this boundary
+TICKS_PERIOD = 1 << 30  # 32-bit MicroPython builds (RP2): 30-bit tick values
+HALF_PERIOD = 1 << 29
 
 
 class LoopStop(Exception):
@@ -44,7 +45,7 @@ class ResettingMachine:
 
 
 class FakeTime:
-    """Controllable MicroPython time stand-in with 31-bit tick wrap.
+    """Controllable MicroPython time stand-in with 30-bit tick wrap.
 
     sleep_ms advances the clock (and records every sleep), so any blocking sleep the implementation inserted would show up in sleep_calls."""
 
@@ -54,14 +55,18 @@ class FakeTime:
         self.sleep_calls = []
 
     def ticks_ms(self):
-        return self._abs_ms % TICKS_LIMIT
+        return self._abs_ms % TICKS_PERIOD
 
     def ticks_diff(self, a, b):
         # MicroPython semantics: signed difference, correct across the wrap.
-        return ((a - b) + (TICKS_LIMIT // 2)) % TICKS_LIMIT - (TICKS_LIMIT // 2)
+        return ((a - b) + (TICKS_PERIOD // 2)) % TICKS_PERIOD - (TICKS_PERIOD // 2)
 
     def ticks_add(self, base, delta):
-        return (base + delta) % TICKS_LIMIT
+        # MicroPython raises when the delta reaches half the period, so
+        # ticks_diff can still round-trip it.
+        if abs(delta) >= HALF_PERIOD:
+            raise OverflowError("ticks interval overflow")
+        return (base + delta) % TICKS_PERIOD
 
     def sleep_ms(self, ms):
         self.sleep_calls.append(ms)
@@ -313,16 +318,16 @@ def test_gate_is_correct_across_tick_wraparound(make_core0):
     """The gate must use ticks_diff, not integer subtraction, past the wrap."""
     instance = make_core0(delay_ms=100)
 
-    # A publish completes just before the 31-bit tick boundary...
-    _FAKE_TIME._abs_ms = TICKS_LIMIT - 50
+    # A publish completes just before the 30-bit tick boundary...
+    _FAKE_TIME._abs_ms = TICKS_PERIOD - 50
     instance._note_mqtt_publish_completed()
 
     # ...and the clock then wraps. 99 ms after the completion (a plain
-    # now - last would be about -2**31 here) the gate is still closed...
-    _FAKE_TIME._abs_ms = TICKS_LIMIT + 49
+    # now - last would be about -2**30 here) the gate is still closed...
+    _FAKE_TIME._abs_ms = TICKS_PERIOD + 49
     assert instance._mqtt_publish_ready() is False
     # ...and it opens at 100 ms despite the wrap.
-    _FAKE_TIME._abs_ms = TICKS_LIMIT + 50
+    _FAKE_TIME._abs_ms = TICKS_PERIOD + 50
     assert instance._mqtt_publish_ready() is True
 
 

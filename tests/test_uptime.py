@@ -4,9 +4,9 @@
 
 """Host-side regression tests for the accumulated-uptime fix.
 
-MicroPython's time.ticks_diff is only guaranteed correct when the two samples are less than half a tick period apart. A long-running device (> ~24.8 days on a 32-bit clock) violates that: a single ticks_diff(now, boot_ticks_ms) returns a negative or wrapped value even though the device is alive and well. The fix accumulates deltas between consecutive samples (each a recent pair) into a running total, so every individual ticks_diff stays within its guaranteed window and the total keeps increasing across the tick-counter wrap.
+MicroPython's time.ticks_diff is only guaranteed correct when the two samples are less than half a tick period apart. A long-running device (> ~12.4 days on the 30-bit clock of the 32-bit RP2 builds) violates that: a single ticks_diff(now, boot_ticks_ms) returns a negative or wrapped value even though the device is alive and well. The fix accumulates deltas between consecutive samples (each a recent pair) into a running total, so every individual ticks_diff stays within its guaranteed window and the total keeps increasing across the tick-counter wrap.
 
-These tests drive the PRODUCTION uptime module (not a copy) under a clock that faithfully models MicroPython's 32-bit ticks -- including the signed two's-complement result of ticks_diff and the counter wrapping past 2**32 -- plus one end-to-end check through Core 1's _message_time to confirm uptime and the UTC timestamp both survive a wrap."""
+These tests drive the PRODUCTION uptime module (not a copy) under a clock that faithfully models MicroPython's 30-bit ticks -- including the signed two's-complement result of ticks_diff, the OverflowError ticks_add raises at half the period, and the counter wrapping past 2**30 -- plus one end-to-end check through Core 1's _message_time to confirm uptime and the UTC timestamp both survive a wrap."""
 
 import importlib
 import os as _real_os
@@ -14,16 +14,18 @@ import pathlib
 import sys
 import time as _real_time
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-TICKS_PERIOD = 1 << 32
-HALF_PERIOD = 1 << 31
+TICKS_PERIOD = 1 << 30  # 32-bit MicroPython builds (RP2): 30-bit tick values
+HALF_PERIOD = 1 << 29
 
 
 class WrappingFakeTime:
-    """Model MicroPython's 32-bit monotonic ticks.
+    """Model MicroPython's 30-bit monotonic ticks (32-bit RP2 builds).
 
-    ticks_diff returns the signed two's-complement difference (correct only within half a period), and the counter wraps past 2**32."""
+    ticks_diff returns the signed two's-complement difference (correct only within half a period), ticks_add rejects deltas at or beyond half a period, and the counter wraps past 2**30."""
 
     def __init__(self, start_ms):
         self.now_ms = start_ms % TICKS_PERIOD
@@ -41,6 +43,11 @@ class WrappingFakeTime:
         return diff
 
     def ticks_add(self, base, delta):
+        # MicroPython raises when the delta reaches half the period, so
+        # ticks_diff can still round-trip it (delta = +-TICKS_PERIOD/2 is
+        # both endpoints of the legal range).
+        if abs(delta) >= HALF_PERIOD:
+            raise OverflowError("ticks interval overflow")
         return (base + delta) % TICKS_PERIOD
 
     def sleep_ms(self, ms):
@@ -94,9 +101,9 @@ def test_uptime_advances_with_normal_progression():
 def test_uptime_stays_increasing_across_wrap_and_half_period():
     """Uptime keeps increasing once elapsed time exceeds half a tick period.
 
-    The counter wraps past 2**32 (now ends up numerically below boot) and the total elapsed (3 * 2**30) exceeds half a period, the regime where a single ticks_diff(now, boot) is wrong. Each step is taken and sampled before the next (as the run loops do), so every individual ticks_diff compares recent samples."""
-    step = 1 << 30  # ~12.4 days; < half a period, so a single diff is valid
-    boot = 3 * (1 << 30)  # just below the 2**32 wrap
+    The counter wraps past 2**30 (now ends up numerically below boot) and the total elapsed (3 * 2**28) exceeds half a period, the regime where a single ticks_diff(now, boot) is wrong. Each step is taken and sampled before the next (as the run loops do), so every individual ticks_diff compares recent samples."""
+    step = 1 << 28  # ~3.1 days; < half a period, so a single diff is valid
+    boot = 3 * step  # at 3/4 of the counter, so the steps cross the 2**30 wrap
     fake = WrappingFakeTime(boot)
     saved = _save_time()
     try:
@@ -126,7 +133,7 @@ def test_uptime_never_decreases_under_repeated_sampling():
         state = uptime.create_uptime_state(fake.now_ms)
         previous = uptime.current_uptime_ms(state)
         for _ in range(20):
-            fake.advance(100)  # crosses the half-period and the 2**32 wrap
+            fake.advance(100)  # crosses the half-period and the 2**30 wrap
             current = uptime.current_uptime_ms(state)
             assert current >= previous
             previous = current
@@ -135,6 +142,22 @@ def test_uptime_never_decreases_under_repeated_sampling():
 
 
 # --- Core 1 integration: uptime and UTC timestamp survive a wrap ---------
+
+
+def test_ticks_add_rejects_half_period_deltas():
+    """The fake's ticks_add matches MicroPython: +-half the period overflows.
+
+    A delta of exactly HALF_PERIOD is ambiguous for ticks_diff, so MicroPython raises OverflowError at both endpoints; the legal range is +-HALF_PERIOD - 1. Production deltas are config-bounded below this, so only a bug could reach it."""
+    fake = WrappingFakeTime(0)
+    assert fake.ticks_add(0, HALF_PERIOD - 1) == HALF_PERIOD - 1
+    assert fake.ticks_add(0, -(HALF_PERIOD - 1)) == TICKS_PERIOD - HALF_PERIOD + 1
+    assert fake.ticks_diff(fake.ticks_add(0, HALF_PERIOD - 1), 0) == HALF_PERIOD - 1
+    with pytest.raises(OverflowError):
+        fake.ticks_add(0, HALF_PERIOD)
+    with pytest.raises(OverflowError):
+        fake.ticks_add(0, -HALF_PERIOD)
+    with pytest.raises(OverflowError):
+        fake.ticks_add(0, TICKS_PERIOD)
 
 
 class _Uname:
@@ -194,10 +217,10 @@ def _reload_core1_under_fakes(fake_time):
 def test_core1_message_time_uptime_and_timestamp_survive_wrap():
     """Core 1's uptime and UTC timestamp both stay correct across a wrap.
 
-    The UTC snapshot is taken at boot (a recent sample, as in production where it is refreshed periodically). The tick counter then wraps past 2**32. Uptime must keep increasing and the timestamp must track utc_epoch_ms + elapsed_since_snapshot -- both of which rely on recent-sample diffs, not a diff against the boot tick."""
+    The UTC snapshot is taken at boot (a recent sample, as in production where it is refreshed periodically). The tick counter then wraps past 2**30. Uptime must keep increasing and the timestamp must track utc_epoch_ms + elapsed_since_snapshot -- both of which rely on recent-sample diffs, not a diff against the boot tick."""
     from intercore import InterCore  # noqa: E402
 
-    boot = TICKS_PERIOD - 1000  # near the top of the 32-bit counter
+    boot = TICKS_PERIOD - 1000  # near the top of the 30-bit counter
     fake = WrappingFakeTime(boot)
     saved_time = _save_time()
     saved_machine = sys.modules.get("machine")
@@ -228,7 +251,7 @@ def test_core1_message_time_uptime_and_timestamp_survive_wrap():
         state = uptime.create_uptime_state(boot)
         samples = [core1._message_time(bus, state)]
         for _ in range(3):
-            fake.advance(500)  # crosses the 2**32 wrap partway through
+            fake.advance(500)  # crosses the 2**30 wrap partway through
             samples.append(core1._message_time(bus, state))
 
         # Uptime increased across the wrap (500ms steps from boot).
