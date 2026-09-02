@@ -129,9 +129,107 @@ def test_network_probe_timeout_sec_is_reboot_required():
 # ---------------------------------------------------------------------------
 
 
-def test_recovery_valid_config_wins_and_cleans_stale_artifacts(config_dir):
-    (config_dir / "config.json.old").write_text(json.dumps(_base_config()))
-    (config_dir / "config.json.tmp").write_text(json.dumps(_hot_candidate()))
+def test_recovery_valid_old_wins_over_uncommitted_candidate(config_dir):
+    """A valid .old means the promotion never reached its commit point: the
+    previous committed config is restored even when the promoted config.json
+    is itself valid."""
+    old = _base_config()
+    (config_dir / "config.json").write_text(json.dumps(_hot_candidate()))
+    (config_dir / "config.json.old").write_text(json.dumps(old))
+
+    manager = ConfigManager(str(config_dir / "config.json"))
+    config = manager.recover()
+
+    assert config == old
+    assert manager.read_persisted() == old
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_recovery_restores_old_after_hot_promotion_reset(config_dir):
+    """Reset after begin_write()'s promotion but before commit_hot_reload():
+    config.json holds the candidate and .old the previous committed config —
+    recovery must roll the unacknowledged candidate back, not commit it."""
+    old = _base_config()
+    (config_dir / "config.json").write_text(json.dumps(_hot_candidate()))
+    (config_dir / "config.json.old").write_text(json.dumps(old))
+
+    manager = ConfigManager(str(config_dir / "config.json"))
+    config = manager.recover()
+
+    assert config == old
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_recovery_pending_hot_ack_rolls_back_after_reboot(config_dir):
+    """A hot write whose Core 1 acknowledgement never arrived: the durable
+    state is the promoted config.json with .old retained (transaction_active
+    is in memory only). A fresh boot recovers the previous committed
+    config."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    manager.begin_write(_hot_candidate())
+
+    assert manager.transaction_active is True
+    assert manager.read_persisted() == _hot_candidate()
+    assert (config_dir / "config.json.old").exists()
+
+    fresh = ConfigManager(str(config_dir / "config.json"))
+    config = fresh.recover()
+
+    assert config == _base_config()
+    assert fresh.read_persisted() == _base_config()
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_recovery_keeps_candidate_after_hot_commit(config_dir):
+    """A committed hot reload (old released and synced) is the committed
+    steady state: recovery must not roll it back."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    manager.begin_write(_hot_candidate())
+    manager.commit_hot_reload()
+
+    assert not (config_dir / "config.json.old").exists()
+
+    fresh = ConfigManager(str(config_dir / "config.json"))
+    config = fresh.recover()
+
+    assert config == _hot_candidate()
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_recovery_rolls_back_interrupted_reboot_required_promotion(config_dir):
+    """Reset after a reboot-required promotion but before its commit removed
+    .old: the previous committed config wins — begin_write had not completed
+    and no success could have been reported."""
+    old = _base_config()
+    (config_dir / "config.json").write_text(json.dumps(_reboot_candidate()))
+    (config_dir / "config.json.old").write_text(json.dumps(old))
+
+    manager = ConfigManager(str(config_dir / "config.json"))
+    config = manager.recover()
+
+    assert config == old
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_recovery_keeps_completed_reboot_required_write(config_dir):
+    """A finished reboot-required write reached its commit point (.old
+    removed and synced): the candidate is committed and survives reboot."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    manager.begin_write(_reboot_candidate())
+
+    assert not (config_dir / "config.json.old").exists()
+
+    fresh = ConfigManager(str(config_dir / "config.json"))
+    config = fresh.recover()
+
+    assert config == _reboot_candidate()
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_recovery_uses_valid_current_when_old_is_invalid(config_dir):
+    """.old wins only when it is itself valid; a corrupt .old is released
+    with the stale artifacts."""
+    (config_dir / "config.json.old").write_text("{ broken")
 
     manager = ConfigManager(str(config_dir / "config.json"))
     config = manager.recover()

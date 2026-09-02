@@ -153,7 +153,6 @@ class DeviceManager:
         device_type = device_def["device_type"]
         sensor_type = device_def.get("sensor_type", "unknown")
         name = device_def.get("name")
-        attempt_logs = []
 
         # Step 1: Construct the driver
         driver, driver_error = self._create_driver(device_def)
@@ -161,18 +160,18 @@ class DeviceManager:
             return self._record_driver_failure(device_id, device_type, driver_error)
 
         # Step 2: Initialize the driver with retries
-        attempts_used, initialized = self._initialize_driver_with_retries(
-            driver, device_def, device_id, device_type, attempt_logs
+        attempts_used, initialized, last_error = self._initialize_driver_with_retries(
+            driver, device_def
         )
 
         if not initialized:
             return self._record_initialization_failure(
-                device_id, device_type, attempts_used, attempt_logs
+                device_id, device_type, attempts_used, last_error
             )
 
         # Step 3: Success - create ManagedDevice
         return self._record_success(
-            device_id, device_type, sensor_type, driver, attempts_used, attempt_logs, name
+            device_id, device_type, sensor_type, driver, attempts_used, name=name
         )
 
     def _create_driver(self, device_def):
@@ -184,10 +183,12 @@ class DeviceManager:
         except Exception as err:
             return None, err
 
-    def _initialize_driver_with_retries(self, driver, device_def, device_id, device_type, attempt_logs):
+    def _initialize_driver_with_retries(self, driver, device_def):
+        # Only the attempt count and the final error are retained: the recovery
+        # algorithm needs neither per-attempt history, and retaining it grew
+        # heap on the startup-failure path for a large configured retry count.
         attempts_used = 0
         last_error = None
-        initialized = False
         device_config = device_def["config"]
 
         for attempt in range(1, self._device_initialization_attempts + 1):
@@ -200,26 +201,11 @@ class DeviceManager:
                 # Pass config to initialize - this is the new interface
                 driver.initialize(device_config)
                 # Initialization succeeded (returns None, raises on failure)
-                attempt_logs.append({
-                    "device_id": device_id,
-                    "device_type": device_type,
-                    "attempt": attempt,
-                    "success": True,
-                    "error": None,
-                })
-                initialized = True
-                break
+                return attempts_used, True, None
             except MemoryError:
                 raise
             except Exception as err:
                 last_error = str(err)
-                attempt_logs.append({
-                    "device_id": device_id,
-                    "device_type": device_type,
-                    "attempt": attempt,
-                    "success": False,
-                    "error": last_error,
-                })
                 if attempt < self._device_initialization_attempts:
                     # Not the final attempt - wait before retry; the sleep
                     # refreshes the liveness stamp at each step boundary, so
@@ -227,40 +213,31 @@ class DeviceManager:
                     # Core 0's watchdog bound.
                     self._sleep_with_activity_refresh(self._device_initialization_retry_delay_ms)
 
-        return attempts_used, initialized
+        return attempts_used, False, last_error
 
     def _record_driver_failure(self, device_id, device_type, error):
-        attempt_logs = [{
-            "device_id": device_id,
-            "device_type": device_type,
-            "attempt": 1,
-            "success": False,
-            "error": str(error),
-        }]
+        last_error = str(error)
         failed_details = [{
             "device_id": device_id,
             "device_type": device_type,
             "initialization_attempts_used": 1,
-            "last_error": str(error),
+            "last_error": last_error,
         }]
         self._failed_devices[device_id] = {
             "id": device_id,
             "device": device_type,
             "state": DEVICE_STATE_INITIALIZATION_FAILED,
             "initialization_attempts_used": 1,
-            "failure_reason": str(error),
+            "failure_reason": last_error,
         }
         return {
             "success": False,
             "device_id": device_id,
             "device_type": device_type,
-            "attempt_logs": attempt_logs,
             "failed_details": failed_details,
         }
 
-    def _record_initialization_failure(self, device_id, device_type, attempts_used, attempt_logs):
-        last_error = attempt_logs[-1]["error"] if attempt_logs else "Unknown error"
-
+    def _record_initialization_failure(self, device_id, device_type, attempts_used, last_error):
         failed_details = [{
             "device_id": device_id,
             "device_type": device_type,
@@ -278,11 +255,10 @@ class DeviceManager:
             "success": False,
             "device_id": device_id,
             "device_type": device_type,
-            "attempt_logs": attempt_logs,
             "failed_details": failed_details,
         }
 
-    def _record_success(self, device_id, device_type, sensor_type, driver, attempts_used, attempt_logs, name=None):
+    def _record_success(self, device_id, device_type, sensor_type, driver, attempts_used, name=None):
         managed_device = ManagedDevice(
             device_id=device_id,
             device_type=device_type,
@@ -298,29 +274,26 @@ class DeviceManager:
             "success": True,
             "device_id": device_id,
             "device_type": device_type,
-            "attempt_logs": attempt_logs,
             "failed_details": [],
         }
 
     def initialize_devices(self):
         """Initialize all configured devices, in configuration order.
 
-        Construct the driver once per device, then attempt initialization up to device_initialization_attempts (retry delay between attempts); on final failure record the device and continue. Must be called on Core 1. Returns (initialized_count, failed_device_details, attempt_logs)."""
+        Construct the driver once per device, then attempt initialization up to device_initialization_attempts (retry delay between attempts); on final failure record the device and continue. Must be called on Core 1. Returns (initialized_count, failed_device_details), where failed_device_details carries each failed device's attempts_used and last_error (no per-attempt history)."""
         initialized_count = 0
         all_failed_device_details = []
-        all_attempt_logs = []
 
         for device_def in self._devices_config:
             # Progress boundary: covers driver construction, which precedes
             # the attempt loop below and could itself take long.
             self._refresh_activity()
             result = self._initialize_single_device(device_def)
-            all_attempt_logs.extend(result["attempt_logs"])
             all_failed_device_details.extend(result["failed_details"])
             if result["success"]:
                 initialized_count += 1
 
-        return initialized_count, all_failed_device_details, all_attempt_logs
+        return initialized_count, all_failed_device_details
 
     def get_active_devices(self):
         """Get the active managed devices in configuration order.

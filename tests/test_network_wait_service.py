@@ -154,6 +154,9 @@ class _FailingClient:
 
     def __init__(self, client_id, broker, keepalive=0):
         type(self).attempts += 1
+        # A real MQTTClient always has a sock attribute (None until
+        # connected); _close_old_client() reads it on the next attempt.
+        self.sock = None
 
     def set_callback(self, callback):
         pass

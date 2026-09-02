@@ -170,9 +170,12 @@ class FakeMqtt:
         if doc.get("message_type") == "info_request":
             self._last_info_request = doc
         if outcome == "fail":
-            # A failed QoS 1 publish drops the session, as the real client does.
+            # A failed QoS 1 publish drops the session, as the real client
+            # does. A lost PUBACK is a transport failure (the socket timeout
+            # the real client hits), so it is raised as OSError -- the type
+            # the boundary classifies as an outage, not a programming bug.
             self.mark_disconnected()
-            raise RuntimeError("PUBACK lost (simulated ambiguous QoS 1 failure)")
+            raise OSError("PUBACK lost (simulated ambiguous QoS 1 failure)")
 
     def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):
         # Simulate the startup probes: fail the first fail_probes_times
@@ -522,7 +525,7 @@ def test_sequence_not_reused_across_ambiguous_qos1_failure_and_reconnect(make_co
     mqtt.publish_script = ["fail", "ok", "ok"]
 
     # Attempt 1: telemetry A transmits, the PUBACK is lost.
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OSError):
         instance._publish_entry(entry)
     # The entry stays in flight (QoS 1 must not drop it) and carries its
     # claimed number so a retry can reuse it.
@@ -573,7 +576,7 @@ def test_command_response_retry_preserves_sequence_across_intervening_message(ma
     instance._pending_core0_responses.append(response)
 
     # Attempt 1: transmits, PUBACK lost -> fails; the response stays pending.
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OSError):
         instance._service_pending_core0_response()
     first_frame = mqtt.published[0][1]
     first_seq = json.loads(first_frame)["sequence"]
@@ -600,3 +603,33 @@ def test_command_response_retry_preserves_sequence_across_intervening_message(ma
     assert retry_seq == first_seq
     assert first_frame == retry_frame  # same logical message: same identity AND content
     assert not instance._pending_core0_responses  # consumed on success
+
+
+def test_transient_publish_failure_keeps_connection_log_pending(make_core0):
+    """A transport failure must NOT discard the connection log.
+
+    The failure is a link condition, not a verdict on the event: the log stays
+    pending (the queue is bounded, so this cannot retry forever) and the next
+    service pass after the link recovers delivers the same event -- a
+    reconnect log is most diagnostic exactly during the instability that
+    dropped it. The permanent case (splice overflow) is still dropped, and
+    stays covered by test_connection_log_oversized_by_the_envelope_is_dropped_not_raised."""
+    instance = make_core0()
+    mqtt = instance._mqtt
+    mqtt.publish_script = ["fail", "ok"]
+
+    instance._queue_connection_log(
+        "mqtt_connection_established", "Connected to MQTT broker", "mqtt", {}
+    )
+
+    # Attempt 1: the ambiguous QoS 1 failure raises; the log must survive it.
+    instance._service_pending_connection_log()
+    assert len(instance._pending_connection_logs) == 1
+    assert instance._pending_connection_logs[0]["payload"]["event"] == "mqtt_connection_established"
+
+    # Attempt 2: the link has recovered; the SAME event is delivered and only
+    # now is the pending entry consumed.
+    instance._service_pending_connection_log()
+    assert instance._pending_connection_logs == []
+    frame = json.loads(mqtt.published[-1][1])
+    assert frame["payload"]["event"] == "mqtt_connection_established"

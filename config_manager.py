@@ -194,27 +194,16 @@ class ConfigManager:
     def recover(self):
         """Boot recovery: settle the committed config before anything else runs.
 
-        Priority: a valid config.json is authoritative (stale .old/.tmp are
-        removed only AFTER this decision); else a valid .old is restored
-        over the invalid current config; else a valid .tmp is promoted; else
+        A valid .old is authoritative: its presence means a promotion was
+        interrupted before its commit point, so it is restored even when the
+        current config.json is valid but uncommitted. Otherwise a valid
+        config.json is the committed steady state (an invalid .old is
+        released); a valid .tmp is the last-resort recovery artifact; else
         startup fails clearly. On success the steady state is exactly one
         valid config.json."""
         config_path = self._config_path
         old_path = self._old_path()
         tmp_path = self._tmp_path()
-
-        if self._path_exists(config_path):
-            try:
-                config = load_config(config_path)
-            except MemoryError:
-                raise
-            except ConfigError:
-                config = None
-            if config is not None:
-                self._remove_if_exists(old_path)
-                self._remove_if_exists(tmp_path)
-                os.sync()
-                return config
 
         if self._path_exists(old_path):
             try:
@@ -227,6 +216,19 @@ class ConfigManager:
                 if self._path_exists(config_path):
                     os.remove(config_path)
                 os.rename(old_path, config_path)
+                self._remove_if_exists(tmp_path)
+                os.sync()
+                return config
+
+        if self._path_exists(config_path):
+            try:
+                config = load_config(config_path)
+            except MemoryError:
+                raise
+            except ConfigError:
+                config = None
+            if config is not None:
+                self._remove_if_exists(old_path)
                 self._remove_if_exists(tmp_path)
                 os.sync()
                 return config

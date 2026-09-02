@@ -316,15 +316,15 @@ def test_device_manager_refreshes_between_attempts():
             _manager_config(attempts=3),
             activity_refresh=refresh,
         )
-        initialized, failed, attempt_logs = manager.initialize_devices()
+        initialized, failed = manager.initialize_devices()
     finally:
         dm.create_device = saved_create
 
-    # Normal initialization behavior is preserved.
+    # Normal initialization behavior is preserved: the device came up after
+    # exactly the attempts the FlakyDriver needed (3), none failed.
     assert initialized == 1
     assert failed == []
-    assert len(attempt_logs) == 3
-    assert attempt_logs[-1]["success"] is True
+    assert driver.calls == 3
 
     # Refresh at every progress boundary, strictly increasing per attempt.
     assert len(driver.observed) == 3
@@ -444,7 +444,7 @@ def test_device_manager_retry_sleep_refreshes_in_steps():
             _manager_config(attempts=2, retry_delay_ms=delay_ms),
             activity_refresh=refresh,
         )
-        initialized, failed, _ = manager.initialize_devices()
+        initialized, failed = manager.initialize_devices()
     finally:
         dm.create_device = saved_create
         dm.time = _HostTimeShim()
@@ -478,7 +478,7 @@ def test_device_manager_without_refresh_callback_is_unchanged():
     try:
         manager = dm.DeviceManager(_manager_config(attempts=1))
         assert manager._activity_refresh is None
-        initialized, failed, _ = manager.initialize_devices()
+        initialized, failed = manager.initialize_devices()
     finally:
         dm.create_device = saved_create
 

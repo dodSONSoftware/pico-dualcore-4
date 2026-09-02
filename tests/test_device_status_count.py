@@ -123,7 +123,7 @@ def test_one_failing_device_does_not_stop_the_others():
                 {"id": "dev2", "device_type": "test", "config": {}},
             ],
         })
-        initialized, failed, _ = manager.initialize_devices()
+        initialized, failed = manager.initialize_devices()
     finally:
         dm.create_device = saved
 

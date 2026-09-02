@@ -159,6 +159,8 @@ class FakeMqtt:
         self.connected = True
         self.published = []  # (topic, message, now_ms)
         self.check_msg_calls = 0
+        # Scripted check_msg() outcome: an exception to raise, or None (ok).
+        self.check_msg_error = None
         self.ping_calls = 0
         # Scripted failures: the next N publish_qos1 calls raise, the way a
         # lost PUBACK fails the exchange.
@@ -181,7 +183,9 @@ class FakeMqtt:
     def publish_qos1(self, topic, message):
         if self.fail_publishes:
             self.fail_publishes -= 1
-            raise RuntimeError("PUBACK timeout (simulated)")
+            # A lost PUBACK is a socket timeout in the real client: a
+            # transport failure (OSError), not a programming error.
+            raise OSError("PUBACK timeout (simulated)")
         self.published.append((topic, message, _FAKE_TIME.ticks_ms()))
         doc = json.loads(message)
         if doc.get("message_type") == "info_request":
@@ -196,6 +200,8 @@ class FakeMqtt:
         return 1
 
     def check_msg(self):
+        if self.check_msg_error is not None:
+            raise self.check_msg_error
         self.check_msg_calls += 1
         if self._utc_deliver and self._last_info_request is not None:
             self._utc_deliver = False
@@ -374,7 +380,7 @@ def test_failed_publish_records_no_completion(make_core0):
     _queue_telemetry(instance, 1)
     entry = instance._intercore.outbound_queue.take()
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OSError):
         instance._publish_entry(entry)
 
     assert instance._last_mqtt_publish_completed_ms is None
@@ -435,6 +441,40 @@ def test_run_loop_stays_responsive_while_gate_closed(make_core0):
     # ...and the only sleeps in run() are the normal 10 ms steps: no blocking
     # sleep of the configured delay anywhere in the runtime path.
     assert max(_FAKE_TIME.sleep_calls) == 10
+
+
+def test_run_loop_lets_a_message_handling_bug_escape(make_core0):
+    """A programming failure inside inbound message handling is NOT an MQTT
+    outage: it must escape run() to the top-level recovery boundary
+    (main.py's controlled reset), instead of the loop swallowing it, marking
+    the link down, reconnecting, and the broker redelivering the same QoS 1
+    message into the same fault -- hiding the real defect."""
+    instance = make_core0()
+    _utc_synchronized(instance)
+    instance._mqtt.check_msg_error = RuntimeError("bug in message handling")
+
+    # If the loop swallowed the bug, it would keep running until the stop
+    # mark (a LoopStop, which _run_to itself expects and would fail this
+    # test); the bug must instead escape run() here.
+    with pytest.raises(RuntimeError):
+        _run_to(instance, 250)
+
+
+def test_run_loop_treats_check_msg_transport_failure_as_outage(make_core0):
+    """The contrast: a genuine transport failure on the receive path is an
+    outage -- the run loop survives it (the next pass recovers the link)
+    instead of escaping to the reset boundary."""
+    instance = make_core0()
+    _utc_synchronized(instance)
+    instance._mqtt.check_msg_error = OSError("link stalled mid-packet")
+
+    # _run_to raises if the loop died on anything other than the stop mark:
+    # a swallowed OSError keeps the loop alive until it.
+    _run_to(instance, 250)
+
+    # The loop kept running across the failed polls (at t=100 and t=200)
+    # and the machine was never reset for it.
+    assert _MACHINE.reset_calls == 0
 
 
 def test_connection_log_then_queued_telemetry_paced(make_core0):

@@ -209,6 +209,7 @@ class FakeClient:
         self.publish_calls = []
         self.ping_error = None
         self.publish_error = None
+        self.check_msg_error = None
 
     def ping(self, timeout_sec=None):
         self.ping_calls.append(timeout_sec)
@@ -219,6 +220,10 @@ class FakeClient:
         self.publish_calls.append((args, kwargs))
         if self.publish_error is not None:
             raise self.publish_error
+
+    def check_msg(self, timeout_sec=None):
+        if self.check_msg_error is not None:
+            raise self.check_msg_error
 
 
 def _mqtt(ticks, keepalive=30):
@@ -1127,6 +1132,59 @@ def test_publish_qos1_timeout_marks_disconnected_and_raises(ticks):
 
     assert mqtt.is_connected() is False
     assert mqtt._disconnect_count == 1
+
+
+def test_publish_qos1_programming_failure_propagates_without_disconnect(ticks):
+    """A non-transport failure during a publish is a bug, not an outage: it
+    propagates WITHOUT marking the session down, so it reaches the
+    top-level recovery boundary (main.py's controlled reset) instead of
+    being reclassified as a network failure and retried into the same fault."""
+    mqtt = _mqtt(ticks)
+    mqtt._connected = True
+    client = FakeClient()
+    client.publish_error = ValueError("bug in frame construction")
+    mqtt._client = client
+
+    with pytest.raises(ValueError):
+        mqtt.publish_qos1("iot/v3/telemetry", "{}")
+
+    assert mqtt.is_connected() is True
+    assert mqtt._disconnect_count == 0
+
+
+def test_check_msg_transport_failure_marks_disconnected_and_raises(ticks):
+    """A stalled or corrupt inbound stream is a link condition: it fails the
+    poll, marks the session down, and propagates into network recovery."""
+    mqtt = _mqtt(ticks)
+    mqtt._connected = True
+    client = FakeClient()
+    client.check_msg_error = OSError("link stalled mid-packet")
+    mqtt._client = client
+
+    with pytest.raises(OSError):
+        mqtt.check_msg()
+
+    assert mqtt.is_connected() is False
+    assert mqtt._disconnect_count == 1
+
+
+def test_check_msg_callback_programming_failure_propagates_without_disconnect(ticks):
+    """check_msg() delivers a ready packet to the message callback, so a bug
+    in that callback is a programming failure, not a link condition: it must
+    propagate WITHOUT marking the session down (to the top-level recovery
+    boundary), instead of the loop reconnecting and the broker redelivering
+    the same QoS 1 message into the same fault."""
+    mqtt = _mqtt(ticks)
+    mqtt._connected = True
+    client = FakeClient()
+    client.check_msg_error = RuntimeError("bug in the message callback")
+    mqtt._client = client
+
+    with pytest.raises(RuntimeError):
+        mqtt.check_msg()
+
+    assert mqtt.is_connected() is True
+    assert mqtt._disconnect_count == 0
 
 
 def test_ping_sends_pingreq_through_client_and_resets_clock(ticks):

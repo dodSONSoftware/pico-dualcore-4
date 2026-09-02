@@ -41,6 +41,14 @@ MAX_MQTT_TOPIC_BYTES = 122
 # raises, or the scheduler re-anchor does.
 MAX_TICKS_SAFE_INTERVAL_MS = (1 << 29) - 1
 
+# Initialization retries ride out a transient driver.initialize() failure; a
+# device that fails all of them is broken, not flaky, so a handful of tries
+# is enough. The shipped value is 3. Bounding the count at the config
+# boundary keeps a misconfigured huge value from stalling startup for
+# attempts x retry delay and from growing retained per-device init
+# diagnostics on the exact startup-failure path where heap must stay flat.
+MAX_DEVICE_INITIALIZATION_ATTEMPTS = 10
+
 # Core 1 builds a per-device status structure before anything can be rejected
 # at the serialized-size ceiling — the bounded startup-log fallback calls
 # get_status_snapshot() before it reduces to counts, and the read-config
@@ -352,6 +360,18 @@ def validate_config(config):
     if config["mqtt_keepalive_sec"] > MAX_MQTT_KEEPALIVE_SEC:
         raise ConfigError(
             "mqtt_keepalive_sec must be at most {}".format(MAX_MQTT_KEEPALIVE_SEC),
+            code="invalid_value",
+        )
+
+    # Retries ride out transient driver.initialize() failures; a device that
+    # fails them all is broken, so a handful of tries is enough. A large
+    # count also stalled startup for attempts x retry delay and grew retained
+    # per-attempt init diagnostics on the startup-failure path.
+    if config["device_initialization_attempts"] > MAX_DEVICE_INITIALIZATION_ATTEMPTS:
+        raise ConfigError(
+            "device_initialization_attempts must be at most {}".format(
+                MAX_DEVICE_INITIALIZATION_ATTEMPTS
+            ),
             code="invalid_value",
         )
 

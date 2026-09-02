@@ -122,9 +122,11 @@ def test_transient_publish_failure_still_keeps_the_original_pending(make_core0):
     core0 = make_core0()
     response = _success_response("cfg-read-t", "read-config", {"ok": True})
     core0._pending_core0_responses.append(response)
-    core0._mqtt.publish_qos1.side_effect = RuntimeError("PUBACK timeout")
+    # A lost PUBACK is a socket timeout in the real client: a transport
+    # failure (OSError), not a programming error.
+    core0._mqtt.publish_qos1.side_effect = OSError("PUBACK timeout")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OSError):
         core0._service_pending_core0_response()
 
     assert core0._pending_core0_responses == [response]

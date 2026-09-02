@@ -13,6 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from command_protocol import MAX_SOURCE_LENGTH
 from config import (
+    MAX_DEVICE_INITIALIZATION_ATTEMPTS,
     MAX_DEVICES,
     MAX_MQTT_KEEPALIVE_SEC,
     MAX_MQTT_TOPIC_BYTES,
@@ -147,6 +148,7 @@ def test_validate_config_accepts_valid_config_without_any_file():
         (lambda config: config["devices"][0].__setitem__("id", "i" * (MAX_DEVICE_ID_LENGTH + 1)), "invalid_value"),
         (lambda config: config.update({"source": "S" * 16384}), "invalid_value"),
         (lambda config: config.update({"mqtt_keepalive_sec": MAX_MQTT_KEEPALIVE_SEC + 1}), "invalid_value"),
+        (lambda config: config.update({"device_initialization_attempts": MAX_DEVICE_INITIALIZATION_ATTEMPTS + 1}), "invalid_value"),
         (lambda config: config.update({"mqtt_topic_command": "t" * (MAX_MQTT_TOPIC_BYTES + 1)}), "invalid_value"),
         (lambda config: config.update({"mqtt_topic_command": "a\x00b"}), "invalid_value"),
         (lambda config: config.update({"read_loop_sec": MAX_TICKS_SAFE_INTERVAL_MS // 1000 + 1}), "invalid_value"),
@@ -196,6 +198,26 @@ def test_validate_config_keepalive_is_bounded_by_the_wire_limit():
     assert excinfo.value.code == "invalid_value"
     assert str(excinfo.value) == "mqtt_keepalive_sec must be at most {}".format(
         MAX_MQTT_KEEPALIVE_SEC
+    )
+
+
+def test_validate_config_device_initialization_attempts_is_bounded():
+    """Retries ride out a transient driver.initialize() failure; a device that
+    fails them all is broken, so the count carries an inclusive upper bound
+    (the shipped value 3 validates) instead of only the positive-integer lower
+    bound — a large value would stall startup and grow retained init
+    diagnostics on the startup-failure path."""
+    config = _base_config()
+    config["device_initialization_attempts"] = MAX_DEVICE_INITIALIZATION_ATTEMPTS
+    assert validate_config(config) is config
+
+    config = _base_config()
+    config["device_initialization_attempts"] = MAX_DEVICE_INITIALIZATION_ATTEMPTS + 1
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "device_initialization_attempts must be at most {}".format(
+        MAX_DEVICE_INITIALIZATION_ATTEMPTS
     )
 
 

@@ -6,11 +6,22 @@ import machine
 import time
 
 from debug import DEBUG
-from mqtt_client import MQTTClient
+from mqtt_client import MQTTClient, MQTTException
 
 # Bounded wait for PINGRESP so a dead link surfaces quickly instead of
 # blocking the Core 0 run loop for the full keepalive window.
 _MAX_PINGRESP_WAIT_SEC = 10
+
+# Expected failure classes at the MQTT boundary: transport failures
+# (OSError — socket errors, DNS, timeouts) and wire-protocol failures
+# (MQTTException — corrupt frame, bad CONNACK/SUBACK/PUBACK/PINGRESP).
+# Those are link conditions: mark the session down and let Core 0's
+# recovery reconnect. Anything else escaping the client (a bug in message
+# handling, callback code, or state handling) is a programming failure: it
+# must reach the top-level recovery boundary (main.py's controlled reset)
+# instead of being reclassified as a network outage, retried with the
+# broker redelivering the same message into the same fault, and hidden.
+MQTT_TRANSPORT_ERRORS = (OSError, MQTTException)
 
 
 class Mqtt:
@@ -131,7 +142,11 @@ class Mqtt:
                 return True
             except MemoryError:
                 raise
-            except Exception as err:
+            except MQTT_TRANSPORT_ERRORS as err:
+                # Only a transport/protocol failure is a failed attempt
+                # (retry with backoff): a programming failure here would be
+                # retried forever into the same fault, so it escapes
+                # (main.py's boundary fails fast) instead.
                 if self._connected:
                     self._disconnect_count += 1
                 self._connected = False
@@ -151,14 +166,16 @@ class Mqtt:
     def check_msg(self):
         """Poll for one pending inbound packet and deliver it to the callback.
 
-        The parse of a ready packet runs under the broker response timeout, so a link that stalls after the first frame byte fails this poll instead of hanging the run loop or short-reading a corrupt frame."""
+        The parse of a ready packet runs under the broker response timeout, so a link that stalls after the first frame byte fails this poll instead of hanging the run loop or short-reading a corrupt frame.
+
+        A ready packet is delivered to the message callback, so a bug in that callback is a programming failure, not a link condition: it propagates (without marking the session down) to the top-level recovery boundary, while a stalled/corrupt stream is a transport failure and fails this poll like any other."""
         if not self.is_connected():
             return
         try:
             self._client.check_msg(self._ack_timeout_ms / 1000.0)
         except MemoryError:
             raise
-        except Exception:
+        except MQTT_TRANSPORT_ERRORS:
             self.mark_disconnected()
             raise
 
@@ -174,7 +191,7 @@ class Mqtt:
             )
         except MemoryError:
             raise
-        except Exception:
+        except MQTT_TRANSPORT_ERRORS:
             self.mark_disconnected()
             raise
         self._touch()
@@ -191,7 +208,7 @@ class Mqtt:
             return True
         except MemoryError:
             raise
-        except Exception as err:
+        except MQTT_TRANSPORT_ERRORS as err:
             if DEBUG:
                 print("[DEBUG] QoS 1 publish with packet_id {} failed: {}".format(packet_id, err))
             self.mark_disconnected()
@@ -220,7 +237,7 @@ class Mqtt:
             self._client.ping(timeout_sec=min(_MAX_PINGRESP_WAIT_SEC, self._ping_interval_sec()))
         except MemoryError:
             raise
-        except Exception:
+        except MQTT_TRANSPORT_ERRORS:
             self.mark_disconnected()
             raise
         self._touch()

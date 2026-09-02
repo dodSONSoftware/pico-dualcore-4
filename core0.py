@@ -32,6 +32,7 @@ from intercore import (
 )
 from message_protocol import format_utc_epoch_ms
 from mqtt import Mqtt
+from mqtt_client import MQTTException
 from uptime import create_uptime_state, current_uptime_ms
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 from wifi import Wifi
@@ -219,6 +220,7 @@ class Core0:
                 "kind": KIND_LOG,
             }
             self._publish_entry(entry)
+            self._pending_connection_logs.pop(0)
         except MemoryError:
             raise
         except OutboundMessageTooLargeError as err:
@@ -227,13 +229,16 @@ class Core0:
             # no command to answer, so it is dropped (the entries behind it
             # keep moving) instead of retried.
             print("[WARNING] Connection log dropped, envelope splice exceeded the per-message ceiling: {}".format(err))
-        except Exception as err:
-            # Log serialization failures but still remove the log from the queue
-            # to prevent infinite retry loop
-            print("[DEBUG] Connection log failed: {}".format(err))
-        finally:
-            # Always remove the log from the queue to prevent infinite retry
             self._pending_connection_logs.pop(0)
+        except (OSError, MQTTException) as err:
+            # A transport/protocol failure is a link condition, not a verdict
+            # on the log: it stays pending (the queue is bounded, so this
+            # cannot retry forever) and the next service pass after the link
+            # recovers delivers it -- a connection event is most diagnostic
+            # exactly during the instability that dropped it. A programming
+            # failure is NOT caught here: it escapes to the top-level recovery
+            # boundary instead of being hidden as a "log publish failure".
+            print("[DEBUG] Connection log publish failed, retrying: {}".format(err))
 
     def _on_mqtt_message(self, topic, payload):
         try:
@@ -1588,7 +1593,11 @@ class Core0:
                     self._service_pending_connection_log()
                 except MemoryError:
                     raise
-                except Exception as err:
+                except (OSError, MQTTException) as err:
+                    # Transport failure only: a link condition, recovered on
+                    # the next pass. A programming failure escapes run() to
+                    # the top-level recovery boundary instead of being
+                    # reclassified as an MQTT outage.
                     if DEBUG:
                         print("[DEBUG] Connection log publish failed: {}".format(err))
 
@@ -1600,7 +1609,14 @@ class Core0:
                     self._mqtt.check_msg()
                 except MemoryError:
                     raise
-                except Exception as err:
+                except (OSError, MQTTException) as err:
+                    # Transport/protocol failure only: a stalled or corrupt
+                    # stream is a link condition (the session is already
+                    # marked down; recovery re-establishes it). A bug in the
+                    # message callback is a programming failure: it escapes
+                    # run() to the top-level recovery boundary instead of
+                    # being hidden as an outage and the message redelivered
+                    # into the same fault.
                     if DEBUG:
                         print("[DEBUG] MQTT check failed: {}".format(err))
                 self._last_command_poll_ms = now_ms
@@ -1623,7 +1639,10 @@ class Core0:
                     self._service_pending_core0_response()
                 except MemoryError:
                     raise
-                except Exception as err:
+                except (OSError, MQTTException) as err:
+                    # Transport failure only: the response stays pending for
+                    # the retry on the recovered link. A programming failure
+                    # escapes run() to the top-level recovery boundary.
                     if DEBUG:
                         print("[DEBUG] Core 0 response publish failed: {}".format(err))
 
@@ -1657,9 +1676,13 @@ class Core0:
                         print("[WARNING] Outbound entry dropped, envelope splice exceeded the per-message ceiling: {}".format(err))
                         if entry["kind"] == KIND_COMMAND_RESPONSE:
                             self._answer_discarded_command_response(entry)
-                    except Exception as err:
-                        # Keep the entry in flight so the next take() retries it:
-                        # QoS 1 must not drop a message the broker has not PUBACKed.
+                    except (OSError, MQTTException) as err:
+                        # Transport failure only: an ambiguous QoS 1 failure
+                        # keeps the entry in flight so the next take() retries
+                        # it -- QoS 1 must not drop a message the broker has
+                        # not PUBACKed. A programming failure escapes run()
+                        # to the top-level recovery boundary instead of
+                        # looping on the same fault.
                         if DEBUG:
                             print("[DEBUG] MQTT publish failed; entry remains in flight: {}".format(err))
                     else:
@@ -1671,7 +1694,11 @@ class Core0:
                         self._mqtt.ping()
                     except MemoryError:
                         raise
-                    except Exception as err:
+                    except (OSError, MQTTException) as err:
+                        # Transport failure only (the session is already
+                        # marked down; recovery re-establishes it). A
+                        # programming failure escapes run() to the top-level
+                        # recovery boundary.
                         if DEBUG:
                             print("[DEBUG] MQTT PINGREQ failed: {}".format(err))
 
