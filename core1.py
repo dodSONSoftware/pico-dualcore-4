@@ -154,11 +154,13 @@ def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup
 def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms):
     """Build the bounded startup-log fallback.
 
-    Device definitions carry no practical length or count bound for id, name,
-    or sensor_type, so the detailed startup log can exceed
-    MAX_OUTBOUND_MESSAGE_BYTES on an otherwise valid configuration. This
-    fallback keeps only the startup statuses and device counts -- no
-    per-device lists, no system_information -- and stays far under the
+    The detailed startup log is still the one payload that can exceed
+    MAX_OUTBOUND_MESSAGE_BYTES: device definitions carry count and length
+    bounds (config.MAX_DEVICES, device_factory.MAX_DEVICE_*_LENGTH), but the
+    payload also carries non-config growth -- the full system_information
+    sections and driver failure-reason strings -- whose size no config bound
+    can pin. This fallback keeps only the startup statuses and device counts
+    -- no per-device lists, no system_information -- and stays far under the
     ceiling. Losing the verbose diagnostics must not keep the device from
     entering normal operation."""
     device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())

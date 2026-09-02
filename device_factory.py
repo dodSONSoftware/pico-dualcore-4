@@ -21,6 +21,19 @@ _DEVICE_REGISTRY = {
 # aggregation so the definition shape has exactly one source.
 DEVICE_DEFINITION_KEYS = frozenset(("id", "device_type", "config", "name", "sensor_type"))
 
+# id, name, and sensor_type are spliced into per-message payloads (the
+# telemetry message's identity fields, the startup log's ready/failed device
+# lists, and the read-config response's whole configuration), so they carry a
+# length bound that keeps a worst-case valid message under
+# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB): with MAX_DEVICES entries the device
+# sections stay in low single-digit KB. 64 matches MAX_SOURCE_LENGTH, the
+# other wire identity string. The bound belongs at this validation boundary —
+# it must hold before Core 1 constructs per-device structures (including in
+# the startup log's bounded fallback), not where the message is serialized.
+MAX_DEVICE_ID_LENGTH = 64
+MAX_DEVICE_NAME_LENGTH = 64
+MAX_SENSOR_TYPE_LENGTH = 64
+
 
 def supported_device_types():
     """The registered device types, sorted (stable for diagnostics)."""
@@ -84,6 +97,11 @@ def validate_device_definition(device_definition):
         raise DeviceValidationError(
             "device id must be a non-empty string", code="invalid_value"
         )
+    if len(device_id) > MAX_DEVICE_ID_LENGTH:
+        raise DeviceValidationError(
+            "device id must be at most {} characters".format(MAX_DEVICE_ID_LENGTH),
+            code="invalid_value",
+        )
 
     device_type = device_definition["device_type"]
     if not isinstance(device_type, str) or not device_type:
@@ -94,11 +112,23 @@ def validate_device_definition(device_definition):
     if not isinstance(device_definition["config"], dict):
         raise DeviceValidationError("device config must be an object", code="invalid_value")
 
-    for key in ("name", "sensor_type"):
+    # name and sensor_type are optional: absent (or None) stays valid, a
+    # present value must be a string within the length bound.
+    for key, max_length in (
+        ("name", MAX_DEVICE_NAME_LENGTH),
+        ("sensor_type", MAX_SENSOR_TYPE_LENGTH),
+    ):
         value = device_definition.get(key)
-        if value is not None and not isinstance(value, str):
+        if value is None:
+            continue
+        if not isinstance(value, str):
             raise DeviceValidationError(
                 "device {} must be a string".format(key), code="invalid_value"
+            )
+        if len(value) > max_length:
+            raise DeviceValidationError(
+                "device {} must be at most {} characters".format(key, max_length),
+                code="invalid_value",
             )
 
     validate_device_config(device_type, device_definition["config"])

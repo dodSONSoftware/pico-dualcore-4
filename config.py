@@ -19,6 +19,19 @@ from version import CONFIG_SCHEMA_VERSION
 # brick the MQTT channel used to fix it).
 MAX_MQTT_KEEPALIVE_SEC = 65535
 
+# mqtt_client.subscribe() encodes the SUBSCRIBE Remaining Length in a
+# single byte (valid through 127), and the body is 2 packet-id + 2
+# topic-length + topic + 1 requested-QoS = topic + 5. A topic longer than
+# this makes the first Remaining Length byte 0x80 — which tells the broker
+# another length byte follows — so the packet is malformed and the
+# subscription silently never completes. Both subscribed topics
+# (mqtt_topic_command, mqtt_topic_info_response) are the channel used to
+# repair a bad configuration, so the bound belongs at the config boundary.
+# (Publish already uses the full variable-length encoding, so the same
+# bound is applied to every topic for a single simple policy: 1..N ASCII
+# bytes, no NUL.)
+MAX_MQTT_TOPIC_BYTES = 122
+
 # The RP2 builds give time.ticks_* 30-bit tick values, so ticks_add()/
 # ticks_diff() only express deltas below half the period (2^29 - 1 ms,
 # about 6.21 days); ticks_add raises OverflowError at half the period.
@@ -27,6 +40,16 @@ MAX_MQTT_KEEPALIVE_SEC = 65535
 # be reached (ticks_diff cannot return that positive value), the deadline
 # raises, or the scheduler re-anchor does.
 MAX_TICKS_SAFE_INTERVAL_MS = (1 << 29) - 1
+
+# Core 1 builds a per-device status structure before anything can be rejected
+# at the serialized-size ceiling — the bounded startup-log fallback calls
+# get_status_snapshot() before it reduces to counts, and the read-config
+# response carries the whole configuration. With per-field lengths bounded at
+# device_factory's MAX_DEVICE_*_LENGTH, this count keeps a worst-case valid
+# configuration's message sections (and the snapshot's transient heap) in low
+# single-digit KB, comfortably under MAX_OUTBOUND_MESSAGE_BYTES (16 KiB), so a
+# valid configuration can no longer exhaust heap during construction.
+MAX_DEVICES = 16
 
 
 class ConfigError(Exception):
@@ -139,6 +162,28 @@ def _require_non_empty_string(config, key):
         )
 
 
+def _require_mqtt_topic(config, key):
+    """A configured topic must be 1..MAX_MQTT_TOPIC_BYTES ASCII bytes with no NUL (see the bound's comment).
+
+    ASCII-only keeps UTF-8 byte length equal to character count, so the
+    single-byte Remaining Length arithmetic in mqtt_client.subscribe()
+    stays exact for every accepted topic."""
+    value = config[key]
+    if not isinstance(value, str) or not value:
+        raise ConfigError(
+            "{} must be a non-empty string".format(key), code="invalid_value"
+        )
+    if len(value) > MAX_MQTT_TOPIC_BYTES or any(
+        ch < "\u0001" or ch > "\u007f" for ch in value
+    ):
+        raise ConfigError(
+            "{} must be 1-{} ASCII bytes with no NUL".format(
+                key, MAX_MQTT_TOPIC_BYTES
+            ),
+            code="invalid_value",
+        )
+
+
 def _require_positive_integer(config, key):
     value = config[key]
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -184,6 +229,11 @@ def _validate_delays(config, key):
 def _validate_devices(devices):
     if not isinstance(devices, list) or not devices:
         raise ConfigError("devices must be a non-empty list", code="invalid_value")
+    if len(devices) > MAX_DEVICES:
+        raise ConfigError(
+            "devices must contain at most {} entries".format(MAX_DEVICES),
+            code="invalid_value",
+        )
 
     seen_ids = set()
     for index, device in enumerate(devices):
@@ -254,9 +304,12 @@ def validate_config(config):
             },
         )
 
+    for key in ("source", "mqtt_broker_ip_address"):
+        _require_non_empty_string(config, key)
+
+    # Topics carry the MQTT single-byte Remaining Length bound (subscribe)
+    # on top of the non-empty-string contract.
     for key in (
-        "source",
-        "mqtt_broker_ip_address",
         "mqtt_topic_telemetry",
         "mqtt_topic_log",
         "mqtt_topic_command",
@@ -266,7 +319,7 @@ def validate_config(config):
         "mqtt_topic_network_probe",
         "mqtt_topic_health",
     ):
-        _require_non_empty_string(config, key)
+        _require_mqtt_topic(config, key)
 
     # source is the device identity on the wire: it is spliced into every
     # Core 0 outbound envelope, so it carries a protocol-scale length bound

@@ -13,13 +13,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from command_protocol import MAX_SOURCE_LENGTH
 from config import (
+    MAX_DEVICES,
     MAX_MQTT_KEEPALIVE_SEC,
+    MAX_MQTT_TOPIC_BYTES,
     MAX_TICKS_SAFE_INTERVAL_MS,
     ConfigError,
     load_config,
     split_config,
     validate_config,
 )
+from device_factory import MAX_DEVICE_ID_LENGTH
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -138,8 +141,14 @@ def test_validate_config_accepts_valid_config_without_any_file():
         (lambda config: config.update({"read_loop_sec": "20"}), "invalid_value"),
         (lambda config: config.update({"wifi_reconnect_delays_sec": []}), "invalid_value"),
         (lambda config: config.update({"devices": []}), "invalid_value"),
+        (lambda config: config.update(
+            {"devices": [dict(config["devices"][0], id="device-{}".format(i)) for i in range(MAX_DEVICES + 1)]}
+        ), "invalid_value"),
+        (lambda config: config["devices"][0].__setitem__("id", "i" * (MAX_DEVICE_ID_LENGTH + 1)), "invalid_value"),
         (lambda config: config.update({"source": "S" * 16384}), "invalid_value"),
         (lambda config: config.update({"mqtt_keepalive_sec": MAX_MQTT_KEEPALIVE_SEC + 1}), "invalid_value"),
+        (lambda config: config.update({"mqtt_topic_command": "t" * (MAX_MQTT_TOPIC_BYTES + 1)}), "invalid_value"),
+        (lambda config: config.update({"mqtt_topic_command": "a\x00b"}), "invalid_value"),
         (lambda config: config.update({"read_loop_sec": MAX_TICKS_SAFE_INTERVAL_MS // 1000 + 1}), "invalid_value"),
         (lambda config: config.update({"mqtt_outbound_publish_delay_ms": MAX_TICKS_SAFE_INTERVAL_MS + 1}), "invalid_value"),
     ],
@@ -226,6 +235,32 @@ def test_validate_config_ticks_backed_intervals_are_bounded_by_the_ticks_limit(
     assert str(excinfo.value)
 
 
+def test_validate_config_device_count_is_bounded():
+    """The device list is a non-empty list of at most MAX_DEVICES entries: the
+    bound is inclusive, unique ids at the bound validate, and one more raises
+    with the stable code and exact message. The bound keeps a valid
+    configuration's per-device structures (startup-log fallback included) and
+    its read-config response under the message-size ceiling."""
+    template = copy.deepcopy(_base_config()["devices"][0])
+
+    config = _base_config()
+    config["devices"] = [
+        dict(template, id="device-{}".format(i)) for i in range(MAX_DEVICES)
+    ]
+    assert validate_config(config) is config
+
+    config = _base_config()
+    config["devices"] = [
+        dict(template, id="device-{}".format(i)) for i in range(MAX_DEVICES + 1)
+    ]
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "devices must contain at most {} entries".format(
+        MAX_DEVICES
+    )
+
+
 def test_validate_config_zero_publish_delay_stays_valid():
     """0 disables outbound pacing and must stay a valid ticks-safe value."""
     config = _base_config()
@@ -266,6 +301,10 @@ def test_validate_config_unknown_device_fields_are_qualified():
         (lambda config: config.update({"config_schema_version": 999}), "invalid_config_schema_version"),
         (lambda config: config.update({"read_loop_sec": "20"}), "invalid_value"),
         (lambda config: config.update({"source": "S" * (MAX_SOURCE_LENGTH + 1)}), "invalid_value"),
+        (lambda config: config.update(
+            {"devices": [dict(config["devices"][0], id="device-{}".format(i)) for i in range(MAX_DEVICES + 1)]}
+        ), "invalid_value"),
+        (lambda config: config["devices"][0].__setitem__("id", "i" * (MAX_DEVICE_ID_LENGTH + 1)), "invalid_value"),
     ],
 )
 def test_load_and_validate_paths_agree_on_rejections(tmp_path, mutate, code):

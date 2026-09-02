@@ -274,6 +274,17 @@ class MQTTClient:
     def subscribe(self, topic, qos=0):
         if self.cb is None:
             raise MQTTException("Subscribe callback is not set")
+        # The Remaining Length below is encoded in exactly one byte (valid
+        # through 127), so the body must fit: 2 packet-id + 2 topic-length
+        # + topic + 1 requested-QoS = topic + 5. Above 122 topic bytes the
+        # first length byte would gain the continuation bit (0x80) and the
+        # packet would be malformed. config.py is the authoritative
+        # boundary (MAX_MQTT_TOPIC_BYTES); this is defensive transport
+        # validation, as for the keepalive in connect().
+        if len(topic) > 122:
+            raise MQTTException(
+                "Subscribe topic exceeds the single-byte remaining-length bound"
+            )
         pkt = bytearray(b"\x82\0\0\0")
         pid = self.next_packet_id()
         struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, pid)

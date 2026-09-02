@@ -18,6 +18,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from config import ConfigError, validate_config
 from device_factory import (
+    MAX_DEVICE_ID_LENGTH,
+    MAX_DEVICE_NAME_LENGTH,
+    MAX_SENSOR_TYPE_LENGTH,
     allowed_config_keys,
     is_supported_device_type,
     supported_device_types,
@@ -106,6 +109,77 @@ def test_pure_validator_dispatches_to_the_device_validator():
     with pytest.raises(DeviceValidationError) as excinfo:
         validate_device_definition(_definition(config={"include": ["nope"]}))
     assert excinfo.value.code == "invalid_value"
+
+
+# ---------------------------------------------------------------------------
+# Length bounds: id, name, sensor_type stay protocol-scale
+# ---------------------------------------------------------------------------
+
+
+def test_pure_validator_binds_the_id_length():
+    """The bound is inclusive: 64 accepts, 65 rejects with the stable code."""
+    validate_device_definition(_definition(id="i" * MAX_DEVICE_ID_LENGTH))
+
+    with pytest.raises(DeviceValidationError) as excinfo:
+        validate_device_definition(_definition(id="i" * (MAX_DEVICE_ID_LENGTH + 1)))
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "device id must be at most {} characters".format(
+        MAX_DEVICE_ID_LENGTH
+    )
+
+
+@pytest.mark.parametrize(
+    "key,max_length",
+    [
+        ("name", MAX_DEVICE_NAME_LENGTH),
+        ("sensor_type", MAX_SENSOR_TYPE_LENGTH),
+    ],
+)
+def test_pure_validator_binds_the_optional_field_lengths(key, max_length):
+    """Optional fields keep their absent/null contract: present values are
+    bounded, missing or null ones stay valid."""
+    validate_device_definition(_definition(**{key: "v" * max_length}))
+    validate_device_definition(_definition(**{key: None}))
+    definition = _definition(**{key: "present"})
+    del definition[key]
+    validate_device_definition(definition)
+
+    with pytest.raises(DeviceValidationError) as excinfo:
+        validate_device_definition(_definition(**{key: "v" * (max_length + 1)}))
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "device {} must be at most {} characters".format(
+        key, max_length
+    )
+
+
+def test_config_level_rejects_an_overlong_device_id():
+    """The shared validate_config() path (startup and write-config) enforces
+    the pure validator's bound, not just the file-loaded path."""
+    config = _base_config()
+    config["devices"][0]["id"] = "i" * (MAX_DEVICE_ID_LENGTH + 1)
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+
+
+def test_worst_case_bounded_device_sections_stay_under_the_message_ceiling():
+    """The bound arithmetic: with MAX_DEVICES entries of maximum-length fields,
+    the per-device sections of a message (startup-log ready/failed lists,
+    telemetry identity fields, the read-config device section) stay under half
+    of MAX_OUTBOUND_MESSAGE_BYTES, leaving margin for the envelope, the fixed
+    top-level configuration, and the non-config growth (system_information,
+    driver failure reasons) that no config bound can pin."""
+    from config import MAX_DEVICES
+    from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
+
+    entry = {
+        "device": "system-information",
+        "name": "n" * MAX_DEVICE_NAME_LENGTH,
+        "sensor_type": "s" * MAX_SENSOR_TYPE_LENGTH,
+    }
+    worst_case_entry = len(json.dumps(entry).encode("utf-8"))
+    device_sections = MAX_DEVICES * worst_case_entry
+    assert device_sections < MAX_OUTBOUND_MESSAGE_BYTES // 2
 
 
 # ---------------------------------------------------------------------------
