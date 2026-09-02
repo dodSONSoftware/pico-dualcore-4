@@ -13,6 +13,12 @@ from device_factory import (
 from devices.device import DeviceValidationError
 from version import CONFIG_SCHEMA_VERSION
 
+# MQTT 3.1.1 encodes Keep Alive as a 16-bit word: 65535 seconds is the
+# maximum a broker can accept, so anything above it can never form a
+# connection (and this key is reboot-required, so a rejected write would
+# brick the MQTT channel used to fix it).
+MAX_MQTT_KEEPALIVE_SEC = 65535
+
 
 class ConfigError(Exception):
     """Configuration load/validation failure with a stable machine-readable code.
@@ -264,6 +270,16 @@ def validate_config(config):
         "health_interval_sec",
     ):
         _require_positive_integer(config, key)
+
+    # Keep Alive is a 16-bit word on the wire; above the maximum the CONNECT
+    # packet is unrepresentable, so the connection can never succeed. config.py
+    # is the authoritative boundary — mqtt_client.py keeps its check only as
+    # defensive transport validation.
+    if config["mqtt_keepalive_sec"] > MAX_MQTT_KEEPALIVE_SEC:
+        raise ConfigError(
+            "mqtt_keepalive_sec must be at most {}".format(MAX_MQTT_KEEPALIVE_SEC),
+            code="invalid_value",
+        )
 
     _require_nonnegative_integer(config, "device_initialization_retry_delay_ms")
     _require_nonnegative_integer(config, "mqtt_outbound_publish_delay_ms")

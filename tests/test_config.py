@@ -12,7 +12,13 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from command_protocol import MAX_SOURCE_LENGTH
-from config import ConfigError, load_config, split_config, validate_config
+from config import (
+    MAX_MQTT_KEEPALIVE_SEC,
+    ConfigError,
+    load_config,
+    split_config,
+    validate_config,
+)
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -132,6 +138,7 @@ def test_validate_config_accepts_valid_config_without_any_file():
         (lambda config: config.update({"wifi_reconnect_delays_sec": []}), "invalid_value"),
         (lambda config: config.update({"devices": []}), "invalid_value"),
         (lambda config: config.update({"source": "S" * 16384}), "invalid_value"),
+        (lambda config: config.update({"mqtt_keepalive_sec": MAX_MQTT_KEEPALIVE_SEC + 1}), "invalid_value"),
     ],
 )
 def test_validate_config_rejects_bad_configs_with_stable_codes(mutate, code):
@@ -158,6 +165,25 @@ def test_validate_config_source_is_bounded_at_protocol_scale():
     assert excinfo.value.code == "invalid_value"
     assert str(excinfo.value) == "source must be at most {} characters".format(
         MAX_SOURCE_LENGTH
+    )
+
+
+def test_validate_config_keepalive_is_bounded_by_the_wire_limit():
+    """Keep Alive is a 16-bit word on the wire, so the inclusive maximum
+    connects while the next value can never form a CONNECT packet — and
+    because the key is reboot-required, accepting it would persist a
+    configuration that bricks the MQTT channel used to repair it."""
+    config = _base_config()
+    config["mqtt_keepalive_sec"] = MAX_MQTT_KEEPALIVE_SEC
+    assert validate_config(config) is config
+
+    config = _base_config()
+    config["mqtt_keepalive_sec"] = MAX_MQTT_KEEPALIVE_SEC + 1
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "mqtt_keepalive_sec must be at most {}".format(
+        MAX_MQTT_KEEPALIVE_SEC
     )
 
 
