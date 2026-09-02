@@ -103,6 +103,13 @@ class MockSocket:
         # link: infinite-blocking -> HangDetected (the production wedge);
         # finite timeout -> OSError (the timeout fired, a bounded failure).
         self.write_stalls = False
+        # When set, the peer has closed the connection (EOF): a read with no
+        # data left returns b"" instead of blocking or timing out. Models the
+        # one documented exception to MicroPython's blocking no-short-read
+        # policy — EOF may return fewer than n bytes (here, zero) — so a frame
+        # truncated by a mid-stream broker/TCP disconnect surfaces the same way
+        # it does on the device.
+        self.eof = False
 
     def write(self, data, size=None):
         if self.write_stalls:
@@ -133,6 +140,10 @@ class MockSocket:
             del self.buffer[:n]
             return data
         # No data available: behavior depends on the socket mode.
+        if self.eof:
+            # The peer closed: a read at EOF returns b"" (the documented
+            # short-read exception), regardless of the blocking/timeout mode.
+            return b""
         if self.nonblocking:
             return b""
         if self.timeout_value is None:
@@ -1385,3 +1396,180 @@ def test_set_last_will_validates_parameters():
     client.set_last_will(b"lwt", b"offline", qos=1)
     assert client.lw_topic == b"lwt"
     assert client.lw_qos == 1
+
+
+# ---------------------------------------------------------------------------
+# EOF mid-frame: a broker/TCP disconnect at the wrong byte is a transport
+# failure, never a programming failure
+#
+# MicroPython blocking sockets guarantee a full-length read(n) EXCEPT at EOF,
+# where a read may return fewer than n bytes. The peer sends a partial frame
+# and then closes: the next read returns the short prefix (or b"" once drained).
+# Before the fix, the first such read into a fixed-width field (CONNACK,
+# SUBACK, PUBACK packet id, remaining length, topic length, topic, packet id,
+# payload) indexed the short bytes and raised IndexError — a programming
+# failure that is NOT in MQTT_TRANSPORT_ERRORS, so it escaped Core 0's
+# reconnect/recovery and reached main.py's controlled reset instead of an
+# ordinary MQTT reconnect. Each read now goes through _read_required(), which
+# turns a short/empty read into OSError (the transport class). These tests
+# therefore assert OSError — which by definition is not IndexError — and, for
+# the variable-width fields, that no truncated frame is delivered to the
+# callback at all (the old code delivered a corrupt frame rather than failing).
+# ---------------------------------------------------------------------------
+
+def test_connect_eof_during_connack_is_transport_error(monkeypatch):
+    """The peer sends 2 of the 4 CONNACK bytes then closes: a transport error.
+
+    The old code indexed resp[2]/resp[3] of the short read and raised IndexError,
+    which escapes Core 0's recovery and resets the MCU; it must be an OSError."""
+    sock = MockSocket(incoming=b"\x20\x02")  # CONNACK truncated at 2 of 4 bytes
+    sock.eof = True
+    _mock_broker_socket(monkeypatch, sock)
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+
+    with pytest.raises(OSError):
+        client.connect(timeout=4.0)
+
+
+def test_subscribe_eof_during_suback_is_transport_error():
+    """The peer sends the SUBACK opcode + 3 of 4 body bytes then closes.
+
+    The old code indexed resp[3] of the short read -> IndexError; it must be OSError."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    sock = MockSocket(incoming=b"\x90\x03\x00\x01")  # SUBACK truncated mid-packet
+    sock.eof = True
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.subscribe(b"t", qos=1)
+
+
+def test_publish_qos1_eof_during_puback_pid_is_transport_error():
+    """The peer sends the PUBACK opcode, length, and 1 of 2 packet-id bytes then
+    closes. The old code indexed rcv_pid[1] of the short read -> IndexError."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"\x40\x02\x01")  # PUBACK pid truncated
+    sock.eof = True
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.publish(b"t", b"x", qos=1)
+
+
+def test_wait_msg_eof_during_remaining_length_is_transport_error():
+    """The peer sends only the PUBLISH opcode then closes. The old code indexed
+    read(1)[0] in _recv_len() on the empty read -> IndexError; it must be OSError."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    sock = MockSocket(incoming=b"\x30")  # opcode, then EOF (no remaining-length byte)
+    sock.eof = True
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.wait_msg()
+
+
+def test_wait_msg_eof_during_topic_length_is_transport_error():
+    """The peer sends the PUBLISH header + 1 of the 2 topic-length bytes then
+    closes. The old code indexed topic_len[1] of the short read -> IndexError."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    sock = MockSocket(incoming=b"\x30\x05\x00")  # header + 1 of 2 topic-length bytes
+    sock.eof = True
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.wait_msg()
+
+
+def test_wait_msg_eof_during_topic_fails_without_delivering():
+    """The peer sends a PUBLISH with a topic and then closes mid-topic. A
+    truncated topic must fail the connection (OSError), NOT be delivered to the
+    callback — the old code passed the short topic straight to self.cb()."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+    # Remaining length 6 = topic-length field (2) + a 4-byte topic; only 3 of
+    # the 4 topic bytes arrive before EOF.
+    sock = MockSocket(incoming=b"\x30\x06\x00\x04abc")
+    sock.eof = True
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.wait_msg()
+
+    assert seen == []  # the truncated frame was never delivered
+
+
+def test_wait_msg_eof_during_packet_id_is_transport_error():
+    """The peer sends a QoS 1 PUBLISH and then closes after 1 of the 2 packet-id
+    bytes. The old code indexed pid[1] of the short read -> IndexError."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    # QoS 1 PUBLISH (0x32): remaining length 5 = topic-length (2) + topic (1)
+    # + packet id (2); topic "t", then 1 of the 2 packet-id bytes, then EOF.
+    sock = MockSocket(incoming=b"\x32\x05\x00\x01t\x01")
+    sock.eof = True
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.wait_msg()
+
+
+def test_wait_msg_eof_during_payload_fails_without_delivering():
+    """The peer sends a QoS 0 PUBLISH and then closes mid-payload. A truncated
+    payload must fail the connection (OSError), NOT be delivered to the
+    callback — the old code passed the short payload straight to self.cb()."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+    # Remaining length 6 = topic-length (2) + topic (1) + 3 payload bytes;
+    # topic "t", then 2 of the 3 payload bytes, then EOF.
+    sock = MockSocket(incoming=b"\x30\x06\x00\x01t\x78\x79")
+    sock.eof = True
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.wait_msg()
+
+    assert seen == []  # the truncated frame was never delivered
+
+
+def test_ping_eof_during_pingresp_length_is_transport_error():
+    """The peer sends the PINGRESP opcode then closes. The old code indexed
+    read(1)[0] on the empty read -> IndexError; it must be OSError."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"\xd0")  # PINGRESP opcode, then EOF (no length byte)
+    sock.eof = True
+    client.sock = sock
+
+    with pytest.raises(OSError):
+        client.ping(timeout_sec=1)
+
+
+def test_check_msg_eof_mid_packet_marks_disconnected(ticks, mock_select):
+    """An inbound frame truncated by a mid-stream EOF is a link condition.
+
+    Driven end-to-end through Mqtt.check_msg(): the truncated inbound PUBLISH
+    must mark the session down and raise the transport class (OSError) so Core
+    0 reconnects — never IndexError, which is not a transport error and would
+    escape Core 0's recovery boundary into main.py's controlled reset."""
+    mqtt = _mqtt(ticks)
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+    # QoS 0 PUBLISH: opcode, remaining length 6, topic-length 0x0001, topic
+    # "t", then 1 of the 3 payload bytes before the peer closes (EOF).
+    sock = MockSocket(incoming=b"\x30\x06\x00\x01t\x78")
+    sock.eof = True
+    client.sock = sock
+    mqtt._client = client
+    mqtt._connected = True
+
+    with pytest.raises(OSError):
+        mqtt.check_msg()
+
+    assert mqtt.is_connected() is False
+    assert mqtt._disconnect_count == 1
+    assert seen == []  # the truncated frame was never delivered

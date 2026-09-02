@@ -71,11 +71,25 @@ class MQTTClient:
             pass
         raise MQTTException(reason)
 
+    def _read_required(self, size):
+        # Read exactly `size` bytes, failing as a transport error on a short or
+        # empty read. A blocking socket guarantees a full-length read except at
+        # EOF, where read(n) may return fewer than n bytes. A short read here
+        # therefore means the link ended mid-frame (a broker/TCP disconnect at
+        # the wrong byte) and must surface as OSError — the class Core 0 treats
+        # as a transport failure and reconnects over — rather than letting the
+        # caller index the short bytes and raise IndexError, which escapes Core
+        # 0's recovery boundary and resets the MCU.
+        data = self.sock.read(size)
+        if data is None or len(data) != size:
+            raise OSError(-1)
+        return data
+
     def _recv_len(self):
         n = 0
         sh = 0
         while 1:
-            b = self.sock.read(1)[0]
+            b = self._read_required(1)[0]
             n |= (b & 0x7F) << sh
             if not b & 0x80:
                 return n
@@ -156,7 +170,7 @@ class MQTTClient:
         if self.user:
             self._send_str(self.user)
             self._send_str(self.pswd)
-        resp = self.sock.read(4)
+        resp = self._read_required(4)
         if resp[0] != 0x20 or resp[1] != 0x02:
             # A malformed CONNACK means the byte stream is not what the
             # handshake assumed; failing here (asserts are omitted under
@@ -251,14 +265,14 @@ class MQTTClient:
                 while 1:
                     op = self.wait_msg()
                     if op == 0x40:
-                        sz = self.sock.read(1)
+                        sz = self._read_required(1)
                         if sz != b"\x02":
                             # A PUBACK is exactly a 2-byte packet id; any
                             # other length corrupts the stream from here on.
                             self._abort_corrupt_inbound(
                                 "PUBACK with unexpected remaining length"
                             )
-                        rcv_pid = self.sock.read(2)
+                        rcv_pid = self._read_required(2)
                         rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
                         if pid == rcv_pid:
                             return
@@ -295,7 +309,7 @@ class MQTTClient:
         while 1:
             op = self.wait_msg()
             if op == 0x90:
-                resp = self.sock.read(4)
+                resp = self._read_required(4)
                 # print(resp)
                 if resp[1] != pkt[2] or resp[2] != pkt[3]:
                     raise MQTTException("Invalid SUBACK packet identifier")
@@ -322,7 +336,7 @@ class MQTTClient:
         if res == b"":
             raise OSError(-1)
         if res == b"\xd0":  # PINGRESP
-            sz = self.sock.read(1)[0]
+            sz = self._read_required(1)[0]
             if sz != 0:
                 # PINGRESP carries no payload; anything else is a corrupt
                 # stream and the leftover bytes make it unreadable.
@@ -368,7 +382,7 @@ class MQTTClient:
                 "Inbound packet too short for a topic length field"
             )
         remaining = sz - 2
-        topic_len = self.sock.read(2)
+        topic_len = self._read_required(2)
         topic_len = (topic_len[0] << 8) | topic_len[1]
         if topic_len > remaining:
             self._abort_corrupt_inbound(
@@ -376,7 +390,7 @@ class MQTTClient:
                     topic_len, remaining
                 )
             )
-        topic = self.sock.read(topic_len)
+        topic = self._read_required(topic_len)
         remaining -= topic_len
         if op & 6:
             if remaining < 2:
@@ -384,9 +398,9 @@ class MQTTClient:
                     "Inbound packet too short for a packet identifier"
                 )
             remaining -= 2
-            pid = self.sock.read(2)
+            pid = self._read_required(2)
             pid = pid[0] << 8 | pid[1]
-        msg = self.sock.read(remaining)
+        msg = self._read_required(remaining)
         self.cb(topic, msg)
         if op & 6 == 2:
             pkt = bytearray(b"\x40\x02\0\0")

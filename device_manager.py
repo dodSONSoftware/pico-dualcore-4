@@ -122,9 +122,12 @@ class DeviceManager:
         self._system_information = system_information
 
         # Optional liveness-stamp refresh callback, owned by Core 1 (which
-        # constructs this manager) and invoked at initialization progress
-        # boundaries. Without it, a legitimately long initialization
-        # (several devices x attempts x retry delays) would age Core 1's
+        # constructs this manager) and invoked at progress boundaries:
+        # initialization (per device, per attempt, per retry-sleep step) and
+        # the normal telemetry pass (per device, via process_device()).
+        # Without it, a legitimately long initialization (several devices x
+        # attempts x retry delays) or a telemetry pass whose cumulative reads
+        # exceed the watchdog bound (each read under it) would age Core 1's
         # liveness stamp past Core 0's watchdog bound and reset a healthy
         # board. A wedge inside a driver call stops the refresh and is still
         # caught. None (the default) leaves behavior unchanged.
@@ -302,7 +305,10 @@ class DeviceManager:
         return self._active_devices
 
     def process_device(self, managed_device):
-        """Process one device for the current cycle (normal read, or reinitialization if pending)."""
+        """Process one device for the current cycle (normal read, or reinitialization if pending).
+
+        Refreshes the liveness stamp at each device boundary: the telemetry pass refreshes once per device, not once per pass, so the watchdog measures the duration of one device operation (a wedge) rather than the cumulative duration of all of them (several legitimately slow reads that individually stay under the bound)."""
+        self._refresh_activity()
         if managed_device.reinitialize_pending:
             return self._process_reinitialization(managed_device)
 

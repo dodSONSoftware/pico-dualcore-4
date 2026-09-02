@@ -51,18 +51,12 @@ class Wifi:
     def _terminal_failure_statuses(self):
         """The WLAN association states that end a connect attempt, as ints.
 
-        WRONG_PASSWORD, NO_AP_FOUND, CONNECT_FAIL are final for the current connect() call; the values are read from the WLAN object, falling back to the documented MicroPython literals (2, 3, 4)."""
-        names = ("STAT_WRONG_PASSWORD", "STAT_NO_AP_FOUND", "STAT_CONNECT_FAIL")
-        literals = (2, 3, 4)
-        statuses = []
-        for name, literal in zip(names, literals):
-            value = getattr(self._wlan, name, None)
-            if not isinstance(value, int):
-                value = getattr(network.WLAN, name, None)
-            if not isinstance(value, int):
-                value = literal
-            statuses.append(value)
-        return statuses
+        WRONG_PASSWORD, NO_AP_FOUND, CONNECT_FAIL are final for the current connect() call. MicroPython exposes the STAT_* constants on the network module (Pico W: -3, -2, -1), so read them from there -- inventing literals is how 3 (STAT_GOT_IP on Pico W) almost became a "failure"."""
+        return (
+            network.STAT_WRONG_PASSWORD,
+            network.STAT_NO_AP_FOUND,
+            network.STAT_CONNECT_FAIL,
+        )
 
     def is_connected(self):
         try:

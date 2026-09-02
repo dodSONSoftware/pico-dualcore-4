@@ -526,6 +526,113 @@ def test_equal_priority_can_evict(monkeypatch):
     assert queue.take()["payload_bytes"] == b"new"
 
 
+def test_critical_cannot_evict_existing_critical(monkeypatch):
+    """CRITICAL is a non-evictable retention floor: an admitted CRITICAL entry
+    (a command response) cannot be displaced by another CRITICAL, so the
+    incoming entry is rejected for the producer to retain and retry instead."""
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    existing = b'{"id":"response-a"}'
+    assert (
+        queue.put_with_kind(KIND_COMMAND_RESPONSE, existing, RETENTION_PRIORITY_CRITICAL)
+        is True
+    )
+    heap.free_bytes = 0  # unrecoverable pressure
+    assert (
+        queue.put_with_kind(
+            KIND_COMMAND_RESPONSE, b'{"id":"response-b"}', RETENTION_PRIORITY_CRITICAL
+        )
+        is False
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == len(existing)
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 1
+    # The retained entry is the one admitted first.
+    assert queue.take()["payload_bytes"] == existing
+
+
+def test_critical_rejection_retains_original_payload(monkeypatch):
+    """Newest-CRITICAL-wins is not an acceptable implementation: the original
+    admitted response survives a rejected same-priority admission unchanged."""
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    existing = b'{"id":"response-a"}'
+    incoming = b'{"id":"response-b"}'
+    assert (
+        queue.put_with_kind(KIND_COMMAND_RESPONSE, existing, RETENTION_PRIORITY_CRITICAL)
+        is True
+    )
+    heap.free_bytes = 0  # unrecoverable pressure
+    assert (
+        queue.put_with_kind(KIND_COMMAND_RESPONSE, incoming, RETENTION_PRIORITY_CRITICAL)
+        is False
+    )
+    retained = queue.take()
+    assert retained["payload_bytes"] == existing
+    assert retained["payload_bytes"] != incoming
+    # The FIFO is empty: the rejected entry was never inserted.
+    assert queue.get_depth() == 1  # only the in-flight entry taken above
+
+
+def test_lower_priority_cannot_evict_critical(monkeypatch):
+    """A lower-priority incoming entry is rejected while a CRITICAL entry is
+    queued, even though equal-priority replacement applies to the replaceable
+    lower priorities (the invariant CRITICAL never evicts CRITICAL)."""
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    existing = b'{"id":"response-a"}'
+    assert (
+        queue.put_with_kind(KIND_COMMAND_RESPONSE, existing, RETENTION_PRIORITY_CRITICAL)
+        is True
+    )
+    heap.free_bytes = 0  # unrecoverable pressure
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b"t" * 8 * KB, RETENTION_PRIORITY_TELEMETRY)
+        is False
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == len(existing)
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 1
+    assert queue.take()["payload_bytes"] == existing
+
+
+def test_critical_evicts_lower_then_rejects_rather_than_evicting_critical(monkeypatch):
+    """CRITICAL may displace lower-priority entries, but once nothing but
+    CRITICAL entries remains, the incoming entry is rejected rather than
+    evicting an admitted CRITICAL one."""
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    existing = b'{"id":"response-a"}'
+    assert (
+        queue.put_with_kind(KIND_COMMAND_RESPONSE, existing, RETENTION_PRIORITY_CRITICAL)
+        is True
+    )
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b"t" * 8 * KB, RETENTION_PRIORITY_TELEMETRY)
+        is True
+    )
+    # 20 KiB short: evicting the 8 KiB telemetry entry is not enough to
+    # restore the reserve, and the CRITICAL entry must not be displaced.
+    heap.free_bytes = RESERVE - 20 * KB
+    assert (
+        queue.put_with_kind(
+            KIND_COMMAND_RESPONSE, b'{"id":"response-b"}', RETENTION_PRIORITY_CRITICAL
+        )
+        is False
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == len(existing)
+    assert status["messages_evicted"] == 1  # only the lower-priority entry
+    assert status["telemetry_evicted"] == 1
+    assert status["messages_rejected"] == 1
+    assert queue.take()["payload_bytes"] == existing
+
+
 def test_eviction_is_oldest_first_within_priority_class(monkeypatch):
     ic, heap = _queue(monkeypatch)
     queue = ic.outbound_queue

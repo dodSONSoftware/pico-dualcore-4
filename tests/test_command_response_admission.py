@@ -6,6 +6,7 @@
 
 The outbound queue distinguishes a transient rejection (False: heap pressure, retry later) from a permanent one (ValueError: the message can never be admitted). The command channel must honor that distinction: a permanently rejected response is answered with a small error response for the same command whose code states the actual cause -- "response_too_large" for an oversized response, "response_invalid" for a validation or serialization failure -- so a response can never permanently stall the command channel behind it."""
 
+import gc
 import json
 import pathlib
 import sys
@@ -104,6 +105,58 @@ def test_transient_rejection_keeps_the_same_response_pending():
     assert kind == KIND_COMMAND_RESPONSE
     assert message["payload"]["success"] is True
     assert priority == RETENTION_PRIORITY_CRITICAL
+
+
+def test_critical_vs_critical_rejection_keeps_both_responses_owned(monkeypatch):
+    """End-to-end with the real queue (the get-details regression): with
+    response A already admitted, the transient rejection of a second
+    CRITICAL response keeps A in the queue (never evicted) and B pending
+    for Core 1 to retry; once the heap recovers, B is admitted behind A.
+
+    At no point does either response exist in a state where neither Core 1
+    nor the queue owns it."""
+    intercore = InterCore(64 * 1024)
+    queue = intercore.outbound_queue
+
+    response_a = _success_response()
+    assert (
+        queue.put(response_a["kind"], response_a["message"], RETENTION_PRIORITY_CRITICAL)
+        is True
+    )
+
+    response_b = _success_response()
+    response_b["message"]["payload"]["command_id"] = "details-002"
+
+    # Unrecoverable heap pressure for the admission attempt that follows.
+    monkeypatch.setattr(gc, "mem_free", lambda: 0, raising=False)
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        pending = core1._admit_or_substitute_command_response(
+            intercore, object(), response_b
+        )
+
+    # Transient rejection: B stays pending for retry (no substitute was
+    # built), and A is still the only queued entry.
+    assert pending is response_b
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 1
+
+    # The heap recovers: the pending response is admitted on the retry.
+    monkeypatch.setattr(gc, "mem_free", lambda: 256 * 1024, raising=False)
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        assert core1._admit_or_substitute_command_response(intercore, object(), pending) is None
+    status = queue.status()
+    assert status["pending"] == 2
+    assert status["messages_evicted"] == 0
+
+    # A is still in the queue, admitted first, with B behind it.
+    first = queue.take()
+    assert json.loads(first["payload_bytes"])["payload"]["command_id"] == "details-001"
+    queue.complete_in_flight(first)
+    second = queue.take()
+    assert json.loads(second["payload_bytes"])["payload"]["command_id"] == "details-002"
+    queue.complete_in_flight(second)
 
 
 def test_oversized_rejection_is_answered_with_response_too_large():

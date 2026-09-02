@@ -81,16 +81,10 @@ class _FakeWLAN:
 class _StatusWLAN:
     """A Wi-Fi radio whose no-arg status() reports a fixed association state.
 
-    isconnected() never becomes True, so the only thing that can end the 20 s observation window early is the association state status() reports. The status_value attribute lets a test drive any state (terminal failure, still connecting, ...) and assert whether the attempt bails early or waits the full window; it also exposes the STAT_* names the firmware reads."""
+    isconnected() never becomes True, so the only thing that can end the 20 s observation window early is the association state status() reports. The status_value attribute lets a test drive any state (terminal failure, still connecting, ...) and assert whether the attempt bails early or waits the full window. The STAT_* constants the firmware compares against live on the fake network module, as they do in MicroPython."""
 
     IF_STA = 0
     PM_NONE = 0
-    STAT_IDLE = 0
-    STAT_CONNECTING = 1
-    STAT_WRONG_PASSWORD = 2
-    STAT_NO_AP_FOUND = 3
-    STAT_CONNECT_FAIL = 4
-    STAT_GOT_IP = 5
     status_value = 1  # default: CONNECTING (non-terminal -> full window)
 
     def __init__(self, interface):
@@ -110,37 +104,6 @@ class _StatusWLAN:
 
     def status(self, key=None):
         # No key -> the association state; a key -> a probe such as RSSI.
-        return type(self).status_value if key is None else -50
-
-    def ifconfig(self):
-        return ("192.168.1.100", "255.255.255.0", "192.168.1.1", "8.8.8.8")
-
-
-class _BareStatusWLAN:
-    """A radio that reports a status() value but exposes no STAT_* names.
-
-    status_value is expected to be a documented MicroPython association state (e.g. 2 = WRONG_PASSWORD); exercises the firmware's fallback to the documented values."""
-
-    IF_STA = 0
-    PM_NONE = 0
-    status_value = 2  # documented MicroPython WRONG_PASSWORD
-
-    def __init__(self, interface):
-        pass
-
-    def active(self, value):
-        pass
-
-    def config(self, **kwargs):
-        raise AttributeError("config unsupported")
-
-    def connect(self, ssid, password):
-        pass
-
-    def isconnected(self):
-        return False
-
-    def status(self, key=None):
         return type(self).status_value if key is None else -50
 
     def ifconfig(self):
@@ -173,6 +136,15 @@ class _FailingClient:
 # other host suites in tests/).
 _NETWORK_MODULE = types.ModuleType("network")
 _NETWORK_MODULE.WLAN = _FakeWLAN
+# The STAT_* association states live on the network module in MicroPython,
+# and the firmware reads them from there. Pinned to the real Pico W/Pico 2 W
+# values: on that platform 3 is STAT_GOT_IP (success), not a failure.
+_NETWORK_MODULE.STAT_IDLE = 0
+_NETWORK_MODULE.STAT_CONNECTING = 1
+_NETWORK_MODULE.STAT_WRONG_PASSWORD = -3
+_NETWORK_MODULE.STAT_NO_AP_FOUND = -2
+_NETWORK_MODULE.STAT_CONNECT_FAIL = -1
+_NETWORK_MODULE.STAT_GOT_IP = 3
 sys.modules["network"] = _NETWORK_MODULE
 sys.modules["machine"] = types.SimpleNamespace(
     unique_id=lambda: b"\x01\x02\x03\x04\x05"
@@ -339,7 +311,7 @@ def _assert_bailed_early(ticks, service):
 def test_wifi_terminal_failure_bails_early(ticks, monkeypatch):
     """A terminal WLAN status ends each attempt without the full 20 s window."""
     monkeypatch.setattr(wifi_mod.network, "WLAN", _StatusWLAN)
-    _StatusWLAN.status_value = _StatusWLAN.STAT_WRONG_PASSWORD
+    _StatusWLAN.status_value = wifi_mod.network.STAT_WRONG_PASSWORD
     service = _counting_service(ticks)
     wifi = wifi_mod.Wifi("test-ssid", "test-password", list(_RECONNECT_DELAYS_SEC), service)
 
@@ -350,7 +322,7 @@ def test_wifi_terminal_failure_bails_early(ticks, monkeypatch):
 def test_wifi_no_ap_bails_early(ticks, monkeypatch):
     """NO_AP_FOUND is terminal too: the attempt bails early, same as above."""
     monkeypatch.setattr(wifi_mod.network, "WLAN", _StatusWLAN)
-    _StatusWLAN.status_value = _StatusWLAN.STAT_NO_AP_FOUND
+    _StatusWLAN.status_value = wifi_mod.network.STAT_NO_AP_FOUND
     service = _counting_service(ticks)
     wifi = wifi_mod.Wifi("test-ssid", "test-password", list(_RECONNECT_DELAYS_SEC), service)
 
@@ -361,7 +333,7 @@ def test_wifi_no_ap_bails_early(ticks, monkeypatch):
 def test_wifi_connecting_state_waits_full_window(ticks, monkeypatch):
     """A still-connecting state is NOT terminal: every attempt waits fully."""
     monkeypatch.setattr(wifi_mod.network, "WLAN", _StatusWLAN)
-    _StatusWLAN.status_value = _StatusWLAN.STAT_CONNECTING
+    _StatusWLAN.status_value = wifi_mod.network.STAT_CONNECTING
     service = _counting_service(ticks)
     wifi = wifi_mod.Wifi("test-ssid", "test-password", list(_RECONNECT_DELAYS_SEC), service)
 
@@ -376,12 +348,24 @@ def test_wifi_connecting_state_waits_full_window(ticks, monkeypatch):
     assert len(service.calls) >= len(_RECONNECT_DELAYS_SEC) * 200
 
 
-def test_wifi_terminal_failure_via_documented_values(ticks, monkeypatch):
-    """Even with no STAT_* names, a documented terminal value bails early."""
-    monkeypatch.setattr(wifi_mod.network, "WLAN", _BareStatusWLAN)
-    _BareStatusWLAN.status_value = 2  # documented MicroPython WRONG_PASSWORD
+def test_wifi_got_ip_is_not_a_failure(ticks, monkeypatch):
+    """STAT_GOT_IP is the Pico W *success* state (3): it is never terminal.
+
+    The removed literal fallback (2, 3, 4) would have classified 3 as a
+    failure and bailed the attempt early -- a connected radio being treated
+    as one that had failed. It must instead wait the full observation window
+    without an early exit (isconnected() on this fake never becomes True)."""
+    monkeypatch.setattr(wifi_mod.network, "WLAN", _StatusWLAN)
+    _StatusWLAN.status_value = wifi_mod.network.STAT_GOT_IP
     service = _counting_service(ticks)
     wifi = wifi_mod.Wifi("test-ssid", "test-password", list(_RECONNECT_DELAYS_SEC), service)
 
     assert wifi.connect() is False
-    _assert_bailed_early(ticks, service)
+
+    # No attempt bailed early: every one ran its full 20 s window, so the
+    # elapsed time includes the whole observation budget, not just backoff.
+    backoff_ms = sum(_RECONNECT_DELAYS_SEC[:-1]) * 1000
+    observation_ms = len(_RECONNECT_DELAYS_SEC) * 200 * 100
+    elapsed_ms = ticks.now_ms
+    assert elapsed_ms >= backoff_ms + observation_ms - 2000
+    assert len(service.calls) >= len(_RECONNECT_DELAYS_SEC) * 200

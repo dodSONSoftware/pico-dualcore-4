@@ -70,7 +70,7 @@ class OutboundMessageTooLargeError(ValueError):
 class OutboundQueue:
     """Core 1 -> Core 0 queue for MQTT-bound messages only.
 
-    Once put() succeeds the payload bytes are immutable (pre-serialized UTF-8 JSON); the Core 0 envelope keys are injected at publish time and must not be carried at the top level. No fixed capacity: admission is governed by the global minimum free-heap reserve, evicting the least-important eligible entries under pressure -- explicit heap pressure, or an append whose own allocations cross the reserve (never the in-flight QoS 1 entry) -- all under the shared heap-admission lock. The reserve is a post-admission invariant: an entry may be retained only while gc.mem_free() is at or above it, re-measured after the append's own allocations."""
+    Once put() succeeds the payload bytes are immutable (pre-serialized UTF-8 JSON); the Core 0 envelope keys are injected at publish time and must not be carried at the top level. No fixed capacity: admission is governed by the global minimum free-heap reserve, evicting the least-important eligible entries under pressure -- explicit heap pressure, or an append whose own allocations cross the reserve (never the in-flight QoS 1 entry) -- all under the shared heap-admission lock. CRITICAL is the non-evictable retention floor: an admitted CRITICAL entry cannot be displaced by another CRITICAL (its producer no longer owns it once admitted, so the new one is rejected for the producer to retry). The reserve is a post-admission invariant: an entry may be retained only while gc.mem_free() is at or above it, re-measured after the append's own allocations."""
 
     def __init__(self, minimum_free_heap_bytes, heap_admission_lock):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
@@ -204,6 +204,25 @@ class OutboundQueue:
                             self,
                             "reject",
                             (("reason", "lower_priority_than_queued"),
+                             ("priority", retention_priority)),
+                        )
+                        return False
+                    # CRITICAL is a non-evictable retention floor: an admitted
+                    # CRITICAL entry (a command response) has no remaining
+                    # owner once evicted, so a same-priority incoming entry is
+                    # rejected (the producer retains and retries it) rather
+                    # than displacing it. Equal-priority replacement still
+                    # applies to the replaceable lower priorities above.
+                    if (
+                        worst_priority == RETENTION_PRIORITY_CRITICAL
+                        and retention_priority == RETENTION_PRIORITY_CRITICAL
+                    ):
+                        self._messages_rejected += 1
+                        _debug_queue_memory(
+                            "outbound_queue",
+                            self,
+                            "reject",
+                            (("reason", "critical_not_evictable"),
                              ("priority", retention_priority)),
                         )
                         return False

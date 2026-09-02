@@ -484,3 +484,100 @@ def test_device_manager_without_refresh_callback_is_unchanged():
 
     assert initialized == 1
     assert failed == []
+
+
+def test_device_manager_normal_read_refreshes_per_device():
+    """A telemetry pass must refresh the stamp at each device boundary.
+
+    Six legitimate reads of 6 s each (total 36 s > Core 0's 30 s watchdog bound) must not let the stamp age across the pass: the refresh fires before every device operation, not once after the whole pass. Pre-fix, only the post-pass loop refresh existed, so the last ~15 s of a legitimate pass aged the stamp past the bound into a false machine.reset()."""
+    READ_MS = 6000
+    WATCHDOG_MS = 30000
+    device_count = 6  # 6 x 6000 ms = 36000 ms > WATCHDOG_MS
+
+    refresh_log = []
+
+    def refresh():
+        refresh_log.append(1)
+
+    class PassTime(_HostTimeShim):
+        """Ticks-based pass clock; each read advances it by READ_MS.
+
+        _process_normal_read records last_read_ms via time.ticks_ms(), so the bound time must provide the ticks API (the host time shim delegates to CPython, which has none)."""
+
+        def __init__(self):
+            self.now_ms = 0
+
+        def ticks_ms(self):
+            return self.now_ms
+
+        def ticks_diff(self, now, prev):
+            return now - prev
+
+        def ticks_add(self, base, delta):
+            return base + delta
+
+        def sleep_ms(self, ms):
+            self.now_ms += ms
+
+        def advance_read(self):
+            self.now_ms += READ_MS
+
+    pass_time = PassTime()
+
+    class SlowDriver:
+        def __init__(self, observed):
+            self.observed = observed
+
+        def initialize(self, config):
+            pass
+
+        def read(self):
+            # Record the refresh count at the moment this read begins, then
+            # consume READ_MS of the simulated pass.
+            self.observed.append(len(refresh_log))
+            pass_time.advance_read()
+            return {"slow": 1}
+
+    observed = []
+    dm = _host_time_device_manager()
+    saved_create = dm.create_device
+    saved_time = dm.time
+    dm.create_device = (
+        lambda device_def, system_information: SlowDriver(observed)
+    )
+    dm.time = pass_time
+    try:
+        config = _manager_config(attempts=1)
+        config["devices"] = [
+            {"id": "dev{}".format(i), "device_type": "probe", "config": {}}
+            for i in range(device_count)
+        ]
+        manager = dm.DeviceManager(config, activity_refresh=refresh)
+        initialized, failed = manager.initialize_devices()
+        assert initialized == device_count
+        assert failed == []
+
+        # One telemetry pass, the same loop core1's _run_telemetry_read_pass
+        # runs (initial and periodic passes share it).
+        for managed_device in manager.get_active_devices():
+            result = manager.process_device(managed_device)
+            assert result["status"] == dm.DEVICE_RESULT_TELEMETRY
+    finally:
+        dm.create_device = saved_create
+        dm.time = saved_time
+
+    # The premise the watchdog bound was violated by: each read is under the
+    # bound, the whole pass is over it.
+    assert READ_MS < WATCHDOG_MS
+    assert pass_time.now_ms > WATCHDOG_MS
+    assert pass_time.now_ms == READ_MS * device_count
+
+    # The regression assertion: a refresh armed before every read, strictly
+    # later than the one before the previous read -- i.e. the stamp is
+    # refreshed in between, so no two consecutive reads ever straddle an
+    # unrefreshed gap of even 2 x READ_MS, let alone the watchdog bound.
+    # (A wedge inside a single read still stops refreshes and ages the stamp;
+    # that is the wedge the watchdog exists to catch.)
+    assert observed[0] >= 1  # armed before the first read
+    for i in range(1, device_count):
+        assert observed[i] > observed[i - 1]
