@@ -438,7 +438,7 @@ See tests in [`tests/`](tests/) — covering core-ownership boundaries, configur
 
 ## Hardware Status
 
-The firmware is software-tested against the full host-side test suite (run `python -m pytest tests/`) and hardware-validated on a Pico 2 W with the system-information sensor: a live capture shows successful startup, telemetry, health, an MQTT reconnect, outbound queue saturation with eviction, and recovery. The current firmware version is defined in a single place — see `FIRMWARE_VERSION` in [`version.py`](version.py) — rather than being restated here.
+The firmware is software-tested against the full host-side test suite (run `python -m pytest tests/`) and hardware-validated on a Pico 2 W with the system-information sensor: a live capture (taken on firmware 0.4.61) shows successful startup, telemetry, and health, an MQTT-outage backlog reaching the outbound queue high-watermark (125 messages / 118,292 queued payload bytes), and a successful reconnect with complete drain — zero queue rejections and zero evictions in that run. Queue eviction itself was not exercised by the capture and is covered by the host-side test suite. The current firmware version is defined in a single place — see `FIRMWARE_VERSION` in [`version.py`](version.py) — rather than being restated here.
 
 ## License
 
