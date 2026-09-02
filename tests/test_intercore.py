@@ -35,7 +35,10 @@ from intercore import (  # noqa: E402
     OutboundQueue,
     StateMailboxes,
 )
-from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES  # noqa: E402
+from message_serializer import (  # noqa: E402
+    MAX_OUTBOUND_MESSAGE_BYTES,
+    SERIALIZATION_HEADROOM_BYTES,
+)
 
 
 # Pico W reserve, and a heap with plenty of headroom over it.
@@ -313,9 +316,18 @@ def test_fast_path_admits_without_gc(monkeypatch):
 
 
 def test_pressure_path_runs_gc_once_and_admits(monkeypatch):
-    """Heap below the reserve with collectable garbage: gc alone restores it."""
+    """Post-admission pressure: heap below the reserve with collectable
+    garbage, gc.collect() alone restores it and the entry is admitted.
+    Driven via put_with_kind() (already-final bytes) so it exercises the
+    post-admission reserve path -- the put() serialization path separately
+    gates on the working-set headroom, tested below."""
     ic, heap = _queue(monkeypatch, free_bytes=RESERVE - 4096, garbage_bytes=8192)
-    assert ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    assert (
+        ic.outbound_queue.put_with_kind(
+            KIND_TELEMETRY, b'{"v":1}', RETENTION_PRIORITY_TELEMETRY
+        )
+        is True
+    )
     assert heap.collects == 1
     assert heap.mem_free() >= RESERVE
 
@@ -671,6 +683,157 @@ def test_in_flight_entry_is_never_evicted(monkeypatch):
     assert queue.complete_in_flight(in_flight) is True
     assert in_flight["payload_bytes"] == b"t" * 16 * KB
     _assert_watermark_at_least_depth(queue)
+
+
+# ---------------------------------------------------------------------------
+# Outbound admission: the pre-serialization working-set headroom
+#
+# put() runs json.dumps() + utf-8 encode before admission, a transient peak of
+# ~3x the wire ceiling (graph + str + bytes). _ensure_serialization_headroom()
+# raises the free heap to at or above reserve + headroom (displacing
+# lower-priority entries, or rejecting) before that allocation, so a peak
+# allocation can never dip the heap below the reserve into a MemoryError while
+# eviction could still make room. put_with_kind() is unaffected: its bytes are
+# already final, so the working set is already gone.
+# ---------------------------------------------------------------------------
+
+
+def test_serialization_headroom_scales_with_the_ceiling():
+    """The working-set margin is 3x the per-message ceiling -- the documented
+    transient peak a serializer needs free on top of the survival reserve --
+    and it is a distinct quantity from minimum_free_heap_bytes."""
+    assert SERIALIZATION_HEADROOM_BYTES == 3 * MAX_OUTBOUND_MESSAGE_BYTES
+    assert SERIALIZATION_HEADROOM_BYTES == 48 * 1024
+    # The required free heap is the reserve PLUS the working set, so the two
+    # concerns stay separate: survival reserve + temporary working memory.
+    assert RESERVE + SERIALIZATION_HEADROOM_BYTES > RESERVE
+
+
+def test_put_evicts_before_serializing_when_working_set_does_not_fit(monkeypatch):
+    """With the heap above the reserve but short of reserve + headroom and an
+    evictable lower-priority entry queued, put() displaces it *before*
+    serializing: the retained payload fits trivially, yet eviction still
+    happens -- a pure working-set concern, invisible to the post-admission
+    reserve check alone (which would admit with zero evictions)."""
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    # A full ceiling-sized lower-priority entry, evictable to free working-set
+    # room.
+    assert (
+        queue.put_with_kind(KIND_HEALTH, b"h" * (16 * KB), RETENTION_PRIORITY_HEALTH)
+        is True
+    )
+    # Above the reserve (the retained payload fits) but short of the
+    # reserve + working set the serializer needs.
+    heap.free_bytes = RESERVE + 40000
+    assert queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    status = queue.status()
+    assert status["pending"] == 1            # the new entry; the HEALTH evicted
+    assert status["messages_evicted"] == 1   # displaced before serializing
+    assert status["messages_rejected"] == 0
+    assert json.loads(queue.take()["payload_bytes"]) == {"v": 1}
+    # The survival reserve still holds after the whole operation.
+    assert gc.mem_free() >= RESERVE
+
+
+def test_put_serializes_only_once_headroom_is_available(monkeypatch):
+    """The working set must be free at the moment json.dumps/encode run: the
+    heap measured inside serialization already covers reserve + headroom,
+    proving the displacement happened before the allocation, not after."""
+    import message_serializer
+
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    required = RESERVE + SERIALIZATION_HEADROOM_BYTES
+    assert (
+        queue.put_with_kind(KIND_HEALTH, b"h" * (16 * KB), RETENTION_PRIORITY_HEALTH)
+        is True
+    )
+    heap.free_bytes = RESERVE + 40000  # below required, above the reserve
+    observed = []
+    original = message_serializer.serialize_and_validate_message
+
+    def _spy(message):
+        observed.append(gc.mem_free())
+        return original(message)
+
+    monkeypatch.setattr(message_serializer, "serialize_and_validate_message", _spy)
+    assert queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    assert len(observed) == 1
+    assert observed[0] >= required
+
+
+def test_put_rejects_before_serializing_when_headroom_unavailable(monkeypatch):
+    """When nothing eligible can be evicted to free the working set, put()
+    rejects (transient False) rather than serialize and risk a MemoryError in
+    the working set -- even though the retained payload itself would fit."""
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    # A CRITICAL entry the incoming TELEMETRY cannot displace.
+    assert (
+        queue.put_with_kind(
+            KIND_COMMAND_RESPONSE, b'{"id":"r"}', RETENTION_PRIORITY_CRITICAL
+        )
+        is True
+    )
+    heap.free_bytes = RESERVE + 1024  # retained payload fits; working set does not
+    assert queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is False
+    status = queue.status()
+    assert status["pending"] == 1            # only the CRITICAL retained
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 1
+    assert json.loads(queue.take()["payload_bytes"]) == {"id": "r"}
+
+
+def test_critical_cannot_evict_existing_critical_for_headroom(monkeypatch):
+    """The retention floor also holds on the pre-serialization path: an
+    admitted CRITICAL cannot be displaced by another CRITICAL to make room for
+    the working set -- the incoming entry is rejected for the producer to
+    retry, not admitted by evicting the earlier response."""
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    existing = b'{"id":"response-a"}'
+    assert (
+        queue.put_with_kind(
+            KIND_COMMAND_RESPONSE, existing, RETENTION_PRIORITY_CRITICAL
+        )
+        is True
+    )
+    heap.free_bytes = RESERVE + 1024
+    assert (
+        queue.put(
+            KIND_COMMAND_RESPONSE, {"id": "response-b"}, RETENTION_PRIORITY_CRITICAL
+        )
+        is False
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 1
+    # The retained entry is the one admitted first.
+    assert queue.take()["payload_bytes"] == existing
+
+
+def test_put_with_kind_does_not_reserve_the_working_set(monkeypatch):
+    """put_with_kind() takes already-final bytes: no json.dumps/encode runs in
+    the queue, so it does not reserve the serialization working set. A small
+    entry is admitted on the fast path without evicting a queued entry, even
+    at a heap that would short the working-set requirement for put()."""
+    ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert (
+        queue.put_with_kind(KIND_HEALTH, b"h" * (16 * KB), RETENTION_PRIORITY_HEALTH)
+        is True
+    )
+    heap.free_bytes = RESERVE + 40000  # below reserve + headroom, above the reserve
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b'{"v":1}', RETENTION_PRIORITY_TELEMETRY)
+        is True
+    )
+    status = queue.status()
+    assert status["pending"] == 2           # both retained
+    assert status["messages_evicted"] == 0  # nothing displaced
+    assert status["messages_rejected"] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,21 @@ from message_protocol import is_json_safe
 MAX_OUTBOUND_MESSAGE_BYTES = 16 * 1024
 
 
+# Transient working set a serializer needs free while json.dumps() builds the
+# JSON string and .encode() builds the UTF-8 bytes on top of the (still-owned)
+# message graph, before that transient memory is released: at peak the graph,
+# the str, and the encoded bytes are all resident at once -- ~3x the wire
+# ceiling, per the rationale above (a 16 KiB payload, roughly 48 KiB). Kept
+# separate from the survival reserve (minimum_free_heap_bytes in hardware.py):
+# the reserve is operational headroom that must survive, the working set is the
+# temporary room a serialization needs in addition to it. A producer that must
+# serialize (the outbound queue's put()) therefore requires
+# minimum_free_heap_bytes + SERIALIZATION_HEADROOM_BYTES free before it
+# serializes, so a peak allocation can never dip the free heap below the
+# reserve into a MemoryError while eviction could still make room.
+SERIALIZATION_HEADROOM_BYTES = 3 * MAX_OUTBOUND_MESSAGE_BYTES
+
+
 class SerializationError(Exception):
     """Base exception for serialization failures."""
     pass
