@@ -14,6 +14,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from command_protocol import MAX_SOURCE_LENGTH
 from config import (
     MAX_MQTT_KEEPALIVE_SEC,
+    MAX_TICKS_SAFE_INTERVAL_MS,
     ConfigError,
     load_config,
     split_config,
@@ -139,6 +140,8 @@ def test_validate_config_accepts_valid_config_without_any_file():
         (lambda config: config.update({"devices": []}), "invalid_value"),
         (lambda config: config.update({"source": "S" * 16384}), "invalid_value"),
         (lambda config: config.update({"mqtt_keepalive_sec": MAX_MQTT_KEEPALIVE_SEC + 1}), "invalid_value"),
+        (lambda config: config.update({"read_loop_sec": MAX_TICKS_SAFE_INTERVAL_MS // 1000 + 1}), "invalid_value"),
+        (lambda config: config.update({"mqtt_outbound_publish_delay_ms": MAX_TICKS_SAFE_INTERVAL_MS + 1}), "invalid_value"),
     ],
 )
 def test_validate_config_rejects_bad_configs_with_stable_codes(mutate, code):
@@ -185,6 +188,49 @@ def test_validate_config_keepalive_is_bounded_by_the_wire_limit():
     assert str(excinfo.value) == "mqtt_keepalive_sec must be at most {}".format(
         MAX_MQTT_KEEPALIVE_SEC
     )
+
+
+@pytest.mark.parametrize(
+    "key,ms_per_unit",
+    [
+        ("read_loop_sec", 1000),
+        ("health_interval_sec", 1000),
+        ("network_snapshot_interval_sec", 1000),
+        ("mqtt_broker_response_timeout_sec", 1000),
+        ("datetime_sync_interval_min", 60 * 1000),
+        ("mqtt_command_poll_ms", 1),
+        ("mqtt_outbound_publish_delay_ms", 1),
+    ],
+)
+def test_validate_config_ticks_backed_intervals_are_bounded_by_the_ticks_limit(
+    key, ms_per_unit
+):
+    """Values that become ticks_diff thresholds or ticks_add deltas must stay
+    under the RP2 ticks delta ceiling: above it the threshold can never be
+    reached or the deadline raises OverflowError, and a mixed REBOOT_REQUIRED
+    candidate would persist that into the next boot."""
+    max_value = MAX_TICKS_SAFE_INTERVAL_MS // ms_per_unit
+    assert max_value * ms_per_unit <= MAX_TICKS_SAFE_INTERVAL_MS
+    assert (max_value + 1) * ms_per_unit > MAX_TICKS_SAFE_INTERVAL_MS
+
+    config = _base_config()
+    config[key] = max_value
+    assert validate_config(config) is config
+
+    config = _base_config()
+    config[key] = max_value + 1
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert "{} must be at most {}".format(key, max_value) in str(excinfo.value)
+    assert str(excinfo.value)
+
+
+def test_validate_config_zero_publish_delay_stays_valid():
+    """0 disables outbound pacing and must stay a valid ticks-safe value."""
+    config = _base_config()
+    config["mqtt_outbound_publish_delay_ms"] = 0
+    assert validate_config(config) is config
 
 
 def test_validate_config_unknown_fields_are_named_and_sorted():

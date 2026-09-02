@@ -19,6 +19,15 @@ from version import CONFIG_SCHEMA_VERSION
 # brick the MQTT channel used to fix it).
 MAX_MQTT_KEEPALIVE_SEC = 65535
 
+# The RP2 builds give time.ticks_* 30-bit tick values, so ticks_add()/
+# ticks_diff() only express deltas below half the period (2^29 - 1 ms,
+# about 6.21 days); ticks_add raises OverflowError at half the period.
+# Every timing value that becomes a ticks_diff threshold or a ticks_add
+# delta must stay under this ceiling — above it the threshold can never
+# be reached (ticks_diff cannot return that positive value), the deadline
+# raises, or the scheduler re-anchor does.
+MAX_TICKS_SAFE_INTERVAL_MS = (1 << 29) - 1
+
 
 class ConfigError(Exception):
     """Configuration load/validation failure with a stable machine-readable code.
@@ -135,6 +144,18 @@ def _require_positive_integer(config, key):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ConfigError(
             "{} must be a positive integer".format(key), code="invalid_value"
+        )
+
+
+def _require_ticks_safe_interval(config, key, ms_per_unit):
+    """value * ms_per_unit must fit a MicroPython ticks delta (see MAX_TICKS_SAFE_INTERVAL_MS)."""
+    value = config[key]
+    max_value = MAX_TICKS_SAFE_INTERVAL_MS // ms_per_unit
+    if value * ms_per_unit > MAX_TICKS_SAFE_INTERVAL_MS:
+        raise ConfigError(
+            "{} must be at most {} (MicroPython ticks intervals are limited "
+            "to {} ms)".format(key, max_value, MAX_TICKS_SAFE_INTERVAL_MS),
+            code="invalid_value",
         )
 
 
@@ -283,6 +304,22 @@ def validate_config(config):
 
     _require_nonnegative_integer(config, "device_initialization_retry_delay_ms")
     _require_nonnegative_integer(config, "mqtt_outbound_publish_delay_ms")
+
+    # Timing values that become ticks_diff thresholds or ticks_add deltas
+    # are bounded by the ticks delta ceiling (above it a threshold can
+    # never be reached, or a deadline/scheduler re-anchor raises
+    # OverflowError). Socket-timeout-only values (reconnect delays, probe
+    # timeout, sliced retry delay) do not use ticks deltas and stay
+    # unbounded here. Runs after the type checks above so a wrong type
+    # still reports invalid_value, not a type error.
+    _require_ticks_safe_interval(config, "read_loop_sec", 1000)
+    _require_ticks_safe_interval(config, "health_interval_sec", 1000)
+    _require_ticks_safe_interval(config, "network_snapshot_interval_sec", 1000)
+    _require_ticks_safe_interval(config, "mqtt_broker_response_timeout_sec", 1000)
+    _require_ticks_safe_interval(config, "datetime_sync_interval_min", 60 * 1000)
+    _require_ticks_safe_interval(config, "mqtt_command_poll_ms", 1)
+    _require_ticks_safe_interval(config, "mqtt_outbound_publish_delay_ms", 1)
+
     _validate_delays(config, "wifi_reconnect_delays_sec")
     _validate_delays(config, "mqtt_reconnect_delays_sec")
     _validate_devices(config["devices"])
