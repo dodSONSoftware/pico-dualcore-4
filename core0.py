@@ -1165,7 +1165,12 @@ class Core0:
             )
         except MemoryError:
             raise
-        except Exception as err:
+        except (OSError, MQTTException) as err:
+            # A transport/protocol failure is a link condition: the
+            # acknowledgement was never published, so the reboot stays
+            # pending for a later pass. A programming failure is NOT caught
+            # here: it escapes to the top-level recovery boundary instead of
+            # being held pending forever for the same deterministic fault.
             if DEBUG:
                 print("[DEBUG] Reboot response publish failed; reboot remains pending: {}".format(err))
             return False
@@ -1263,9 +1268,11 @@ class Core0:
         except MemoryError:
             self._pending_utc_request_id = None
             raise
-        except Exception as err:
+        except (OSError, MQTTException) as err:
             # Roll back the armed ID: no response can ever arrive for a
-            # request that was not delivered.
+            # request that was not delivered. A programming failure is NOT
+            # caught here: it escapes to the top-level recovery boundary
+            # instead of being retried into the same deterministic fault.
             self._pending_utc_request_id = None
             if DEBUG:
                 print("[DEBUG] UTC request publish failed: {}".format(err))
@@ -1287,7 +1294,12 @@ class Core0:
                 self._mqtt.check_msg()
             except MemoryError:
                 raise
-            except Exception as err:
+            except (OSError, MQTTException) as err:
+                # A transport failure fails the attempt cleanly; a
+                # programming failure (the realistic source: the inbound
+                # callback) escapes to the top-level recovery boundary
+                # instead of arming a retry that re-delivers the same frame
+                # into the same bug.
                 if DEBUG:
                     print("[DEBUG] UTC response wait failed: {}".format(err))
                 break
@@ -1354,7 +1366,12 @@ class Core0:
             return result
         except MemoryError:
             raise
-        except Exception as err:
+        except (OSError, MQTTException) as err:
+            # A transport/protocol failure is a link condition: the probe
+            # reports False so the pass re-establishes and retries. A
+            # programming failure is NOT caught here: it escapes to the
+            # top-level recovery boundary instead of being probed forever
+            # into the same deterministic fault.
             if DEBUG:
                 print("[DEBUG] Network probe failed: {}".format(err))
             return False
@@ -1373,21 +1390,21 @@ class Core0:
             if time.ticks_diff(time.ticks_ms(), deadline_ms) >= 0:
                 print("[WARNING] Startup MQTT work drain timeout")
                 return False
-            try:
-                self._service_pending_connection_log()
-            except MemoryError:
-                raise
-            except Exception as err:
-                if DEBUG:
-                    print("[DEBUG] Startup work drain failed: {}".format(err))
-                # Continue draining, don't fail the entire startup
+            # No wrapper of its own: _service_pending_connection_log()
+            # already owns MemoryError (re-raised), the size rejection, and
+            # the transport/protocol failures (it holds the head for a later
+            # pass). A programming failure must escape to the top-level
+            # recovery boundary -- with the broad wrapper it was swallowed
+            # while the un-removed head stayed queued, so this loop
+            # re-attempted the same failing operation forever.
+            self._service_pending_connection_log()
 
         return True
 
     def _synchronize_utc_required(self):
         """Run one bounded pass of startup UTC synchronization.
 
-        Returns True once a valid snapshot is acquired, False after _UTC_STARTUP_MAX_ATTEMPTS so the caller re-establishes and retries. MemoryError propagates."""
+        Returns True once a valid snapshot is acquired, False after _UTC_STARTUP_MAX_ATTEMPTS so the caller re-establishes and retries. Transport failures are those failed attempts; a MemoryError or a programming failure propagates to the recovery boundary in main()."""
         for attempt in range(_UTC_STARTUP_MAX_ATTEMPTS):
             # The preceding startup publish (probe #2, or the drain) recorded
             # its completion: respect the same pacing interval before the
@@ -1490,7 +1507,7 @@ class Core0:
     def start(self):
         """Establish Core 0 network services before Core 1 starts (the deterministic startup contract).
 
-        Connect steps are unbounded; the verification steps (probes, drain, UTC) are self-healing -- a failed pass re-establishes the network and retries. Returns only on a clean pass; Core 1 stays gated until then. A MemoryError propagates to the recovery boundary in main()."""
+        Connect steps are unbounded; the verification steps (probes, drain, UTC) are self-healing -- a failed pass re-establishes the network and retries. Returns only on a clean pass; Core 1 stays gated until then. Transport failures (OSError, MQTTException) fail the pass and are retried; a MemoryError or a programming failure (anything else escaping the MQTT boundary) propagates to the recovery boundary in main()."""
         self._led_manager.set_connecting(True)
 
         # Steps 1-2: Establish Wi-Fi, then MQTT + subscriptions.
@@ -1502,9 +1519,10 @@ class Core0:
         # Self-healing, like the connect loops above: on any verification
         # failure, drop the (possibly wedged) MQTT session, re-establish the
         # network, and retry the whole pass. Core 1 stays gated because
-        # start() has not returned. A MemoryError propagates out of
-        # _verify_startup_contract and out of this loop (fail-fast on OOM;
-        # the recovery boundary in main() turns it into a board reset).
+        # start() has not returned. A MemoryError or a programming failure
+        # propagates out of _verify_startup_contract and out of this loop
+        # (fail-fast; the recovery boundary in main() turns it into a board
+        # reset) -- only transport failures are retried.
         while True:
             if self._verify_startup_contract():
                 break
@@ -1531,7 +1549,7 @@ class Core0:
     def _verify_startup_contract(self):
         """Run one full pass of the startup verification contract (probe #1, drain, stabilization, probe #2, UTC).
 
-        Returns True only when every step succeeds, False on any failure so the caller re-establishes and retries. MemoryError propagates."""
+        Returns True only when every step succeeds, False on any failure so the caller re-establishes and retries. Transport failures (OSError, MQTTException) are those failures; a MemoryError or a programming failure propagates to the recovery boundary in main() instead of being retried into the same deterministic fault."""
         # Step 3: QoS 1 network probe #1
         if not self._perform_network_probe():
             print("[WARNING] Startup verification: network probe #1 failed")
