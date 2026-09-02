@@ -142,6 +142,16 @@ See `hardware.py` for implementation details.
 4. Once an object is transferred into an inter-core lane it becomes immutable. Neither producer nor consumer may mutate it.
 5. Live subsystem objects never cross cores.
 
+## Security model
+
+The firmware is designed for a **trusted private network**. This is a deliberate trust boundary, not an omission:
+
+- **Trusted private network.** The MQTT broker and the firmware devices are assumed to operate on a private network under the operator's control. The firmware does not itself authenticate or authorize MQTT peers.
+- **Command authorization is network-level.** The command protocol (`reboot`, `read-config`, `write-config`, `get-details`) is authorized by *network access control* — by who can reach the broker and publish on its subscribed topics — not by any credential, token, or per-command policy inside the firmware. A peer that can publish a well-formed, in-boundary command frame to a subscribed topic can drive the device.
+- **Operational requirement.** The broker must not be exposed to untrusted or public networks. Exposing it removes the boundary this design relies on, and every command — including `write-config` (arbitrary configuration) and `reboot` — becomes reachable by that network's peers.
+
+This is why the firmware defends the **integrity and boundedness** of inbound frames (the MQTT wire/QoS gates, the global schema gate, the staged command-validation order, and the bounded payloads) rather than authenticating their source. The absence of per-command authorization is the threat model, not a gap.
+
 ## Inter-core lanes
 
 ### 1. `outbound_queue`
@@ -290,6 +300,7 @@ Core 0 owns the command protocol boundary and the set of commands this device an
 - **Dispatched event is validated and bounded.** Core 0 sends Core 1 only `{command_id, command, payload, targeted}` where `payload` is the validated empty `{}` — the raw (possibly non-empty) request payload never crosses. Core 1 trusts the payload is `{}` and no longer re-checks it.
 - **Shared empty-payload contract.** Both `reboot` and `get-details` require an exactly-`{}` payload. Any key is unknown for the command, so a non-empty object is answered with `error.code: "unknown_fields"` carrying every offending key in a **sorted** `unknown_fields` array (the missing / non-object cases are the common contract and still get a bounded `invalid_payload`). A `get-details` with a non-empty payload no longer reaches Core 1 — Core 0 answers it before dispatch.
 - **String bounds are enforced at the protocol boundary** (independent of, and additional to, the overall per-message MQTT size ceiling): `command_id` ≤ 128 characters, `command` ≤ 32, `target` ≤ 128, all non-empty when required. A command response carries the identifying `command` field only while it is bounded and valid — the over-long-name error is bounded and never reproduces the string, so a single command can never build an oversized error substitute and stall the channel.
+- **Authorization is by design, not a gap.** Nothing in this registry authenticates the sender: which commands a peer can run is bounded by who can reach the broker and its topics. See [Security model](#security-model) — a trusted private network, network-level access control, and a broker that must not be exposed to untrusted or public networks.
 
 #### Command-ID debounce cache
 
