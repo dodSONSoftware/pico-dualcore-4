@@ -6,7 +6,6 @@ import _thread
 import gc
 
 from debug import DEBUG_QUEUE_MEMORY
-from message_serializer import SERIALIZATION_HEADROOM_BYTES
 
 
 KIND_TELEMETRY = "telemetry"
@@ -143,90 +142,97 @@ class OutboundQueue:
             self._high_watermark_bytes = self._queued_bytes
         return True
 
-    def _ensure_serialization_headroom(self, retention_priority):
-        """Guarantee the serialization working set fits before put() serializes.
+    def _evict_one_eligible_locked(self, retention_priority):
+        """Evict the oldest entry in the least-important class this priority may displace; caller holds self._lock.
 
-        put() runs json.dumps() + utf-8 encode before admission, a transient
-        peak of ~3x the wire ceiling on top of the (still-owned) message graph.
-        Under heap pressure that peak can raise MemoryError even though
-        evictable lower-priority entries would free it -- so make room first,
-        under the shared heap-admission lock, with the same priority/displacement
-        rules as admission: displace the least-important eligible entries until
-        free heap covers minimum_free_heap_bytes plus the working set, or reject.
-        Returns True if the headroom is (now) available, False if nothing
-        eligible remains and the entry must be rejected (the producer retains
-        and retries, exactly as on the admission pressure path). put_with_kind()
-        does not need this: its bytes are already final, so the working set is
-        already gone. No locks are held on entry; a MemoryError from the
-        eviction's own allocations is not caught here -- the caller owns it."""
-        required = self._minimum_free_heap_bytes + SERIALIZATION_HEADROOM_BYTES
-        with self._heap_admission_lock:
-            if gc.mem_free() < required:
-                _debug_queue_memory(
-                    "outbound_queue", self, "serialization_headroom"
-                )
-                gc.collect()
-            if gc.mem_free() >= required:
-                return True
-            # Retained-memory pressure: displace the least-important eligible
-            # entries one at a time, reclaiming after each, until the working
-            # set fits or nothing eligible remains -- mirroring the admission
-            # displacement loop but against the working-set requirement.
-            with self._lock:
-                while True:
-                    if not self._queue:
-                        self._messages_rejected += 1
-                        _debug_queue_memory(
-                            "outbound_queue",
-                            self,
-                            "reject",
-                            (("reason", "serialization_headroom"),
-                             ("priority", retention_priority)),
-                        )
-                        return False
-                    # Explicit loop: no generator/list allocation in the
-                    # pressure path (MCU-safe).
-                    worst_priority = RETENTION_PRIORITY_MIN
-                    for entry in self._queue:
-                        if entry["retention_priority"] > worst_priority:
-                            worst_priority = entry["retention_priority"]
-                    # Incoming is less important than everything queued: reject
-                    # rather than evict a more important retained entry.
-                    if retention_priority > worst_priority:
-                        self._messages_rejected += 1
-                        _debug_queue_memory(
-                            "outbound_queue",
-                            self,
-                            "reject",
-                            (("reason", "lower_priority_than_queued"),
-                             ("priority", retention_priority)),
-                        )
-                        return False
-                    # CRITICAL is the non-evictable retention floor: never
-                    # displace an admitted CRITICAL for another CRITICAL.
-                    if (
-                        worst_priority == RETENTION_PRIORITY_CRITICAL
-                        and retention_priority == RETENTION_PRIORITY_CRITICAL
-                    ):
-                        self._messages_rejected += 1
-                        _debug_queue_memory(
-                            "outbound_queue",
-                            self,
-                            "reject",
-                            (("reason", "critical_not_evictable"),
-                             ("priority", retention_priority)),
-                        )
-                        return False
-                    self._evict_oldest_by_priority_locked(worst_priority)
+        The one shared eligibility rule for both the admission pressure path and the serialization-recovery path: an empty queue has nothing to reclaim, an incoming entry less important than everything queued may not evict, and CRITICAL is the non-evictable retention floor (an admitted CRITICAL is never displaced, not even by another CRITICAL). Returns (True, worst_priority) if an entry was evicted (counted by the regular eviction metrics; worst_priority names the displaced class), else (False, reason) with reason "memory_pressure" (queue empty), "lower_priority_than_queued", or "critical_not_evictable" -- the caller decides what a non-eviction means (a transient admission rejection, or an unrecovered serialization MemoryError that must propagate)."""
+        if not self._queue:
+            return (False, "memory_pressure")
+        # Explicit loop: no generator/list allocation in the
+        # pressure path (MCU-safe).
+        worst_priority = RETENTION_PRIORITY_MIN
+        for entry in self._queue:
+            if entry["retention_priority"] > worst_priority:
+                worst_priority = entry["retention_priority"]
+        # Incoming is less important than everything queued: no eviction.
+        if retention_priority > worst_priority:
+            return (False, "lower_priority_than_queued")
+        # CRITICAL is the non-evictable retention floor: never displace an
+        # admitted CRITICAL for another CRITICAL.
+        if (
+            worst_priority == RETENTION_PRIORITY_CRITICAL
+            and retention_priority == RETENTION_PRIORITY_CRITICAL
+        ):
+            return (False, "critical_not_evictable")
+        self._evict_oldest_by_priority_locked(worst_priority)
+        return (True, worst_priority)
+
+    def _serialize_with_recovery(self, message, retention_priority):
+        """Serialize the message, recovering a MemoryError without discarding queued data first.
+
+        The serializer works on the actual message -- no fixed worst-case threshold stands in for it. Only a MemoryError from the serializer triggers recovery (validation, size, and serialization failures raise immediately, as before). The first failure runs gc.collect() and retries: fragmentation or collectable garbage can resolve it with no data loss. Only if serialization still fails does the queue reclaim memory -- one eviction per attempt, the oldest entry in the least-important class this message may displace under the same eligibility rule as admission (CRITICAL never displaced), each re-claimed with gc.collect() -- until serialization succeeds or nothing eligible remains, in which case the MemoryError propagates to the firmware recovery boundary. The loop is bounded by the number of eligible retained entries, so it terminates without a retry count. No locks are held across the serializer or gc.collect(): only the eviction step takes the queue lock."""
+        from message_serializer import (
+            serialize_and_validate_message,
+            MessageTooLargeError,
+            UnsupportedValueError,
+            NonStringKeyError,
+            NonFiniteFloatError,
+            SerializationError,
+        )
+        gc_attempted = False
+        while True:
+            try:
+                # Returning here exits the retry loop on success; the
+                # MemoryError branch below falls back to the top of the loop.
+                return serialize_and_validate_message(message)
+            except MemoryError:
+                if not gc_attempted:
+                    # First failure: reclaim collectable garbage before
+                    # discarding any queued data.
+                    _debug_queue_memory(
+                        "outbound_queue", self, "serialization_memory_error"
+                    )
+                    gc.collect()
+                    gc_attempted = True
+                    continue
+                with self._lock:
+                    evicted, evicted_priority = self._evict_one_eligible_locked(
+                        retention_priority
+                    )
+                if not evicted:
+                    # No queue-owned memory this message may reclaim: the
+                    # failure is not queue pressure -- propagate it, do not
+                    # convert it into a transient rejection.
                     _debug_queue_memory(
                         "outbound_queue",
                         self,
-                        "evict",
-                        (("evicted_priority", worst_priority),),
+                        "serialization_memory_error",
+                        (("outcome", "unrecovered"),),
                     )
-                    gc.collect()
-                    if gc.mem_free() >= required:
-                        return True
+                    raise
+                _debug_queue_memory(
+                    "outbound_queue",
+                    self,
+                    "evict",
+                    (("evicted_priority", evicted_priority),),
+                )
+                gc.collect()
+            except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
+                # Validation errors are raised immediately
+                raise ValueError("Message validation failed: {}".format(err))
+            except MessageTooLargeError as err:
+                # Oversized is a permanent failure of the message (the ceiling
+                # is a static invariant): raise, so a caller can distinguish
+                # it from the False (transient, retry later) return. Queue
+                # state is untouched, as before. OutboundMessageTooLargeError
+                # (a ValueError subclass) lets a caller tell this size failure
+                # apart from the other permanent rejections.
+                self._oversized_rejected += 1
+                raise OutboundMessageTooLargeError("Message too large: {}".format(err))
+            except SerializationError as err:
+                # A serialization failure is likewise permanent for this message.
+                self._serialization_rejected += 1
+                raise ValueError("Message serialization failed: {}".format(err))
 
     def _admit_heap_governed(self, kind, payload_bytes, retention_priority):
         """Apply the heap-reserve admission decision. No locks are held on entry.
@@ -265,59 +271,28 @@ class OutboundQueue:
             # retained, or nothing eligible remains.
             with self._lock:
                 while True:
-                    if not self._queue:
+                    evicted, detail = self._evict_one_eligible_locked(
+                        retention_priority
+                    )
+                    if not evicted:
+                        # Nothing eligible can be displaced (queue empty, the
+                        # incoming entry is less important than everything
+                        # queued, or both are CRITICAL): reject as transient --
+                        # the producer retains and retries.
                         self._messages_rejected += 1
                         _debug_queue_memory(
                             "outbound_queue",
                             self,
                             "reject",
-                            (("reason", "memory_pressure"),
+                            (("reason", detail),
                              ("priority", retention_priority)),
                         )
                         return False
-                    # Explicit loop: no generator/list allocation in the
-                    # pressure path (MCU-safe).
-                    worst_priority = RETENTION_PRIORITY_MIN
-                    for entry in self._queue:
-                        if entry["retention_priority"] > worst_priority:
-                            worst_priority = entry["retention_priority"]
-                    # Incoming is less important than everything queued: reject
-                    # rather than evict a more important retained entry.
-                    if retention_priority > worst_priority:
-                        self._messages_rejected += 1
-                        _debug_queue_memory(
-                            "outbound_queue",
-                            self,
-                            "reject",
-                            (("reason", "lower_priority_than_queued"),
-                             ("priority", retention_priority)),
-                        )
-                        return False
-                    # CRITICAL is a non-evictable retention floor: an admitted
-                    # CRITICAL entry (a command response) has no remaining
-                    # owner once evicted, so a same-priority incoming entry is
-                    # rejected (the producer retains and retries it) rather
-                    # than displacing it. Equal-priority replacement still
-                    # applies to the replaceable lower priorities above.
-                    if (
-                        worst_priority == RETENTION_PRIORITY_CRITICAL
-                        and retention_priority == RETENTION_PRIORITY_CRITICAL
-                    ):
-                        self._messages_rejected += 1
-                        _debug_queue_memory(
-                            "outbound_queue",
-                            self,
-                            "reject",
-                            (("reason", "critical_not_evictable"),
-                             ("priority", retention_priority)),
-                        )
-                        return False
-                    self._evict_oldest_by_priority_locked(worst_priority)
                     _debug_queue_memory(
                         "outbound_queue",
                         self,
                         "evict",
-                        (("evicted_priority", worst_priority),),
+                        (("evicted_priority", detail),),
                     )
                     gc.collect()
                     if self._reserve_restored():
@@ -339,7 +314,7 @@ class OutboundQueue:
     def put(self, kind, message, retention_priority):
         """Admit one MQTT-bound message after validation, serialization, encoding, and size check.
 
-        Before serializing, the working set json.dumps()/encode() need is made room for (free heap raised to at or above the survival reserve plus SERIALIZATION_HEADROOM_BYTES, displacing lower-priority entries or rejecting) so a peak allocation cannot MemoryError while eviction could still make room. Returns True if admitted, False on transient heap pressure (a later retry may succeed). Raises ValueError on a permanent failure of the message itself (unsupported value, serialization, or size beyond MAX_OUTBOUND_MESSAGE_BYTES); the oversized case raises OutboundMessageTooLargeError, a ValueError subclass."""
+        Serialization works on the actual message: a MemoryError from it runs gc.collect() first, then (if it persists) reclaims one eligible queued entry at a time under the same retention policy as admission, retrying after each, until serialization succeeds or no eligible entry remains -- in which case the MemoryError propagates to the firmware recovery boundary. The heap-governed admission then decides whether the serialized payload may be retained while preserving the minimum free-heap reserve. Returns True if admitted, False on transient heap pressure (a later retry may succeed). Raises ValueError on a permanent failure of the message itself (unsupported value, serialization, or size beyond MAX_OUTBOUND_MESSAGE_BYTES); the oversized case raises OutboundMessageTooLargeError, a ValueError subclass."""
         if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(message, dict):
@@ -353,44 +328,11 @@ class OutboundQueue:
                 )
             )
 
-        # The working set json.dumps() + utf-8 encode need is allocated below,
-        # before admission can evict. Guarantee it fits (free heap at or above
-        # the survival reserve plus the working set) first, displacing
-        # lower-priority entries under the same rules as admission -- a peak
-        # allocation must not dip the heap below the reserve while eviction
-        # could still make room. A rejection here is transient (False), so the
-        # producer retains and retries, as on the admission pressure path;
-        # _admit_heap_governed below keeps its own post-admission reserve check.
-        if not self._ensure_serialization_headroom(retention_priority):
-            return False
-
-        # Validate, serialize, and encode before queue admission
-        from message_serializer import (
-            serialize_and_validate_message,
-            MessageTooLargeError,
-            UnsupportedValueError,
-            NonStringKeyError,
-            NonFiniteFloatError,
-            SerializationError,
-        )
-        try:
-            payload_bytes = serialize_and_validate_message(message)
-        except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
-            # Validation errors are raised immediately
-            raise ValueError("Message validation failed: {}".format(err))
-        except MessageTooLargeError as err:
-            # Oversized is a permanent failure of the message (the ceiling is
-            # a static invariant): raise, so a caller can distinguish it from
-            # the False (transient, retry later) return. Queue state is
-            # untouched, as before. OutboundMessageTooLargeError (a ValueError
-            # subclass) lets a caller tell this size failure apart from the
-            # other permanent ValueError rejections (validation, serialization).
-            self._oversized_rejected += 1
-            raise OutboundMessageTooLargeError("Message too large: {}".format(err))
-        except SerializationError as err:
-            # A serialization failure is likewise permanent for this message.
-            self._serialization_rejected += 1
-            raise ValueError("Message serialization failed: {}".format(err))
+        # Serialize the actual message (with MemoryError recovery: gc first,
+        # then one eligible queued entry per persistent failure, under the
+        # same retention policy as admission). Admission below keeps its own
+        # post-serialization reserve check.
+        payload_bytes = self._serialize_with_recovery(message, retention_priority)
 
         return self._admit_heap_governed(kind, payload_bytes, retention_priority)
 

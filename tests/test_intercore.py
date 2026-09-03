@@ -37,7 +37,6 @@ from intercore import (  # noqa: E402
 )
 from message_serializer import (  # noqa: E402
     MAX_OUTBOUND_MESSAGE_BYTES,
-    SERIALIZATION_HEADROOM_BYTES,
 )
 
 
@@ -686,111 +685,190 @@ def test_in_flight_entry_is_never_evicted(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Outbound admission: the pre-serialization working-set headroom
+# Outbound admission: serialization with MemoryError recovery
 #
-# put() runs json.dumps() + utf-8 encode before admission, a transient peak of
-# ~3x the wire ceiling (graph + str + bytes). _ensure_serialization_headroom()
-# raises the free heap to at or above reserve + headroom (displacing
-# lower-priority entries, or rejecting) before that allocation, so a peak
-# allocation can never dip the heap below the reserve into a MemoryError while
-# eviction could still make room. put_with_kind() is unaffected: its bytes are
-# already final, so the working set is already gone.
+# put() serializes the actual message -- no fixed worst-case threshold stands
+# in for it. A MemoryError from the serializer first triggers gc.collect()
+# (no data loss); if it persists, the queue reclaims one eligible retained
+# entry at a time under the same retention policy as admission pressure (a
+# lower-priority incoming may not evict a more important entry, and CRITICAL
+# is never displaced), retrying after each reclamation. When no eligible
+# entry remains, the MemoryError propagates to the firmware recovery boundary
+# (it is not a transient rejection). put_with_kind() never serializes: its
+# bytes are already final, so only the existing admission rules apply.
 # ---------------------------------------------------------------------------
 
 
-def test_serialization_headroom_scales_with_the_ceiling():
-    """The working-set margin is 3x the per-message ceiling -- the documented
-    transient peak a serializer needs free on top of the survival reserve --
-    and it is a distinct quantity from minimum_free_heap_bytes."""
-    assert SERIALIZATION_HEADROOM_BYTES == 3 * MAX_OUTBOUND_MESSAGE_BYTES
-    assert SERIALIZATION_HEADROOM_BYTES == 48 * 1024
-    # The required free heap is the reserve PLUS the working set, so the two
-    # concerns stay separate: survival reserve + temporary working memory.
-    assert RESERVE + SERIALIZATION_HEADROOM_BYTES > RESERVE
+def test_pico_w_steady_state_small_telemetry_admitted(monkeypatch):
+    """The real Pico W condition: ~85 KiB free heap against the 64 KiB
+    reserve, an empty queue, a small telemetry message. put() must admit it --
+    the old fixed gate demanded reserve + 48 KiB (≈ 112 KiB) of free heap
+    before the serializer was even allowed to run, so this steady state was
+    rejected indefinitely on supported hardware."""
+    ic, heap = _queue(monkeypatch, free_bytes=85 * KB)
+    queue = ic.outbound_queue
+    assert (
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    )
+    assert json.loads(queue.take()["payload_bytes"]) == {"v": 1}
+    assert heap.mem_free() >= RESERVE
 
 
-def test_put_evicts_before_serializing_when_working_set_does_not_fit(monkeypatch):
-    """With the heap above the reserve but short of reserve + headroom and an
-    evictable lower-priority entry queued, put() displaces it *before*
-    serializing: the retained payload fits trivially, yet eviction still
-    happens -- a pure working-set concern, invisible to the post-admission
-    reserve check alone (which would admit with zero evictions)."""
+def test_put_does_not_evict_for_the_obsolete_worst_case_gate(monkeypatch):
+    """Heap above the reserve but below the old reserve + 48 KiB threshold,
+    with a retained entry queued: the incoming message serializes
+    successfully, so nothing may be evicted to satisfy the obsolete fixed
+    gate -- the post-serialization admission decides final retention."""
     ic, heap = _queue(monkeypatch)
     queue = ic.outbound_queue
-    # A full ceiling-sized lower-priority entry, evictable to free working-set
-    # room.
     assert (
         queue.put_with_kind(KIND_HEALTH, b"h" * (16 * KB), RETENTION_PRIORITY_HEALTH)
         is True
     )
-    # Above the reserve (the retained payload fits) but short of the
-    # reserve + working set the serializer needs.
-    heap.free_bytes = RESERVE + 40000
-    assert queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    heap.free_bytes = RESERVE + 40000  # above the reserve, below the old gate
+    assert (
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    )
     status = queue.status()
-    assert status["pending"] == 1            # the new entry; the HEALTH evicted
-    assert status["messages_evicted"] == 1   # displaced before serializing
+    assert status["pending"] == 2           # both retained
+    assert status["messages_evicted"] == 0  # nothing displaced
     assert status["messages_rejected"] == 0
+    first = queue.take()
+    assert first["payload_bytes"] == b"h" * (16 * KB)
+    assert queue.complete_in_flight(first) is True
     assert json.loads(queue.take()["payload_bytes"]) == {"v": 1}
-    # The survival reserve still holds after the whole operation.
-    assert gc.mem_free() >= RESERVE
 
 
-def test_put_serializes_only_once_headroom_is_available(monkeypatch):
-    """The working set must be free at the moment json.dumps/encode run: the
-    heap measured inside serialization already covers reserve + headroom,
-    proving the displacement happened before the allocation, not after."""
+def test_serialization_memory_error_recovers_with_gc_before_eviction(monkeypatch):
+    """First serialization MemoryError: gc.collect() alone resolves it, so no
+    queued data is discarded -- the retry happens before any eviction."""
     import message_serializer
 
     ic, heap = _queue(monkeypatch)
     queue = ic.outbound_queue
-    required = RESERVE + SERIALIZATION_HEADROOM_BYTES
-    assert (
-        queue.put_with_kind(KIND_HEALTH, b"h" * (16 * KB), RETENTION_PRIORITY_HEALTH)
-        is True
-    )
-    heap.free_bytes = RESERVE + 40000  # below required, above the reserve
-    observed = []
-    original = message_serializer.serialize_and_validate_message
-
-    def _spy(message):
-        observed.append(gc.mem_free())
-        return original(message)
-
-    monkeypatch.setattr(message_serializer, "serialize_and_validate_message", _spy)
-    assert queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
-    assert len(observed) == 1
-    assert observed[0] >= required
-
-
-def test_put_rejects_before_serializing_when_headroom_unavailable(monkeypatch):
-    """When nothing eligible can be evicted to free the working set, put()
-    rejects (transient False) rather than serialize and risk a MemoryError in
-    the working set -- even though the retained payload itself would fit."""
-    ic, heap = _queue(monkeypatch)
-    queue = ic.outbound_queue
-    # A CRITICAL entry the incoming TELEMETRY cannot displace.
+    # An evictable entry is present, so success is only credible if GC (not
+    # eviction) recovered the failure.
     assert (
         queue.put_with_kind(
-            KIND_COMMAND_RESPONSE, b'{"id":"r"}', RETENTION_PRIORITY_CRITICAL
+            KIND_TELEMETRY, b"t" * (8 * KB), RETENTION_PRIORITY_TELEMETRY
         )
         is True
     )
-    heap.free_bytes = RESERVE + 1024  # retained payload fits; working set does not
-    assert queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is False
+    original = message_serializer.serialize_and_validate_message
+    attempts = {"n": 0}
+
+    def _oom_then_ok(message):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise MemoryError
+        return original(message)
+
+    monkeypatch.setattr(
+        message_serializer, "serialize_and_validate_message", _oom_then_ok
+    )
+    assert (
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
+    )
     status = queue.status()
-    assert status["pending"] == 1            # only the CRITICAL retained
+    assert status["pending"] == 2
     assert status["messages_evicted"] == 0
-    assert status["messages_rejected"] == 1
-    assert json.loads(queue.take()["payload_bytes"]) == {"id": "r"}
+    assert status["messages_rejected"] == 0
+    assert heap.collects >= 1
 
 
-def test_critical_cannot_evict_existing_critical_for_headroom(monkeypatch):
-    """The retention floor also holds on the pre-serialization path: an
-    admitted CRITICAL cannot be displaced by another CRITICAL to make room for
-    the working set -- the incoming entry is rejected for the producer to
-    retry, not admitted by evicting the earlier response."""
+def test_serialization_memory_error_reclaims_one_eligible_entry(monkeypatch):
+    """A serialization MemoryError that survives the gc.collect() retry
+    reclaims one eligible lower-retention-priority entry (TELEMETRY, via the
+    regular eviction metrics) and then succeeds -- eviction only after GC."""
+    import message_serializer
+
     ic, heap = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert (
+        queue.put_with_kind(
+            KIND_TELEMETRY, b"t" * (8 * KB), RETENTION_PRIORITY_TELEMETRY
+        )
+        is True
+    )
+    original = message_serializer.serialize_and_validate_message
+    attempts = {"n": 0}
+
+    def _oom_twice_then_ok(message):
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise MemoryError
+        return original(message)
+
+    monkeypatch.setattr(
+        message_serializer, "serialize_and_validate_message", _oom_twice_then_ok
+    )
+    # Incoming is more important than the queued TELEMETRY entry, so the
+    # retention policy allows the displacement.
+    assert (
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_ERROR) is True
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["messages_evicted"] == 1
+    assert status["telemetry_evicted"] == 1
+    assert status["messages_rejected"] == 0
+    assert json.loads(queue.take()["payload_bytes"]) == {"v": 1}
+    assert heap.mem_free() >= RESERVE
+
+
+def test_serialization_memory_error_reclaims_exactly_as_many_entries_as_needed(monkeypatch):
+    """Recovery is incremental, not bulk-destructive: one entry per failed
+    attempt, stopping as soon as serialization succeeds -- here exactly two
+    of the three eligible entries are reclaimed."""
+    import message_serializer
+
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    seeded = (
+        (KIND_TELEMETRY, RETENTION_PRIORITY_TELEMETRY, b"t" * (8 * KB)),
+        (KIND_HEALTH, RETENTION_PRIORITY_HEALTH, b"h" * (8 * KB)),
+        (KIND_TELEMETRY, RETENTION_PRIORITY_INFO, b"i" * (8 * KB)),
+    )
+    for kind, priority, payload in seeded:
+        assert queue.put_with_kind(kind, payload, priority) is True
+    original = message_serializer.serialize_and_validate_message
+    attempts = {"n": 0}
+
+    def _fail_until_two_evictions(message):
+        # The first failure is answered by gc.collect() alone; each later
+        # failure triggers one eviction. So exactly three failures = GC plus
+        # two evictions, then serialization succeeds.
+        attempts["n"] += 1
+        if attempts["n"] <= 3:
+            raise MemoryError
+        return original(message)
+
+    monkeypatch.setattr(
+        message_serializer,
+        "serialize_and_validate_message",
+        _fail_until_two_evictions,
+    )
+    assert (
+        queue.put(KIND_COMMAND_RESPONSE, {"id": "r"}, RETENTION_PRIORITY_CRITICAL)
+        is True
+    )
+    status = queue.status()
+    assert status["pending"] == 2          # TELEMETRY + the incoming CRITICAL
+    assert status["messages_evicted"] == 2  # HEALTH then INFO, oldest least-important first
+    assert status["telemetry_evicted"] == 1
+    assert status["messages_rejected"] == 0
+    taken = queue.take()
+    assert taken["payload_bytes"] == b"t" * (8 * KB)
+
+
+def test_serialization_recovery_does_not_evict_a_critical_entry(monkeypatch):
+    """An incoming lower-priority message whose serialization keeps failing
+    must not displace a retained CRITICAL: nothing eligible remains, so the
+    MemoryError propagates instead of the retention floor being discarded or
+    the incoming message silently rejected."""
+    import message_serializer
+
+    ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
     existing = b'{"id":"response-a"}'
     assert (
@@ -799,41 +877,192 @@ def test_critical_cannot_evict_existing_critical_for_headroom(monkeypatch):
         )
         is True
     )
-    heap.free_bytes = RESERVE + 1024
-    assert (
-        queue.put(
-            KIND_COMMAND_RESPONSE, {"id": "response-b"}, RETENTION_PRIORITY_CRITICAL
-        )
-        is False
+
+    def _always_oom(*args):
+        raise MemoryError
+
+    monkeypatch.setattr(
+        message_serializer, "serialize_and_validate_message", _always_oom
     )
+    with pytest.raises(MemoryError):
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
     status = queue.status()
     assert status["pending"] == 1
+    assert status["queued_bytes"] == len(existing)
     assert status["messages_evicted"] == 0
-    assert status["messages_rejected"] == 1
-    # The retained entry is the one admitted first.
+    assert status["messages_rejected"] == 0
     assert queue.take()["payload_bytes"] == existing
 
 
-def test_put_with_kind_does_not_reserve_the_working_set(monkeypatch):
-    """put_with_kind() takes already-final bytes: no json.dumps/encode runs in
-    the queue, so it does not reserve the serialization working set. A small
-    entry is admitted on the fast path without evicting a queued entry, even
-    at a heap that would short the working-set requirement for put()."""
-    ic, heap = _queue(monkeypatch)
+def test_serialization_recovery_does_not_evict_critical_for_critical(monkeypatch):
+    """The retention floor also holds on the recovery path: an admitted
+    CRITICAL cannot be displaced by another CRITICAL's failed serialization --
+    the MemoryError propagates rather than discarding the earlier response."""
+    import message_serializer
+
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    existing = b'{"id":"response-a"}'
+    assert (
+        queue.put_with_kind(
+            KIND_COMMAND_RESPONSE, existing, RETENTION_PRIORITY_CRITICAL
+        )
+        is True
+    )
+
+    def _always_oom(*args):
+        raise MemoryError
+
+    monkeypatch.setattr(
+        message_serializer, "serialize_and_validate_message", _always_oom
+    )
+    with pytest.raises(MemoryError):
+        queue.put(
+            KIND_COMMAND_RESPONSE, {"id": "response-b"}, RETENTION_PRIORITY_CRITICAL
+        )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 0
+    assert queue.take()["payload_bytes"] == existing
+
+
+def test_serialization_recovery_equal_priority_matches_admission_policy(monkeypatch):
+    """Equal-priority replacement: the existing admission policy allows an
+    incoming entry to displace a same-priority queued entry, and the
+    serialization recovery path uses that same rule -- no new equal-priority
+    semantics are invented for recovery."""
+    import message_serializer
+
+    ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
     assert (
-        queue.put_with_kind(KIND_HEALTH, b"h" * (16 * KB), RETENTION_PRIORITY_HEALTH)
+        queue.put_with_kind(
+            KIND_TELEMETRY, b"o" * (8 * KB), RETENTION_PRIORITY_TELEMETRY
+        )
         is True
     )
-    heap.free_bytes = RESERVE + 40000  # below reserve + headroom, above the reserve
+    original = message_serializer.serialize_and_validate_message
+    attempts = {"n": 0}
+
+    def _oom_twice_then_ok(message):
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise MemoryError
+        return original(message)
+
+    monkeypatch.setattr(
+        message_serializer, "serialize_and_validate_message", _oom_twice_then_ok
+    )
     assert (
-        queue.put_with_kind(KIND_TELEMETRY, b'{"v":1}', RETENTION_PRIORITY_TELEMETRY)
-        is True
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
     )
     status = queue.status()
-    assert status["pending"] == 2           # both retained
-    assert status["messages_evicted"] == 0  # nothing displaced
+    assert status["pending"] == 1
+    assert status["messages_evicted"] == 1
+    assert status["telemetry_evicted"] == 1
+    assert json.loads(queue.take()["payload_bytes"]) == {"v": 1}
+
+
+def test_unrecoverable_serialization_memory_error_propagates(monkeypatch):
+    """Empty queue: no queue-owned memory to reclaim, so an unrecovered
+    serialization MemoryError propagates to the firmware recovery boundary
+    rather than being converted into a transient (False) queue rejection."""
+    import message_serializer
+
+    ic, _ = _queue(monkeypatch)
+
+    def _always_oom(*args):
+        raise MemoryError
+
+    monkeypatch.setattr(
+        message_serializer, "serialize_and_validate_message", _always_oom
+    )
+    with pytest.raises(MemoryError):
+        ic.outbound_queue.put(
+            KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY
+        )
+    assert ic.outbound_queue.get_depth() == 0
+
+
+def test_non_memory_serializer_failures_propagate_without_eviction(monkeypatch):
+    """Only MemoryError triggers reclamation: a serializer defect (a TypeError
+    or ValueError from the serializer itself) propagates unchanged, evicting
+    nothing and never being converted into queue pressure -- fail-fast is
+    preserved."""
+    import message_serializer
+
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+    assert (
+        queue.put_with_kind(
+            KIND_TELEMETRY, b"t" * (8 * KB), RETENTION_PRIORITY_TELEMETRY
+        )
+        is True
+    )
+
+    def _type_error(*args):
+        raise TypeError("serializer defect")
+
+    monkeypatch.setattr(
+        message_serializer, "serialize_and_validate_message", _type_error
+    )
+    with pytest.raises(TypeError):
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
+
+    def _value_error(*args):
+        raise ValueError("serializer defect")
+
+    monkeypatch.setattr(
+        message_serializer, "serialize_and_validate_message", _value_error
+    )
+    with pytest.raises(ValueError):
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
+
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["messages_evicted"] == 0
     assert status["messages_rejected"] == 0
+    assert queue.take()["payload_bytes"] == b"t" * (8 * KB)
+
+
+def test_put_post_serialization_admission_still_enforces_the_reserve(monkeypatch):
+    """A message that serializes successfully still goes through the
+    heap-governed admission: heap below the reserve with nothing to reclaim
+    is a transient (False) rejection exactly as before -- the recovery change
+    touches only the serialization working-set stage."""
+    ic, _ = _queue(monkeypatch, free_bytes=0)
+    queue = ic.outbound_queue
+    assert (
+        queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is False
+    )
+    status = queue.status()
+    assert status["pending"] == 0
+    assert status["messages_rejected"] == 1
+    assert status["messages_evicted"] == 0
+
+
+def test_put_with_kind_never_serializes(monkeypatch):
+    """put_with_kind() receives already-final bytes: the serializer and the
+    serialization-recovery path are never invoked, and only the existing
+    admission rules apply."""
+    import message_serializer
+
+    ic, _ = _queue(monkeypatch)
+    queue = ic.outbound_queue
+
+    def _boom(*args):
+        raise AssertionError("the serializer must not run on put_with_kind()")
+
+    monkeypatch.setattr(
+        message_serializer, "serialize_and_validate_message", _boom
+    )
+    assert (
+        queue.put_with_kind(
+            KIND_TELEMETRY, b'{"v":1}', RETENTION_PRIORITY_TELEMETRY
+        )
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------
