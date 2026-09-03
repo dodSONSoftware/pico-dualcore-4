@@ -14,7 +14,7 @@ This firmware implements a clean architecture where:
 
 - **Core 0** exclusively owns Wi-Fi, MQTT, sockets, UTC time synchronization, and system reboot
 - **Core 1** exclusively owns device drivers, sensor reads, device lifecycle management, and telemetry construction
-- Communication between cores uses four lanes with strict ownership rules (the two FIFO lanes are heap-governed: admitted against the board's minimum free-heap reserve; the latest-value lanes carry state snapshots and the config-update request/result)
+- Communication between cores uses four lanes with strict ownership rules (the two FIFO lanes are heap-governed: admitted against the board's two heap thresholds — the preferred reserve where memory-pressure handling begins and the hard minimum floor that must stay intact; the latest-value lanes carry state snapshots and the config-update request/result)
 
 ### Architecture
 
@@ -130,7 +130,7 @@ Core 1 queues messages for MQTT; Core 0 publishes them.
 | INFO | 50 | Informational messages |
 | HEALTH | 70 | Health checks |
 
-When full, the queue evicts the oldest message from the least important priority class that has capacity.
+The queue has no fixed capacity: under heap pressure it evicts the oldest message of the least-important eligible priority class to make room, and rejects the new message transiently (for the producer to retry) when no eligible entry remains.
 
 ### 2. Event Queue (Core 0 → Core 1)
 
@@ -141,7 +141,7 @@ Core 0 forwards MQTT commands to Core 1 via discrete events.
 Latest-value snapshots:
 - `network_snapshot`: Wi-Fi status, IP, RSSI, connection counts
 - `utc_snapshot`: Current UTC time, ticks base, runtime start
-- `hardware`: Detected hardware type and heap reserve
+- `hardware`: Detected hardware type, machine string, and the board's preferred/minimum heap thresholds
 - `core_1_activity_ms`: Timestamp of last Core 1 activity
 
 ## Health Messages
@@ -164,7 +164,8 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 
 ### Memory
 - `free_heap_bytes`: Current free heap
-- `minimum_free_heap_bytes`: Configured heap reserve (64KB Pico W, 128KB Pico 2 W)
+- `preferred_free_heap_bytes`: Preferred reserve — where memory-pressure handling begins (64KB Pico W, 144KB Pico 2 W); not a rejection wall
+- `minimum_free_heap_bytes`: Hard survival floor that admission must protect (48KB Pico W, 128KB Pico 2 W)
 - `heap_headroom_bytes`: free_heap - minimum_free_heap (may be negative)
 
 ### Core Activity
@@ -184,7 +185,7 @@ The queues are heap-governed (no fixed capacity), so these are observability met
 - `outbound_queue_high_watermark_bytes`: Peak retained payload bytes since boot
 - `outbound_evicted`: Entries evicted under memory pressure (all kinds)
 - `telemetry_evicted`: Evicted entries of the telemetry kind
-- `outbound_rejected`: Admissions rejected because the free-heap reserve could not be restored
+- `outbound_rejected`: Admissions rejected because the hard free-heap floor could not be restored
 
 ### UTC
 - `utc_valid`: Boolean indicating UTC time is valid
@@ -197,7 +198,7 @@ The health status is "degraded" when any of these conditions are true:
 - `wifi_not_connected`: Wi-Fi disconnected
 - `mqtt_not_connected`: MQTT broker connection lost
 - `core_1_inactive`: Core 1 activity exceeds threshold (3x read_loop_sec, min 60s)
-- `low_free_heap`: free_heap < minimum_free_heap
+- `low_free_heap`: free_heap < minimum_free_heap (below the hard floor)
 - `device_count_mismatch`: devices_active != devices_configured
 - `utc_not_valid`: UTC snapshot unavailable
 
@@ -228,6 +229,7 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 - **Pre-serialized Queue**: Outbound messages validated and serialized before admission
 - **Hardware Detection**: Automatic Pico W vs Pico 2 W detection
 - **Memory-Efficient**: Designed for 256KB RAM constraint
+- **Two-Threshold Heap Admission**: Each board splits its free-heap reserve into a preferred pressure band (64KB Pico W / 144KB Pico 2 W) and a hard survival floor (48KB / 128KB); queue admission reclaims under pressure instead of rejecting, so a Pico W admits normal telemetry in steady state
 
 ## Configuration
 

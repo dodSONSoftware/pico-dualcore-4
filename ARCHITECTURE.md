@@ -27,8 +27,9 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
     "core_1_active": true,
     "core_1_activity_age_ms": 42,
     "free_heap_bytes": 95728,
-    "minimum_free_heap_bytes": 65536,
-    "heap_headroom_bytes": 30192,
+    "preferred_free_heap_bytes": 65536,
+    "minimum_free_heap_bytes": 49152,
+    "heap_headroom_bytes": 46576,
     "devices_configured": 1,
     "devices_active": 1,
     "device_failures": 0,
@@ -65,8 +66,9 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 ### Memory Fields
 
 - `free_heap_bytes`: Current `gc.mem_free()` value
-- `minimum_free_heap_bytes`: Board-specific heap reserve (64KB Pico W, 128KB Pico 2 W)
-- `heap_headroom_bytes`: free_heap - minimum_free_heap (negative when below reserve)
+- `preferred_free_heap_bytes`: Board-specific preferred reserve (64 KiB Pico W, 144 KiB Pico 2 W) — where memory-pressure handling (GC, then reclamation of low-retention entries) begins; never a rejection wall by itself
+- `minimum_free_heap_bytes`: Board-specific hard survival floor that admission must protect (48 KiB Pico W, 128 KiB Pico 2 W)
+- `heap_headroom_bytes`: free_heap - minimum_free_heap (negative when below the hard floor)
 
 ### Core Activity Fields
 
@@ -89,7 +91,7 @@ The queues are heap-governed (no fixed capacity), so these are observability met
 - `outbound_queue_high_watermark_bytes`: Peak retained payload bytes since boot
 - `outbound_evicted`: Entries evicted under memory pressure (all kinds)
 - `telemetry_evicted`: Evicted entries of the telemetry kind
-- `outbound_rejected`: Admissions rejected because the free-heap reserve could not be restored
+- `outbound_rejected`: Admissions rejected because the hard free-heap floor could not be restored
 
 ### UTC Fields
 
@@ -102,7 +104,7 @@ The queues are heap-governed (no fixed capacity), so these are observability met
 - `wifi_not_connected`: Wi-Fi disconnected
 - `mqtt_not_connected`: MQTT broker connection lost
 - `core_1_inactive`: Core 1 activity exceeds threshold (3x read_loop_sec, min 60s)
-- `low_free_heap`: free_heap < minimum_free_heap
+- `low_free_heap`: free_heap < minimum_free_heap (below the hard floor)
 - `device_count_mismatch`: devices_active != devices_configured
 - `utc_not_valid`: UTC snapshot unavailable
 
@@ -122,14 +124,14 @@ This prevents health messages from accumulating during MQTT outages. A boundary 
 
 The firmware explicitly identifies the hardware at startup using `os.uname().machine`.
 
-- Raspberry Pi Pico W: `RPI_PICO_W with RP2040` → canonical type `pico_w`, heap reserve 64 KiB
-- Raspberry Pi Pico 2 W: `RPI_PICO2_W with RP2350` → canonical type `pico_2_w`, heap reserve 128 KiB
+- Raspberry Pi Pico W: `RPI_PICO_W with RP2040` → canonical type `pico_w`, preferred reserve 64 KiB, hard floor 48 KiB
+- Raspberry Pi Pico 2 W: `RPI_PICO2_W with RP2350` → canonical type `pico_2_w`, preferred reserve 144 KiB, hard floor 128 KiB
 - Unsupported hardware raises a clear `RuntimeError` during startup
 
 The hardware module provides:
 - Canonical hardware type identifiers (`HARDWARE_TYPE_PICO_W`, `HARDWARE_TYPE_PICO_2_W`, `HARDWARE_TYPE_UNKNOWN`)
-- Board-specific minimum free-heap reserves (`PICO_W_MIN_FREE_HEAP_BYTES`, `PICO_2_W_MIN_FREE_HEAP_BYTES`)
-- `classify_machine()` — the single source of truth mapping a machine string to canonical type and board heap reserve. Both `detect_hardware()` (startup) and `SystemInformation.get_machine()` (telemetry/health) classify through it, so they can never disagree.
+- Board-specific free-heap thresholds — the preferred reserve (`PICO_W_PREFERRED_FREE_HEAP_BYTES`, `PICO_2_W_PREFERRED_FREE_HEAP_BYTES`) where memory-pressure handling begins, and the hard floor (`PICO_W_MIN_FREE_HEAP_BYTES`, `PICO_2_W_MIN_FREE_HEAP_BYTES`) that admission must protect
+- `classify_machine()` — the single source of truth mapping a machine string to canonical type and both board heap thresholds. Both `detect_hardware()` (startup) and `SystemInformation.get_machine()` (telemetry/health) classify through it, so they can never disagree.
 - Detection function `detect_hardware()` returning an immutable result dict, failing fast on unknown hardware
 
 See `hardware.py` for implementation details.
@@ -158,7 +160,7 @@ This is why the firmware defends the **integrity and boundedness** of inbound fr
 
 Core 1 -> Core 0. Contains only data intended for MQTT.
 
-- FIFO and heap-governed: no fixed entry count or byte budget — admission is decided against the board's minimum free-heap reserve (see Memory safety below), so the queue retains whatever the heap can safely hold.
+- FIFO and heap-governed: no fixed entry count or byte budget — admission is decided against the board's two heap thresholds (see Memory safety below): the preferred reserve opens memory-pressure handling and the minimum is the hard survival floor no retained entry may cross, so the queue retains whatever the heap can safely hold.
 - Core 1 supplies only a message kind plus domain data; it does not know MQTT topics.
 - Core 0 maps the kind to the authoritative MQTT topic, publishes with QoS 1, and owns the MQTT envelope (sequence, runtime_id, source, firmware_version, message_schema_version). Kinds: TELEMETRY → `mqtt_topic_telemetry`, COMMAND_RESPONSE → `mqtt_topic_command_response`, HEALTH → `mqtt_topic_health`, LOG → `mqtt_topic_log`.
 - The startup log and connection logs travel as KIND_LOG entries; no hardcoded topics cross into Core 1.
@@ -168,7 +170,7 @@ Core 1 -> Core 0. Contains only data intended for MQTT.
 - The MQTT client waits for the matching PUBACK before the next publish proceeds, naturally enforcing one application QoS 1 publish in flight. The wait is bounded by `mqtt_broker_response_timeout_sec`, so a blackholed link fails the publish (the entry stays in flight) instead of blocking the run loop.
 - Retention priority is explicit: lower numeric values are more important.
 - Priority classes are: CRITICAL 10, ERROR 20, WARN 30, TELEMETRY 40, INFO 50, HEALTH 70.
-- Under memory pressure — the free heap below the reserve even after `gc.collect()`, or the admission's own allocations (the entry dict and list growth) crossing the reserve when the append is re-measured after it — the queue finds the least-important queued class (highest numeric priority). If the incoming message is at least as important, the oldest entry in that least-important class is evicted, the heap is reclaimed and rechecked, and this repeats until the reserve is restored and the entry is retained, or no eligible entry remains. If the incoming message is less important than everything queued, or the queue is empty, it is rejected without dropping a valid entry.
+- Admission is three-banded against the two thresholds: at or above the preferred reserve the entry is admitted on the fast path (no `gc.collect()`, no eviction); between the preferred reserve and the hard floor (memory pressure) the queue runs `gc.collect()` first — if that restores the preferred reserve the admission proceeds as normal, otherwise it reclaims the oldest entry of the least-important queued class the incoming message may displace (an increased willingness to discard low-retention traffic, since the preferred reserve is not a rejection wall) and still admits; below the hard floor after GC (hard pressure), or when the append's own allocations (the entry dict and list growth) cross the floor when re-measured after the append, it reclaims eligible entries one at a time, reclaiming and rechecking after each, until the entry is retained with the hard floor intact, or no eligible entry remains. If the incoming message is less important than everything queued, or the queue is empty, it is rejected as transient (the producer retains and retries) without dropping a valid entry.
 - **CRITICAL is a non-evictable retention floor.** An admitted CRITICAL entry (a command response) has no remaining owner once Core 1 has handed it off, so evicting it to make room for another CRITICAL entry would permanently lose the response — and with the command-ID debounce suppressing the retry, the client would lose the answer to a command that was processed. A CRITICAL admission that cannot fit without evicting an existing CRITICAL entry is therefore rejected (the producer retains it and retries), while a CRITICAL entry still displaces lower-priority ones, and equal-priority replacement is unchanged for the replaceable lower priorities.
 - The current Core 1 command response uses CRITICAL 10; telemetry uses TELEMETRY 40; health messages use HEALTH 70; the startup log uses INFO 50.
 - An in-flight QoS 1 entry is retained until its PUBACK (its payload bytes stay counted in the retained-bytes metric) and is never an eviction candidate.
@@ -225,7 +227,7 @@ The original message dictionary is not retained after queue admission. Any mutat
 
 Admission failures are distinguished by outcome, and both admission paths (`put()` and `put_with_kind()`) share the same contract:
 
-- **Transient — returns `False`**: heap-pressure rejection (the free-heap reserve could not be restored, or the incoming entry is less important than everything queued). A later retry may succeed.
+- **Transient — returns `False`**: heap-pressure rejection (the hard free-heap floor could not be restored, or the incoming entry is less important than everything queued). A later retry may succeed.
 - **Permanent — raises `ValueError`**: the message itself can never be admitted — an unsupported value, a non-string key, a non-finite float, a serialization failure, or a serialized size beyond `MAX_OUTBOUND_MESSAGE_BYTES`. Retrying the same message cannot succeed, so these are raised rather than returned as `False`. Queue state is untouched in both cases.
 
 Callers act on the distinction: telemetry and health discard a permanently rejected message (current-state data is not retryable), the startup log treats any admission failure as fatal, and the Core 1 command path answers a permanently rejected response with a small error response for the same command, then moves on — so an individual command response can never permanently block the command channel behind it. The substitute's code states the actual cause, so a firmware defect is never misreported to the command sender as a size problem: an oversized response (`OutboundQueue` raises `OutboundMessageTooLargeError`, a `ValueError` subclass, for the ceiling case on both admission paths) gets `error.code: "response_too_large"`, while a validation or serialization failure (plain `ValueError`) gets `error.code: "response_invalid"`. A transiently rejected response stays pending and is retried on later passes. The same permanent-failure distinction holds at the wire boundary: an entry whose spliced wire length exceeds the ceiling (the body was admitted at or under it, the envelope pushed it over) is a size failure of the same cause class, and is handled the same way — command responses answered with `response_too_large`, everything else discarded and counted.
@@ -235,10 +237,10 @@ Callers act on the distinction: telemetry and health discard a permanently rejec
 Three rules keep the outbound path safe on MCU-scale heap (Pico W: 256 KiB SRAM). The per-message size check happens after `json.dumps()` + UTF-8 `encode`, so at peak allocation the object graph, the serialized `str`, and the encoded `bytes` are all resident at once — a large payload can therefore exhaust heap before a limit is even reached:
 
 - **Per-message ceiling** — `message_serializer.MAX_OUTBOUND_MESSAGE_BYTES = 16 KiB`. Bounds a single message's transient peak (graph + str + bytes ≈ 3x the payload ≈ 48 KiB) and keeps the largest legitimate message (the one-shot startup log, the only payload that grows with device count) comfortably under the limit with margin. Config-derived growth is bounded at the config boundary (`config.MAX_DEVICES` and `device_factory.MAX_DEVICE_*_LENGTH`), so the startup log is the one payload that can legitimately exceed the ceiling only through its non-config content (the full `system_information` sections and driver failure reasons); when it does, Core 1 admits a bounded fallback summary instead of failing startup (see Startup log). The queue enforces it on both admission paths: `put()` via the serialization step, and `put_with_kind()` via a direct byte-length check on the pre-serialized payload, so a caller bypassing `serialize_and_validate_message()` cannot admit a larger entry. The ceiling is enforced a second time at the wire boundary, against the final spliced length (`core0._publish_entry`), so the 16 KiB bound holds for the actual MQTT payload even though the envelope is added after admission.
-- **Global free-heap reserve** — the board's minimum free heap (`hardware.py`: 64 KiB Pico W, 128 KiB Pico 2 W), the single source of truth for queue memory safety. An entry may be retained only while `gc.mem_free()` is at or above the reserve, so the queue cannot exhaust heap on its own during an MQTT outage, regardless of how many entries it holds.
-- **Serialization with `MemoryError` recovery** — the `put()` path (the only admission path that serializes) works on the *actual* message's working set: it attempts `json.dumps()` + `encode()` directly, with no fixed worst-case threshold standing in for it, so a small telemetry message on a Pico W at ~85 KiB free heap (against the 64 KiB reserve) serializes and is admitted. A `MemoryError` from the serializer is a recovery trigger, not a rejection: first `gc.collect()` and retry (fragmentation or collectable garbage can resolve it with no data loss); only if serialization still fails does the queue reclaim memory — one eviction per attempt, the oldest entry in the least-important class this message may displace under the *same* eligibility rule as admission pressure (a lower-priority incoming may not evict a more important entry; CRITICAL is never displaced), each re-claimed with `gc.collect()` — until serialization succeeds or no eligible entry remains, in which case the `MemoryError` propagates to the firmware recovery boundary (it is not converted into a transient rejection, and nothing is swallowed). The loop is bounded by the number of eligible retained entries, so it terminates without a retry count. Non-`MemoryError` serializer failures (validation, size, serialization) propagate immediately, as before. `put_with_kind()` takes already-final bytes, so it never serializes and never enters recovery; the post-admission reserve check above still applies to both.
+- **Two heap thresholds** — `hardware.py` splits each board's reserve into a preferred pressure band and a hard survival floor (Pico W: 64 KiB preferred / 48 KiB floor; Pico 2 W: 144 KiB preferred / 128 KiB floor), the single source of truth for queue memory safety. The preferred reserve marks where memory-pressure handling begins — `gc.collect()` first, then an increased willingness to reclaim low-retention entries — and is never a rejection wall by itself; the hard floor is what admission must protect: an entry may be retained only while `gc.mem_free()` is at or above it, re-measured after the append's own allocations, so the queue cannot exhaust heap on its own during an MQTT outage, regardless of how many entries it holds.
+- **Serialization with `MemoryError` recovery** — the `put()` path (the only admission path that serializes) works on the *actual* message's working set: it attempts `json.dumps()` + `encode()` directly, with no fixed worst-case threshold standing in for it, so a small telemetry message on a Pico W at ~85 KiB free heap (above the 64 KiB preferred reserve, 48 KiB hard floor) serializes and is admitted on the fast path. A `MemoryError` from the serializer is a recovery trigger, not a rejection: first `gc.collect()` and retry (fragmentation or collectable garbage can resolve it with no data loss); only if serialization still fails does the queue reclaim memory — one eviction per attempt, the oldest entry in the least-important class this message may displace under the *same* eligibility rule as admission pressure (a lower-priority incoming may not evict a more important entry; CRITICAL is never displaced), each re-claimed with `gc.collect()` — until serialization succeeds or no eligible entry remains, in which case the `MemoryError` propagates to the firmware recovery boundary (it is not converted into a transient rejection, and nothing is swallowed). The loop is bounded by the number of eligible retained entries, so it terminates without a retry count. Non-`MemoryError` serializer failures (validation, size, serialization) propagate immediately, as before. `put_with_kind()` takes already-final bytes, so it never serializes and never enters recovery; the post-admission hard-floor check above still applies to both.
 
-Admission is heap-governed under one shared heap-admission lock (the heap is global to both cores, and both queues share the lock). The `put()` path first serializes the actual message — recovering a `MemoryError` with `gc.collect()`, then one eligible queued entry per persistent failure under the retention policy, with the queue lock held only for the eviction step (never across the serializer or `gc.collect()`) — and only then admits; `put_with_kind()` skips that step (its bytes are already final). Both then apply the admission decision: fast path — reserve satisfied, admit, no garbage collection; pressure path — `gc.collect()` once, and if the reserve is still not restored, evict the oldest entry in the least-important eligible queued class, reclaim, and recheck, repeating until the reserve is restored or nothing eligible remains — then admit or reject. The reserve is a **post-admission invariant**, not a pre-admission threshold: it is re-measured after the append itself (which allocates the entry and any list growth) on both admission paths, and an admission whose own allocations cross it is undone (entry removed, heap reclaimed) and fed into the same priority-displacement decision — an eligible less-important queued entry may be evicted for it, and only when none remains is it rejected as transient — so no retained entry can ever sit below the reserve. A valid queued entry is never dropped to admit a less important one, and the in-flight entry is never evicted. `OutboundQueue.status()` reports `queued_bytes`, the depth/bytes high watermarks, and the eviction/rejection counters for observability.
+Admission is heap-governed under one shared heap-admission lock (the heap is global to both cores, and both queues share the lock). The `put()` path first serializes the actual message — recovering a `MemoryError` with `gc.collect()`, then one eligible queued entry per persistent failure under the retention policy, with the queue lock held only for the eviction step (never across the serializer or `gc.collect()`) — and only then admits; `put_with_kind()` skips that step (its bytes are already final). Both then apply the admission decision against the two thresholds: **NORMAL** (free heap at or above the preferred reserve) — admit with no garbage collection and no pressure eviction; **memory pressure** (at or above the hard floor but below the preferred reserve) — `gc.collect()` first, and if that restores the preferred reserve the admission is normal, otherwise one eligible entry of the least-important class this message may displace is reclaimed and the entry is still admitted (the preferred reserve opens pressure handling but is not a rejection wall); **hard pressure** (below the hard floor after GC, or an append whose own allocations cross it) — evict eligible entries one at a time, reclaim and recheck after each, until the entry is retained with the floor intact or nothing eligible remains — then admit, or reject as transient for the producer to retain and retry. The hard floor is a **post-admission invariant**, not a pre-admission threshold: it is re-measured after the append itself (which allocates the entry and any list growth) on both admission paths, and an admission whose own allocations cross it is undone (entry removed, heap reclaimed) and fed into the same priority-displacement decision — an eligible less-important queued entry may be evicted for it, and only when none remains is it rejected as transient — so no retained entry can ever sit below the floor. A valid queued entry is never dropped to admit a less important one, and the in-flight entry is never evicted. `OutboundQueue.status()` reports `queued_bytes`, the depth/bytes high watermarks, and the eviction/rejection counters for observability.
 
 ### 2. `event_queue`
 
@@ -252,7 +254,7 @@ by the configured scheduled `system-information` device `include` list. The
 command requires an empty payload (any key is an unknown field, named sorted,
 at the Core 0 boundary — the same contract as `reboot`).
 
-- FIFO and heap-governed: the same global free-heap reserve and shared heap-admission lock as the outbound queue, but with NO eviction — an admitted event is a discrete control operation and is never displaced by a newer one. Under memory pressure the new event is rejected and the caller reports the `intercore_event_queue_memory_pressure` failure.
+- FIFO and heap-governed: the same hard free-heap floor and shared heap-admission lock as the outbound queue, but with NO eviction — an admitted event is a discrete control operation and is never displaced by a newer one. Under memory pressure the new event is rejected and the caller reports the `intercore_event_queue_memory_pressure` failure.
 - Every admitted event matters.
 - Entries are never automatically published to MQTT.
 - Reboot never enters this lane; Core 0 owns reboot completely.
@@ -339,7 +341,7 @@ Core 0 -> Core 1 latest-value state.
 
 - `network_snapshot`: Wi-Fi status, IP, RSSI, connection counts, `network_stack_ready` flag
 - `utc_snapshot`: Current UTC time, ticks base, runtime start
-- `hardware`: Detected hardware type, machine string, heap reserve
+- `hardware`: Detected hardware type, machine string, and the board's preferred/minimum heap thresholds
 - `core_1_activity_ms`: Timestamp of last Core 1 activity report (in milliseconds) — written by Core 1, read by Core 1 for health reporting and by Core 0 as the input to the liveness watchdog
 
 State is replaced, not accumulated. Core 1 keeps the latest immutable snapshot until Core 0 replaces it.
@@ -370,6 +372,8 @@ Core 0 intentionally follows the original known-good behavior:
 ### Boot when the network never appears
 
 The connect loops in `establish_network()` are intentionally unbounded (a watchdog is listed under "Features intentionally not carried into the baseline"). If the configured SSID is absent, or the broker is unreachable, Core 0 retries forever: each Wi-Fi attempt observes the link for up to 20 s (200 × 100 ms) — or ends the attempt early the moment the radio reports a terminal association state (a wrong password, a missing AP, or a known connect failure, so a misconfigured SSID no longer burns the full window before each retry) — then sleeps the configured backoff delays between attempts, then the whole sequence restarts. These waits are not monolithic: every one of them sleeps or observes in 100 ms slices with Core 0's servicing hook (`_service_wait`, the Core 1 heartbeat check) invoked between slices (see Core 1 liveness heartbeat). At boot the check is a no-op — Core 1 has not registered yet — but on the mid-run recovery path it is what keeps a dead Core 1 from hiding behind a network outage. Core 1 never starts, and the flashing connection LED (50 ms on / 50 ms off) is the only visible state of this boot loop. The startup verification steps behave the same way: a failed probe or a failed UTC pass drops the MQTT session, re-establishes the network, and retries the pass, so a transient failure after connection is recovered rather than fatal (see Deterministic startup sequence).
+
+The exhaustion is observable, not silent: when an MQTT connection sequence uses up its attempts, `establish_network()` logs one warning naming the final cause the client retained — `Mqtt.last_connect_error`, the last expected transport/protocol error of the sequence (an ECONNREFUSED or ETIMEDOUT socket error, a connection reset, a CONNACK failure, or a SUBACK failure) — followed by the retry delay, falling back to the generic exhausted-sequence warning when no cause was retained. The Wi-Fi exhaustion warning has the same shape without a cause (the Wi-Fi layer retains no per-attempt error).
 
 ## QoS 1 network probe
 
@@ -550,7 +554,7 @@ Core 1 generates health messages on a normal-runtime-anchored cadence: `health_i
    - Uptime since boot is accumulated from deltas between recent samples (`uptime.py`), never as a single `ticks_diff(now, boot)` — that one-shot form is only guaranteed within half a tick period and wraps on long-running devices
    - UTC sync age: integer division of milliseconds by 1000
 
-4. **Memory pressure**: free heap below the board reserve (`low_free_heap`). Both queues are admitted against the same global reserve (see Memory safety), so a below-reserve heap is itself the queue-pressure condition — no separate queue-utilization threshold exists.
+4. **Memory pressure**: free heap below the hard floor — `minimum_free_heap_bytes` — adds `low_free_heap`. Both queues are admitted against the same two thresholds (see Memory safety), so a below-floor heap is itself the queue-pressure condition — no separate queue-utilization threshold exists.
 
 5. **Low-priority retention**: Uses `RETENTION_PRIORITY_HEALTH = 70`, the lowest priority class
 
@@ -561,7 +565,7 @@ Health status is "degraded" when any of these conditions are true:
 - `wifi_not_connected`: Wi-Fi disconnected
 - `mqtt_not_connected`: MQTT broker connection lost
 - `core_1_inactive`: Activity age exceeds threshold (3x read_loop_sec, minimum 60 seconds)
-- `low_free_heap`: Free heap below configured reserve
+- `low_free_heap`: Free heap below the hard floor (`minimum_free_heap_bytes`)
 - `device_count_mismatch`: Active devices don't match configured count
 - `utc_not_valid`: UTC snapshot unavailable
 
