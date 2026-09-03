@@ -2,14 +2,11 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
-"""Command protocol constants and pure validation helpers (the Core 0 command boundary).
-
-The firmware owns one strict command protocol boundary before any command
-executes. This module holds only the protocol constants and the pure helpers
-that validate against them -- no classes, no state, no generic schema
-framework. Firmware policy (the command-ID debounce cache, response queues,
-command dispatch) stays in the owning core modules.
-"""
+"""Command protocol constants and pure validation helpers (the Core 0
+command boundary). Only the protocol constants and the pure helpers that
+validate against them — no classes, no state, no schema framework. Firmware
+policy (debounce cache, response queues, dispatch) stays in the owning core
+modules."""
 
 COMMAND_REBOOT = "reboot"
 COMMAND_GET_DETAILS = "get-details"
@@ -22,8 +19,8 @@ MAX_TARGET_LENGTH = 128
 
 # The configured source is spliced into every Core 0 outbound envelope, so it
 # is a protocol-scale identity (matched against a bounded target), not an
-# open-ended string: a multi-kilobyte identity would push even a tiny envelope
-# past the outbound wire ceiling.
+# open-ended string: a huge identity would push even a tiny envelope past the
+# outbound wire ceiling.
 MAX_SOURCE_LENGTH = 64
 
 BROADCAST_TARGET = "*"
@@ -39,12 +36,11 @@ COMMAND_ENVELOPE_KEYS = frozenset((
     "payload",
 ))
 
-# Command ownership: Core 0-owned commands are executed on Core 0 (reboot,
-# read-config / write-config with the configuration manager); Core 1-owned
-# commands are dispatched to Core 1 as validated bounded events. Only
-# get-details crosses; the configuration hot-reload handshake (the
-# config-update event for read_loop_sec / health_interval_sec) is internal
-# control traffic, not an external command.
+# Command ownership: Core 0 executes its own commands (reboot, read-config /
+# write-config); Core 1-owned commands are dispatched to Core 1 as validated
+# bounded events. Only get-details crosses. The configuration hot-reload
+# handshake (the config-update event) is internal control traffic, not an
+# external command.
 CORE0_OWNED_COMMANDS = (
     COMMAND_REBOOT,
     COMMAND_READ_CONFIG,

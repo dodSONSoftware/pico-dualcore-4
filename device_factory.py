@@ -7,29 +7,26 @@ from devices.system_information.system_information_device import SystemInformati
 from devices.system_information.validation import ALLOWED_CONFIG_KEYS, validate_config
 
 # The supported device_type registry: device_type -> (pure config validator,
-# allowed config keys). The single source of truth for which device types the
-# firmware supports and how each validates its device-specific config. It is
-# shared by create_device() (construction, which additionally needs the runtime
-# system_information source) and the pure validation path in config.py. Adding
-# a device type is adding one entry here plus its pure validator.
+# allowed config keys). The single source of truth for which types the
+# firmware supports and how each validates its device-specific config, shared
+# by create_device() (construction) and the pure validation path in config.py.
+# Adding a device type is adding one entry here plus its pure validator.
 _DEVICE_REGISTRY = {
     "system-information": (validate_config, ALLOWED_CONFIG_KEYS),
 }
 
-# The complete set of keys a device definition may carry; anything beyond these
-# is unknown and reported as a qualified path. Shared with config.py's
-# aggregation so the definition shape has exactly one source.
+# The complete set of keys a device definition may carry; anything beyond is
+# unknown and reported as a qualified path. Shared with config.py's
+# aggregation so the definition shape has one source.
 DEVICE_DEFINITION_KEYS = frozenset(("id", "device_type", "config", "name", "sensor_type"))
 
-# id, name, and sensor_type are spliced into per-message payloads (the
-# telemetry message's identity fields, the startup log's ready/failed device
-# lists, and the read-config response's whole configuration), so they carry a
-# length bound that keeps a worst-case valid message under
-# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB): with MAX_DEVICES entries the device
-# sections stay in low single-digit KB. 64 matches MAX_SOURCE_LENGTH, the
-# other wire identity string. The bound belongs at this validation boundary —
-# it must hold before Core 1 constructs per-device structures (including in
-# the startup log's bounded fallback), not where the message is serialized.
+# id, name, and sensor_type are spliced into per-message payloads (telemetry
+# identity fields, startup-log device lists, the read-config response), so
+# they carry a length bound that keeps a worst-case valid message under
+# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB). 64 matches MAX_SOURCE_LENGTH. The bound
+# belongs at this validation boundary — it must hold before Core 1 constructs
+# per-device structures (including the startup log's bounded fallback), not
+# where the message is serialized.
 MAX_DEVICE_ID_LENGTH = 64
 MAX_DEVICE_NAME_LENGTH = 64
 MAX_SENSOR_TYPE_LENGTH = 64
@@ -52,11 +49,9 @@ def allowed_config_keys(device_type):
 
 
 def validate_device_config(device_type, config):
-    """Pure validation of one device's device-specific config (no hardware).
-
-    Dispatches to the registered validator; raises DeviceValidationError with
-    unsupported_device_type when the type is unknown, otherwise the validator's
-    own code."""
+    """Pure validation of one device's device-specific config (no hardware);
+    dispatches to the registered validator (unsupported_device_type when the
+    type is unknown, otherwise the validator's own code)."""
     entry = _DEVICE_REGISTRY.get(device_type)
     if entry is None:
         raise DeviceValidationError(
@@ -67,14 +62,11 @@ def validate_device_config(device_type, config):
 
 
 def validate_device_definition(device_definition):
-    """Pure validation of one complete device definition (no hardware).
-
-    Checks the generic device-definition shape, that the device_type is
-    supported, and dispatches to the type's pure config validator. Raises
-    DeviceValidationError with a stable code on the first violation. Never
-    constructs or initializes a hardware resource: a valid definition with no
-    physical backing passes, leaving physical absence to the boot-time
-    initialization outcome."""
+    """Pure validation of one complete device definition (no hardware):
+    generic shape, supported device_type, then the type's pure config
+    validator. Raises DeviceValidationError (stable code) on the first
+    violation. Never constructs hardware: a valid definition with no physical
+    backing passes, leaving absence to the boot-time initialization outcome."""
     if not isinstance(device_definition, dict):
         raise DeviceValidationError("device definition must be an object", code="invalid_value")
 

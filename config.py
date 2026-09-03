@@ -13,72 +13,58 @@ from device_factory import (
 from devices.device import DeviceValidationError
 from version import CONFIG_SCHEMA_VERSION
 
-# MQTT 3.1.1 encodes Keep Alive as a 16-bit word: 65535 seconds is the
-# maximum a broker can accept, so anything above it can never form a
-# connection (and this key is reboot-required, so a rejected write would
-# brick the MQTT channel used to fix it).
+# MQTT 3.1.1 encodes Keep Alive as a 16-bit word: above 65535 s the
+# CONNECT packet is unrepresentable. This key is reboot-required, so a
+# rejected write would brick the MQTT channel used to fix it.
 MAX_MQTT_KEEPALIVE_SEC = 65535
 
-# mqtt_client.subscribe() encodes the SUBSCRIBE Remaining Length in a
-# single byte (valid through 127), and the body is 2 packet-id + 2
-# topic-length + topic + 1 requested-QoS = topic + 5. A topic longer than
-# this makes the first Remaining Length byte 0x80 — which tells the broker
-# another length byte follows — so the packet is malformed and the
-# subscription silently never completes. Both subscribed topics
-# (mqtt_topic_command, mqtt_topic_info_response) are the channel used to
-# repair a bad configuration, so the bound belongs at the config boundary.
-# (Publish already uses the full variable-length encoding, so the same
-# bound is applied to every topic for a single simple policy: 1..N ASCII
-# bytes, no NUL.)
+# mqtt_client.subscribe() encodes the SUBSCRIBE Remaining Length in one byte
+# (valid through 127) and the body is topic + 5, so above 122 topic bytes the
+# length byte gains the continuation bit and the subscription silently never
+# completes. Both subscribed topics are the repair channel for a bad
+# configuration, so the bound sits at the config boundary. (Publish uses full
+# variable-length encoding; the same bound is applied to every topic for one
+# simple policy: 1..N ASCII bytes, no NUL.)
 MAX_MQTT_TOPIC_BYTES = 122
 
-# The RP2 builds give time.ticks_* 30-bit tick values, so ticks_add()/
-# ticks_diff() only express deltas below half the period (2^29 - 1 ms,
-# about 6.21 days); ticks_add raises OverflowError at half the period.
-# Every timing value that becomes a ticks_diff threshold or a ticks_add
-# delta must stay under this ceiling — above it the threshold can never
-# be reached (ticks_diff cannot return that positive value), the deadline
-# raises, or the scheduler re-anchor does.
+# The RP2 builds give time.ticks_* 30-bit values: ticks_diff only expresses
+# deltas below half the period (2^29 - 1 ms, ~6.21 days) and ticks_add raises
+# OverflowError at it. Any value that becomes a ticks_diff threshold or
+# ticks_add delta must stay under this ceiling, or the threshold can never be
+# reached (or the deadline/re-anchor raises).
 MAX_TICKS_SAFE_INTERVAL_MS = (1 << 29) - 1
 
-# Initialization retries ride out a transient driver.initialize() failure; a
-# device that fails all of them is broken, not flaky, so a handful of tries
-# is enough. The shipped value is 3. Bounding the count at the config
-# boundary keeps a misconfigured huge value from stalling startup for
-# attempts x retry delay and from growing retained per-device init
-# diagnostics on the exact startup-failure path where heap must stay flat.
+# Retries ride out a transient driver.initialize() failure; a device that
+# fails all of them is broken, so a handful is enough (shipped: 3). The
+# bound also keeps a misconfigured huge value from stalling startup for
+# attempts x retry delay and growing retained init diagnostics on the
+# startup-failure path where heap must stay flat.
 MAX_DEVICE_INITIALIZATION_ATTEMPTS = 10
 
-# Reconnect delays are bounded for operational liveness, not for the ticks
-# ceiling (they only drive sliced sleeps, so the ticks rule does not apply to
-# them): a delay long enough to outlast any human diagnosis, or a sequence
-# long enough to loop for days, makes recovery indistinguishable from a hang.
-# The shipped sequences (3/5/10/20/40 s, at most a dozen entries) are nowhere
-# near either bound; anything above them is a misconfiguration, not policy.
+# Reconnect delays are bounded for operational liveness, not the ticks
+# ceiling (they only drive sliced sleeps): a delay long enough to outlast any
+# human diagnosis, or a sequence long enough to loop for days, makes recovery
+# indistinguishable from a hang. The shipped sequences (3/5/10/20/40 s) are
+# nowhere near either bound; above them is misconfiguration, not policy.
 MAX_RECONNECT_DELAY_SEC = 600
 MAX_RECONNECT_ATTEMPTS = 32
 
 # Core 1 builds a per-device status structure before anything can be rejected
-# at the serialized-size ceiling — the bounded startup-log fallback calls
-# get_status_snapshot() before it reduces to counts, and the read-config
-# response carries the whole configuration. With per-field lengths bounded at
+# at the serialized-size ceiling (the bounded startup-log fallback and the
+# read-config response both carry it). With per-field lengths bounded at
 # device_factory's MAX_DEVICE_*_LENGTH, this count keeps a worst-case valid
-# configuration's message sections (and the snapshot's transient heap) in low
-# single-digit KB, comfortably under MAX_OUTBOUND_MESSAGE_BYTES (16 KiB), so a
-# valid configuration can no longer exhaust heap during construction.
+# configuration in low single-digit KB — under MAX_OUTBOUND_MESSAGE_BYTES
+# (16 KiB) — so a valid configuration cannot exhaust heap during construction.
 MAX_DEVICES = 16
 
 
 class ConfigError(Exception):
-    """Configuration load/validation failure with a stable machine-readable code.
-
-    ``str(err)`` remains the full human-readable message (startup prints and
-    command response both read it); ``code`` and ``unknown_fields`` let the
-    command handler respond with a stable cause rather than parsing the
-    message; ``details`` is a small flat key/value map for error-specific
-    structured fields (for example, expected/received schema versions) that
-    the command handler merges as-is into the error object. ``code`` becomes
-    None only for errors raised outside this module."""
+    """Configuration load/validation failure with a stable machine-readable
+    code. ``str(err)`` stays the full human-readable message; ``code`` and
+    ``unknown_fields`` let the command handler answer with a stable cause
+    rather than parsing the message; ``details`` is a small flat key/value
+    map the command handler merges as-is (e.g. expected/received schema
+    versions). ``code`` is None only for errors raised outside this module."""
 
     def __init__(self, message, code=None, unknown_fields=None, details=None):
         super().__init__(message)
@@ -124,13 +110,11 @@ _ALLOWED_KEYS = frozenset(_REQUIRED_KEYS)
 
 
 def _unknown_config_paths(config):
-    """All unknown configuration paths, sorted: top-level keys, device-definition keys, and (for a supported type) device-config keys, each qualified by device id.
-
-    ``devices[<id>].<key>`` (the index when the entry has no usable id) so a
-    caller knows exactly where each unknown field sits; device-config keys
-    are qualified ``devices[<id>].config.<key>``. The scan runs before any
-    other check, so every unknown field is reported together in one sorted
-    array rather than one at a time."""
+    """All unknown configuration paths, sorted: top-level keys,
+    device-definition keys, and (for a supported type) device-config keys,
+    qualified ``devices[<id>].<key>`` / ``devices[<id>].config.<key>`` (the
+    index when the entry has no usable id). Runs before any other check, so
+    every unknown field is reported together in one sorted array."""
     unknown = set(config.keys()) - _ALLOWED_KEYS
     devices = config.get("devices")
     if isinstance(devices, list):
@@ -144,8 +128,7 @@ def _unknown_config_paths(config):
                 for key in set(device.keys()) - DEVICE_DEFINITION_KEYS
             )
             # The device config dict is driver-owned; only a supported type has
-            # a known allowed-key set to check its keys against (an unsupported
-            # type is a fail-fast error handled by _validate_devices).
+            # a known allowed-key set to check against.
             device_config = device.get("config")
             if isinstance(device_config, dict):
                 allowed = allowed_config_keys(device.get("device_type"))
@@ -180,11 +163,10 @@ def _require_non_empty_string(config, key):
 
 
 def _require_mqtt_topic(config, key):
-    """A configured topic must be 1..MAX_MQTT_TOPIC_BYTES ASCII bytes with no NUL (see the bound's comment).
-
-    ASCII-only keeps UTF-8 byte length equal to character count, so the
-    single-byte Remaining Length arithmetic in mqtt_client.subscribe()
-    stays exact for every accepted topic."""
+    """A configured topic must be 1..MAX_MQTT_TOPIC_BYTES ASCII bytes with no
+    NUL (see the bound's comment); ASCII-only keeps UTF-8 byte length equal to
+    character count, so the single-byte Remaining Length arithmetic in
+    mqtt_client.subscribe() stays exact."""
     value = config[key]
     if not isinstance(value, str) or not value:
         raise ConfigError(
@@ -273,8 +255,8 @@ def _validate_devices(devices):
                 "devices[{}] must be an object".format(index), code="invalid_value"
             )
 
-        # Duplicate ids span the whole list (a candidate-level concern), so
-        # they are checked here before the per-device pure validation.
+        # Duplicate ids span the whole list, so they are checked here before
+        # the per-device pure validation.
         device_id = device.get("id")
         if isinstance(device_id, str) and device_id:
             if device_id in seen_ids:
@@ -283,9 +265,9 @@ def _validate_devices(devices):
                 )
             seen_ids.add(device_id)
 
-        # Generic shape, supported device_type, and the device-specific config
-        # are all pure and live in the device registry (device_factory); a
-        # DeviceValidationError maps onto a ConfigError with its stable code.
+        # Generic shape, supported device_type, and device-specific config are
+        # pure and live in device_factory's registry; a DeviceValidationError
+        # maps onto a ConfigError with its stable code.
         try:
             validate_device_definition(device)
         except DeviceValidationError as err:
@@ -293,13 +275,11 @@ def _validate_devices(devices):
 
 
 def validate_config(config):
-    """Pure validation of a complete configuration dict (no filesystem, no hardware).
-
-    Startup (``load_config``) and the write-config command both run
-    candidates through this single path, so a config the firmware boots from
-    and a config a command may commit are validated by exactly the same
-    rules. Returns the validated dict; raises ``ConfigError`` (with a stable
-    ``code``) on the first violation."""
+    """Pure validation of a complete configuration dict (no filesystem, no
+    hardware). Startup (``load_config``) and the write-config command both
+    run candidates through this single path, so a booted config and a
+    committed one are validated by exactly the same rules. Returns the
+    validated dict; raises ``ConfigError`` (stable ``code``) on violation."""
     if not isinstance(config, dict):
         raise ConfigError("Config must be a JSON object", code="invalid_value")
 
@@ -323,9 +303,8 @@ def validate_config(config):
             "config_schema_version must be an integer", code="invalid_value"
         )
     if schema_version != CONFIG_SCHEMA_VERSION:
-        # The schema version is a configuration invariant, not a change
-        # policy: the mismatch is answered with both sides named so the
-        # sender can correct the candidate.
+        # A configuration invariant, not a change policy: the mismatch is
+        # answered with both sides named so the sender can correct it.
         raise ConfigError(
             "Unsupported config_schema_version",
             code="invalid_config_schema_version",
@@ -352,10 +331,9 @@ def validate_config(config):
     ):
         _require_mqtt_topic(config, key)
 
-    # source is the device identity on the wire: it is spliced into every
-    # Core 0 outbound envelope, so it carries a protocol-scale length bound
-    # rather than an open-ended string (a huge identity would make even a
-    # tiny envelope fail the outbound wire ceiling).
+    # source is the wire identity, spliced into every Core 0 envelope, so it
+    # carries a protocol-scale bound: a huge identity would make even a tiny
+    # envelope fail the outbound wire ceiling.
     if len(config["source"]) > MAX_SOURCE_LENGTH:
         raise ConfigError(
             "source must be at most {} characters".format(MAX_SOURCE_LENGTH),
@@ -377,19 +355,16 @@ def validate_config(config):
         _require_positive_integer(config, key)
 
     # Keep Alive is a 16-bit word on the wire; above the maximum the CONNECT
-    # packet is unrepresentable, so the connection can never succeed. config.py
-    # is the authoritative boundary — mqtt_client.py keeps its check only as
-    # defensive transport validation.
+    # packet is unrepresentable. config.py is authoritative; mqtt_client.py
+    # keeps its check only as defensive transport validation.
     if config["mqtt_keepalive_sec"] > MAX_MQTT_KEEPALIVE_SEC:
         raise ConfigError(
             "mqtt_keepalive_sec must be at most {}".format(MAX_MQTT_KEEPALIVE_SEC),
             code="invalid_value",
         )
 
-    # Retries ride out transient driver.initialize() failures; a device that
-    # fails them all is broken, so a handful of tries is enough. A large
-    # count also stalled startup for attempts x retry delay and grew retained
-    # per-attempt init diagnostics on the startup-failure path.
+    # See MAX_DEVICE_INITIALIZATION_ATTEMPTS: retries ride out transient
+    # initialize() failures; a device that fails them all is broken.
     if config["device_initialization_attempts"] > MAX_DEVICE_INITIALIZATION_ATTEMPTS:
         raise ConfigError(
             "device_initialization_attempts must be at most {}".format(
@@ -401,17 +376,11 @@ def validate_config(config):
     _require_nonnegative_integer(config, "device_initialization_retry_delay_ms")
     _require_nonnegative_integer(config, "mqtt_outbound_publish_delay_ms")
 
-    # Timing values that become ticks_diff thresholds or ticks_add deltas
-    # are bounded by the ticks delta ceiling (above it a threshold can
-    # never be reached, or a deadline/scheduler re-anchor raises
-    # OverflowError). Values that only drive sliced sleeps (reconnect
-    # delays, probe timeout, sliced retry delay) do not use ticks deltas:
-    # reconnect delays are additionally bounded for operational liveness
-    # (MAX_RECONNECT_DELAY_SEC / MAX_RECONNECT_ATTEMPTS) because a delay or
-    # sequence long enough to outlast any human diagnosis makes recovery
-    # indistinguishable from a hang, while the probe timeout and the sliced
-    # retry delay stay unbounded. Runs after the type checks above so a
-    # wrong type still reports invalid_value, not a type error.
+    # Values that become ticks_diff thresholds or ticks_add deltas are bounded
+    # by the ticks ceiling; values that only drive sliced sleeps (reconnect
+    # delays, probe timeout, sliced retry delay) are not — reconnect delays
+    # get their own operational-liveness bounds instead. Runs after the type
+    # checks so a wrong type still reports invalid_value, not a type error.
     _require_ticks_safe_interval(config, "read_loop_sec", 1000)
     _require_ticks_safe_interval(config, "health_interval_sec", 1000)
     _require_ticks_safe_interval(config, "network_snapshot_interval_sec", 1000)
@@ -456,9 +425,9 @@ def load_wifi_config(path="config-secrets.json"):
 
 
 def split_config(config):
-    """Create the immutable-by-convention per-core startup configuration.
-
-    The bus carries no configuration: its heap-reserve admission bound is a board property owned by hardware.py and passed to InterCore directly."""
+    """Create the immutable-by-convention per-core startup configuration. The
+    bus carries no configuration: its heap-reserve bound is a board property
+    owned by hardware.py, passed to InterCore directly."""
     core0 = {
         "source": config["source"],
         "mqtt_broker_ip_address": config["mqtt_broker_ip_address"],

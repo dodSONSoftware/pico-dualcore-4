@@ -70,14 +70,22 @@ class OutboundMessageTooLargeError(ValueError):
 class OutboundQueue:
     """Core 1 -> Core 0 queue for MQTT-bound messages only.
 
-    Once put() succeeds the payload bytes are immutable (pre-serialized UTF-8 JSON); the Core 0 envelope keys are injected at publish time and must not be carried at the top level. No fixed capacity: admission is governed by two heap thresholds. The preferred free-heap reserve marks the beginning of memory-pressure handling -- gc.collect() first, then an increased willingness to reclaim low-retention eligible entries -- but it is never a rejection wall by itself; the minimum free-heap threshold is the hard survival floor that admission must protect, and only below it (after GC) may expendable incoming traffic be rejected. Reclamation -- explicit heap pressure, or an append whose own allocations cross the floor (never the in-flight QoS 1 entry) -- always uses the existing retention-priority eligibility, and all decisions run under the shared heap-admission lock. CRITICAL is the non-evictable retention floor: an admitted CRITICAL entry cannot be displaced by another CRITICAL (its producer no longer owns it once admitted, so the new one is rejected for the producer to retry). The hard floor is a post-admission invariant: an entry may be retained only while gc.mem_free() is at or above it, re-measured after the append's own allocations."""
+    Payload bytes are immutable once put() succeeds (pre-serialized UTF-8
+    JSON); the Core 0 envelope keys are injected at publish time, not carried
+    at the top level. No fixed capacity: the preferred reserve marks where
+    memory-pressure handling begins (GC, then reclaiming eligible
+    low-retention entries) and is never a rejection wall by itself; the hard
+    floor is the survival boundary admission must protect, re-measured after
+    the append's own allocations. CRITICAL is the non-evictable retention
+    floor: an admitted CRITICAL entry is never displaced, not even by another
+    CRITICAL. All decisions run under the shared heap-admission lock."""
 
     def __init__(self, minimum_free_heap_bytes, heap_admission_lock,
                  preferred_free_heap_bytes=None):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
         if preferred_free_heap_bytes is None:
-            # Single-threshold callers keep the old behavior: no pressure
-            # band, the hard floor is also the preferred reserve.
+            # Single-threshold callers: no pressure band; the hard floor is
+            # also the preferred reserve.
             preferred_free_heap_bytes = minimum_free_heap_bytes
         _require_positive_integer(
             preferred_free_heap_bytes, "preferred_free_heap_bytes"
@@ -92,25 +100,23 @@ class OutboundQueue:
         self._queue = []
         self._in_flight = None
         self._lock = _thread.allocate_lock()
-        # Observability only -- metrics, not capacity limits. The watermark
-        # is the peak of the depth metric (queued + in-flight), as
-        # _high_watermark_bytes is the peak of the retained-bytes metric.
+        # Observability only -- metrics, not capacity limits: each watermark
+        # is the peak of its metric (depth, or retained bytes).
         self._high_watermark = 0
         self._high_watermark_bytes = 0
         self._queued_bytes = 0
-        # Entries admitted since the queue last fully drained: supports the
-        # DEBUG_QUEUE_MEMORY "drained" event without logging steady-state
-        # single-entry completion (validation instrumentation only).
+        # Entries admitted since the last full drain: lets the
+        # DEBUG_QUEUE_MEMORY "drained" event skip steady-state single-entry
+        # completion.
         self._backlog_depth = 0
         self._messages_evicted = 0
         self._telemetry_evicted = 0
         self._messages_rejected = 0
         self._serialization_rejected = 0
         self._oversized_rejected = 0
-        # Discarded at publish time: the body was admitted at or under the
-        # ceiling, but the spliced Core 0 envelope pushed the final wire
-        # length over it. Permanent for the entry (retrying re-fails), so it
-        # is discarded instead of held in flight.
+        # Discarded at publish time: admitted at or under the ceiling, but
+        # the spliced envelope pushed the final wire length over it
+        # (permanent for the entry).
         self._oversized_discarded = 0
 
     def _reserve_restored(self):
@@ -131,9 +137,9 @@ class OutboundQueue:
         return False
 
     def _append_locked(self, kind, payload_bytes, retention_priority):
-        """Append under the queue lock; return False (having undone the append) if the append's own allocations cross the hard floor.
-
-        The documented invariant is post-admission -- an entry may be retained only while gc.mem_free() is at or above the hard floor -- so the heap is measured after the append (which allocates the entry dict and any list growth), not only before it."""
+        """Append under the queue lock; return False (having undone the
+        append) if the append's own allocations cross the hard floor (the
+        floor is re-measured after the append, since the append allocates)."""
         entry = {
             "kind": kind,
             "retention_priority": retention_priority,
@@ -141,9 +147,8 @@ class OutboundQueue:
         }
         self._queue.append(entry)
         if not self._reserve_restored():
-            # The append crossed the reserve: undo it (counters above are
-            # untouched, so the admission is fully reversed) and reclaim, so
-            # the heap is measurable again for the next admission decision.
+            # The append crossed the reserve: undo it (the counters are
+            # untouched, so the admission is fully reversed) and reclaim.
             self._queue.pop()
             gc.collect()
             return False
@@ -159,9 +164,14 @@ class OutboundQueue:
         return True
 
     def _evict_one_eligible_locked(self, retention_priority):
-        """Evict the oldest entry in the least-important class this priority may displace; caller holds self._lock.
-
-        The one shared eligibility rule for both the admission pressure path and the serialization-recovery path: an empty queue has nothing to reclaim, an incoming entry less important than everything queued may not evict, and CRITICAL is the non-evictable retention floor (an admitted CRITICAL is never displaced, not even by another CRITICAL). Returns (True, worst_priority) if an entry was evicted (counted by the regular eviction metrics; worst_priority names the displaced class), else (False, reason) with reason "memory_pressure" (queue empty), "lower_priority_than_queued", or "critical_not_evictable" -- the caller decides what a non-eviction means (a transient admission rejection, or an unrecovered serialization MemoryError that must propagate)."""
+        """Evict the oldest entry in the least-important class this priority
+        may displace (caller holds self._lock). Shared eligibility rule for
+        admission and serialization recovery: no eviction on an empty queue,
+        an incoming entry less important than everything queued, or CRITICAL
+        (non-evictable floor). Returns (True, worst_priority) on eviction
+        (counted by the regular eviction metrics), else (False, reason) with
+        reason "memory_pressure", "lower_priority_than_queued", or
+        "critical_not_evictable"."""
         if not self._queue:
             return (False, "memory_pressure")
         # Explicit loop: no generator/list allocation in the
@@ -184,9 +194,16 @@ class OutboundQueue:
         return (True, worst_priority)
 
     def _serialize_with_recovery(self, message, retention_priority):
-        """Serialize the message, recovering a MemoryError without discarding queued data first.
-
-        The serializer works on the actual message -- no fixed worst-case threshold stands in for it. Only a MemoryError from the serializer triggers recovery (validation, size, and serialization failures raise immediately, as before). The first failure runs gc.collect() and retries: fragmentation or collectable garbage can resolve it with no data loss. Only if serialization still fails does the queue reclaim memory -- one eviction per attempt, the oldest entry in the least-important class this message may displace under the same eligibility rule as admission (CRITICAL never displaced), each re-claimed with gc.collect() -- until serialization succeeds or nothing eligible remains, in which case the MemoryError propagates to the firmware recovery boundary. The loop is bounded by the number of eligible retained entries, so it terminates without a retry count. No locks are held across the serializer or gc.collect(): only the eviction step takes the queue lock."""
+        """Serialize the message, recovering a MemoryError before discarding
+        queued data. Only a serializer MemoryError triggers recovery (other
+        failures raise immediately); the first failure runs gc.collect() and
+        retries, then reclaims one eligible entry per persistent attempt
+        (same eligibility as admission, CRITICAL never displaced),
+        gc.collect() after each, until serialization succeeds or nothing
+        eligible remains -- then the MemoryError propagates to the firmware
+        recovery boundary. Bounded by the eligible entries, so it terminates
+        without a retry count. No locks are held across the serializer or
+        gc.collect()."""
         from message_serializer import (
             serialize_and_validate_message,
             MessageTooLargeError,
@@ -198,8 +215,6 @@ class OutboundQueue:
         gc_attempted = False
         while True:
             try:
-                # Returning here exits the retry loop on success; the
-                # MemoryError branch below falls back to the top of the loop.
                 return serialize_and_validate_message(message)
             except MemoryError:
                 if not gc_attempted:
@@ -216,9 +231,9 @@ class OutboundQueue:
                         retention_priority
                     )
                 if not evicted:
-                    # No queue-owned memory this message may reclaim: the
-                    # failure is not queue pressure -- propagate it, do not
-                    # convert it into a transient rejection.
+                    # Nothing this message may reclaim: not queue pressure --
+                    # propagate it, do not convert it into a transient
+                    # rejection.
                     _debug_queue_memory(
                         "outbound_queue",
                         self,
@@ -234,15 +249,11 @@ class OutboundQueue:
                 )
                 gc.collect()
             except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
-                # Validation errors are raised immediately
                 raise ValueError("Message validation failed: {}".format(err))
             except MessageTooLargeError as err:
-                # Oversized is a permanent failure of the message (the ceiling
-                # is a static invariant): raise, so a caller can distinguish
-                # it from the False (transient, retry later) return. Queue
-                # state is untouched, as before. OutboundMessageTooLargeError
-                # (a ValueError subclass) lets a caller tell this size failure
-                # apart from the other permanent rejections.
+                # Oversized is a permanent failure of the message: raise it,
+                # so it is distinguishable from the False (transient) return
+                # and from the other permanent rejections.
                 self._oversized_rejected += 1
                 raise OutboundMessageTooLargeError("Message too large: {}".format(err))
             except SerializationError as err:
@@ -251,14 +262,23 @@ class OutboundQueue:
                 raise ValueError("Message serialization failed: {}".format(err))
 
     def _admit_heap_governed(self, kind, payload_bytes, retention_priority):
-        """Apply the two-threshold heap admission decision. No locks are held on entry.
+        """Apply the two-threshold heap admission decision (no locks held on entry).
 
-        NORMAL (free heap at/above the preferred reserve): fast path -- admit, no gc.collect(), no pressure eviction. MEMORY PRESSURE (free heap at or above the hard floor but below the preferred reserve): gc.collect() first -- if it restores the preferred reserve the admission is normal -- otherwise one eligible lower-priority entry may be reclaimed (increased willingness to discard low-retention traffic; the preferred reserve is not a rejection wall) and the entry is still admitted. HARD PRESSURE (free heap below the hard floor after GC, or an append whose own allocations cross it): reclaim eligible entries one at a time, gc.collect() after each, until the entry can be retained with the hard floor intact -- or reject it as transient (the producer retains and retries) when nothing eligible remains. The hard floor is re-measured after the append itself: an admission whose own allocations cross it is undone and the same priority-displacement rules decide -- a more important admission is not rejected while a less important entry stays retained, and no state may ever evict a retained CRITICAL."""
+        NORMAL (at/above the preferred reserve): admit, no GC, no eviction.
+        MEMORY PRESSURE (down to the hard floor): gc.collect() first, else one
+        eligible entry may be reclaimed and the entry is still admitted --
+        the preferred reserve is not a rejection wall. HARD PRESSURE (below
+        the hard floor after GC, or an append whose own allocations cross
+        it): reclaim eligible entries one at a time, gc.collect() after each,
+        until the entry can be retained with the hard floor intact -- or
+        reject as transient (the producer retains and retries) when nothing
+        eligible remains. A more important admission is never rejected while
+        a less important entry is retained, and no state evicts a retained
+        CRITICAL."""
         with self._heap_admission_lock:
             if not self._preferred_restored():
-                # Memory pressure (preferred reserve or hard floor crossed):
-                # give GC the first chance to reclaim unreachable objects,
-                # before any queued data is considered.
+                # Pressure band crossed: give GC the first chance to reclaim
+                # unreachable objects, before any queued data.
                 _debug_queue_memory("outbound_queue", self, "memory_pressure")
                 _debug_queue_memory("outbound_queue", self, "gc_before_admission")
                 gc.collect()
@@ -269,13 +289,11 @@ class OutboundQueue:
                 with self._lock:
                     if self._append_locked(kind, payload_bytes, retention_priority):
                         # Log after the append: the line reports the
-                        # post-admission state (count and bytes include the
-                        # admitted entry), matching the gc_after pair above it.
+                        # post-admission state (including the admitted entry).
                         _debug_queue_memory("outbound_queue", self, "admit")
                         return True
                 # The append's own allocations crossed the hard floor and
-                # were undone: the displacement path below decides (its
-                # priority rules and rejection conditions apply unchanged).
+                # were undone: the displacement path below decides.
                 _debug_queue_memory(
                     "outbound_queue",
                     self,
@@ -283,11 +301,9 @@ class OutboundQueue:
                     (("priority", retention_priority),),
                 )
             elif self._reserve_restored():
-                # MEMORY PRESSURE (soft): the device is still operational, so
-                # the preferred reserve does not reject an otherwise-valid
-                # entry. Reclaim one eligible entry, if any, then admit --
-                # not a bulk flush, and never of a class this priority may
-                # not displace.
+                # MEMORY PRESSURE (soft): the preferred reserve does not
+                # reject an otherwise-valid entry -- reclaim one eligible
+                # entry, if any, then admit.
                 with self._lock:
                     evicted, evicted_priority = self._evict_one_eligible_locked(
                         retention_priority
@@ -303,10 +319,8 @@ class OutboundQueue:
                     if self._append_locked(kind, payload_bytes, retention_priority):
                         _debug_queue_memory("outbound_queue", self, "admit")
                         return True
-                # The append's own allocations still cross the hard floor
-                # (the soft-reclamation did not suffice, or the append
-                # crossed it on its own): the displacement path below
-                # decides.
+                # The append still crosses the hard floor: the displacement
+                # path below decides.
                 _debug_queue_memory(
                     "outbound_queue",
                     self,
@@ -314,21 +328,17 @@ class OutboundQueue:
                     (("priority", retention_priority),),
                 )
 
-            # HARD PRESSURE -- explicit (below the hard floor after GC), or
-            # an append whose own allocations cross it: displace the
-            # least-important eligible entries one at a time, reclaiming
-            # after each, until the hard floor is restored and the entry is
-            # retained, or nothing eligible remains.
+            # HARD PRESSURE: displace the least-important eligible entries
+            # one at a time (reclaiming after each) until the entry is
+            # retained or nothing eligible remains.
             while True:
                 with self._lock:
                     evicted, detail = self._evict_one_eligible_locked(
                         retention_priority
                     )
                     if not evicted:
-                        # Nothing eligible can be displaced (queue empty, the
-                        # incoming entry is less important than everything
-                        # queued, or both are CRITICAL): reject as transient --
-                        # the producer retains and retries.
+                        # Nothing eligible can be displaced: reject as
+                        # transient -- the producer retains and retries.
                         self._messages_rejected += 1
                         _debug_queue_memory(
                             "outbound_queue",
@@ -350,11 +360,9 @@ class OutboundQueue:
                         if self._append_locked(kind, payload_bytes, retention_priority):
                             _debug_queue_memory("outbound_queue", self, "admit")
                             return True
-                    # The eviction restored the floor, but the append's own
-                    # allocations still cross it: displace the next eligible
-                    # entry (or reject once none remain) rather than
-                    # retaining lower-priority entries while rejecting this
-                    # one.
+                    # The eviction restored the floor, but the append still
+                    # crosses it: displace the next eligible entry (or reject
+                    # once none remain).
                     _debug_queue_memory(
                         "outbound_queue",
                         self,
@@ -363,9 +371,12 @@ class OutboundQueue:
                     )
 
     def put(self, kind, message, retention_priority):
-        """Admit one MQTT-bound message after validation, serialization, encoding, and size check.
-
-        Serialization works on the actual message: a MemoryError from it runs gc.collect() first, then (if it persists) reclaims one eligible queued entry at a time under the same retention policy as admission, retrying after each, until serialization succeeds or no eligible entry remains -- in which case the MemoryError propagates to the firmware recovery boundary. The two-threshold heap-governed admission then decides whether the serialized payload may be retained (NORMAL above the preferred reserve; MEMORY PRESSURE between the preferred reserve and the hard floor, where GC and one eligible reclamation run but the entry is still admitted; HARD PRESSURE below the hard floor after GC, where expendable traffic may be rejected). Returns True if admitted, False on transient heap pressure (a later retry may succeed). Raises ValueError on a permanent failure of the message itself (unsupported value, serialization, or size beyond MAX_OUTBOUND_MESSAGE_BYTES); the oversized case raises OutboundMessageTooLargeError, a ValueError subclass."""
+        """Admit one MQTT-bound message after validation, serialization, and
+        size check. A serializer MemoryError is recovered per
+        _serialize_with_recovery() before any queued data is discarded.
+        True if admitted, False on transient heap pressure (a later retry may
+        succeed); ValueError (or OutboundMessageTooLargeError for the size
+        case) on a permanent failure of the message itself."""
         if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(message, dict):
@@ -379,10 +390,8 @@ class OutboundQueue:
                 )
             )
 
-        # Serialize the actual message (with MemoryError recovery: gc first,
-        # then one eligible queued entry per persistent failure, under the
-        # same retention policy as admission). Admission below keeps its own
-        # post-serialization reserve check.
+        # Serialize the actual message (recovery per _serialize_with_recovery);
+        # admission below keeps its own post-serialization reserve check.
         payload_bytes = self._serialize_with_recovery(message, retention_priority)
 
         return self._admit_heap_governed(kind, payload_bytes, retention_priority)
@@ -405,15 +414,11 @@ class OutboundQueue:
             )
 
         # Enforce the same per-message ceiling the put() serialization path
-        # enforces, so the queue's own boundary holds on both admission paths.
-        # No re-parsing or JSON allocation: the bytes are already final, only
-        # their length matters.
+        # enforces; the bytes are already final, only their length matters.
         from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
         if len(payload_bytes) > MAX_OUTBOUND_MESSAGE_BYTES:
             # Oversized is a permanent failure of the message: raise, the
-            # same as the put() serialization path. Queue state is untouched.
-            # OutboundMessageTooLargeError (a ValueError subclass) keeps this
-            # size failure distinguishable for callers, as in put().
+            # same as the put() serialization path (queue state untouched).
             self._oversized_rejected += 1
             raise OutboundMessageTooLargeError(
                 "Message too large: {} bytes exceeds the {} byte per-message limit".format(
@@ -448,10 +453,8 @@ class OutboundQueue:
                 if discarded:
                     self._oversized_discarded += 1
                 if not self._queue:
-                    # The queue is fully drained. Log only if a backlog (more
-                    # than this one in-flight entry) flowed through since the
-                    # last drain, so steady-state single-message completion
-                    # stays quiet even with DEBUG_QUEUE_MEMORY enabled.
+                    # Fully drained: log only if a backlog (more than this
+                    # one in-flight entry) flowed through since the last drain.
                     if self._backlog_depth > 1:
                         _debug_queue_memory("outbound_queue", self, "drained")
                     self._backlog_depth = 0
@@ -517,10 +520,9 @@ class InterCoreEventQueue:
             if gc.mem_free() >= self._minimum_free_heap_bytes:
                 with self._lock:
                     self._queue.append(event)
-                    # Post-admission invariant, as on the outbound queue: the
-                    # append itself may allocate (list growth), so the
-                    # reserve must hold with the event retained, not only
-                    # before the append.
+                    # Post-admission invariant: the append itself may
+                    # allocate, so the reserve must hold with the event
+                    # retained.
                     if gc.mem_free() < self._minimum_free_heap_bytes:
                         self._queue.pop()
                         gc.collect()
@@ -615,16 +617,14 @@ class StateMailboxes:
 
 
 class ConfigUpdateLane:
-    """A narrow request/result lane for the HOT_RELOADED configuration apply.
+    """A narrow request/result lane for the HOT_RELOADED configuration apply
+    (internal runtime control, not an external command).
 
-    This is internal runtime control, not an external command: Core 0 posts a
-    request carrying the Core 1-owned hot subset (only the keys that changed,
-    plus a monotonic ``generation``), and Core 1 posts exactly one result for
-    that generation (success, or a bounded failure descriptor). Latest-value
-    mailboxes -- state replaces rather than queues -- under the same
-    allocate_lock discipline as StateMailboxes, so a reader never spins on
-    unlocked shared state. One transaction is in flight at a time (Core 0
-    enforces it), and the generation keeps a stale result from being mistaken
+    Core 0 posts a request carrying the Core 1-owned hot subset (changed
+    keys, plus a monotonic generation); Core 1 posts exactly one result for
+    that generation. Latest-value mailboxes under the same allocate_lock
+    discipline as StateMailboxes; one transaction in flight at a time (Core
+    0 enforces), and the generation keeps a stale result from being mistaken
     for the current one."""
 
     def __init__(self):
@@ -652,10 +652,8 @@ class ConfigUpdateLane:
             self._result = result
 
     def take_result_for(self, generation):
-        """The result posted for this generation (cleared on a match), else None.
-
-        A result for a different generation is left in place for its owner; a
-        match is consumed so it is read exactly once."""
+        """The result posted for this generation (cleared on a match), else
+        None; a result for another generation is left in place for its owner."""
         with self._lock:
             result = self._result
             if result is not None and result.get("generation") == generation:
@@ -672,8 +670,8 @@ class InterCore:
     def __init__(self, minimum_free_heap_bytes, preferred_free_heap_bytes=None):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
         if preferred_free_heap_bytes is None:
-            # Single-threshold callers keep the old behavior: the hard floor
-            # is also the preferred reserve (no pressure band).
+            # Single-threshold callers: the hard floor is also the preferred
+            # reserve.
             preferred_free_heap_bytes = minimum_free_heap_bytes
         _require_positive_integer(
             preferred_free_heap_bytes, "preferred_free_heap_bytes"

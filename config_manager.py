@@ -2,29 +2,15 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
-"""Core 0-owned configuration manager: persistence, ACTIVE-vs-PERSISTED state, change classification, file transactions and boot recovery.
+"""Core 0-owned configuration manager: persistence, ACTIVE-vs-PERSISTED
+state, change classification, file transactions, and boot recovery.
 
 config.py remains the single source of truth for schema validation and
-per-core splitting (this manager calls it, never re-implements it). This
-manager owns:
-
-- boot recovery of the committed config from the transaction artifacts;
-- the ACTIVE (running firmware) vs PERSISTED (config.json) distinction and
-  the derived ``reboot_required`` state;
-- classification of a write-config candidate (UNCHANGED / HOT_RELOADED /
-  REBOOT_REQUIRED) against the explicit policy table below;
-- the atomic config.json promotion (``.tmp`` write + read-back + rename)
-  and its commit/rollback for HOT_RELOADED transactions.
-
-It does not own subsystem behavior (no MQTT, Wi-Fi, devices, or machine
-control): Core 0 orchestrates the HOT_RELOADED runtime apply/ack and tells
-this manager to commit or roll back.
-
-State invariant: an active snapshot exists <=> ACTIVE differs from PERSISTED
-(a reboot is required to make the committed config the running one). The
-snapshot is a compact serialized copy, never a second permanent object
-graph; ``reboot_required`` is derived from it, never maintained separately.
-A reboot clears RAM and reloads config.json, so no flag is persisted.
+per-core splitting. State invariant: an active snapshot exists <=> ACTIVE
+differs from PERSISTED (a reboot is required to make the committed config
+the running one); ``reboot_required`` is derived from the snapshot, never
+maintained separately. Core 0 orchestrates the HOT_RELOADED runtime
+apply/ack and tells this manager to commit or roll back.
 """
 
 import json
@@ -39,12 +25,11 @@ CLASSIFICATION_REBOOT_REQUIRED = "REBOOT_REQUIRED"
 CHANGE_POLICY_HOT_RELOADED = "HOT_RELOADED"
 CHANGE_POLICY_REBOOT_REQUIRED = "REBOOT_REQUIRED"
 
-# Explicit top-level change policy: every classifiable config key appears
-# exactly once (config_schema_version is a schema invariant, validated
-# before classification, not classifiable). This table is the single source
-# of truth for classification -- no reboot/hot decision lives anywhere else.
-# A future required key without a policy fails the coverage test rather
-# than defaulting silently.
+# Explicit top-level change policy: every classifiable key appears exactly
+# once (config_schema_version is validated before classification, not
+# classifiable). Single source of truth for classification -- a required
+# key without a policy fails the coverage test rather than defaulting
+# silently.
 _CHANGE_POLICY = {
     "source": CHANGE_POLICY_REBOOT_REQUIRED,
     "read_loop_sec": CHANGE_POLICY_HOT_RELOADED,
@@ -54,9 +39,8 @@ _CHANGE_POLICY = {
     "device_initialization_retry_delay_ms": CHANGE_POLICY_REBOOT_REQUIRED,
     "device_read_failure_threshold": CHANGE_POLICY_REBOOT_REQUIRED,
     "network_snapshot_interval_sec": CHANGE_POLICY_HOT_RELOADED,
-    # Only consumed by the startup verification contract's network probes;
-    # no steady-state probe reads it, so a live change would have no effect
-    # until the next boot -- HOT_RELOADED would be a false promise.
+    # Consumed only by the startup probes: no steady-state probe reads it,
+    # so HOT_RELOADED would be a false promise.
     "network_probe_timeout_sec": CHANGE_POLICY_REBOOT_REQUIRED,
     "mqtt_broker_ip_address": CHANGE_POLICY_REBOOT_REQUIRED,
     "mqtt_keepalive_sec": CHANGE_POLICY_REBOOT_REQUIRED,
@@ -78,12 +62,10 @@ _CHANGE_POLICY = {
 
 
 def _device_changes(old_devices, new_devices):
-    """Compact whole-device change entries (ADDED / REMOVED / MODIFIED), sorted by id.
-
-    Whole-device entries keep the summary small in RAM and on the wire; the
-    per-field diff is what the sender already knows (it sent the candidate).
-    A difference no single id accounts for (a list-order change) is one
-    bounded list-level MODIFIED entry -- never the arrays themselves."""
+    """Compact whole-device change entries (ADDED / REMOVED / MODIFIED),
+    sorted by id; whole-device entries keep the summary small, and a
+    difference no single id accounts for (ordering) is one list-level
+    MODIFIED entry -- never the arrays themselves."""
     old_by_id = {device["id"]: device for device in old_devices}
     new_by_id = {device["id"]: device for device in new_devices}
     changes = []
@@ -119,11 +101,9 @@ def _device_changes(old_devices, new_devices):
 
 
 def _changes_summary(persisted, candidate):
-    """Describe what THIS write changed: PERSISTED-before vs candidate, deterministically sorted.
-
-    Scalar/list/string settings carry original/new values; devices carry
-    compact whole-device entries. config_schema_version is never reported:
-    a different version is invalid, not a change."""
+    """Describe what this write changed (PERSISTED-before vs candidate),
+    deterministically sorted; config_schema_version is never reported (a
+    different version is invalid, not a change)."""
     changes = []
     for key in sorted(persisted):
         if key == "config_schema_version":
@@ -154,9 +134,8 @@ class ConfigManager:
     def __init__(self, config_path="config.json"):
         self._config_path = config_path
         # Serialized ACTIVE configuration, present only while ACTIVE differs
-        # from the committed config.json (a reboot is pending). None is the
-        # normal state: ACTIVE == current config.json, and nothing
-        # configuration-shaped is retained at all.
+        # from the committed config.json (a reboot is pending); None is the
+        # normal state.
         self._active_snapshot = None
         # One write transaction at a time: True from begin_write() until
         # commit_hot_reload()/rollback_hot_reload() (HOT_RELOADED only).
@@ -194,13 +173,10 @@ class ConfigManager:
     def recover(self):
         """Boot recovery: settle the committed config before anything else runs.
 
-        A valid .old is authoritative: its presence means a promotion was
-        interrupted before its commit point, so it is restored even when the
-        current config.json is valid but uncommitted. Otherwise a valid
-        config.json is the committed steady state (an invalid .old is
-        released); a valid .tmp is the last-resort recovery artifact; else
-        startup fails clearly. On success the steady state is exactly one
-        valid config.json."""
+        A valid .old is authoritative (a promotion interrupted before its
+        commit point), then a valid config.json, then a valid .tmp; an
+        invalid .old is released. On success the steady state is exactly one
+        valid config.json; else startup fails clearly."""
         config_path = self._config_path
         old_path = self._old_path()
         tmp_path = self._tmp_path()
@@ -259,17 +235,17 @@ class ConfigManager:
         return load_config(self._config_path)
 
     def begin_write(self, candidate):
-        """Validate, classify and (for a changed candidate) atomically promote a write-config candidate.
+        """Validate, classify, and (for a changed candidate) atomically
+        promote a write-config candidate.
 
-        Returns a result dict: classification, the change summary (PERSISTED-before
-        vs candidate), the resulting reboot_required, and whether the
-        transaction awaits runtime application (HOT_RELOADED only). For
-        REBOOT_REQUIRED the first transition serializes the ACTIVE snapshot
-        BEFORE any file is modified; the snapshot is kept unchanged by later
-        writes. For HOT_RELOADED the previous config is retained in .old
-        until commit_hot_reload()/rollback_hot_reload(). MemoryError
-        propagates to the fail-fast boundary; any other failure leaves the
-        transaction artifacts for boot recovery and restores pre-write state."""
+        Returns classification, the change summary (PERSISTED-before vs
+        candidate), reboot_required, and whether the transaction awaits
+        runtime application (HOT_RELOADED only). The first REBOOT_REQUIRED
+        transition serializes the ACTIVE snapshot before any file is
+        modified, kept unchanged by later writes; HOT_RELOADED keeps the
+        previous config in .old until commit/rollback. MemoryError
+        propagates to the fail-fast boundary; other failures restore
+        pre-write state and leave the artifacts for boot recovery."""
         if self._transaction_active:
             raise ConfigError(
                 "A configuration write transaction is already in progress",
@@ -291,8 +267,7 @@ class ConfigManager:
             }
 
         # Resolve ACTIVE: no snapshot means the committed config is what is
-        # running; otherwise deserialize the compact snapshot (released
-        # again by the end of the transaction).
+        # running; otherwise deserialize the compact snapshot.
         active = (
             persisted
             if self._active_snapshot is None
@@ -300,10 +275,9 @@ class ConfigManager:
         )
         classification = _classify_change(active, candidate)
 
-        # First reboot-pending transition: the committed config is also the
-        # active one; keep a compact serialized copy before the destructive
-        # promotion. A failed allocation aborts before any file is touched
-        # (MemoryError propagates; the snapshot is still None).
+        # First reboot-pending transition: keep a serialized ACTIVE copy
+        # before the destructive promotion (a failed allocation aborts
+        # before any file is touched).
         snapshot_created_here = False
         if (
             classification == CLASSIFICATION_REBOOT_REQUIRED
@@ -337,16 +311,14 @@ class ConfigManager:
             try:
                 self._restore_committed()
             except OSError:
-                # A failed restoration still leaves every recovery
-                # artifact in place for boot recovery; the original
-                # failure below propagates unchanged.
+                # A failed restoration still leaves every recovery artifact
+                # in place for boot recovery.
                 pass
             raise
 
         if classification == CLASSIFICATION_REBOOT_REQUIRED:
             # The running firmware keeps its active values until the next
-            # reboot: the snapshot is the reboot state and the previous
-            # committed config is no longer needed.
+            # reboot: the previous committed config is no longer needed.
             self._remove_if_exists(self._old_path())
             os.sync()
             self._transaction_active = False
@@ -361,35 +333,27 @@ class ConfigManager:
         }
 
     def commit_hot_reload(self):
-        """Runtime application succeeded: the candidate is now ACTIVE and PERSISTED.
-
-        Any pending reboot is cancelled (the snapshot is discarded), the
-        retained previous config is released, and the steady state is one
-        valid config.json."""
+        """Runtime application succeeded: the candidate is now ACTIVE and
+        PERSISTED -- any pending reboot is cancelled and the steady state is
+        one valid config.json."""
         self._active_snapshot = None
         self._remove_if_exists(self._old_path())
         os.sync()
         self._transaction_active = False
 
     def rollback_hot_reload(self):
-        """Runtime application failed: restore the previous committed configuration.
-
-        The active snapshot state is exactly what it was before
-        begin_write() (begin_write only ever CREATES a snapshot, for a
-        REBOOT_REQUIRED classification -- never for a HOT one), so no
-        snapshot handling is needed here."""
+        """Runtime application failed: restore the previous committed
+        configuration (no snapshot handling: a HOT transaction never creates
+        one)."""
         os.rename(self._old_path(), self._config_path)
         os.sync()
         self._transaction_active = False
 
     def _restore_committed(self):
-        """Restore the pre-write committed config after a failed promotion.
-
-        If the first promotion rename has already moved config.json into
-        .old, the previous committed config is there: put it back BEFORE
-        releasing the failed candidate, so config.json is never missing
-        when the caller regains control. A failure here is an OSError
-        for the caller to preserve (artifacts stay for boot recovery)."""
+        """Restore the pre-write committed config after a failed promotion:
+        if the first rename moved config.json into .old, put it back before
+        releasing the failed candidate, so config.json is never missing when
+        the caller regains control."""
         if self._path_exists(self._old_path()):
             self._remove_if_exists(self._config_path)
             os.rename(self._old_path(), self._config_path)

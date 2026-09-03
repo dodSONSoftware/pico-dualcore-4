@@ -40,9 +40,8 @@ class SystemInformationDevice(Device):
         )
 
     def initialize(self, config):
-        """Initialize the device with its configuration."""
-        # Same pure rules as startup (validate_config()); hardware is untouched
-        # until after the config is known-valid.
+        """Initialize with the shared pure validation (same rules as startup)."""
+        # Hardware is untouched until after the config is known-valid.
         validate_config(config)
         self._include = tuple(config["include"])
         self._initialized = True

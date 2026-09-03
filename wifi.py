@@ -16,8 +16,7 @@ class Wifi:
         self._password = password
         self._reconnect_delays_sec = reconnect_delays_sec
         # Optional Core 0 servicing hook (the Core 1 heartbeat watchdog),
-        # invoked at each 100 ms wait slice below so a dead Core 1 is
-        # detected while Wi-Fi is reconnecting, not after the sequence ends.
+        # invoked at each 100 ms wait slice below.
         self._wait_service = wait_service
         self._wlan = None
         self._connect_count = 0
@@ -37,11 +36,10 @@ class Wifi:
             time.sleep_ms(100)
 
     def _current_status(self):
-        """The current WLAN association state, or None if it cannot be read.
-
-        Callers treat None as "unknown" and let the observation timeout govern -- never as a failure.
-        Only a transport failure (OSError) reads as unknown; a programming failure must escape the
-        same way it does at the MQTT boundary, not be masked as "no state"."""
+        """The current WLAN association state, or None if it cannot be read;
+        callers treat None as "unknown" (the observation timeout governs),
+        never as a failure. Only OSError reads as unknown; a programming
+        failure escapes, as at the MQTT boundary, not masked as "no state"."""
         try:
             status = self._wlan.status()
         except MemoryError:
@@ -52,8 +50,10 @@ class Wifi:
 
     def _terminal_failure_statuses(self):
         """The WLAN association states that end a connect attempt, as ints.
-
-        WRONG_PASSWORD, NO_AP_FOUND, CONNECT_FAIL are final for the current connect() call. MicroPython exposes the STAT_* constants on the network module (Pico W: -3, -2, -1), so read them from there -- inventing literals is how 3 (STAT_GOT_IP on Pico W) almost became a "failure"."""
+        WRONG_PASSWORD, NO_AP_FOUND, CONNECT_FAIL are final for the current
+        connect() call. The STAT_* constants live on the network module
+        (Pico W: -3, -2, -1) — read them from there; inventing literals is
+        how 3 (STAT_GOT_IP) almost became a "failure"."""
         return (
             network.STAT_WRONG_PASSWORD,
             network.STAT_NO_AP_FOUND,
@@ -61,9 +61,8 @@ class Wifi:
         )
 
     def is_connected(self):
-        # The same taxonomy as connect(): a transient driver state error
-        # (OSError) reads as "not connected"; a programming failure escapes
-        # to the recovery boundary instead of masking itself as False.
+        # Same taxonomy as connect(): OSError reads as "not connected"; a
+        # programming failure escapes instead of masking itself as False.
         try:
             return self._wlan is not None and self._wlan.isconnected()
         except MemoryError:
@@ -88,12 +87,11 @@ class Wifi:
                 self._wlan = network.WLAN(network.WLAN.IF_STA)
                 self._wlan.active(True)
 
-                # The PM_NONE probe keeps a deliberately broad catch: it is a
-                # compatibility fallback for an optional power-management
-                # feature, and a driver that lacks it reports the absence
-                # with no single portable exception type. This is the one
-                # broad catch in this module -- everything else follows the
-                # transport-failure taxonomy below.
+                # The PM_NONE probe keeps a deliberately broad catch: an
+                # optional power-management feature whose absence a driver
+                # reports with no single portable exception type. This is the
+                # one broad catch in this module — everything else follows the
+                # transport-failure taxonomy.
                 try:
                     self._wlan.config(pm=self._wlan.PM_NONE)
                 except MemoryError:
@@ -117,11 +115,10 @@ class Wifi:
                     # slice of the up-to-20-second observation window.
                     self._service_wait()
                     # A terminal association state (wrong password, missing
-                    # AP, known connect failure) means the driver will not
-                    # recover within this window -- stop observing instead of
-                    # waiting out the full 20 s. A still-connecting state is
-                    # not terminal, so the loop keeps observing and the
-                    # existing timeout remains the fallback.
+                    # AP, connect failure) means the driver will not recover
+                    # within this window: stop observing instead of waiting
+                    # out the full 20 s (a still-connecting state is not
+                    # terminal; the timeout remains the fallback).
                     status = self._current_status()
                     if status is not None and status in terminal_statuses:
                         terminal_status = status
@@ -144,13 +141,11 @@ class Wifi:
             except MemoryError:
                 raise
             except OSError as err:
-                # The same taxonomy the MQTT boundary follows: a transport
+                # Same taxonomy the MQTT boundary follows: a transport
                 # failure (OSError) is a link condition to retry, but a
-                # programming failure (a deterministic AttributeError/TypeError
-                # or an unexpected API incompatibility) must escape to
-                # main.py's controlled-reset boundary -- a broad catch here
-                # would hand Core0.establish_network() an infinite sequence
-                # of retries into the same deterministic fault.
+                # programming failure must escape to main.py's controlled
+                # reset — a broad catch would hand establish_network()
+                # infinite retries into the same deterministic fault.
                 if DEBUG:
                     print("[DEBUG] Wi-Fi attempt failed: {}".format(err))
 

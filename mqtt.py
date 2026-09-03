@@ -12,15 +12,11 @@ from mqtt_client import MQTTClient, MQTTException
 # blocking the Core 0 run loop for the full keepalive window.
 _MAX_PINGRESP_WAIT_SEC = 10
 
-# Expected failure classes at the MQTT boundary: transport failures
-# (OSError — socket errors, DNS, timeouts) and wire-protocol failures
-# (MQTTException — corrupt frame, bad CONNACK/SUBACK/PUBACK/PINGRESP).
-# Those are link conditions: mark the session down and let Core 0's
-# recovery reconnect. Anything else escaping the client (a bug in message
-# handling, callback code, or state handling) is a programming failure: it
-# must reach the top-level recovery boundary (main.py's controlled reset)
-# instead of being reclassified as a network outage, retried with the
-# broker redelivering the same message into the same fault, and hidden.
+# Expected failure classes at the MQTT boundary: transport (OSError) and
+# wire-protocol (MQTTException) failures are link conditions — mark the
+# session down and let Core 0's recovery reconnect. Anything else escaping
+# the client is a programming failure: it must reach main.py's controlled
+# reset instead of being retried into the same fault and hidden.
 MQTT_TRANSPORT_ERRORS = (OSError, MQTTException)
 
 
@@ -32,25 +28,22 @@ class Mqtt:
         self._command_topic = config["mqtt_topic_command"]
         self._info_response_topic = config["mqtt_topic_info_response"]
         self._keepalive = config["mqtt_keepalive_sec"]
-        # Bounded wait for PUBACK so a blackholed link surfaces as a
-        # publish failure (and triggers network recovery) instead of
-        # blocking the Core 0 run loop indefinitely.
+        # Bounded wait for PUBACK: a blackholed link surfaces as a publish
+        # failure (recovery) instead of blocking the Core 0 run loop.
         self._ack_timeout_ms = config["mqtt_broker_response_timeout_sec"] * 1000
         self._reconnect_delays = config["mqtt_reconnect_delays_sec"]
         self._message_callback = message_callback
         # Optional Core 0 servicing hook (the Core 1 heartbeat watchdog),
-        # invoked at each 100 ms slice of the retry backoffs so a dead
-        # Core 1 is detected while the broker is being retried, not after.
+        # invoked at each 100 ms slice of the retry backoffs.
         self._wait_service = wait_service
         self._client = None
         self._connected = False
         self._connect_count = 0
         self._disconnect_count = 0
         # The final expected transport/protocol error from the most recent
-        # failed connect() attempt-sequence (None on success, or before any
-        # attempt). Retained only so Core 0's exhaustion warning can name the
-        # cause (ECONNREFUSED, ETIMEDOUT, CONNACK/SUBACK failure, ...) — it is
-        # cleared on success and never inspected for anything else.
+        # failed connect() attempt-sequence (None on success / before any
+        # attempt); cleared on success, used only to name the cause in
+        # Core 0's exhaustion warning.
         self._last_connect_error = None
         self._last_activity_ms = time.ticks_ms()
 
@@ -92,17 +85,13 @@ class Mqtt:
         return client
 
     def _close_old_client(self):
-        # Dispose of the old client by closing its TCP socket directly. This
-        # path only runs when the session is not connected (connect() is only
-        # entered while not connected), so the client is always failed or
-        # never established and a graceful MQTT DISCONNECT frame is not
-        # warranted. Writing one into a socket whose link has already failed
-        # is exactly what must not happen: after a bounded exchange fails,
-        # its finally has restored the socket to infinite-blocking mode, and
-        # a DISCONNECT write on a blackholed link would wedge Core 0 inside
-        # sock.write() with no timeout -- and with Core 0 wedged, its Core 1
-        # heartbeat watchdog could never run either. A direct socket close
-        # performs no write at all.
+        # Close the old client's TCP socket directly. This path only runs
+        # while not connected, so the client is failed or never established
+        # and a graceful DISCONNECT frame is not warranted — a DISCONNECT
+        # write on a blackholed link (the socket is back in infinite-blocking
+        # mode after a failed bounded exchange) would wedge Core 0 inside
+        # sock.write() with no timeout, and the Core 1 watchdog could never
+        # run either. A direct close performs no write at all.
         client = self._client
         self._client = None
 
@@ -118,11 +107,12 @@ class Mqtt:
                 print("[DEBUG] MQTT socket cleanup failed: {}".format(err))
 
     def connect(self):
-        """Connect and subscribe, with the whole handshake time-bounded.
-
-        The CONNACK/SUBACK waits run under mqtt_broker_response_timeout_sec, so an unresponsive broker fails the attempt (retried with backoff) instead of wedging Core 0. On success the socket returns to normal blocking mode; every later operation installs and restores its own timeout.
-
-        On a fully failed sequence the last attempt's expected transport/protocol error is retained on self.last_connect_error so the caller can name the cause in its exhaustion warning; a success clears it."""
+        """Connect and subscribe, handshake time-bounded: the CONNACK/SUBACK
+        waits run under mqtt_broker_response_timeout_sec, so an unresponsive
+        broker fails the attempt (retried with backoff) instead of wedging
+        Core 0. On success the socket returns to normal blocking mode. On a
+        fully failed sequence the last attempt's cause is retained on
+        self.last_connect_error; a success clears it."""
         self._last_connect_error = None
         for attempt_index, delay_sec in enumerate(self._reconnect_delays):
             try:
@@ -137,12 +127,10 @@ class Mqtt:
                 self._client.connect(timeout=self._ack_timeout_ms / 1000.0)
                 self._client.subscribe(self._command_topic, qos=1)
                 self._client.subscribe(self._info_response_topic, qos=1)
-                # Handshake complete: restore normal blocking mode. This is
-                # not best-effort — a socket that cannot be put back into
-                # blocking mode is not the state the later bounded waits
-                # assume, so a failed restoration fails this attempt (the
-                # retry loop below reconnects) instead of marking a broken
-                # link healthy.
+                # Handshake complete: restore normal blocking mode. Not
+                # best-effort — the later bounded waits assume it, so a
+                # failed restoration fails this attempt instead of marking a
+                # broken link healthy.
                 self._client.sock.settimeout(None)
                 self._connected = True
                 self._connect_count += 1
@@ -153,9 +141,8 @@ class Mqtt:
                 raise
             except MQTT_TRANSPORT_ERRORS as err:
                 # Only a transport/protocol failure is a failed attempt
-                # (retry with backoff): a programming failure here would be
-                # retried forever into the same fault, so it escapes
-                # (main.py's boundary fails fast) instead.
+                # (retried with backoff); a programming failure escapes to
+                # main.py's boundary instead of retrying the same fault.
                 if self._connected:
                     self._disconnect_count += 1
                 self._connected = False
@@ -176,11 +163,11 @@ class Mqtt:
         self._connected = False
 
     def check_msg(self):
-        """Poll for one pending inbound packet and deliver it to the callback.
-
-        The parse of a ready packet runs under the broker response timeout, so a link that stalls after the first frame byte fails this poll instead of hanging the run loop or short-reading a corrupt frame.
-
-        A ready packet is delivered to the message callback, so a bug in that callback is a programming failure, not a link condition: it propagates (without marking the session down) to the top-level recovery boundary, while a stalled/corrupt stream is a transport failure and fails this poll like any other."""
+        """Poll for one pending inbound packet and deliver it to the callback;
+        the parse runs under the broker response timeout, so a stall after the
+        first frame byte fails this poll instead of hanging. A callback bug is
+        a programming failure (propagates without marking the session down);
+        a stalled/corrupt stream is a transport failure that fails the poll."""
         if not self.is_connected():
             return
         try:
@@ -192,9 +179,8 @@ class Mqtt:
             raise
 
     def publish_qos1(self, topic, message):
-        """Publish one application message and wait for its matching PUBACK.
-
-        The PUBACK wait is bounded by mqtt_broker_response_timeout_sec, so a blackholed link fails fast and network recovery can fire."""
+        """Publish one application message and wait for its PUBACK (bounded by
+        mqtt_broker_response_timeout_sec, so a blackholed link fails fast)."""
         if not self.is_connected():
             raise OSError("MQTT is not connected")
         try:
@@ -214,7 +200,6 @@ class Mqtt:
             raise OSError("MQTT is not connected")
 
         try:
-            # Pass timeout to mqtt_client's publish method
             self._client.publish(topic, message, qos=1, packet_id=packet_id, timeout_ms=timeout_ms)
             self._touch()
             return True
@@ -255,18 +240,19 @@ class Mqtt:
         self._touch()
 
     def get_next_packet_id(self):
-        """Advance and return the next packet ID to use for a QoS 1 message.
-
-        Delegates to the client's single increment helper so the 1..65535 wrap is defined in one place; advancing means the ID is consumed and cannot be reused."""
+        """Advance and return the next QoS 1 packet ID via the client's single
+        increment helper (1..65535 wrap defined in one place); the ID is
+        consumed and cannot be reused."""
         if self._client is None:
             return 1
         return self._client.next_packet_id()
 
     @property
     def last_connect_error(self):
-        """The final expected transport/protocol error from the most recent failed connect() attempt-sequence, or None (before any attempt, or after a success).
-
-        Exposed so Core 0's exhaustion warning can name the cause — which of ECONNREFUSED, ETIMEDOUT, connection reset, CONNACK failure, or SUBACK failure tore the sequence down — instead of a generic 'sequence exhausted'."""
+        """The final expected transport/protocol error from the most recent
+        failed connect() attempt-sequence, or None (before any attempt, or
+        after a success) — exposed so Core 0's exhaustion warning can name
+        the cause instead of a generic 'sequence exhausted'."""
         return self._last_connect_error
 
     def status(self):

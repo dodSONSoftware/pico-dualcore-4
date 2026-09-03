@@ -91,16 +91,12 @@ def main():
     wifi_config = None
 
     # Recovery boundary for the operational phase. Everything above is
-    # deterministic startup validation (hardware, config, construction) and
-    # intentionally fails fast: a misconfigured or unsupported board must
-    # stay down with a diagnosable error, not reboot forever. From here on
-    # the firmware is in operational runtime, and the supervision is still
-    # one-directional: Core 0's heartbeat watchdog recovers a dead Core 1,
-    # but nothing supervises Core 0 itself. A Core 0 that terminates (a
-    # MemoryError, an unexpected exception escaping start()/run()) would
-    # leave the board with no networking, no Core 1 supervision, and no
-    # recovery — a transient failure turned into a permanent outage until
-    # something external resets the Pico. An unrecoverable Core 0 exception
+    # deterministic startup validation that intentionally fails fast: a
+    # misconfigured or unsupported board must stay down with a diagnosable
+    # error, not reboot forever. From here on supervision is one-directional
+    # (Core 0's watchdog recovers a dead Core 1; nothing supervises Core 0),
+    # so a terminating Core 0 would leave the board with no networking, no
+    # Core 1 supervision, and no recovery. An unrecoverable Core 0 exception
     # is therefore a controlled board reset, not application termination.
     try:
         # Core 0 establishes the network before any Core 1 module is imported.

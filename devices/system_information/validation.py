@@ -3,13 +3,10 @@
 # SPDX-License-Identifier: MIT
 
 """Authoritative pure validation for the ``system-information`` device config.
-
-Kept in a host-importable module (imports only ``devices.device`` for the
-shared exception -- no ``machine``) so it can be driven from ``config.py``'s
-pure path, from the driver's ``initialize()``, and from host-side tests alike.
-This is the single source of truth for which sections a system-information
-device may report and how its config validates; the driver and the Core 1
-data source both read the section list from here."""
+Kept host-importable (no ``machine``) so ``config.py``'s pure path, the
+driver's ``initialize()``, and host tests all drive it. Single source of
+truth for the reportable sections and the config shape: the driver and the
+Core 1 data source both read the section list from here."""
 
 from devices.device import DeviceValidationError
 
@@ -33,14 +30,12 @@ ALLOWED_CONFIG_KEYS = frozenset(("include",))
 
 
 def validate_config(config):
-    """Pure validation of a system-information device config (no hardware).
-
-    Accepts the config's ``include`` list and nothing else. Raises
+    """Pure validation of a system-information device config (no hardware):
+    accepts the ``include`` list and nothing else; raises
     ``DeviceValidationError`` (a ``ValueError``) with a stable ``code`` on the
-    first violation. Does not construct or touch any hardware: a valid
-    definition with no physical backing passes, and physical absence is an
-    operational device failure (``initialization_failed`` at boot), not a
-    configuration-schema failure."""
+    first violation. Touches no hardware: a valid definition with no physical
+    backing passes — physical absence is an operational failure
+    (``initialization_failed`` at boot), not a schema failure."""
     if not isinstance(config, dict):
         raise DeviceValidationError(
             "system-information device config must be an object",

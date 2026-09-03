@@ -100,7 +100,7 @@ class SystemInformation:
             version = "unknown"
 
         # Classify via the shared hardware policy (single source of truth for
-        # machine-string -> board type and board-specific heap thresholds).
+        # machine-string -> board type and heap thresholds).
         classification = classify_machine(machine_name)
         return {
             "hardware_type": classification["hardware_type"],

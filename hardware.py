@@ -4,19 +4,17 @@
 
 import os
 
-# Canonical hardware type identifiers
 HARDWARE_TYPE_PICO_W = "pico_w"
 HARDWARE_TYPE_PICO_2_W = "pico_2_w"
 HARDWARE_TYPE_UNKNOWN = "unknown"
 
-# Board-specific free-heap thresholds (bytes). Two distinct concepts:
-# the PREFERRED reserve marks the beginning of memory-pressure handling
-# (GC, increased willingness to reclaim low-retention queue entries --
-# not a rejection wall), and the MINIMUM is the hard survival floor that
-# admission must protect after reasonable recovery attempts (below it,
-# expendable incoming traffic may be rejected). Real Pico W operation
-# transiently approaches or dips below 64 KiB while constructing and
-# serializing legitimate messages, so the two must not be one value.
+# Board-specific free-heap thresholds (bytes). Two distinct concepts: the
+# PREFERRED reserve marks the start of memory-pressure handling (GC,
+# increased willingness to reclaim low-retention queue entries — not a
+# rejection wall), and the MINIMUM is the hard survival floor admission must
+# protect (below it, expendable incoming traffic may be rejected). Real Pico
+# W operation transiently approaches or dips below 64 KiB while constructing
+# and serializing legitimate messages, so the two must not be one value.
 PICO_W_PREFERRED_FREE_HEAP_BYTES = 64 * 1024   # 65,536 bytes
 PICO_W_MIN_FREE_HEAP_BYTES = 48 * 1024         # 49,152 bytes
 # Pico 2 W keeps its own policy: the same 16 KiB pressure band above its
@@ -24,8 +22,7 @@ PICO_W_MIN_FREE_HEAP_BYTES = 48 * 1024         # 49,152 bytes
 PICO_2_W_PREFERRED_FREE_HEAP_BYTES = 144 * 1024  # 147,456 bytes
 PICO_2_W_MIN_FREE_HEAP_BYTES = 128 * 1024        # 131,072 bytes
 
-# Machine string patterns for supported boards
-# These are the actual strings returned by os.uname().machine on supported boards
+# Machine strings returned by os.uname().machine on supported boards
 _PICO_W_MACHINE_PATTERNS = (
     "Raspberry Pi Pico W with RP2040",
     "RPI_PICO_W with RP2040",
@@ -67,7 +64,6 @@ def detect_hardware():
     except Exception:
         raise RuntimeError("Unable to read machine identifier")
 
-    # Classify via the shared policy, then fail startup on unknown hardware.
     result = classify_machine(machine_name)
     if result["hardware_type"] == HARDWARE_TYPE_UNKNOWN:
         raise RuntimeError("Unsupported hardware: {}".format(machine_name))

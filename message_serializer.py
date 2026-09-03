@@ -2,11 +2,9 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
-"""
-Outbound message validation and serialization for the inter-core bus.
-
-Only JSON-safe values, string dict keys, and finite floats; the serialized message must not exceed MAX_OUTBOUND_MESSAGE_BYTES.
-"""
+"""Outbound message validation and serialization for the inter-core bus:
+only JSON-safe values, string dict keys, and finite floats; the serialized
+message must not exceed MAX_OUTBOUND_MESSAGE_BYTES."""
 
 import json
 import math
@@ -14,17 +12,13 @@ import math
 from message_protocol import is_json_safe
 
 
-# Maximum outbound MQTT payload bytes (16 KiB).
-#
-# MCU-scale ceiling. The limit is enforced after json.dumps() + utf-8 encode, so
-# at peak allocation the object graph, the serialized str, and the encoded bytes
-# are all resident at once; a 128 KiB payload could not be admitted safely on a
-# Pico W (256 KiB SRAM, 64 KiB reserved). 16 KiB keeps a single message's transient
-# peak (graph + str + bytes, ~3x) to roughly 48 KiB and leaves ~6x headroom over the
-# largest legitimate message (the one-shot startup log, which is the only payload that
-# grows with device count). The aggregate retained footprint is separately governed
-# by the global minimum free-heap reserve that both inter-core queues enforce at
-# admission (the reserve itself is owned by hardware.py).
+# Maximum outbound MQTT payload bytes (16 KiB). The limit is enforced after
+# json.dumps() + utf-8 encode, so at peak the object graph, the str, and the
+# bytes are all resident: 16 KiB keeps that ~3x transient peak near 48 KiB on
+# a Pico W (256 KiB SRAM, 64 KiB reserved) and leaves ~6x headroom over the
+# largest legitimate message (the one-shot startup log, the only payload that
+# grows with device count). The aggregate retained footprint is governed
+# separately by the inter-core queues' free-heap reserve (owned by hardware.py).
 MAX_OUTBOUND_MESSAGE_BYTES = 16 * 1024
 
 
@@ -81,14 +75,12 @@ def _validate_value(value, path="root"):
 
     if isinstance(value, dict):
         for key, val in value.items():
-            # Check that keys are strings
             if not isinstance(key, str):
                 raise NonStringKeyError("Non-string key at {}: {}".format(path, key))
             key_path = "{}[{}]".format(path, repr(key))
             _validate_value(val, key_path)
         return
 
-    # Unsupported type
     raise UnsupportedValueError(
         "Unsupported type at {}: {} (got {})".format(path, value, type(value).__name__)
     )
@@ -106,23 +98,20 @@ def _serialize_to_bytes(message):
 
 
 def serialize_and_validate_message(message):
-    """
-    Validate a message and serialize it to UTF-8 bytes for queue admission.
-
-    is_json_safe() runs first as an allocation-light pass; the path-producing validator runs only on failure. Raises UnsupportedValueError, NonStringKeyError, NonFiniteFloatError, MessageTooLargeError, or SerializationError.
-    """
-    # Validate structure and values. is_json_safe() enforces the same rules
-    # as _validate_value() but without building per-node diagnostic paths, so
-    # the common valid-message case stays allocation-light. On failure the
-    # path-producing validator re-walks the message and raises the precise
-    # error (with the offending path) the caller reports.
+    """Validate a message and serialize it to UTF-8 bytes for queue admission.
+    is_json_safe() runs first as an allocation-light pass; the path-producing
+    validator runs only on failure. Raises UnsupportedValueError,
+    NonStringKeyError, NonFiniteFloatError, MessageTooLargeError, or
+    SerializationError."""
+    # is_json_safe() enforces the same rules as _validate_value() but without
+    # building per-node diagnostic paths, so the common valid-message case
+    # stays allocation-light; on failure the path-producing validator re-walks
+    # and raises the precise error (with the offending path).
     if not is_json_safe(message):
         _validate_value(message)
 
-    # Serialize to bytes
     payload_bytes = _serialize_to_bytes(message)
 
-    # Check size
     if len(payload_bytes) > MAX_OUTBOUND_MESSAGE_BYTES:
         raise MessageTooLargeError(
             "Message size {} exceeds maximum {}".format(

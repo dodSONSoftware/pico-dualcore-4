@@ -41,12 +41,9 @@ from message_serializer import (
 
 
 class StartupLogTooLargeError(ValueError):
-    """The detailed startup log exceeds MAX_OUTBOUND_MESSAGE_BYTES.
-
-    Distinguished from the other permanent rejections because it is the one
-    a different object -- the bounded fallback summary -- can answer, while
-    a validation or serialization failure cannot be fixed by re-submitting a
-    changed object."""
+    """The detailed startup log exceeds MAX_OUTBOUND_MESSAGE_BYTES; the one
+    permanent rejection a different object (the bounded fallback summary)
+    can answer."""
 
 
 def _collect_system_information_full(system_information):
@@ -61,18 +58,15 @@ def _collect_system_information_full(system_information):
         except MemoryError:
             raise
         except Exception as err:
-            # If a section fails to collect, include error info but continue
             system_info[section] = {"error": str(err)}
     return system_info
 
 
 def _startup_summary(device_status, startup_duration_ms):
-    """Startup statuses and device counts, shared by the detailed startup log and its bounded fallback.
-
-    Subscription readiness is reported without topic
-    names: topic ownership belongs to Core 0 (message kind only crosses cores).
-    The startup duration is named explicitly (duration_ms) so it carries its
-    units and is not confused with the envelope's device-uptime (uptime_ms)."""
+    """Startup statuses and device counts, shared by the detailed startup log
+    and its bounded fallback. Subscription readiness is reported without topic
+    names (topic ownership belongs to Core 0), and the startup duration is
+    named duration_ms so it is not confused with the envelope's uptime_ms."""
     startup_summary = {
         "duration_ms": startup_duration_ms,
         "hardware": {"status": "ready"},
@@ -86,7 +80,6 @@ def _startup_summary(device_status, startup_duration_ms):
         "core_1": {"status": "running"},
     }
 
-    # Add device status
     startup_summary["devices_configured"] = device_status["devices"]["configured"]
     startup_summary["devices_ready"] = device_status["devices"]["active"]
     startup_summary["devices_failed"] = device_status["devices"].get("initialization_failed", 0)
@@ -94,12 +87,8 @@ def _startup_summary(device_status, startup_duration_ms):
 
 
 def _startup_log_message(intercore, startup_duration_ms, startup_summary, system_information=None):
-    """Message envelope shared by the detailed startup log and its bounded fallback.
-
-    Core 0 injects the envelope (sequence, runtime_id,
-    source, firmware_version, message_schema_version) at publish time.
-    The `system_information` key is omitted entirely when None -- that is
-    exactly what the bounded fallback drops."""
+    """Message envelope shared by the detailed startup log and its bounded
+    fallback; the system_information key is omitted entirely when None."""
     data = {"startup": startup_summary}
     if system_information is not None:
         data["system_information"] = system_information
@@ -118,13 +107,11 @@ def _startup_log_message(intercore, startup_duration_ms, startup_summary, system
 
 
 def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information=None):
-    """Build the detailed system_startup_completed log message.
-
-    Carries only Core 1's own fields -- the Core 0 envelope keys are injected at publish time and must not be repeated."""
+    """Build the detailed system_startup_completed log message (Core 1's own
+    fields only)."""
     device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
     startup_summary = _startup_summary(device_status, startup_duration_ms)
 
-    # Add lists of detailed device info for ready and failed devices
     ready_devices = []
     failed_devices = []
     for status in device_status["device_status"]:
@@ -141,9 +128,8 @@ def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup
     startup_summary["ready_devices"] = ready_devices
     startup_summary["failed_devices"] = failed_devices
 
-    # Collect full system information
-    # Use provided system_information if available (with device_manager set),
-    # otherwise create a new one for host-side testing
+    # Use the provided system_information if available, else create one for
+    # host-side testing.
     if system_information is None:
         system_information = SystemInformation(intercore, config)
     system_info = _collect_system_information_full(system_information)
@@ -152,16 +138,10 @@ def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup
 
 
 def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms):
-    """Build the bounded startup-log fallback.
-
-    The detailed startup log is still the one payload that can exceed
-    MAX_OUTBOUND_MESSAGE_BYTES: device definitions carry count and length
-    bounds (config.MAX_DEVICES, device_factory.MAX_DEVICE_*_LENGTH), but the
-    payload also carries non-config growth -- the full system_information
-    sections and driver failure-reason strings -- whose size no config bound
-    can pin. This fallback keeps only the startup statuses and device counts
-    -- no per-device lists, no system_information -- and stays far under the
-    ceiling. Losing the verbose diagnostics must not keep the device from
+    """Build the bounded startup-log fallback: only the startup statuses and
+    device counts -- no per-device lists, no system_information -- so it fits
+    when the detailed log (which carries non-config growth no bound can pin)
+    cannot. Losing the verbose diagnostics must not keep the device from
     entering normal operation."""
     device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
     return _startup_log_message(
@@ -175,7 +155,10 @@ def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms):
 def _try_queue_startup_log(intercore, message, retention_priority):
     """Attempt to queue the startup log message.
 
-    True if admitted; False if admission failed transiently (heap pressure). Raises ValueError on a permanent rejection: retrying the same object cannot succeed, so the caller fails fast with the actual reason. The oversized case raises StartupLogTooLargeError (a ValueError subclass) so the caller can answer it with the bounded fallback instead of failing startup."""
+    True if admitted; False on transient heap pressure. ValueError on a
+    permanent rejection (retrying cannot succeed), except the oversized case,
+    which raises StartupLogTooLargeError so the caller can answer it with the
+    bounded fallback instead of failing startup."""
     try:
         payload_bytes = serialize_and_validate_message(message)
     except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
@@ -190,11 +173,8 @@ def _try_queue_startup_log(intercore, message, retention_priority):
         print("[ERROR] Startup log serialization failed: {}".format(err))
         raise ValueError("Startup log serialization failed: {}".format(err))
 
-    # Queue under KIND_LOG: Core 0 maps the kind to the log topic at publish
-    # time. Core 1 never names MQTT topics. A permanent queue rejection
-    # (the per-message ceiling is enforced again on this path) raises
-    # ValueError, which escapes unchanged; a transient heap-pressure
-    # rejection returns False.
+    # Queue under KIND_LOG (Core 0 maps the kind to the log topic; Core 1
+    # never names MQTT topics).
     return intercore.outbound_queue.put_with_kind(
         KIND_LOG,
         payload_bytes,
@@ -203,24 +183,24 @@ def _try_queue_startup_log(intercore, message, retention_priority):
 
 
 def _admit_startup_log(intercore, message):
-    """Admit the startup log, retrying only a transient rejection.
-
-    A permanent rejection is never retried: the ValueError escapes to the caller, which fails fast. True if admitted, False if the single transient retry also failed."""
+    """Admit the startup log, retrying only a transient rejection (a
+    permanent one escapes to the caller). True if admitted, False if the
+    single transient retry also failed."""
     if _try_queue_startup_log(intercore, message, RETENTION_PRIORITY_INFO):
         return True
 
     # Transient (heap pressure): the queue may admit it on the next pass.
     # Startup log must be admitted before telemetry can begin.
     print("[ERROR] Startup log queue admission failed - telemetry gated")
-    # Wait for queue space and retry once
     time.sleep_ms(100)
     return _try_queue_startup_log(intercore, message, RETENTION_PRIORITY_INFO)
 
 
 def _admit_startup_log_with_fallback(intercore, message, fallback_builder):
-    """Admit the startup log; if the detailed message is rejected for exceeding the outbound ceiling only, admit the bounded fallback summary instead.
-
-    Failure to emit the verbose diagnostics must not keep an otherwise valid configuration from entering normal operation: the oversized rejection is permanent for the detailed object, but a bounded fallback -- no per-device lists, no system_information -- is admitted even by the configuration that made the detailed message too large. Every other permanent rejection escapes with its actual reason so the caller fails fast. Each admission keeps _admit_startup_log's retry discipline (the single transient retry)."""
+    """Admit the startup log; if the detailed message is rejected for
+    exceeding the outbound ceiling only, admit the bounded fallback summary
+    instead. Every other permanent rejection escapes with its actual reason
+    so the caller fails fast (each admission keeps the single transient retry)."""
     try:
         return _admit_startup_log(intercore, message)
     except StartupLogTooLargeError:
@@ -229,12 +209,10 @@ def _admit_startup_log_with_fallback(intercore, message, fallback_builder):
 
 
 def _current_utc_timestamp(intercore, uptime_ms):
-    """Current UTC timestamp from the shared snapshot, or None if unsynchronized.
-
-    The snapshot pins the UTC epoch to the shared boot base; adding this
-    sample's accumulated uptime tracks the clock between refreshes and stays
-    correct across the tick wrap, where a one-shot ticks_diff against the sync
-    tick would go stale once the snapshot is more than half a tick period old."""
+    """Current UTC timestamp from the shared snapshot, or None if
+    unsynchronized. Adding this sample's accumulated uptime to the pinned
+    runtime start stays correct across the tick wrap, where a one-shot
+    ticks_diff against the sync tick would go stale past half a tick period."""
     snapshot = intercore.state_mailboxes.get_utc_snapshot()
     if snapshot is None:
         return None
@@ -273,7 +251,8 @@ def _build_command_response(intercore, uptime_state, event, success, data=None, 
 def _try_queue_response(intercore, response):
     """Queue a command response at CRITICAL retention priority.
 
-    True if admitted; False if transiently rejected (retry on a later pass). Raises ValueError on a permanent rejection; the oversized case raises OutboundMessageTooLargeError (a ValueError subclass)."""
+    True if admitted; False if transiently rejected (retry on a later pass);
+    ValueError on a permanent rejection (oversized: OutboundMessageTooLargeError)."""
     return intercore.outbound_queue.put(
         response["kind"],
         response["message"],
@@ -282,9 +261,9 @@ def _try_queue_response(intercore, response):
 
 
 def _build_substitute_error_response(intercore, uptime_state, response, code, message):
-    """A small error response standing in for a permanently rejected one.
-
-    The rejected response's payload carries the command's identifying fields, so it doubles as the descriptor; the result is far under the per-message ceiling."""
+    """A small error response standing in for a permanently rejected one; the
+    rejected payload carries the command's identifying fields and doubles as
+    the descriptor."""
     payload = response["message"]["payload"]
     return _build_command_response(
         intercore,
@@ -299,9 +278,8 @@ def _build_substitute_error_response(intercore, uptime_state, response, code, me
 
 
 def _admit_substitute(intercore, uptime_state, response, code, message, warning):
-    """Log a permanent rejection, admit the small error substitute for it.
-
-    None if the substitute was admitted; the substitute (still pending) if its admission was transiently rejected."""
+    """Log a permanent rejection and admit the small error substitute for it;
+    None if admitted, the substitute (still pending) if transiently rejected."""
     print("[WARNING] {}".format(warning))
     substitute = _build_substitute_error_response(intercore, uptime_state, response, code, message)
     if _try_queue_response(intercore, substitute):
@@ -310,9 +288,10 @@ def _admit_substitute(intercore, uptime_state, response, code, message, warning)
 
 
 def _admit_or_substitute_command_response(intercore, uptime_state, response):
-    """Admit a command response, or a small error substitute for it; either way the channel moves on.
-
-    A transient rejection leaves the response pending. A permanent rejection is answered with a small error response whose code states the cause: "response_too_large" for oversized, "response_invalid" for a validation/serialization failure. Returns the response still pending after this pass, or None if one was admitted."""
+    """Admit a command response, or a small error substitute for it (code
+    "response_too_large" for oversized, "response_invalid" for a
+    validation/serialization failure); either way the channel moves on.
+    Returns the response still pending, or None if one was admitted."""
     try:
         if _try_queue_response(intercore, response):
             return None
@@ -338,10 +317,8 @@ def _admit_or_substitute_command_response(intercore, uptime_state, response):
 
 
 def _regrid_next_boundary(anchor, now, interval_ms):
-    """The next interval-aligned scheduler boundary from the anchor that is strictly after now.
-
-    Boundaries that already passed are skipped, never replayed (same
-    missed-boundary policy as startup and the read/health skip loops)."""
+    """The next interval-aligned boundary from the anchor strictly after now;
+    boundaries that already passed are skipped, never replayed."""
     elapsed = time.ticks_diff(now, anchor)
     if elapsed < 0:
         return anchor
@@ -349,9 +326,13 @@ def _regrid_next_boundary(anchor, now, interval_ms):
 
 
 def _apply_config_update(config_update, config, schedulers):
-    """Apply a HOT_RELOADED Core 1 hot update (or its rollback): re-anchor the read/health schedulers and refresh Core 1's own config copy.
+    """Apply a HOT_RELOADED Core 1 hot update (or its rollback): re-anchor
+    the read/health schedulers and refresh Core 1's own config copy.
 
-    A configuration reload is a NEW scheduling boundary, deliberately re-anchored from the reload instant rather than re-gridded to the boot anchor: a changed interval means the next sample is one interval after now (next = now + interval). Only the keys present in the update are touched, and no catch-up sample is emitted for a shortened interval. Core 1's local config copy is updated too, so the health activity threshold (which reads read_loop_sec) reflects the new active value."""
+    A reload is a NEW scheduling boundary, re-anchored from the reload instant
+    rather than re-gridded to the boot anchor (next = now + interval); only
+    the keys present are touched, and no catch-up sample is emitted for a
+    shortened interval."""
     now_ms = time.ticks_ms()
     if "read_loop_sec" in config_update:
         config["read_loop_sec"] = config_update["read_loop_sec"]
@@ -368,9 +349,12 @@ def _apply_config_update(config_update, config, schedulers):
 
 
 def _process_config_update(intercore, config, schedulers):
-    """Apply one HOT_RELOADED config-update request from Core 0 and acknowledge it.
-
-    Internal runtime control on the dedicated config-update lane, not an external command: take the pending request, apply it (re-anchor the read/health schedulers from the reload instant and refresh Core 1's own config copy), then post exactly one result for the request's generation. No command response is owed on this path. On an apply failure the prior values are restored and a bounded failure result posted, so Core 1 is left unchanged. MemoryError propagates per the Core 1 recovery policy."""
+    """Apply one HOT_RELOADED config-update request from Core 0 and
+    acknowledge it. Internal runtime control on the dedicated lane, not an
+    external command: take the pending request, apply it, then post exactly
+    one result for the request's generation (no command response is owed).
+    On an apply failure the prior values are restored and a bounded failure
+    posted, so Core 1 is left unchanged. MemoryError propagates."""
     request = intercore.config_update_lane.take_request()
     if request is None:
         return
@@ -412,22 +396,14 @@ def _process_config_update(intercore, config, schedulers):
 
 
 def _process_intercore_event(intercore, uptime_state, system_information=None):
-    """Handle a Core 1-owned command event dispatched by Core 0.
-
-    Core 0 validates the command against its supported-command registry and
-    dispatches only supported Core 1-owned events (currently get-details, with
-    a validated {} payload). Core 0 owns the unknown-command response, so Core
-    1 is not the generic fallback for arbitrary command names. (Internal
-    config-update traffic does not flow through this event queue: it uses the
-    dedicated config-update lane and is handled by _process_config_update.)"""
+    """Handle a Core 1-owned command event dispatched by Core 0 (currently
+    get-details, with a validated {} payload). Core 0 owns the unknown-command
+    response, so Core 1 is not the generic fallback for arbitrary command
+    names. (Config-update traffic uses the dedicated lane, not this queue.)"""
     event = intercore.event_queue.take()
     if event is None:
         return None
 
-    # Only supported Core 1-owned command events reach here (currently
-    # get-details, with a validated {} payload -- Core 0 already rejected a
-    # non-empty payload with unknown_fields). A command name Core 0 does not
-    # own is answered on Core 0, so there is no generic fallback here.
     if event.get("command") != COMMAND_GET_DETAILS:
         return None
 
@@ -474,9 +450,8 @@ def _handle_device_result(intercore, config, uptime_state, result):
                 RETENTION_PRIORITY_TELEMETRY,
             )
         except ValueError as err:
-            # Permanent rejection (oversized or invalid): this sample can
-            # never be admitted, so discard it rather than retry it forever.
-            # Telemetry is a current sample, not a replayable record.
+            # Permanent rejection (oversized or invalid): discard this sample
+            # rather than retry it -- telemetry is current, not replayable.
             print("[WARNING] Core 1 telemetry rejected: {}: {}".format(
                 result["device_id"], err
             ))
@@ -498,9 +473,8 @@ def _handle_device_result(intercore, config, uptime_state, result):
         return
 
     if status == DEVICE_RESULT_REINITIALIZATION_FAILED:
-        # device_manager flags which reinitialization failures should warn: the
-        # first for a device, not the repeats. Default to logging so a missing
-        # field never silences a genuine failure.
+        # device_manager flags which failures should warn (the first, not the
+        # repeats); default to logging so a missing field never silences one.
         if result.get("log_failure_warning", True):
             print("[WARNING] Core 1 device reinitialization failed: {}: {}".format(
                 result["device_id"], result.get("error")
@@ -508,9 +482,8 @@ def _handle_device_result(intercore, config, uptime_state, result):
 
 
 def _run_telemetry_read_pass(device_manager, intercore, uptime_state, config):
-    """One telemetry read pass across all active devices.
-
-    Shared by the initial at-anchor sample and the periodic read boundary, so the read path (and its gc) has a single implementation."""
+    """One telemetry read pass across all active devices; shared by the
+    initial at-anchor sample and the periodic read boundary."""
     for managed_device in device_manager.get_active_devices():
         result = device_manager.process_device(managed_device)
         _handle_device_result(intercore, config, uptime_state, result)
@@ -518,42 +491,31 @@ def _run_telemetry_read_pass(device_manager, intercore, uptime_state, config):
 
 
 def _build_health_payload(intercore, uptime_state, config, system_information):
-    """Build the health payload from shared state snapshots.
-
-    Carries only Core 1's own fields -- the Core 0 envelope keys are injected at publish time. None if no network snapshot exists yet."""
+    """Build the health payload from shared state snapshots (Core 1's own
+    fields only); None if no network snapshot exists yet."""
     now_ms = time.ticks_ms()
     uptime_ms = current_uptime_ms(uptime_state)
 
-    # Get network snapshot (from Core 0)
     network_snapshot = intercore.state_mailboxes.get_network_snapshot()
     if network_snapshot is None:
-        # No network snapshot available yet
         return None
 
-    # Get UTC snapshot (from Core 0)
     utc_snapshot = intercore.state_mailboxes.get_utc_snapshot()
     utc_valid = utc_snapshot is not None
 
-    # Get Core 1 activity timestamp
     core_1_activity_ms = intercore.state_mailboxes.get_core_1_activity_ms()
-    # Age of the last Core 1 activity report (None if never reported)
     core_1_activity_age_ms = time.ticks_diff(now_ms, core_1_activity_ms) if core_1_activity_ms is not None else None
-    # Calculate threshold: 3x the read loop interval (with reasonable minimum)
     core_1_activity_threshold_ms = max(config["read_loop_sec"] * 3 * 1000, 60000)  # 60 seconds min
     core_1_active = core_1_activity_age_ms is not None and core_1_activity_age_ms <= core_1_activity_threshold_ms
 
-    # Get device status from SystemInformation (which uses DeviceManager)
     devices = system_information.get_devices() if system_information else {"configured": 0, "active": 0}
     devices_configured = devices["configured"]
     devices_active = devices["active"]
 
-    # Get queue status. The queue is heap-governed (no fixed capacity), so the
-    # reportable metrics are depth, retained bytes, high watermarks, and the
-    # memory-pressure eviction/rejection counters -- not utilization against a
-    # capacity that no longer exists.
+    # Queue status: heap-governed (no fixed capacity), so the metrics are
+    # depth, retained bytes, watermarks, and eviction/rejection counters.
     outbound_status = intercore.outbound_queue.status()
 
-    # Get memory info
     try:
         free_heap = gc.mem_free()
     except MemoryError:
@@ -561,12 +523,11 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     except Exception:
         free_heap = 0
 
-    # Get hardware info from state mailboxes
     try:
         hardware = intercore.state_mailboxes.get_hardware()
         minimum_free_heap = hardware.get("minimum_free_heap_bytes") if hardware else 65536
-        # The preferred reserve defaults to the hard floor, so a
-        # single-threshold hardware snapshot keeps the legacy behavior.
+        # The preferred reserve defaults to the hard floor for
+        # single-threshold hardware snapshots.
         preferred_free_heap = (
             hardware.get("preferred_free_heap_bytes", minimum_free_heap)
             if hardware else 65536
@@ -581,23 +542,19 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
         hardware_type = "unknown"
         machine = "unknown"
 
-    # Get RSSI from network snapshot
     wifi_rssi_dbm = network_snapshot.get("rssi")
 
-    # Calculate heap headroom
     heap_headroom_bytes = free_heap - minimum_free_heap
 
-    # Calculate UTC sync age in seconds. current_uptime - sync_uptime, both on
-    # the shared boot base: correct for any duration, where ticks_diff(now,
-    # sync_ticks) would go stale past half a tick period and could go negative.
+    # UTC sync age: current_uptime - sync_uptime on the shared boot base
+    # (correct for any duration, unlike a one-shot ticks_diff past half a
+    # tick period, which could go negative).
     utc_sync_age_sec = None
     if utc_snapshot is not None:
         utc_sync_age_sec = (uptime_ms - utc_snapshot["sync_uptime_ms"]) // 1000
 
-    # Calculate device failures from DeviceManager state
     device_failures = devices_configured - devices_active
 
-    # Evaluate health status and build degraded reasons
     degraded_reasons = []
     network_stack_ready = bool(network_snapshot.get("network_stack_ready"))
     wifi_connected = bool(network_snapshot.get("wifi_connected"))
@@ -618,12 +575,9 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     if not utc_valid:
         degraded_reasons.append("utc_not_valid")
 
-    # Determine status
     status = "healthy" if not degraded_reasons else "degraded"
 
-    # Build health payload. The timestamp comes from the shared UTC snapshot
-    # (already fetched above for the utc_* fields); Core 0 injects the
-    # envelope at publish time.
+    # The timestamp comes from the shared UTC snapshot (fetched above).
     if utc_snapshot is None:
         timestamp = None
     else:
@@ -684,7 +638,6 @@ def _try_queue_health_message(intercore, message):
         print("[WARNING] Health message serialization failed: {}".format(err))
         return False
 
-    # Queue the pre-serialized message with health kind
     try:
         return intercore.outbound_queue.put_with_kind(
             KIND_HEALTH,
@@ -693,8 +646,7 @@ def _try_queue_health_message(intercore, message):
         )
     except ValueError as err:
         # Permanent rejection: health is a current-state report, so the
-        # boundary is discarded (missed health boundaries are skipped, never
-        # replayed) rather than retried forever.
+        # boundary is discarded (missed boundaries are never replayed).
         print("[WARNING] Health message permanently rejected: {}".format(err))
         return False
 
@@ -703,25 +655,20 @@ def _try_queue_health_message_intercore(intercore, uptime_state, config, system_
     """Build health payload and attempt to queue it.
 
     Only when the network stack is ready and MQTT is connected, so health messages don't accumulate during outages."""
-    # Check if network stack is ready before generating health
     network_snapshot = intercore.state_mailboxes.get_network_snapshot()
     if network_snapshot is None:
         return
 
-    # Only generate health if network is ready and MQTT is connected
-    # This prevents stale health messages from accumulating during outages
     network_stack_ready = network_snapshot.get("network_stack_ready", False)
     mqtt_connected = network_snapshot.get("mqtt_connected", False)
 
     if not network_stack_ready or not mqtt_connected:
         return
 
-    # Build health payload
     health_payload = _build_health_payload(intercore, uptime_state, config, system_information)
     if health_payload is None:
         return
 
-    # Queue the health message
     _try_queue_health_message(intercore, health_payload)
 
 
@@ -730,36 +677,29 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
     try:
         print("[INFO] Core 1 starting")
 
-        # Register the liveness stamp before any initialization work. Core 0's
-        # heartbeat watchdog is a no-op until the first stamp exists, so
-        # without this a Core 1 wedged inside driver construction or a device
-        # initialize() call would be indistinguishable from "Core 1 has not
-        # started yet" and the watchdog could never fire. From this moment on,
-        # a wedge anywhere in startup ages the stamp and is recoverable.
+        # Register the liveness stamp before any initialization work: Core 0's
+        # heartbeat watchdog is a no-op until the first stamp exists, so a
+        # startup wedge must age a stamp to be caught.
         intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
 
         # Accumulated uptime: every ticks_diff compares recent samples, so
-        # uptime stays correct across a tick-counter wrap on long runs.
-        # boot_ticks_ms anchors this boot-lifetime uptime only; periodic
-        # scheduling anchors to normal_runtime_start_ticks_ms (captured
-        # after startup-log admission, below).
+        # uptime stays correct across a tick-counter wrap. boot_ticks_ms
+        # anchors boot-lifetime uptime only; periodic scheduling anchors to
+        # normal_runtime_start_ticks_ms (captured below).
         uptime_state = create_uptime_state(boot_ticks_ms)
 
         system_information = SystemInformation(intercore, config)
         # activity_refresh keeps the liveness stamp current at initialization
-        # progress boundaries (before each device, before each attempt), so a
-        # legitimately long multi-device initialization does not age the stamp
-        # past Core 0's 30 s watchdog bound while a wedged driver call --
-        # which stops the refresh -- is still caught.
+        # progress boundaries, so a legitimately long initialization does not
+        # age it past Core 0's 30 s watchdog bound while a wedged driver call
+        # (which stops the refresh) is still caught.
         device_manager = DeviceManager(
             config,
             system_information=system_information,
             activity_refresh=lambda: intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms()),
-            # Shared boot-relative uptime base: the device read-age fields are
-            # stored and measured on the same accumulated-uptime source of
-            # truth as the UTC timestamp, so they stay correct across a tick
-            # wrap (a device stuck in failure/reinit past half a tick period
-            # would otherwise report a wrong read age).
+            # Shared boot-relative uptime base: the device read-age fields
+            # stay correct across a tick wrap (past half a tick period, raw
+            # ticks would report a wrong age).
             uptime_state=uptime_state,
         )
         system_information.set_device_manager(device_manager)
@@ -768,28 +708,21 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         print("[INFO] Core 1 devices initialized: {}/{}".format(
             initialized, len(config["devices"])
         ))
-        # failed carries each failed device's attempts_used and last_error (no
-        # per-attempt history): the diagnostic summary, bounded to one entry
-        # per failed device.
+        # failed carries each failed device's attempts_used and last_error
+        # (one entry per device, no per-attempt history).
         if failed and DEBUG:
             print("[DEBUG] Core 1 failed devices: {}".format(failed))
 
-        # Calculate startup duration
         startup_duration_ms = current_uptime_ms(uptime_state)
 
-        # Build and queue the one-time startup log
         startup_log_message = _build_startup_log(
             intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information
         )
 
         # The startup log must be admitted before telemetry can begin. A
-        # permanent rejection (validation, serialization) fails fast with its
-        # actual reason -- retrying the same object 100 ms later cannot change
-        # the outcome; only a genuinely transient rejection (heap pressure) is
-        # retried. The oversized case is the one permanent rejection a
-        # different object can answer: the bounded fallback summary, so a
-        # failure to emit the verbose diagnostics never keeps an otherwise
-        # valid configuration from reaching normal operation.
+        # permanent rejection fails fast with its actual reason; only heap
+        # pressure is retried. The oversized case is the one a different
+        # object can answer: the bounded fallback summary.
         try:
             startup_log_admitted = _admit_startup_log_with_fallback(
                 intercore,
@@ -799,7 +732,6 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 ),
             )
         except ValueError as err:
-            # Permanent: fail immediately with the actual reason
             print("[FATAL] Startup log permanently rejected: {}".format(err))
             raise RuntimeError("Startup log queue admission failed")
 
@@ -810,17 +742,12 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         print("[INFO] Startup log admitted to outbound queue")
 
         # The single normal-runtime scheduling anchor, captured exactly once,
-        # immediately after system_startup_completed is admitted. All
-        # periodic Core 1 work (telemetry and health) derives its fixed
-        # boundaries from this moment -- not from boot_ticks_ms (which
-        # remains the boot-lifetime reference for uptime and startup-duration
-        # measurement) and not from when startup merely completed. A Wi-Fi or
-        # MQTT reconnect, a UTC resynchronization, a device reinitialization,
-        # or a queue drain must never re-capture this anchor; only a true
-        # reboot -- a new runtime with a new runtime_id -- creates a new one.
+        # after the startup log is admitted. All periodic Core 1 work derives
+        # its fixed boundaries from this moment (not boot_ticks_ms). A
+        # reconnect, UTC resync, device reinit, or queue drain must never
+        # re-capture it; only a true reboot creates a new one.
         normal_runtime_start_ticks_ms = time.ticks_ms()
 
-        # Store hardware info in state mailboxes (from system_information)
         try:
             hardware = system_information.get_machine()
             intercore.state_mailboxes.set_hardware(hardware)
@@ -830,22 +757,16 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             if DEBUG:
                 print("[DEBUG] Hardware storage failed: {}".format(err))
 
-        # Refresh Core 1 activity: the initial registration happened at the
-        # top of core1_main (arming Core 0's watchdog); this marks the
-        # transition into the normal runtime loop.
+        # Refresh Core 1 activity: marks the transition into the normal
+        # runtime loop.
         intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
 
         # The read/health schedulers share the normal-runtime anchor: fixed
-        # boundaries every read_loop_sec / health_interval_sec from
-        # normal-runtime start (a 60s health interval means +60s, +120s,
-        # +180s relative to the anchor). Independent of each other: the two
-        # share the epoch, not an execution dependency. The state lives in
-        # one mutable holder -- a HOT_RELOADED write-config re-anchors a
-        # changed interval from the reload instant (next = now + interval) via
-        # the config-update lane, without touching the anchor -- and the run
-        # loop reads and writes through it. The one immediate telemetry pass
-        # and health report at the anchor are emitted once below, before the
-        # run loop.
+        # boundaries every read_loop_sec / health_interval_sec from it,
+        # independent of each other (they share the epoch, not an execution
+        # dependency). A HOT_RELOADED write re-anchors a changed interval
+        # from the reload instant via the config-update lane, without
+        # touching the anchor; the one immediate anchor pass runs below.
         schedulers = {
             "anchor_ms": normal_runtime_start_ticks_ms,
             "read_loop_ms": config["read_loop_sec"] * 1000,
@@ -853,10 +774,8 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         }
         now_ms = time.ticks_ms()
 
-        # Boundaries already passed (only possible if scheduler initialization
-        # was delayed by more than a full interval) are skipped, never
-        # replayed: telemetry and health are current-state data, not
-        # historical data. Advance both to the next future boundary.
+        # Boundaries already passed (scheduler initialization delayed by more
+        # than a full interval) are skipped, never replayed.
         schedulers["next_read_ms"] = _regrid_next_boundary(
             normal_runtime_start_ticks_ms, now_ms, schedulers["read_loop_ms"]
         )
@@ -868,16 +787,11 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         activity_interval_ms = 5000
         next_activity_ms = time.ticks_add(now_ms, activity_interval_ms)
 
-        # Initial sample at the anchor: one telemetry read pass and one
-        # health report immediately after startup-log admission, so a
-        # subscriber that connects at boot sees current data within the
-        # startup-stabilization window instead of waiting a full
-        # read_loop_sec / health_interval_sec. The periodic schedulers above
-        # are untouched -- their boundaries stay at anchor + n * interval --
-        # so this one-shot is not a second grid and cannot accumulate drift.
-        # Telemetry first, then health, so the health report reflects queue
-        # state that already includes the fresh samples. The health path is
-        # gated as usual (skipped if the network snapshot says not ready).
+        # Initial sample at the anchor: one telemetry pass and one health
+        # report right after startup-log admission, so a subscriber connecting
+        # at boot sees current data. Telemetry first, then health, so the
+        # health report reflects queue state that already includes the fresh
+        # samples. The periodic schedulers are untouched (not a second grid).
         _run_telemetry_read_pass(device_manager, intercore, uptime_state, config)
         _try_queue_health_message_intercore(intercore, uptime_state, config, system_information)
 
@@ -885,10 +799,8 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         while True:
             # Internal control first: a pending HOT_RELOADED config-update
-            # request from Core 0 re-anchors the read/health schedulers from
-            # the reload instant and is acknowledged on the config-update lane
-            # (Core 0 commits or rolls back when it reads the result). This is
-            # independent of, and never mixed with, the user-command event queue.
+            # request from Core 0 re-anchors the schedulers and is acked on
+            # the config-update lane; independent of the user-command queue.
             _process_config_update(intercore, config, schedulers)
 
             if pending_command_response is not None:
@@ -908,44 +820,31 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             if time.ticks_diff(now_ms, schedulers["next_read_ms"]) >= 0:
                 _run_telemetry_read_pass(device_manager, intercore, uptime_state, config)
 
-                # Skip any boundaries that elapsed while the read ran, rather
-                # than replaying them as catch-up reads. Telemetry is a current
-                # sample, not historical data, so a slow read cannot reconstruct
-                # the missed samples -- emitting them as catch-up reads would
-                # only produce a burst of near-identical samples, JSON work, and
-                # queue admissions immediately after an overload. This is the
-                # same missed-boundary policy the health scheduler already uses.
-                # Advance from the previous deadline (never from execution time)
-                # so processing delay cannot accumulate into drift: boundaries
-                # stay fixed at anchor + n * read_loop_ms.
-                #
-                # Re-capture the clock here: now_ms above is stale by however
-                # long the read took, and skipping against it would
-                # under-advance and leave a catch-up read for the next pass.
+                # Skip boundaries that elapsed while the read ran, never
+                # replay them: telemetry is a current sample, not historical
+                # data (same policy as the health scheduler). Advance from the
+                # previous deadline (not execution time) so delay cannot
+                # accumulate into drift: boundaries stay at anchor + n *
+                # read_loop_ms. now_ms is stale by the read duration, so
+                # re-capture the clock for the skip comparison.
                 skip_now_ms = time.ticks_ms()
                 while time.ticks_diff(skip_now_ms, schedulers["next_read_ms"]) >= 0:
                     schedulers["next_read_ms"] = time.ticks_add(
                         schedulers["next_read_ms"], schedulers["read_loop_ms"]
                     )
 
-            # Register Core 1 activity periodically (every 5 seconds).
-            # Re-capture the clock: now_ms is stale by however long a device
-            # read (or other processing) took this pass, and both comparing
-            # and stamping with it would let a healthy slow operation age the
-            # stamp past Core 0's watchdog bound -- the same stale-clock
-            # correction the read-boundary skip below makes with skip_now_ms.
+            # Activity stamp every 5 s. now_ms is stale by the pass duration,
+            # and stamping with it could age a healthy slow read past Core 0's
+            # watchdog bound, so re-capture the clock for both compare and stamp.
             activity_now_ms = time.ticks_ms()
             if time.ticks_diff(activity_now_ms, next_activity_ms) >= 0:
                 intercore.state_mailboxes.set_core_1_activity_ms(activity_now_ms)
                 next_activity_ms = time.ticks_add(activity_now_ms, activity_interval_ms)
 
-            # Health boundary reached: emit at most one current health
-            # report (skipped entirely during a network outage), then advance
-            # to the next normal-runtime-relative boundary. Advancing from
-            # the old deadline -- not from now -- keeps the cadence aligned
-            # to the anchor-based boundaries and avoids cumulative drift;
-            # missed boundaries are skipped, never replayed as catch-up
-            # reports.
+            # Health boundary reached: emit at most one current report (skipped
+            # during a network outage), then advance from the old deadline so
+            # the cadence stays anchored and missed boundaries are skipped,
+            # never replayed.
             if time.ticks_diff(now_ms, schedulers["next_health_ms"]) >= 0:
                 _try_queue_health_message_intercore(intercore, uptime_state, config, system_information)
                 while time.ticks_diff(now_ms, schedulers["next_health_ms"]) >= 0:

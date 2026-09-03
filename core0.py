@@ -48,8 +48,7 @@ _MAX_PENDING_CORE0_RESPONSES = 4
 _MAX_PENDING_CONNECTION_LOGS = 4
 
 # Bounded substitutes for a command response that can never be published
-# as-is (the pending queue is FIFO, so holding it would stall every
-# response behind it -- the same policy Core 1 applies at admission).
+# as-is (holding it would stall the FIFO responses behind it).
 _SUBSTITUTE_ERROR_MESSAGES = {
     "response_too_large": "Command response exceeded the per-message size limit",
     "response_invalid": "Command response could not be serialized for transmission",
@@ -58,32 +57,21 @@ _UTC_STARTUP_MAX_ATTEMPTS = 3
 _UTC_RETRY_INTERVAL_MS = 30000
 _UTC_PROMPT_RETRY_DELAY_MS = 500
 
-# Command-ID debounce cache: the number of recent command IDs Core 0
-# retains. The cache is a short-lived debounce mechanism, not durable
-# idempotency or exactly-once execution: it stops repeated copies of the same
-# message (broker redelivery, sender retry) from generating repeated
-# validation responses and repeated executions. A repeated command_id is
-# silently ignored (no execution, no event, no response) until it evicts.
-# Fixed count, FIFO eviction, RAM-only (cleared on reboot): a tiny amount of
-# bounded control metadata, deliberately not heap-governed. The first bounded
-# use of an ID claims it; a duplicate receipt does not refresh its position
-# (the cache holds the last claimed distinct IDs, not an LRU access order).
-# Static constant; not a config key.
+# Command-ID debounce cache: stops repeated copies of one message (broker
+# redelivery, sender retry) from producing repeated responses and executions.
+# FIFO eviction, RAM-only, deliberately not heap-governed; a repeated ID is
+# ignored until it evicts and a duplicate never refreshes its position (not
+# LRU). Not durable idempotency or exactly-once. Static constant; not a config key.
 _RECENT_COMMAND_ID_CAPACITY = 16
 
-# Core 0 watchdog timeout for the Core 1 liveness heartbeat. Core 1 refreshes
-# core_1_activity_ms on a 5-second deadline (core1.py), so a stamp already
-# this old means the Core 1 thread is dead or wedged: no legitimate loop pass
-# can miss six consecutive refreshes. Deliberately conservative -- far above
-# any live-loop processing gap, yet below the 60s core_1_inactive diagnostic
-# threshold, so a dead Core 1 resets the board instead of the health stream
-# quietly stopping. Static constant; not a config key.
+# Core 1 heartbeat watchdog timeout: Core 1 refreshes the stamp on a 5 s
+# deadline, so a stamp this old means the Core 1 thread is dead or wedged.
+# Far above any live-loop gap, below the 60 s core_1_inactive diagnostic
+# threshold, so a dead Core 1 resets the board. Static constant; not a config key.
 _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS = 30000
 
-# HOT_RELOADED settings Core 0 applies to its own live configuration when a
-# write-config transaction is about to commit. The two Core 1-owned HOT
-# settings (read_loop_sec / health_interval_sec) are not in Core 0's split
-# config; they cross to Core 1 as an internal config-update event.
+# HOT_RELOADED settings Core 0 applies to its live config at commit time;
+# Core 1's two HOT settings cross as an internal config-update event.
 _HOT_APPLY_CORE0_KEYS = (
     "datetime_sync_interval_min",
     "mqtt_command_poll_ms",
@@ -92,9 +80,8 @@ _HOT_APPLY_CORE0_KEYS = (
 )
 _HOT_APPLY_CORE1_KEYS = ("read_loop_sec", "health_interval_sec")
 
-# Reserved key in the hot-apply rollback record: when mqtt_command_poll_ms
-# changes, the last-poll stamp is re-anchored at apply time so the new cadence
-# starts cleanly; the old stamp is carried under this key for rollback.
+# Rollback key for the last-poll stamp: when mqtt_command_poll_ms changes the
+# stamp is re-anchored at apply time; the old value is kept for rollback.
 _POLL_STAMP_KEY = "_last_command_poll_ms"
 
 
@@ -103,9 +90,8 @@ class Core0:
     def __init__(self, intercore, config, wifi_config, runtime_id, boot_ticks_ms, led_manager, config_manager):
         self._intercore = intercore
         self._config = config
-        # Core 0 owns the configuration manager (persistence, ACTIVE-vs-
-        # PERSISTED state, change classification); it is never shared with
-        # Core 1 -- Core 1 only ever sees the internal config-update event.
+        # Core 0 owns the configuration manager; it is never shared with
+        # Core 1, which only ever sees the internal config-update event.
         self._config_manager = config_manager
         self._runtime_id = runtime_id
         self._uptime_state = create_uptime_state(boot_ticks_ms)
@@ -120,21 +106,18 @@ class Core0:
         self._mqtt = Mqtt(config, self._on_mqtt_message, self._service_wait)
 
         self._pending_reboot = None
-        # Recent command IDs (debounce cache; see _RECENT_COMMAND_ID_CAPACITY).
-        # Oldest first, evicted FIFO.
+        # Recent command IDs (debounce cache, FIFO; see _RECENT_COMMAND_ID_CAPACITY).
         self._recent_command_ids = []
         self._pending_core0_responses = []
         self._pending_connection_logs = []
-        # A HOT_RELOADED write-config is one logical transaction across both
-        # cores: the Core 0 subset is applied, the Core 1 subset is requested
-        # on the config-update lane, and the response + file commit are held
-        # until Core 1's acknowledgement arrives (resolved in the run loop).
-        # None when no such transaction is pending. _transaction_active (the
-        # config manager) is True for the same window, enforcing single-flight.
+        # A HOT_RELOADED write-config is one transaction across both cores:
+        # Core 0 applies its subset, Core 1's is requested on the
+        # config-update lane, and the response + commit are held until
+        # Core 1's ack (the run loop resolves it). _transaction_active stays
+        # True for the same window (single-flight).
         self._pending_config_update = None
-        # Monotonic generation for config-update requests/results; each
-        # transaction uses the next value so a stale result can never be read
-        # as the current one.
+        # Monotonic generation for config-update requests/results; a stale
+        # result can never be read as the current one.
         self._config_update_generation = 0
         self._utc_request_counter = 0
         self._pending_utc_request_id = None
@@ -142,10 +125,8 @@ class Core0:
         self._utc_last_attempt_ms = None
         self._utc_snapshot = None
         self._last_network_snapshot_ms = None
-        # Completion time of the most recent successful outbound application
-        # PUBLISH (the QoS 1 exchange finished, PUBACK received); None until
-        # the first publish. Drives the mqtt_outbound_publish_delay_ms pacing
-        # gate: one timestamp, one source of truth for every publish path.
+        # Completion time of the last successful application PUBLISH (PUBACK
+        # received); drives the publish pacing gate for every publish path.
         self._last_mqtt_publish_completed_ms = None
         self._last_command_poll_ms = time.ticks_ms()
         self._next_sequence = 0
@@ -166,17 +147,12 @@ class Core0:
         )
 
     def _target_matches(self, target):
-        # A target is a non-empty string within the protocol bound before any
-        # matching; everything below only decides whether it addresses this
-        # device.
         if not is_bounded_target(target):
             return False
         if target == BROADCAST_TARGET:
             return True
-        # Source and IP matching are case-insensitive: only the comparison is
-        # normalized; the stored source keeps its configured casing, and
-        # emitted messages do too. (IPv4 strings have no case distinction;
-        # the comparison stays uniform anyway.)
+        # Case-insensitive matching: only the comparison is normalized; the
+        # stored source keeps its configured casing in emitted messages.
         if target.lower() == self._config["source"].lower():
             return True
         ip_address = self._wifi.ip_address()
@@ -209,22 +185,16 @@ class Core0:
         if not self._pending_connection_logs:
             return
 
-        # For connection logs, we use the pre-serialized message approach
         from message_serializer import serialize_and_validate_message
         message = self._pending_connection_logs[0]
-        # The pending container is the persistent identity, the same way a
-        # Core 0 response container is: uptime and timestamp are the sender's
-        # to carry and are stamped once, the body is serialized once, and the
-        # wire sequence is claimed once (by _publish_entry, on the container).
-        # A transport retry of the same event reuses all three, so a PUBACK
-        # lost after delivery redelivers ONE (runtime_id, sequence) pair with
-        # the same document instead of a second apparent application message
-        # with a fresh sequence and a newer uptime/timestamp.
+        # The container is the persistent identity: uptime, timestamp, and
+        # body are stamped/serialized once, and the wire sequence is claimed
+        # once (by _publish_entry) -- a transport retry redelivers ONE
+        # (runtime_id, sequence) pair with the same document.
         if "payload_bytes" not in message:
             message["uptime_ms"] = self._uptime_ms()
             message["timestamp"] = self._current_utc_timestamp()
             message["payload_bytes"] = serialize_and_validate_message(message)
-            # KIND_LOG: _publish_entry resolves the log topic via _topic_for_kind
             message["kind"] = KIND_LOG
         try:
             self._publish_entry(message)
@@ -232,20 +202,16 @@ class Core0:
         except MemoryError:
             raise
         except OutboundMessageTooLargeError as err:
-            # The log body passed the admission ceiling but the spliced
-            # envelope pushed it over the wire limit: permanent, and a log has
-            # no command to answer, so it is dropped (the entries behind it
-            # keep moving) instead of retried.
+            # The spliced envelope pushed the log over the wire limit:
+            # permanent, and a log has no command to answer, so it is dropped
+            # (entries behind it keep moving) instead of retried.
             print("[WARNING] Connection log dropped, envelope splice exceeded the per-message ceiling: {}".format(err))
             self._pending_connection_logs.pop(0)
         except (OSError, MQTTException) as err:
-            # A transport/protocol failure is a link condition, not a verdict
-            # on the log: it stays pending (the queue is bounded, so this
-            # cannot retry forever) and the next service pass after the link
-            # recovers delivers it -- a connection event is most diagnostic
-            # exactly during the instability that dropped it. A programming
-            # failure is NOT caught here: it escapes to the top-level recovery
-            # boundary instead of being hidden as a "log publish failure".
+            # Transport failure is a link condition: the log stays pending
+            # (bounded queue) for the pass after the link recovers. A
+            # programming failure is NOT caught here: it escapes to the
+            # top-level recovery boundary instead of being hidden.
             print("[DEBUG] Connection log publish failed, retrying: {}".format(err))
 
     def _on_mqtt_message(self, topic, payload):
@@ -267,12 +233,9 @@ class Core0:
                 print("[DEBUG] Ignoring MQTT payload that is not an object")
             return
 
-        # Global inbound message-schema gate: the firmware never interprets a
-        # wire protocol version it does not support. A missing, wrong-typed,
-        # older, or newer version is ignored for the whole message -- no
-        # response, no debounce-cache entry, no UTC state change, no
-        # message-type or topic-specific processing -- including inbound
-        # info_response.
+        # Global inbound schema gate: an unsupported message_schema_version
+        # is ignored for the whole message -- no response, no debounce
+        # entry, no state change -- including inbound info_response.
         version = doc.get("message_schema_version")
         if type(version) is not int or version != MESSAGE_SCHEMA_VERSION:
             if DEBUG:
@@ -289,46 +252,33 @@ class Core0:
         if doc.get("message_type") != "command":
             return
 
-        # Staged command validation: target and command_id drops are silent
-        # (no response is possible without a bounded command_id, and another
-        # device's traffic must not consume a cache entry); once the debounce
-        # cache has claimed the ID, every failure is answered.
+        # Staged validation: target and command_id drops are silent (no
+        # response is possible without a bounded command_id, and foreign
+        # traffic must not consume a cache entry); once the ID is claimed,
+        # every failure is answered.
         target = doc.get("target")
         if not self._target_matches(target):
             return
 
         command_id = doc.get("command_id")
         if not is_bounded_command_id(command_id):
-            # A standard response requires a bounded command_id, so a
-            # missing / non-string / empty / over-long one is dropped without
-            # a response and is never cached.
+            # No standard response is possible without a bounded command_id:
+            # drop without a response and without caching.
             return
 
         if self._is_recent_command_id(command_id):
-            # Debounce: this command_id was already claimed in this runtime.
-            # Ignore the copy -- no execution, no Core 1 event, no response,
-            # no change to a pending reboot. Expected transport behavior
-            # (broker redelivery, sender retry), so DEBUG-only: not a
-            # production warning.
+            # Debounce: an already-claimed ID is ignored (no execution, event,
+            # or response) -- expected transport behavior, so DEBUG-only.
             if DEBUG:
                 print("[DEBUG] Duplicate command_id ignored: {}".format(command_id))
             return
 
-        # Admission is conditioned on being able to acknowledge: a command
-        # must be able to reserve a response slot before it is claimed and
-        # executed. Otherwise it could execute -- write-config promotes
-        # config.json, reboot arms _pending_reboot -- and then lose its
-        # acknowledgement to a full response queue, after which the sender's
-        # retry hits the debounce cache above and is silently dropped: the
-        # command ran, the answer never arrived, and no retry can recover it.
-        # Refusing here (before the ID is claimed) leaves the side effects
-        # unapplied and the ID unclaimed, so an application-level retry
-        # redelivers the command once capacity frees up.
-        #
-        # The single-flight pending HOT_RELOADED update holds one slot too:
-        # its response is queued later (at Core 1's acknowledgement, in
-        # _resolve_pending_config_update), so it must not be overrun by a
-        # new admission -- or that deferred acknowledgement is the one lost.
+        # Admit only if a response slot can be reserved first: otherwise the
+        # command could execute and then lose its answer to a full queue,
+        # with the sender's retry hitting the debounce cache above -- the
+        # command ran, the answer never arrived. The pending HOT transaction
+        # holds one slot too (reserved above) so its deferred acknowledgement
+        # cannot be overrun by a new admission.
         reserved = 1 if self._pending_config_update is not None else 0
         if (
             len(self._pending_core0_responses) + reserved
@@ -336,15 +286,13 @@ class Core0:
         ):
             return
 
-        # The first bounded use of the ID claims it -- before deeper
-        # validation, so a malformed duplicate cannot generate a second
-        # validation response.
+        # Claim the ID before deeper validation so a malformed duplicate
+        # cannot generate a second validation response.
         self._remember_command_id(command_id)
         targeted = target != BROADCAST_TARGET
 
-        # Command envelope: every top-level key must be a known v3 envelope
-        # field. All unknown fields at this scope are named, sorted, in one
-        # error.
+        # Envelope: every top-level key must be a known v3 field; all
+        # unknowns are named, sorted, in one error.
         unknown = unknown_field_names(doc, COMMAND_ENVELOPE_KEYS)
         if unknown:
             self._queue_core0_response(self._command_error(
@@ -356,7 +304,6 @@ class Core0:
             ))
             return
 
-        # Required envelope fields: command is a non-empty string...
         command = doc.get("command")
         if not isinstance(command, str) or not command:
             self._queue_core0_response(self._command_error(
@@ -375,10 +322,9 @@ class Core0:
             ))
             return
 
-        # ...and within the length bound. An over-long name is answered with
-        # a bounded error and is never echoed into the response (not even
-        # partially): echoing it back would itself build the oversized
-        # response the bound exists to prevent.
+        # An over-long name is answered with a bounded error and never
+        # echoed: echoing it back would build the oversized response the
+        # bound exists to prevent.
         if len(command) > MAX_COMMAND_LENGTH:
             self._queue_core0_response(self._command_error(
                 command_id, targeted, command, {
@@ -398,11 +344,10 @@ class Core0:
             ))
             return
 
-        # Ownership dispatch: only a supported command name proceeds. A
-        # bounded name outside the registry is answered here -- never routed
-        # blindly to Core 1, which is not the generic fallback -- and the
-        # actual name is preserved in the standard command field (not
-        # duplicated inside error).
+        # Ownership dispatch: only a supported name proceeds. An unregistered
+        # bounded name is answered here (Core 1 is not the generic
+        # fallback); the actual name rides in the standard command field,
+        # not duplicated inside error.
         if not is_supported_command(command):
             self._queue_core0_response(self._command_error(
                 command_id, targeted, command, {
@@ -412,21 +357,18 @@ class Core0:
             ))
             return
 
-        # Broadcast policy: write-config must never apply fleet-wide -- no
-        # configuration validation, no filesystem operation, no response.
-        # The ID remains claimed by the debounce cache above: the cache is
-        # intentionally a message-debounce mechanism.
+        # write-config never applies fleet-wide: no validation, no file
+        # operation, no response (the ID stays claimed -- this is a
+        # message-debounce mechanism).
         if command == COMMAND_WRITE_CONFIG and target == BROADCAST_TARGET:
             return
 
         if command == COMMAND_REBOOT:
-            # Core 0-owned: the shared protocol validation above is done;
-            # this is the command's own contract.
             self._handle_reboot_command(command_id, targeted, payload_obj)
             return
 
         if command == COMMAND_GET_DETAILS:
-            # Core 1-owned: dispatch the validated bounded event.
+            # Core 1 owns execution; dispatch the validated bounded event.
             self._handle_get_details_command(command_id, targeted, payload_obj)
             return
 
@@ -439,11 +381,7 @@ class Core0:
             return
 
     def _command_error(self, command_id, targeted, command, error):
-        """A bounded Core 0 command error response.
-
-        The identifying command field is carried only when it is a bounded,
-        valid string: an over-long or non-string name is never echoed into
-        the response, so the response itself can never be oversized."""
+        """A bounded command error response; an unbounded command name is never echoed."""
         response = {
             "command_id": command_id,
             "success": False,
@@ -455,7 +393,7 @@ class Core0:
         return response
 
     def _is_response_substitute(self, response):
-        """True if the response is already one of the bounded substitutes (a failed response carrying a substitute error code)."""
+        """True if the response is already one of the bounded substitutes."""
         error = response.get("error")
         return (
             response.get("success") is False
@@ -464,9 +402,8 @@ class Core0:
         )
 
     def _handle_reboot_command(self, command_id, targeted, payload):
-        """Dedicated reboot validator/handler, called after the common protocol validation.
-
-        The payload contract is exactly {}: any key is unknown for this command, so a non-empty object is answered with an ``unknown_fields`` error carrying the keys sorted (the missing / non-object cases are the common contract and are rejected before this handler). Debounce already ran, so a duplicate command_id never reaches the pending check."""
+        """Reboot handler, after the common protocol validation. Payload is
+        exactly {}: a non-empty object is answered with unknown_fields (sorted)."""
         if payload:
             self._queue_core0_response(
                 self._unknown_fields_error(COMMAND_REBOOT, command_id, targeted, payload)
@@ -493,12 +430,8 @@ class Core0:
         }
 
     def _unknown_fields_error(self, command, command_id, targeted, payload):
-        """A non-empty payload is an unknown-fields error for a command that requires {}.
-
-        Both Core 0-owned (reboot) and Core 1-owned (get-details) commands that
-        require an empty payload share this contract: any key is unknown, and
-        every offending key is named in a sorted ``unknown_fields`` array so
-        the sender knows exactly which fields to remove."""
+        """Shared contract for {}-payload commands: any key is unknown, named
+        in a sorted unknown_fields array so the sender knows what to remove."""
         return {
             "command_id": command_id,
             "command": command,
@@ -512,16 +445,10 @@ class Core0:
         }
 
     def _handle_get_details_command(self, command_id, targeted, payload):
-        """Dedicated get-details validator/dispatcher, called after the common protocol validation.
-
-        Core 1 owns the execution because the authoritative SystemInformation
-        instance and device state live there, so Core 0 only dispatches a
-        validated bounded event. The payload contract is exactly {} (shared with
-        reboot): any key is unknown and is answered with an ``unknown_fields``
-        error naming the keys sorted. A {} dispatches the event with the
-        validated empty payload; if event admission fails the only cause is a
-        free-heap reserve that could not be restored, so the error names that
-        cause rather than a "full" queue."""
+        """get-details dispatch: Core 1 owns execution (it holds the
+        SystemInformation instance and device state), so Core 0 only forwards
+        the validated event. Payload is exactly {} (shared with reboot); an
+        admission failure means the free-heap reserve could not be restored."""
         if payload:
             self._queue_core0_response(
                 self._unknown_fields_error(COMMAND_GET_DETAILS, command_id, targeted, payload)
@@ -547,9 +474,10 @@ class Core0:
             })
 
     def _handle_read_config_command(self, command_id, targeted, payload):
-        """read-config: answer with the committed (PERSISTED) configuration and the derived reboot state.
-
-        The payload contract is exactly {} (shared with reboot / get-details). Wi-Fi secrets live in a separate file and never cross this path. A missing or invalid committed file is answered with the actual cause (normally unreachable: boot recovery guarantees a valid config.json)."""
+        """read-config: answer with the committed (PERSISTED) configuration
+        and derived reboot state. Payload is exactly {}; Wi-Fi secrets never
+        cross this path; a missing/invalid committed file is answered with
+        the actual cause (boot recovery normally guarantees a valid one)."""
         if payload:
             self._queue_core0_response(
                 self._unknown_fields_error(COMMAND_READ_CONFIG, command_id, targeted, payload)
@@ -581,19 +509,14 @@ class Core0:
         })
 
     def _handle_write_config_command(self, command_id, targeted, payload):
-        """write-config: the payload is exactly {"config": <complete candidate configuration>}, validated by the same validate_config() path startup uses.
-
-        The payload contract is one key, "config", whose value must be the
-        complete candidate configuration object -- there is no patch, merge,
-        or partial-update shape in this command. A changed candidate is
-        atomically promoted to config.json. UNCHANGED writes nothing;
-        REBOOT_REQUIRED commits (the active snapshot holds the running values
-        until the next reboot); HOT_RELOADED is additionally applied on both
-        cores, and the transaction is committed once that application is
-        acknowledged -- rolled back, with the file state restored, when it
-        cannot be. MemoryError propagates to the fail-fast boundary."""
-        # Unknown payload keys are all named together (sorted), whatever the
-        # rest of the payload is.
+        """write-config: the payload is exactly {"config": <complete
+        candidate>} -- no patch/merge/partial shape -- validated by the same
+        validate_config() as startup. UNCHANGED writes nothing; REBOOT_REQUIRED
+        commits; HOT_RELOADED is applied on both cores and committed once Core
+        1 acknowledges, rolled back with the file restored if it cannot be.
+        MemoryError propagates to the fail-fast boundary."""
+        # Unknown payload keys are named together (sorted) regardless of the
+        # rest of the payload.
         unknown = sorted(key for key in payload if key != "config")
         if unknown:
             self._queue_core0_response(self._command_error(
@@ -625,10 +548,9 @@ class Core0:
             return
 
         if self._config_manager.transaction_active:
-            # A hot transaction is pending (Core 1's acknowledgement not yet
-            # resolved): single-flight, so a second write is refused with a
-            # bounded, non-executing answer (the command ID stays governed by
-            # the debounce cache).
+            # A hot transaction is pending Core 1's acknowledgement:
+            # single-flight, so a second write is refused with a bounded,
+            # non-executing answer.
             self._queue_core0_response(self._command_error(
                 command_id, targeted, COMMAND_WRITE_CONFIG, {
                     "code": "config_update_in_progress",
@@ -648,8 +570,8 @@ class Core0:
             }
             if err.unknown_fields:
                 error["unknown_fields"] = err.unknown_fields
-            # Structured fields of the error (e.g. expected/received schema
-            # version) cross into the response as-is.
+            # Structured error fields (e.g. expected/received schema version)
+            # cross into the response as-is.
             if err.details:
                 error.update(err.details)
             self._queue_core0_response(self._command_error(
@@ -672,16 +594,13 @@ class Core0:
             )
             return
 
-        # HOT_RELOADED: Core 0 and Core 1 form one logical transaction. Apply
-        # the Core 0 subset now, then ask Core 1 for its subset on the
-        # config-update lane. No success response is sent until Core 1's
-        # acknowledgement arrives (resolved in the run loop), and a failed
-        # apply rolls Core 0 and the file back so the committed configuration
-        # and the running firmware agree again.
+        # HOT_RELOADED: one transaction across both cores. No success
+        # response until Core 1's ack (run loop); a failed apply rolls Core 0
+        # and the file back so committed and running configuration agree.
         old_values, core1_update = self._apply_hot_changes(result["changes"])
         if not core1_update:
-            # Only Core 0-owned hot settings changed: Core 0 already applied
-            # them and nothing is owed to Core 1, so commit now.
+            # Only Core 0-owned settings changed: nothing owed to Core 1,
+            # commit now.
             self._config_manager.commit_hot_reload()
             self._queue_core0_response(
                 self._write_config_success(command_id, targeted, result)
@@ -692,10 +611,9 @@ class Core0:
         request = {"generation": generation}
         request.update(core1_update)
         self._intercore.config_update_lane.post_request(request)
-        # Hold the response and the rollback state until Core 1's ack is on
-        # the lane (resolved by _resolve_pending_config_update in the run
-        # loop). While this is pending _transaction_active stays True, so a
-        # second write-config is refused with config_update_in_progress.
+        # Hold the response and rollback state until Core 1's ack (the run
+        # loop resolves it); _transaction_active stays True meanwhile
+        # (single-flight).
         self._pending_config_update = {
             "generation": generation,
             "old_values": old_values,
@@ -712,24 +630,22 @@ class Core0:
             "success": True,
             "targeted": targeted,
             "data": {
-                # This command's effect on the persisted desired config,
-                # independent of the reboot state it left behind.
+                # This command's effect on the persisted config, independent
+                # of the reboot state it left behind.
                 "configuration_changed": classification != CLASSIFICATION_UNCHANGED,
                 "classification": classification,
                 # Derived at response time: True for REBOOT_REQUIRED, False
-                # for UNCHANGED without a pending reboot, and False once a
-                # hot application has committed (cancelling any pending one).
+                # for UNCHANGED without a pending reboot or after a hot
+                # commit cancels one.
                 "reboot_required": self._config_manager.reboot_required,
                 "changes": result["changes"],
             },
         }
 
     def _apply_hot_changes(self, changes):
-        """Apply the changed Core 0-owned HOT settings to the live config.
-
-        Returns the old values (for rollback -- including the last-poll stamp
-        under _POLL_STAMP_KEY when the poll interval changed) and the Core 1
-        update (the Core 1-owned HOT settings that changed; {} when none)."""
+        """Apply changed Core 0 HOT settings to the live config; return the
+        old values (for rollback, incl. the last-poll stamp) and the Core 1
+        update ({} when none)."""
         old_values = {}
         core1_update = {}
         for change in changes:
@@ -738,9 +654,8 @@ class Core0:
                 old_values[setting] = self._config[setting]
                 self._config[setting] = change["new_value"]
                 if setting == "mqtt_command_poll_ms":
-                    # The new poll cadence starts cleanly from the reload
-                    # instant: re-anchor the last-poll stamp so it neither
-                    # bursts a stale interval nor waits one out.
+                    # Re-anchor the last-poll stamp to the reload instant so
+                    # the new cadence starts cleanly.
                     old_values[_POLL_STAMP_KEY] = self._last_command_poll_ms
                     self._last_command_poll_ms = time.ticks_ms()
             elif setting in _HOT_APPLY_CORE1_KEYS:
@@ -759,15 +674,11 @@ class Core0:
         return self._config_update_generation
 
     def _resolve_pending_config_update(self):
-        """Resolve a pending HOT_RELOADED apply once Core 1's acknowledgement is on the lane.
-
-        Success commits the manager (releasing the retained config.json.old)
-        and releases the held success response; a failed apply rolls Core 0 and
-        the file back and answers a bounded error. A dead Core 1 never acks,
-        but that is bounded by the existing liveness watchdog (which resets the
-        board and boot recovery restores the retained config.json.old) -- so no
-        unbounded wait is owed and no success response is sent before the
-        runtime update is complete."""
+        """Resolve a pending HOT apply once Core 1's ack is on the lane:
+        success commits (releasing the retained config.json.old) and releases
+        the held response; a failed apply rolls back and answers a bounded
+        error. A dead Core 1 never acks, but the liveness watchdog bounds
+        that (board reset; boot recovery restores config.json.old)."""
         pending = self._pending_config_update
         if pending is None:
             return
@@ -807,9 +718,8 @@ class Core0:
             return
 
         response = self._pending_core0_responses[0]
-        # Claim (or, on a retry, reuse) the wire sequence on the persistent
-        # response so a re-publish after an ambiguous QoS 1 failure keeps the
-        # same (runtime_id, sequence) identity instead of shifting it.
+        # Claim (or reuse, on retry) the wire sequence on the persistent
+        # response so a re-publish keeps the same (runtime_id, sequence).
         wire_sequence = self._claim_wire_sequence(response)
         published = self._publish_core0_command_response(
             response["command_id"],
@@ -824,16 +734,13 @@ class Core0:
         if not published:
             failure = response.get("_permanent_failure")
             if failure is None or self._is_response_substitute(response):
-                # No recorded cause, or the response is already the bounded
-                # substitute: hold it for a later pass, the same way a failed
-                # publish (which raises) leaves it pending.
+                # No recorded cause (or already the bounded substitute):
+                # hold it for a later pass.
                 return
-            # A permanent serialization failure can never succeed by
-            # retrying the same bytes, and the queue is FIFO -- so instead of
-            # blocking every response behind it (the same policy Core 1
-            # applies at admission), the command is answered with a small
-            # bounded error substitute whose code states the cause. The
-            # substitute publishes on a later pass.
+            # A permanent failure can never succeed by retrying the same
+            # bytes, and the queue is FIFO: answer the command with the
+            # bounded substitute whose code states the cause (it publishes on
+            # a later pass).
             print("[WARNING] Core 0 command response {}: answering with a "
                   "bounded error response".format(failure))
             self._pending_core0_responses[0] = self._command_error(
@@ -847,17 +754,13 @@ class Core0:
             )
             return
         self._pending_core0_responses.pop(0)
-        # A substitute that answered a permanently unsendable reboot
-        # acknowledgement has now been published: the command was reported
-        # failed, so release the held reboot. The device keeps running, and a
-        # later reboot command is admissible instead of hitting
-        # reboot_already_pending forever.
+        # The substitute for an unsendable reboot acknowledgement is
+        # published: the command was reported failed, so release the held
+        # reboot.
         if response.get("_clears_pending_reboot"):
             self._pending_reboot = None
 
     def _handle_info_response(self, doc):
-        # The global inbound message-schema gate in _on_mqtt_message has
-        # already run: only a supported message_schema_version reaches here.
         if doc.get("source") not in ("server", self._config["source"]):
             return
         if doc.get("target") != self._config["source"]:
@@ -869,11 +772,9 @@ class Core0:
         if doc.get("request_id") != self._pending_utc_request_id:
             return
 
-        # A malformed answer to OUR request is still an answer: clear the
-        # pending request so we retry after a short backoff instead of
-        # waiting out the full deadline or the 30s retry interval.
-        # (Responses that are not ours are rejected earlier above, without
-        # touching pending state.)
+        # A malformed answer to our request is still an answer: re-key the
+        # throttle for a prompt retry instead of waiting out the deadline or
+        # 30 s interval.
         payload = doc.get("payload")
         if not isinstance(payload, dict):
             self._utc_note_reachable_failure()
@@ -903,12 +804,9 @@ class Core0:
             return
 
         # Anchor the snapshot to the accumulated uptime, not a raw ticks_ms
-        # sample: elapsed since sync is computed later as current_uptime -
-        # sync_uptime, which stays correct across the tick-counter wrap. A
-        # one-shot ticks_diff(now, sync_ticks) is only guaranteed within half
-        # a tick period, so once the snapshot is that old it would mis-compute
-        # the elapsed time and could block the very refresh that repairs the
-        # clock.
+        # sample: a one-shot ticks_diff is only guaranteed within half a tick
+        # period, and a stale one-shot diff could block the very refresh that
+        # repairs the clock.
         sync_uptime_ms = self._uptime_ms()
         snapshot = {
             "timestamp": normalized_timestamp,
@@ -933,9 +831,8 @@ class Core0:
         raise ValueError("Unsupported outbound message kind: {}".format(kind))
 
     def _envelope_fragment(self, sequence):
-        """Serialize the five Core-0-owned envelope members as a braceless fragment.
-
-        Senders must not carry any of these keys at the top level of their message."""
+        """Serialize the five Core-0-owned envelope members as a braceless
+        fragment; senders must not carry any of these keys at the top level."""
         fragment = json.dumps({
             "sequence": sequence,
             "runtime_id": self._runtime_id,
@@ -946,9 +843,8 @@ class Core0:
         return fragment[1:-1].encode("utf-8")
 
     def _claim_wire_sequence(self, container):
-        """Claim the next wire sequence and stamp it on ``container``; never rolled back.
-
-        A retry of the same logical message reuses the stamped number; a different message always gets a fresh one, so a (runtime_id, sequence) pair never collides."""
+        """Claim the next wire sequence and stamp it on ``container`` (never
+        rolled back); a retry reuses it and a different message always gets a fresh one."""
         sequence = container.get("_wire_sequence")
         if sequence is None:
             sequence = self._next_sequence
@@ -959,15 +855,10 @@ class Core0:
     # --- Outbound publish pacing (mqtt_outbound_publish_delay_ms) --------
     #
     # A minimum quiet period between consecutive outbound application
-    # PUBLISHes, measured from the moment the previous QoS 1 publish COMPLETED
-    # (PUBACK received), not from when it started: broker latency is outside
-    # the configured interval. It exists to drain a backlogged outbound queue
-    # progressively after a reconnect instead of as a broker-speed burst.
-    #
-    # The interval is state, not a sleep: while the gate is closed Core 0
-    # keeps running its normal loop (Core 1 watchdog, command polling,
-    # keepalive, recovery) and simply does not begin another application
-    # PUBLISH. Protocol-control traffic (PINGREQ and friends) is never paced.
+    # PUBLISHes, measured from the previous publish's COMPLETION (PUBACK),
+    # not its start. It is state, not a sleep: while the gate is closed Core
+    # 0 keeps running its normal loop and simply does not begin another
+    # application PUBLISH. Protocol-control traffic (PINGREQ) is never paced.
 
     def _mqtt_publish_ready(self):
         delay_ms = self._config["mqtt_outbound_publish_delay_ms"]
@@ -989,29 +880,23 @@ class Core0:
             time.sleep_ms(10)
 
     def _publish_entry(self, entry):
-        """Publish one MQTT entry from its pre-serialized bytes, envelope spliced in before the closing brace.
-
-        The payload is never decoded or re-serialized here; the wire sequence is claimed once, before the first transmission attempt. The spliced wire length must stay within MAX_OUTBOUND_MESSAGE_BYTES: a body the envelope pushes over the ceiling raises OutboundMessageTooLargeError instead of publishing (permanent for the entry, never retried)."""
+        """Publish one entry from its pre-serialized bytes, envelope spliced
+        in before the closing brace (never decoded/re-serialized here). The
+        final spliced length must stay within MAX_OUTBOUND_MESSAGE_BYTES or
+        OutboundMessageTooLargeError is raised -- permanent for the entry."""
         payload = entry["payload_bytes"]
         if not isinstance(payload, (bytes, bytearray)) or bytes(payload[-1:]) != b"}":
             raise ValueError("queued payload must be a serialized JSON object")
-        # The queue contract allows bytes or bytearray; normalize once so the
-        # assembled frame is plain bytes (MicroPython's bytes.join is strict
-        # about item types).
+        # Normalize bytearray to bytes: MicroPython's bytes.join is strict
+        # about item types.
         body = payload if isinstance(payload, bytes) else bytes(payload)
-        # Claim the wire sequence now that the frame is about to be transmitted,
-        # and stamp it on the entry. A later retry of this same entry (an
-        # ambiguous QoS 1 failure left it in flight) reuses the stamped number,
-        # while a different message is never handed it.
         sequence = self._claim_wire_sequence(entry)
         fragment = self._envelope_fragment(sequence)
-        # The body was admitted at or under MAX_OUTBOUND_MESSAGE_BYTES, but the
-        # spliced envelope is added on top of it (the comma and fragment
-        # replace the body's closing brace): enforce the ceiling against the
-        # FINAL wire length, before the joined frame is allocated. Permanent
-        # for this entry (its bytes are fixed), so raise the size error the
-        # admission paths raise; the callers answer command responses with the
-        # bounded substitute and discard the other kinds instead of retrying.
+        # The spliced envelope is added on top of the admitted body: enforce
+        # the ceiling against the FINAL wire length, before the frame is
+        # allocated. Permanent for this entry (its bytes are fixed) -- callers
+        # answer a command response with the bounded substitute and discard
+        # the other kinds.
         wire_length = len(body) + len(fragment) + 1
         if wire_length > MAX_OUTBOUND_MESSAGE_BYTES:
             raise OutboundMessageTooLargeError(
@@ -1024,9 +909,8 @@ class Core0:
         if topic is None:
             topic = self._topic_for_kind(entry["kind"])
         self._mqtt.publish_qos1(topic, encoded)
-        # The PUBACK has been received: the publish is complete, so the
-        # pacing interval (if any) now begins. A failed publish raises before
-        # this line and records nothing.
+        # PUBACK received: the publish is complete, so the pacing interval
+        # begins (a failed publish raises before this line and records nothing).
         self._note_mqtt_publish_completed()
         if entry.get("kind") == KIND_TELEMETRY:
             self._led_manager.telemetry_sent()
@@ -1034,9 +918,10 @@ class Core0:
             print("[DEBUG] QoS 1 published: seq={}".format(sequence))
 
     def _answer_discarded_command_response(self, entry):
-        """Queue the bounded substitute for a discarded oversized command response.
-
-        The command was accepted and its acknowledgement is owed, so the channel moves on with a small error response for the same command (code "response_too_large"), serviced by the normal Core 0 response path. The body carries the command's identifying fields; only a bounded subset is read back (an over-long name or ID is never echoed). A body that cannot be read back has no identity to answer with: the discard stands."""
+        """Queue the bounded substitute for a discarded oversized command
+        response: the acknowledgement is owed, so answer with a small
+        response_too_large error, reading only bounded identifying fields back
+        (an unreadable body has no identity to answer with -- the discard stands)."""
         body = entry["payload_bytes"]
         if isinstance(body, bytearray):
             body = bytes(body)
@@ -1071,18 +956,17 @@ class Core0:
         self, command_id, command, success, targeted=True, data=None, error=None,
         wire_sequence=None, container=None
     ):
-        """Build and publish a Core 0 command response (pre-serialized).
-
-        ``wire_sequence``/``container`` let a retry keep the claimed identity and the same bytes. Returns True on publish, False on a permanent serialization failure or a splice-time size failure (its cause is recorded on the container, when there is one, so the servicing path can answer with the matching bounded substitute); MemoryError propagates."""
+        """Build and publish a Core 0 command response (pre-serialized); the
+        container lets a retry keep the claimed identity and bytes. True on
+        publish, False on a permanent failure (cause recorded on the container
+        for the matching bounded substitute); MemoryError propagates."""
         payload_bytes = container.get("_payload_bytes") if container is not None else None
         if payload_bytes is None:
             payload = {
                 "command_id": command_id,
             }
-            # The command field is the standard location for the command
-            # name and is carried whenever it is available (bounded and
-            # valid); an error whose name failed the bound omits it rather
-            # than echoing it.
+            # The command field is carried only when bounded and valid; an
+            # over-long name is omitted rather than echoed.
             if command is not None:
                 payload["command"] = command
             payload["targeted"] = targeted
@@ -1092,9 +976,8 @@ class Core0:
             else:
                 payload["error"] = error
 
-            # Build the logical message first. Uptime and timestamp are the
-            # sender's to carry (the envelope is spliced in at publish time),
-            # so they are captured at construction time, not at publish time.
+            # Uptime and timestamp are the sender's to carry (envelope spliced
+            # at publish time): capture them at construction, not publish, time.
             message = {
                 "message_type": "command_response",
                 "uptime_ms": self._uptime_ms(),
@@ -1102,7 +985,6 @@ class Core0:
                 "payload": payload,
             }
 
-            # Serialize and encode the message for the pre-serialized queue
             try:
                 payload_bytes = serialize_and_validate_message(message)
             except MemoryError:
@@ -1120,10 +1002,8 @@ class Core0:
                     container["_permanent_failure"] = "response_invalid"
                 return False
             if container is not None:
-                # Freeze the bytes on the persistent container so a retry after
-                # an ambiguous QoS 1 failure re-publishes the same document
-                # (same sequence, same content) instead of rebuilding it with a
-                # newer uptime/timestamp.
+                # Freeze the bytes on the container so a retry re-publishes
+                # the same document instead of a newer uptime/timestamp.
                 container["_payload_bytes"] = payload_bytes
 
         entry = {
@@ -1131,19 +1011,16 @@ class Core0:
             "kind": KIND_COMMAND_RESPONSE,
             "payload_bytes": payload_bytes,
         }
-        # Carry the caller's claimed sequence into the entry so the retry keeps
-        # it; a first attempt (None) leaves the entry unstamped and
-        # _publish_entry claims a fresh number.
+        # Carry the claimed sequence into the entry (a retry keeps it; a first
+        # attempt claims a fresh one in _publish_entry).
         if wire_sequence is not None:
             entry["_wire_sequence"] = wire_sequence
         try:
             self._publish_entry(entry)
         except OutboundMessageTooLargeError as err:
-            # The body passed the admission ceiling but the spliced envelope
-            # pushed the final wire length over it: permanent for these bytes,
-            # the same cause class as an oversized serialization. Record the
-            # cause so the servicing path answers with the matching bounded
-            # substitute instead of retrying the same entry forever.
+            # The spliced envelope pushed the final wire length over the
+            # ceiling: permanent for these bytes -- record the cause so the
+            # servicing path answers with the matching bounded substitute.
             if DEBUG:
                 print("[DEBUG] Command response too large after envelope splice: {}".format(err))
             if container is not None:
@@ -1157,17 +1034,16 @@ class Core0:
             return True
         if self._intercore.outbound_queue.has_in_flight():
             return False
-        # The success acknowledgement was permanently unsendable and the
-        # command was answered with the bounded substitute: the request is
-        # terminal. Never re-attempt the unsendable bytes and never queue the
-        # same substitute a second time; the held reboot is released by the
-        # servicing path once the substitute is published.
+        # The acknowledgement was permanently unsendable and already answered
+        # with the bounded substitute: terminal -- never re-attempt the bytes
+        # or queue the substitute twice; the servicing path releases the
+        # held reboot.
         if request.get("_permanent_failure_answer_queued"):
             return False
 
         try:
-            # Claim (or, on a retry, reuse) the wire sequence on the pending
-            # reboot request so a re-publish keeps the same sequence identity.
+            # Claim (or reuse) the wire sequence so a re-publish keeps the
+            # same identity.
             wire_sequence = self._claim_wire_sequence(request)
             published = self._publish_core0_command_response(
                 request["command_id"],
@@ -1181,23 +1057,19 @@ class Core0:
         except MemoryError:
             raise
         except (OSError, MQTTException) as err:
-            # A transport/protocol failure is a link condition: the
-            # acknowledgement was never published, so the reboot stays
-            # pending for a later pass. A programming failure is NOT caught
-            # here: it escapes to the top-level recovery boundary instead of
-            # being held pending forever for the same deterministic fault.
+            # Transport failure is a link condition: the reboot stays
+            # pending. A programming failure escapes to the top-level
+            # recovery boundary.
             if DEBUG:
                 print("[DEBUG] Reboot response publish failed; reboot remains pending: {}".format(err))
             return False
         if not published:
             failure = request.get("_permanent_failure")
             if failure is not None:
-                # A permanent failure (the recorded cause names it) can never
-                # publish by retrying the same bytes: answer the command with
-                # the bounded substitute instead of spinning. Hold the reboot
-                # (a reset with no acknowledgement at all is worse) until the
-                # substitute is published, then release it -- the command has
-                # been reported failed and the device keeps running.
+                # A permanent failure can never publish by retrying the same
+                # bytes: answer with the bounded substitute and hold the
+                # reboot (a reset with no acknowledgement is worse) until the
+                # substitute is published.
                 print("[WARNING] Reboot response {}: answering with a "
                       "bounded error response".format(failure))
                 substitute = self._command_error(
@@ -1209,8 +1081,8 @@ class Core0:
                         "message": _SUBSTITUTE_ERROR_MESSAGES[failure],
                     },
                 )
-                # When the servicing path publishes it, release the held
-                # reboot (see _service_pending_core0_response).
+                # The servicing path releases the held reboot when it
+                # publishes the substitute.
                 substitute["_clears_pending_reboot"] = True
                 if self._queue_core0_response(substitute):
                     # Only now is the request terminal: a full queue left the
@@ -1285,9 +1157,8 @@ class Core0:
             raise
         except (OSError, MQTTException) as err:
             # Roll back the armed ID: no response can ever arrive for a
-            # request that was not delivered. A programming failure is NOT
-            # caught here: it escapes to the top-level recovery boundary
-            # instead of being retried into the same deterministic fault.
+            # request that was not delivered. A programming failure escapes
+            # to the top-level recovery boundary.
             self._pending_utc_request_id = None
             if DEBUG:
                 print("[DEBUG] UTC request publish failed: {}".format(err))
@@ -1312,9 +1183,7 @@ class Core0:
             except (OSError, MQTTException) as err:
                 # A transport failure fails the attempt cleanly; a
                 # programming failure (the realistic source: the inbound
-                # callback) escapes to the top-level recovery boundary
-                # instead of arming a retry that re-delivers the same frame
-                # into the same bug.
+                # callback) escapes to the top-level recovery boundary.
                 if DEBUG:
                     print("[DEBUG] UTC response wait failed: {}".format(err))
                 break
@@ -1346,10 +1215,9 @@ class Core0:
         if self._utc_snapshot is None:
             return True
         interval_ms = self._config["datetime_sync_interval_min"] * 60 * 1000
-        # Elapsed since sync as current_uptime - sync_uptime: correct for any
-        # duration (accumulated recent deltas), where ticks_diff(now,
-        # sync_ticks) is only valid within half a tick period and would go
-        # stale on a long outage and block the refresh that repairs the clock.
+        # current_uptime - sync_uptime: correct for any duration, where
+        # ticks_diff(now, sync_ticks) is only valid within half a tick period
+        # and would block the refresh that repairs the clock on a long outage.
         return (
             self._uptime_ms() - self._utc_snapshot["sync_uptime_ms"]
             >= interval_ms
@@ -1378,62 +1246,54 @@ class Core0:
                 timeout_ms=timeout_ms,
             )
             if result:
-                # A matched PUBACK is a completed outbound publish: it opens
-                # the pacing gate for the following startup publishes (drain,
-                # probe #2, UTC request) exactly like any other one.
+                # A matched PUBACK is a completed publish: it opens the pacing
+                # gate for the following startup publishes like any other.
                 self._note_mqtt_publish_completed()
             return result
         except MemoryError:
             raise
         except (OSError, MQTTException) as err:
-            # A transport/protocol failure is a link condition: the probe
-            # reports False so the pass re-establishes and retries. A
-            # programming failure is NOT caught here: it escapes to the
-            # top-level recovery boundary instead of being probed forever
-            # into the same deterministic fault.
+            # A transport failure is a link condition (the pass
+            # re-establishes and retries); a programming failure escapes to
+            # the top-level recovery boundary.
             if DEBUG:
                 print("[DEBUG] Network probe failed: {}".format(err))
             return False
 
     def _drain_startup_mqtt_work(self):
-        """Drain pending Core 0 MQTT work (connection logs, etc.); True when none remains, False on timeout.
+        """Drain pending Core 0 MQTT work; True when none remains, False on timeout.
 
-        Each pending log is measured against its own grace window, starting when the previous log's cycle completed: one slow-but-legal QoS 1 cycle (its PUBACK wait can lawfully run to mqtt_broker_response_timeout_sec) must not consume the budget of the logs behind it. Startup publishes are paced like any other outbound traffic."""
+        Each log gets its own grace window starting when the previous one
+        completed, so a slow-but-legal QoS 1 cycle (up to
+        mqtt_broker_response_timeout_sec) cannot consume the logs behind it."""
         grace_ms = 2000  # per-log grace before that log may begin its publish
 
         while self._pending_connection_logs:
-            # A fresh window per log, measured from here -- i.e. from the
-            # previous log's completion, never from the drain's start.
             deadline_ms = time.ticks_add(time.ticks_ms(), grace_ms)
             self._wait_for_mqtt_publish_slot()
             if time.ticks_diff(time.ticks_ms(), deadline_ms) >= 0:
                 print("[WARNING] Startup MQTT work drain timeout")
                 return False
             # No wrapper of its own: _service_pending_connection_log()
-            # already owns MemoryError (re-raised), the size rejection, and
-            # the transport/protocol failures (it holds the head for a later
-            # pass). A programming failure must escape to the top-level
-            # recovery boundary -- with the broad wrapper it was swallowed
-            # while the un-removed head stayed queued, so this loop
-            # re-attempted the same failing operation forever.
+            # already owns MemoryError, the size rejection, and transport
+            # failures; a programming failure must escape to the top-level
+            # recovery boundary.
             self._service_pending_connection_log()
 
         return True
 
     def _synchronize_utc_required(self):
-        """Run one bounded pass of startup UTC synchronization.
-
-        Returns True once a valid snapshot is acquired, False after _UTC_STARTUP_MAX_ATTEMPTS so the caller re-establishes and retries. Transport failures are those failed attempts; a MemoryError or a programming failure propagates to the recovery boundary in main()."""
+        """Run one bounded pass of startup UTC sync; True once a snapshot is
+        acquired, False after _UTC_STARTUP_MAX_ATTEMPTS. A MemoryError or
+        programming failure propagates to the recovery boundary in main()."""
         for attempt in range(_UTC_STARTUP_MAX_ATTEMPTS):
-            # The preceding startup publish (probe #2, or the drain) recorded
-            # its completion: respect the same pacing interval before the
-            # request's PUBLISH begins.
+            # Respect the pacing interval left by the preceding startup
+            # publish.
             self._wait_for_mqtt_publish_slot()
             self._utc_send_request()
             self._utc_wait_response()
             if self._utc_snapshot is not None:
                 return True
-            # Wait before retry
             time.sleep_ms(500)
 
         print("[WARNING] UTC synchronization pass failed after {} attempts; will re-establish and retry".format(_UTC_STARTUP_MAX_ATTEMPTS))
@@ -1476,9 +1336,8 @@ class Core0:
                 # LED remains flashing during network probe and UTC sync
                 break
             delay_sec = self._config["mqtt_reconnect_delays_sec"][-1]
-            # Name the final cause so a production console can tell apart
-            # ECONNREFUSED / ETIMEDOUT / reset / CONNACK / SUBACK failures —
-            # once per exhausted sequence, no per-attempt or stack logging.
+            # Name the final cause once per exhausted sequence; no
+            # per-attempt or stack logging.
             last_error = self._mqtt.last_connect_error
             if last_error is not None:
                 print("[WARNING] MQTT connection sequence exhausted: {}; retrying in {} sec".format(last_error, delay_sec))
@@ -1491,8 +1350,8 @@ class Core0:
             return
 
         # Report the outage immediately so the snapshot (and Core 1 health
-        # gating) reflects the loss; the flag is restored only after the
-        # link is re-established.
+        # gating) reflects the loss; the flag is restored after
+        # re-establishment.
         self._network_stack_ready = False
         if not self._wifi.is_connected():
             # Wi-Fi loss implies MQTT loss; drop the stale session state.
@@ -1500,14 +1359,13 @@ class Core0:
         self._publish_network_snapshot(force=True)
         self.establish_network()
         self._network_stack_ready = True
-        # establish_network() armed the connection LED; recovery is complete.
         self._led_manager.set_connecting(False)
         self._publish_network_snapshot(force=True)
 
     def _watch_core_1_heartbeat(self):
-        """Watch Core 1's liveness heartbeat and reset the MCU when stale.
-
-        No-op before Core 1's first stamp, so the unbounded startup connect loops are unaffected."""
+        """Watch Core 1's liveness heartbeat and reset the MCU when stale;
+        no-op before Core 1's first stamp so the unbounded startup connect
+        loops are unaffected."""
         last_activity_ms = self._intercore.state_mailboxes.get_core_1_activity_ms()
         if last_activity_ms is None:
             return
@@ -1517,9 +1375,8 @@ class Core0:
             machine.reset()
 
     def _service_wait(self):
-        """Core 0 servicing hook invoked at each 100 ms slice of long network waits.
-
-        Keeps the Core 1 heartbeat check firing through connect/reconnect backoffs."""
+        """Core 0 servicing hook for each 100 ms slice of long network waits:
+        keeps the Core 1 heartbeat check firing through backoffs."""
         self._watch_core_1_heartbeat()
 
     def _sleep_and_service(self, delay_sec):
@@ -1531,24 +1388,22 @@ class Core0:
             time.sleep_ms(100)
 
     def start(self):
-        """Establish Core 0 network services before Core 1 starts (the deterministic startup contract).
-
-        Connect steps are unbounded; the verification steps (probes, drain, UTC) are self-healing -- a failed pass re-establishes the network and retries. Returns only on a clean pass; Core 1 stays gated until then. Transport failures (OSError, MQTTException) fail the pass and are retried; a MemoryError or a programming failure (anything else escaping the MQTT boundary) propagates to the recovery boundary in main()."""
+        """Establish Core 0 network services before Core 1 starts. Connect
+        steps are unbounded; verification (probes, drain, UTC) is
+        self-healing -- a failed pass re-establishes and retries. Returns only
+        on a clean pass; a MemoryError or programming failure propagates to
+        the recovery boundary in main()."""
         self._led_manager.set_connecting(True)
 
-        # Steps 1-2: Establish Wi-Fi, then MQTT + subscriptions.
-        # Shared with the run-loop recovery path so connect loops, backoff,
-        # logging, and LED behavior stay in one place.
+        # Connect (Wi-Fi, then MQTT + subscriptions), shared with the
+        # run-loop recovery path so backoff, logging, and LED behavior stay
+        # in one place.
         self.establish_network()
 
-        # Steps 3-7: Verify the QoS 1 path (two probes) and acquire UTC.
-        # Self-healing, like the connect loops above: on any verification
-        # failure, drop the (possibly wedged) MQTT session, re-establish the
-        # network, and retry the whole pass. Core 1 stays gated because
-        # start() has not returned. A MemoryError or a programming failure
-        # propagates out of _verify_startup_contract and out of this loop
-        # (fail-fast; the recovery boundary in main() turns it into a board
-        # reset) -- only transport failures are retried.
+        # Verify the QoS 1 path (two probes) and acquire UTC; self-healing
+        # like the connect loops (the failed session is dropped and
+        # re-established). Core 1 stays gated until start() returns; only
+        # transport failures are retried.
         while True:
             if self._verify_startup_contract():
                 break
@@ -1558,42 +1413,36 @@ class Core0:
             self._mqtt.mark_disconnected()
             self.establish_network()
 
-        # Step 8: Publish initial UTC snapshot
         self._publish_utc_snapshot()
 
-        # Step 9: Network startup proven complete - set ready flag
         self._network_stack_ready = True
 
-        # Step 10: Publish initial network snapshot with ready flag
         self._publish_network_snapshot(force=True)
 
-        # Step 11: Stop connection LED
         self._led_manager.set_connecting(False)
 
         print("[INFO] Core 0 startup complete - network stack verified and ready")
 
     def _verify_startup_contract(self):
-        """Run one full pass of the startup verification contract (probe #1, drain, stabilization, probe #2, UTC).
-
-        Returns True only when every step succeeds, False on any failure so the caller re-establishes and retries. Transport failures (OSError, MQTTException) are those failures; a MemoryError or a programming failure propagates to the recovery boundary in main() instead of being retried into the same deterministic fault."""
-        # Step 3: QoS 1 network probe #1
+        """Run one full pass of the startup verification (probe, drain,
+        stabilization, probe, UTC); True only when every step succeeds. A
+        MemoryError or programming failure propagates to the recovery
+        boundary in main()."""
         if not self._perform_network_probe():
             print("[WARNING] Startup verification: network probe #1 failed")
             return False
 
-        # Step 4: Drain startup MQTT work (non-fatal, matching prior behavior)
+        # Non-fatal: a drain timeout does not fail the pass.
         if not self._drain_startup_mqtt_work():
             print("[WARNING] Startup MQTT work drain did not complete")
 
-        # Step 5: Wait 5 seconds for stabilization
         time.sleep_ms(5000)
 
-        # Step 6: QoS 1 network probe #2
         if not self._perform_network_probe():
             print("[WARNING] Startup verification: network probe #2 failed")
             return False
 
-        # Step 7: Acquire UTC (mandatory before Core 1 starts)
+        # UTC is mandatory before Core 1 starts.
         if not self._synchronize_utc_required():
             print("[WARNING] Startup verification: UTC synchronization failed")
             return False
@@ -1607,15 +1456,14 @@ class Core0:
 
     def run(self):
         while True:
-            # First each pass: a dead Core 1 wedges the whole sensor (no
-            # telemetry, no health) and cannot report itself, so Core 0
-            # resets the board before doing any other work.
+            # First each pass: a dead Core 1 wedges the whole sensor and
+            # cannot report itself, so Core 0 resets the board before doing
+            # any other work.
             self._watch_core_1_heartbeat()
 
-            # Resolve a pending HOT_RELOADED apply now that the watchdog has
-            # run: if Core 1 has acknowledged, commit or roll back; if Core 1
-            # is dead the watchdog above has already reset, so no unbounded
-            # wait can accumulate here.
+            # Resolve a pending HOT apply now that the watchdog has run: if
+            # Core 1 is dead it has already reset, so no unbounded wait can
+            # accumulate here.
             self._resolve_pending_config_update()
 
             # The reboot response is an outbound PUBLISH: hold (without
@@ -1638,10 +1486,9 @@ class Core0:
                 except MemoryError:
                     raise
                 except (OSError, MQTTException) as err:
-                    # Transport failure only: a link condition, recovered on
-                    # the next pass. A programming failure escapes run() to
-                    # the top-level recovery boundary instead of being
-                    # reclassified as an MQTT outage.
+                    # Transport failure only (recovered on the next pass); a
+                    # programming failure escapes run() to the top-level
+                    # recovery boundary.
                     if DEBUG:
                         print("[DEBUG] Connection log publish failed: {}".format(err))
 
@@ -1654,13 +1501,9 @@ class Core0:
                 except MemoryError:
                     raise
                 except (OSError, MQTTException) as err:
-                    # Transport/protocol failure only: a stalled or corrupt
-                    # stream is a link condition (the session is already
-                    # marked down; recovery re-establishes it). A bug in the
-                    # message callback is a programming failure: it escapes
-                    # run() to the top-level recovery boundary instead of
-                    # being hidden as an outage and the message redelivered
-                    # into the same fault.
+                    # Transport failure only (recovery re-establishes the
+                    # down session); a bug in the message callback escapes
+                    # run() to the top-level recovery boundary.
                     if DEBUG:
                         print("[DEBUG] MQTT check failed: {}".format(err))
                 self._last_command_poll_ms = now_ms
@@ -1684,19 +1527,17 @@ class Core0:
                 except MemoryError:
                     raise
                 except (OSError, MQTTException) as err:
-                    # Transport failure only: the response stays pending for
-                    # the retry on the recovered link. A programming failure
-                    # escapes run() to the top-level recovery boundary.
+                    # Transport failure only (the response stays pending for
+                    # the recovered link); a programming failure escapes run()
+                    # to the top-level recovery boundary.
                     if DEBUG:
                         print("[DEBUG] Core 0 response publish failed: {}".format(err))
 
             if self._mqtt.is_connected():
                 # Dequeue only when the pacing gate is open: take() promotes
-                # the entry to in-flight, and there is no benefit in doing that
-                # for a message Core 0 already knows it cannot transmit yet.
-                # The PINGREQ below is NOT gated on pacing: keepalive is
-                # protocol-control traffic and never waits on application
-                # publishes (and vice versa).
+                # the entry to in-flight, and there is no benefit for a
+                # message Core 0 cannot yet send. The PINGREQ below is
+                # protocol-control traffic and never pacing-gated.
                 entry = (
                     self._intercore.outbound_queue.take()
                     if self._mqtt_publish_ready()
@@ -1708,12 +1549,11 @@ class Core0:
                     except MemoryError:
                         raise
                     except OutboundMessageTooLargeError as err:
-                        # The spliced wire length exceeds the per-message
-                        # ceiling: permanent for this entry (its bytes are
-                        # fixed), so retrying it would only re-fail and stall
-                        # the in-flight slot. Discard it -- and answer a
-                        # command response with the bounded substitute, so the
-                        # command channel never stalls behind it either.
+                        # The spliced wire length exceeds the ceiling:
+                        # permanent for this entry (its bytes are fixed), so
+                        # discard it -- and answer a command response with
+                        # the bounded substitute, so the channel never stalls
+                        # behind it.
                         self._intercore.outbound_queue.complete_in_flight(
                             entry, discarded=True
                         )
@@ -1722,11 +1562,9 @@ class Core0:
                             self._answer_discarded_command_response(entry)
                     except (OSError, MQTTException) as err:
                         # Transport failure only: an ambiguous QoS 1 failure
-                        # keeps the entry in flight so the next take() retries
-                        # it -- QoS 1 must not drop a message the broker has
-                        # not PUBACKed. A programming failure escapes run()
-                        # to the top-level recovery boundary instead of
-                        # looping on the same fault.
+                        # keeps the entry in flight for the next take() --
+                        # QoS 1 must not drop a message the broker has not
+                        # PUBACKed. A programming failure escapes run().
                         if DEBUG:
                             print("[DEBUG] MQTT publish failed; entry remains in flight: {}".format(err))
                     else:
@@ -1739,10 +1577,9 @@ class Core0:
                     except MemoryError:
                         raise
                     except (OSError, MQTTException) as err:
-                        # Transport failure only (the session is already
-                        # marked down; recovery re-establishes it). A
-                        # programming failure escapes run() to the top-level
-                        # recovery boundary.
+                        # Transport failure only (recovery re-establishes the
+                        # down session); a programming failure escapes run()
+                        # to the top-level recovery boundary.
                         if DEBUG:
                             print("[DEBUG] MQTT PINGREQ failed: {}".format(err))
 
