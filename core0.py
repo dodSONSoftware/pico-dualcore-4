@@ -1461,7 +1461,14 @@ class Core0:
                 # LED remains flashing during network probe and UTC sync
                 break
             delay_sec = self._config["mqtt_reconnect_delays_sec"][-1]
-            print("[WARNING] MQTT connection sequence exhausted; retrying in {} sec".format(delay_sec))
+            # Name the final cause so a production console can tell apart
+            # ECONNREFUSED / ETIMEDOUT / reset / CONNACK / SUBACK failures —
+            # once per exhausted sequence, no per-attempt or stack logging.
+            last_error = self._mqtt.last_connect_error
+            if last_error is not None:
+                print("[WARNING] MQTT connection sequence exhausted: {}; retrying in {} sec".format(last_error, delay_sec))
+            else:
+                print("[WARNING] MQTT connection sequence exhausted; retrying in {} sec".format(delay_sec))
             self._sleep_and_service(delay_sec)
 
     def _recover_network_if_needed(self):

@@ -24,7 +24,8 @@ Core 1 periodically publishes health messages to `iot/v3/health` containing diag
 
 **Memory Fields:**
 - `free_heap_bytes`: Current free heap
-- `minimum_free_heap_bytes`: Configured heap reserve
+- `preferred_free_heap_bytes`: Board-specific preferred reserve — where memory-pressure handling (GC / reclaiming low-retention entries) begins; not a rejection wall
+- `minimum_free_heap_bytes`: Board-specific hard survival floor that admission must protect
 - `heap_headroom_bytes`: free_heap - minimum_free_heap (may be negative)
 
 **Core Activity Fields:**

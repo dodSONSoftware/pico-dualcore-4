@@ -46,6 +46,12 @@ class Mqtt:
         self._connected = False
         self._connect_count = 0
         self._disconnect_count = 0
+        # The final expected transport/protocol error from the most recent
+        # failed connect() attempt-sequence (None on success, or before any
+        # attempt). Retained only so Core 0's exhaustion warning can name the
+        # cause (ECONNREFUSED, ETIMEDOUT, CONNACK/SUBACK failure, ...) — it is
+        # cleared on success and never inspected for anything else.
+        self._last_connect_error = None
         self._last_activity_ms = time.ticks_ms()
 
         try:
@@ -114,7 +120,10 @@ class Mqtt:
     def connect(self):
         """Connect and subscribe, with the whole handshake time-bounded.
 
-        The CONNACK/SUBACK waits run under mqtt_broker_response_timeout_sec, so an unresponsive broker fails the attempt (retried with backoff) instead of wedging Core 0. On success the socket returns to normal blocking mode; every later operation installs and restores its own timeout."""
+        The CONNACK/SUBACK waits run under mqtt_broker_response_timeout_sec, so an unresponsive broker fails the attempt (retried with backoff) instead of wedging Core 0. On success the socket returns to normal blocking mode; every later operation installs and restores its own timeout.
+
+        On a fully failed sequence the last attempt's expected transport/protocol error is retained on self.last_connect_error so the caller can name the cause in its exhaustion warning; a success clears it."""
+        self._last_connect_error = None
         for attempt_index, delay_sec in enumerate(self._reconnect_delays):
             try:
                 self._close_old_client()
@@ -150,6 +159,9 @@ class Mqtt:
                 if self._connected:
                     self._disconnect_count += 1
                 self._connected = False
+                # Retain the final cause so the caller's exhaustion warning can
+                # name it (ECONNREFUSED, ETIMEDOUT, CONNACK/SUBACK failure, ...).
+                self._last_connect_error = err
                 if DEBUG:
                     print("[DEBUG] MQTT attempt failed: {}".format(err))
                 if attempt_index < len(self._reconnect_delays) - 1:
@@ -249,6 +261,13 @@ class Mqtt:
         if self._client is None:
             return 1
         return self._client.next_packet_id()
+
+    @property
+    def last_connect_error(self):
+        """The final expected transport/protocol error from the most recent failed connect() attempt-sequence, or None (before any attempt, or after a success).
+
+        Exposed so Core 0's exhaustion warning can name the cause — which of ECONNREFUSED, ETIMEDOUT, connection reset, CONNACK failure, or SUBACK failure tore the sequence down — instead of a generic 'sequence exhausted'."""
+        return self._last_connect_error
 
     def status(self):
         return {

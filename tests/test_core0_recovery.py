@@ -388,6 +388,78 @@ def test_start_recovers_from_transient_probe_failure(make_core0):
     assert instance._intercore.state_mailboxes.utc_snapshots
 
 
+class _FailedMqtt:
+    """A connect() that always fails, retaining a configurable last_connect_error.
+
+    Models an exhausted MQTT attempt-sequence so establish_network() reaches
+    the exhaustion warning without touching a real broker."""
+
+    def __init__(self, last_error):
+        self.last_connect_error = last_error
+
+    def is_connected(self):
+        return False
+
+    def connect(self):
+        return False
+
+
+class _StopAfterFirstExhaustion(Exception):
+    """Raised from the _sleep_and_service stub to exit the unbounded loop."""
+
+
+def _stop_after_first_exhaustion(*args):
+    # The exhaustion warning was already printed in the loop body immediately
+    # before this hook, so raising here ends the intentionally-unbounded
+    # reconnect loop after exactly one warning instead of looping forever
+    # (a no-op sleep would spin the loop at full speed and buffer warnings
+    # into capsys until the host runs out of memory).
+    raise _StopAfterFirstExhaustion
+
+
+def test_establish_network_names_final_cause_in_exhaustion_warning(make_core0, capsys):
+    """P3: the MQTT exhaustion warning must name the final transport cause.
+
+    The cause (ECONNREFUSED / ETIMEDOUT / reset / CONNACK / SUBACK ...) is
+    printed once per exhausted sequence, not buried behind DEBUG — that is
+    what makes a silent-broker production run diagnosable from the console."""
+    instance = make_core0()
+    instance._wifi.connected = True  # skip the Wi-Fi loop; get to MQTT
+    cause = OSError("connect timed out (ETIMEDOUT)")
+    instance._mqtt = _FailedMqtt(cause)
+    # Terminate the intentionally-unbounded production reconnect loop
+    # immediately after its first exhaustion warning.
+    instance._sleep_and_service = _stop_after_first_exhaustion
+
+    with pytest.raises(_StopAfterFirstExhaustion):
+        instance.establish_network()
+
+    out = capsys.readouterr().out
+    assert "MQTT connection sequence exhausted:" in out
+    assert "connect timed out (ETIMEDOUT)" in out
+    # Named once, not once per retry attempt (no per-attempt noise).
+    assert out.count("MQTT connection sequence exhausted") == 1
+
+
+def test_establish_network_exhaustion_warning_falls_back_without_cause(make_core0, capsys):
+    """A missing retained cause must never silence the exhaustion warning.
+
+    Preserves the pre-P3 message shape (semicolon, no cause) as the defensive
+    fallback, so a lost cause degrades to the old line rather than dropping."""
+    instance = make_core0()
+    instance._wifi.connected = True
+    instance._mqtt = _FailedMqtt(None)  # no retained cause
+    instance._sleep_and_service = _stop_after_first_exhaustion
+
+    with pytest.raises(_StopAfterFirstExhaustion):
+        instance.establish_network()
+
+    out = capsys.readouterr().out
+    assert "MQTT connection sequence exhausted; retrying in" in out
+    assert "connect timed out" not in out
+    assert out.count("MQTT connection sequence exhausted") == 1
+
+
 def test_publish_utc_snapshot_has_no_force_argument(make_core0):
     """_publish_utc_snapshot takes no force parameter (it has no throttle)."""
     instance = make_core0()

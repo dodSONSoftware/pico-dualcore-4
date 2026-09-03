@@ -57,11 +57,13 @@ class TestHardwareConstants:
         assert hardware.HARDWARE_TYPE_PICO_2_W == "pico_2_w"
 
     def test_pico_w_heap_reserve(self):
-        """Verify Pico W minimum free-heap reserve."""
-        assert hardware.PICO_W_MIN_FREE_HEAP_BYTES == 65536  # 64 KiB
+        """Verify Pico W free-heap thresholds (preferred pressure band and hard floor)."""
+        assert hardware.PICO_W_PREFERRED_FREE_HEAP_BYTES == 65536  # 64 KiB
+        assert hardware.PICO_W_MIN_FREE_HEAP_BYTES == 49152  # 48 KiB
 
     def test_pico_2_w_heap_reserve(self):
-        """Verify Pico 2 W minimum free-heap reserve."""
+        """Verify Pico 2 W free-heap thresholds (preferred pressure band and hard floor)."""
+        assert hardware.PICO_2_W_PREFERRED_FREE_HEAP_BYTES == 147456  # 144 KiB
         assert hardware.PICO_2_W_MIN_FREE_HEAP_BYTES == 131072  # 128 KiB
 
 
@@ -76,7 +78,8 @@ class TestDetectHardware:
 
         assert result["hardware_type"] == "pico_w"
         assert result["machine"] == "Raspberry Pi Pico W with RP2040"
-        assert result["minimum_free_heap_bytes"] == 65536
+        assert result["preferred_free_heap_bytes"] == 65536
+        assert result["minimum_free_heap_bytes"] == 49152
 
     def test_pico_2_w_detection(self, monkeypatch):
         """Pico 2 W should be classified correctly."""
@@ -106,7 +109,8 @@ class TestDetectHardware:
 
         assert result["hardware_type"] == "pico_w"
         assert result["machine"] == "RPI_PICO_W with RP2040"
-        assert result["minimum_free_heap_bytes"] == 65536
+        assert result["preferred_free_heap_bytes"] == 65536
+        assert result["minimum_free_heap_bytes"] == 49152
 
     def test_pico_2_w_detection_old_format(self, monkeypatch):
         """Pico 2 W should also be classified with old format machine string."""
@@ -127,7 +131,7 @@ class TestDetectHardware:
 
     def test_get_minimum_free_heap_pico_w(self):
         """Verify get_minimum_free_heap returns correct value for Pico W."""
-        assert hardware.get_minimum_free_heap("pico_w") == 65536
+        assert hardware.get_minimum_free_heap("pico_w") == 49152
 
     def test_get_minimum_free_heap_pico_2_w(self):
         """Verify get_minimum_free_heap returns correct value for Pico 2 W."""
@@ -185,29 +189,32 @@ class TestClassifyMachine:
     """Test the shared machine-string -> board classification policy in hardware.py."""
 
     def test_classify_machine_pico_w(self):
-        """Pico W machine string classifies to pico_w with its 64 KiB reserve."""
+        """Pico W machine string classifies to pico_w with its 64 KiB preferred / 48 KiB minimum."""
         result = hardware.classify_machine("Raspberry Pi Pico W with RP2040")
 
         assert result == {
             "hardware_type": "pico_w",
-            "minimum_free_heap_bytes": 65536,
+            "preferred_free_heap_bytes": 65536,
+            "minimum_free_heap_bytes": 49152,
         }
 
     def test_classify_machine_pico_2_w(self):
-        """Pico 2 W machine string classifies to pico_2_w with its 128 KiB reserve."""
+        """Pico 2 W machine string classifies to pico_2_w with its 144 KiB preferred / 128 KiB minimum."""
         result = hardware.classify_machine("Raspberry Pi Pico 2 W with RP2350")
 
         assert result == {
             "hardware_type": "pico_2_w",
+            "preferred_free_heap_bytes": 147456,
             "minimum_free_heap_bytes": 131072,
         }
 
     def test_classify_machine_unknown(self):
-        """An unrecognized machine string classifies to unknown with no reserve."""
+        """An unrecognized machine string classifies to unknown with no thresholds."""
         result = hardware.classify_machine("UNKNOWN_BOARD")
 
         assert result == {
             "hardware_type": "unknown",
+            "preferred_free_heap_bytes": None,
             "minimum_free_heap_bytes": None,
         }
 
@@ -217,7 +224,8 @@ class TestClassifyMachine:
 
         assert result == {
             "hardware_type": "pico_w",
-            "minimum_free_heap_bytes": 65536,
+            "preferred_free_heap_bytes": 65536,
+            "minimum_free_heap_bytes": 49152,
         }
 
     def test_classify_machine_pico_2_w_old_format(self):
@@ -226,6 +234,7 @@ class TestClassifyMachine:
 
         assert result == {
             "hardware_type": "pico_2_w",
+            "preferred_free_heap_bytes": 147456,
             "minimum_free_heap_bytes": 131072,
         }
 
@@ -269,7 +278,8 @@ class TestGetMachineConsumesSharedClassifier:
         result = self._system_information().get_machine()
 
         assert result["hardware_type"] == "pico_w"
-        assert result["minimum_free_heap_bytes"] == 65536
+        assert result["preferred_free_heap_bytes"] == 65536
+        assert result["minimum_free_heap_bytes"] == 49152
 
     def test_get_machine_unknown(self, monkeypatch):
         import system_information

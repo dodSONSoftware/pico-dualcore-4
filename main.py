@@ -35,10 +35,12 @@ def main():
     boot_ticks_ms = time.ticks_ms()
     gc.collect()
 
-    # Detect hardware early to validate the board and select heap reserve.
+    # Detect hardware early to validate the board and select the heap
+    # thresholds (preferred reserve and hard survival floor).
     hardware = detect_hardware()
-    print("[INFO] Hardware detected: {} (heap reserve: {} bytes)".format(
+    print("[INFO] Hardware detected: {} (heap reserve: {} preferred / {} minimum bytes)".format(
         hardware["hardware_type"],
+        hardware["preferred_free_heap_bytes"],
         hardware["minimum_free_heap_bytes"],
     ))
 
@@ -62,10 +64,14 @@ def main():
     core0_config, core1_config = split_config(config)
     config = None
 
-    # The bus is heap-governed: its admission bound is the board-specific
-    # minimum free-heap reserve (hardware.py is the single source of truth),
-    # shared by both queues through one heap-admission lock.
-    intercore = InterCore(minimum_free_heap_bytes=hardware["minimum_free_heap_bytes"])
+    # The bus is heap-governed: its admission thresholds are the board-specific
+    # preferred free-heap reserve (start of pressure handling) and the hard
+    # survival floor (hardware.py is the single source of truth), shared by
+    # both queues through one heap-admission lock.
+    intercore = InterCore(
+        minimum_free_heap_bytes=hardware["minimum_free_heap_bytes"],
+        preferred_free_heap_bytes=hardware["preferred_free_heap_bytes"],
+    )
 
     from core0 import Core0
 

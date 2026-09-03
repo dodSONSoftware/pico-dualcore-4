@@ -100,13 +100,14 @@ class SystemInformation:
             version = "unknown"
 
         # Classify via the shared hardware policy (single source of truth for
-        # machine-string -> board type and board-specific heap reserve).
+        # machine-string -> board type and board-specific heap thresholds).
         classification = classify_machine(machine_name)
         return {
             "hardware_type": classification["hardware_type"],
             "machine": machine_name,
             "version": version,
             "implementation": sys.implementation.name,
+            "preferred_free_heap_bytes": classification["preferred_free_heap_bytes"],
             "minimum_free_heap_bytes": classification["minimum_free_heap_bytes"],
         }
 

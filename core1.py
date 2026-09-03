@@ -562,12 +562,19 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     try:
         hardware = intercore.state_mailboxes.get_hardware()
         minimum_free_heap = hardware.get("minimum_free_heap_bytes") if hardware else 65536
+        # The preferred reserve defaults to the hard floor, so a
+        # single-threshold hardware snapshot keeps the legacy behavior.
+        preferred_free_heap = (
+            hardware.get("preferred_free_heap_bytes", minimum_free_heap)
+            if hardware else 65536
+        )
         hardware_type = hardware.get("hardware_type", "unknown")
         machine = hardware.get("machine", "unknown")
     except MemoryError:
         raise
     except Exception:
         minimum_free_heap = 65536
+        preferred_free_heap = 65536
         hardware_type = "unknown"
         machine = "unknown"
 
@@ -635,6 +642,7 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
             "core_1_active": core_1_active,
             "core_1_activity_age_ms": core_1_activity_age_ms,
             "free_heap_bytes": free_heap,
+            "preferred_free_heap_bytes": preferred_free_heap,
             "minimum_free_heap_bytes": minimum_free_heap,
             "heap_headroom_bytes": heap_headroom_bytes,
             "devices_configured": devices_configured,

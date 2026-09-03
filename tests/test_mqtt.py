@@ -932,6 +932,73 @@ def test_mqtt_connect_fails_when_blocking_restore_raises(ticks, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Mqtt.last_connect_error: the final expected transport/protocol cause of a
+# failed connect() attempt-sequence, retained for Core 0's exhaustion warning
+#
+# P3 — the production console could not tell apart ECONNREFUSED / ETIMEDOUT /
+# reset / CONNACK / SUBACK failure, because the only per-attempt cause was
+# printed behind DEBUG. connect() now retains the last attempt's error so the
+# caller can name it once per exhausted sequence (no per-attempt/stack noise).
+# ---------------------------------------------------------------------------
+
+def test_connect_last_error_is_none_before_any_attempt(ticks):
+    """A fresh Mqtt reports no connect failure until one happens."""
+    mqtt = _mqtt(ticks)
+    assert mqtt.last_connect_error is None
+
+
+def test_connect_retains_final_transport_error_on_failed_sequence(ticks, monkeypatch):
+    """A fully failed sequence (CONNACK never arrives) retains the cause.
+
+    The retained value is the expected transport error (OSError here), so
+    Core 0's exhaustion warning can print 'sequence exhausted: <cause>' —
+    the whole point of P3."""
+    sock = MockSocket(incoming=b"")  # link up, then silent -> read timeout
+    _mock_broker_socket(monkeypatch, sock)
+    mqtt = _mqtt(ticks)
+
+    assert mqtt.connect() is False
+    assert isinstance(mqtt.last_connect_error, OSError)
+    # str() is bounded and names the cause (the real socket gives
+    # '[Errno 111] ECONNREFUSED' / 'ETIMEDOUT' / a CONNACK message).
+    assert "timeout" in str(mqtt.last_connect_error)
+
+
+def test_connect_retains_final_error_even_when_later_attempt_also_fails(ticks, monkeypatch):
+    """Every failed attempt overwrites the retained cause; the last one wins.
+
+    With two reconnect delays both attempts fail with a read timeout; the
+    retained error must be set (not clobbered to None by the retry cleanup)."""
+    sock = MockSocket(incoming=b"")
+    _mock_broker_socket(monkeypatch, sock)
+    mqtt = _mqtt(ticks)
+
+    assert mqtt.connect() is False
+    assert mqtt.last_connect_error is not None
+    # The retry loop's _close_old_client() must not clear the retained cause.
+    assert isinstance(mqtt.last_connect_error, OSError)
+
+
+def test_connect_clears_last_error_on_success(ticks, monkeypatch):
+    """A successful connect clears the retained cause so a stale failure
+    from an earlier sequence cannot leak into a later warning."""
+    incoming = (
+        b"\x20\x02\x00\x00"       # CONNACK
+        b"\x90\x03\x00\x01\x00"   # SUBACK pid 1 (command topic)
+        b"\x90\x03\x00\x02\x00"   # SUBACK pid 2 (info response topic)
+    )
+    sock = MockSocket(incoming=incoming)
+    _mock_broker_socket(monkeypatch, sock)
+    mqtt = _mqtt(ticks)
+    # Seed a prior failure, then succeed: the reset at the top of connect()
+    # must clear it.
+    mqtt._last_connect_error = OSError("stale cause from an earlier sequence")
+
+    assert mqtt.connect() is True
+    assert mqtt.last_connect_error is None
+
+
+# ---------------------------------------------------------------------------
 # Mqtt reconnect cleanup: disposing an already-failed client must never
 # write to the stalled socket
 #
