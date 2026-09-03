@@ -166,7 +166,7 @@ def _reload_core1_under_fakes():
 
 
 def _core1_config(health_interval_sec):
-    config = json.loads((ROOT / "config.json").read_text())
+    config = json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
     _core0, core1_config= split_config(config)
     # Scheduling is independent of the device set; keep startup fast.
     core1_config["devices"] = []

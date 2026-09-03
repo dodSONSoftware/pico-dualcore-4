@@ -187,7 +187,7 @@ def _make_core0():
     core0_mod = importlib.import_module("core0")
     importlib.reload(core0_mod)
 
-    config = json.loads((ROOT / "config.json").read_text())
+    config = json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
     core0_config, _core1_config= split_config(config)
 
     instance = core0_mod.Core0(
@@ -197,7 +197,7 @@ def _make_core0():
         "test-runtime",
         0,
         MagicMock(),
-            ConfigManager("config.json"),
+            ConfigManager(str(ROOT / "tests" / "fixtures" / "config.json")),
     )
     return core0_mod, instance
 

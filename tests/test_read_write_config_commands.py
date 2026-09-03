@@ -84,7 +84,7 @@ from version import MESSAGE_SCHEMA_VERSION  # noqa: E402
 
 
 def _full_config():
-    return json.loads((ROOT / "config.json").read_text())
+    return json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
 
 
 def _core0_config():

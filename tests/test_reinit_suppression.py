@@ -154,7 +154,7 @@ class ReinitEnv:
             driver=self.driver,
         )
 
-        raw = json.loads((ROOT / "config.json").read_text())
+        raw = json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
         _core0, core1_config= split_config(raw)
         self.config = core1_config
         self.bus = InterCore(minimum_free_heap_bytes=65536)

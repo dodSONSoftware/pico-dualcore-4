@@ -80,7 +80,7 @@ import command_protocol  # noqa: E402
 
 
 def _full_config():
-    return json.loads((ROOT / "config.json").read_text())
+    return json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
 
 
 def _load_core0_config():

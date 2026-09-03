@@ -120,7 +120,7 @@ from version import MESSAGE_SCHEMA_VERSION  # noqa: E402
 
 
 def _load_core0_config():
-    config = json.loads((ROOT / "config.json").read_text())
+    config = json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
     core0_config, _core1_config = split_config(config)
     return core0_config
 
@@ -183,7 +183,7 @@ def make_core0():
             "test-runtime",
             0,
             MagicMock(),
-                    ConfigManager("config.json"),
+                    ConfigManager(str(ROOT / "tests" / "fixtures" / "config.json")),
         )
         instance._wifi = FakeWifi()
         instance._mqtt = MagicMock()

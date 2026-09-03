@@ -83,7 +83,7 @@ _MQTT_INSTANCE = _MQTT_MOCK.Mqtt.return_value
 
 
 def _load_core0_config(broker_response_timeout_sec):
-    config = json.loads((ROOT / "config.json").read_text())
+    config = json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
     config["mqtt_broker_response_timeout_sec"] = broker_response_timeout_sec
     core0_config, _core1_config= split_config(config)
     return core0_config
@@ -128,7 +128,7 @@ def make_core0():
             "test-runtime",
             0,
             MagicMock(),
-                    ConfigManager("config.json"),
+                    ConfigManager(str(ROOT / "tests" / "fixtures" / "config.json")),
         )
 
     return _make

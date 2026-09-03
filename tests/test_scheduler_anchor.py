@@ -185,7 +185,7 @@ def _reload_core1_under_fakes():
 
 def _core1_config():
     """Core 1 config with the default telemetry-producing device kept."""
-    config = json.loads((ROOT / "config.json").read_text())
+    config = json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
     _core0, core1_config= split_config(config)
     return core1_config
 

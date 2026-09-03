@@ -36,7 +36,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _base_config():
-    return json.loads((ROOT / "config.json").read_text())
+    return json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
 
 
 @pytest.fixture

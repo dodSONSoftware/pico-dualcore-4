@@ -165,7 +165,7 @@ class HealthEnv:
         gc.collect = lambda: None
 
     def _core1_config(self):
-        config = load_config(str(ROOT / "config.json"))
+        config = load_config(str(ROOT / "tests" / "fixtures" / "config.json"))
         _core0, core1_config = split_config(config)
         return core1_config
 

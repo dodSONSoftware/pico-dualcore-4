@@ -150,7 +150,7 @@ def _reload_core1_under_fakes():
 
 
 def _core1_config():
-    config = json.loads((ROOT / "config.json").read_text())
+    config = json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
     _core0, core1_config= split_config(config)
     # Liveness is independent of the device set; keep startup fast.
     core1_config["devices"] = []
@@ -258,7 +258,7 @@ class SlowReadDriver:
 
 
 def _core1_config_with_slow_read_device():
-    config = json.loads((ROOT / "config.json").read_text())
+    config = json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
     _core0, core1_config = split_config(config)
     core1_config["devices"] = [
         {"id": "probe", "device_type": "probe", "config": {}}
