@@ -5,6 +5,7 @@
 import time
 from device_factory import create_device
 from message_protocol import is_json_safe
+from uptime import current_uptime_ms
 
 # Device state constants
 DEVICE_STATE_READY = "ready"
@@ -94,14 +95,18 @@ class ManagedDevice:
         if self.name is not None:
             snapshot["name"] = self.name
 
-        # Add age fields if now_ms is provided
+        # Add age fields if now_ms is provided. now_ms and the stored read
+        # timestamps both sit on the shared boot-relative uptime base (set by
+        # DeviceManager._now_ms()), so the age is a plain subtraction, correct
+        # for any duration -- where a one-shot ticks_diff(now, last_read) wraps
+        # once a read is more than half a tick period old.
         if now_ms is not None:
             snapshot["last_read_age_ms"] = None
             snapshot["last_successful_read_age_ms"] = None
             if self.last_read_ms is not None:
-                snapshot["last_read_age_ms"] = time.ticks_diff(now_ms, self.last_read_ms)
+                snapshot["last_read_age_ms"] = now_ms - self.last_read_ms
             if self.last_successful_read_ms is not None:
-                snapshot["last_successful_read_age_ms"] = time.ticks_diff(now_ms, self.last_successful_read_ms)
+                snapshot["last_successful_read_age_ms"] = now_ms - self.last_successful_read_ms
 
         return snapshot
 
@@ -109,7 +114,7 @@ class ManagedDevice:
 class DeviceManager:
     """Manages device lifecycle for Core 1."""
 
-    def __init__(self, config, system_information=None, activity_refresh=None):
+    def __init__(self, config, system_information=None, activity_refresh=None, uptime_state=None):
         self._active_devices = []
         self._failed_devices = {}
 
@@ -120,6 +125,11 @@ class DeviceManager:
         self._devices_config = config["devices"]
 
         self._system_information = system_information
+
+        # Core 1's accumulated-uptime state (same object Core 1 advances), the
+        # single source of truth for the read-age fields. When None (host tests
+        # that do not wire it), the manager falls back to raw ticks.
+        self._uptime_state = uptime_state
 
         # Optional liveness-stamp refresh callback, owned by Core 1 (which
         # constructs this manager) and invoked at progress boundaries:
@@ -137,6 +147,20 @@ class DeviceManager:
         """Refresh Core 1's liveness stamp at a progress boundary, if armed."""
         if self._activity_refresh is not None:
             self._activity_refresh()
+
+    def _now_ms(self):
+        """Current time on the shared boot-relative uptime base.
+
+        Accumulated uptime (the same single source of truth Core 1 uses for its
+        UTC timestamp and uptime fields) when a Core 1 uptime state is wired; raw
+        ticks otherwise (host tests without a wired state). Both the stored read
+        timestamps and every read-age subtraction use this base, so a device that
+        stays failed/reinitializing past half a tick period still reports a
+        correct read age -- where a one-shot ticks_diff against the read tick
+        would wrap."""
+        if self._uptime_state is not None:
+            return current_uptime_ms(self._uptime_state)
+        return time.ticks_ms()
 
     # One liveness-refresh step inside a long retry sleep.
     _ACTIVITY_REFRESH_STEP_MS = 100
@@ -317,9 +341,12 @@ class DeviceManager:
     def _process_normal_read(self, managed_device):
         """Process a normal read for a device; validate the telemetry and record the outcome."""
         try:
-            # Record read attempt
+            # Record read attempt. The timestamp is boot-relative accumulated
+            # uptime (not a raw tick) so the read-age stays correct for any
+            # duration, including a device stuck in failure/reinit past half a
+            # tick period.
             managed_device.read_count += 1
-            managed_device.last_read_ms = time.ticks_ms()
+            managed_device.last_read_ms = self._now_ms()
 
             telemetry = managed_device.driver.read()
 
@@ -333,9 +360,10 @@ class DeviceManager:
             if not is_json_safe(telemetry):
                 raise TypeError("Driver read() returned non-JSON-safe data")
 
-            # Record successful read
+            # Record successful read (same boot-relative uptime base as
+            # last_read_ms, so the age is a plain subtraction on that base).
             managed_device.successful_read_count += 1
-            managed_device.last_successful_read_ms = time.ticks_ms()
+            managed_device.last_successful_read_ms = self._now_ms()
 
             previous_failures = managed_device.consecutive_read_failures
             managed_device.record_read_success()
@@ -384,7 +412,9 @@ class DeviceManager:
         if not isinstance(device_status, list):
             return
 
-        now_ms = time.ticks_ms()
+        # Same boot-relative uptime base as the stored read timestamps, so the
+        # age is a plain subtraction on that base (correct for any duration).
+        now_ms = self._now_ms()
         fresh_status = managed_device.get_status_snapshot(now_ms=now_ms)
 
         for index, status in enumerate(device_status):
@@ -467,13 +497,19 @@ class DeviceManager:
     def get_status_snapshot(self, now_ms=None):
         """Get a JSON-safe status snapshot of all devices (active + failed), in deterministic configuration order.
 
-        Failed devices carry their final state and diagnostic info; now_ms (optional) enables the age fields."""
+        Failed devices carry their final state and diagnostic info; now_ms (optional) enables the age fields. When the age fields are enabled the actual reference is resolved from the shared boot-relative uptime base (not the raw now_ms passed in), so the ages stay correct for any duration."""
+        # Resolve the age reference on the shared boot-relative uptime base when
+        # age fields are requested (None otherwise): now_ms is kept only as the
+        # "include age fields" gate, while the timestamps and the subtraction
+        # share one base, so the age is correct for any duration.
+        now = self._now_ms() if now_ms is not None else None
+
         # Build a map of device_id -> status snapshot for all devices
         device_snapshots = {}
 
         # Add active devices in order (preserved by list order)
         for managed_device in self._active_devices:
-            device_snapshots[managed_device.device_id] = managed_device.get_status_snapshot(now_ms=now_ms)
+            device_snapshots[managed_device.device_id] = managed_device.get_status_snapshot(now_ms=now)
 
         # Add failed devices with their diagnostic info
         for device_id, device_info in self._failed_devices.items():

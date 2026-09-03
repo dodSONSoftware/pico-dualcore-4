@@ -49,6 +49,15 @@ MAX_TICKS_SAFE_INTERVAL_MS = (1 << 29) - 1
 # diagnostics on the exact startup-failure path where heap must stay flat.
 MAX_DEVICE_INITIALIZATION_ATTEMPTS = 10
 
+# Reconnect delays are bounded for operational liveness, not for the ticks
+# ceiling (they only drive sliced sleeps, so the ticks rule does not apply to
+# them): a delay long enough to outlast any human diagnosis, or a sequence
+# long enough to loop for days, makes recovery indistinguishable from a hang.
+# The shipped sequences (3/5/10/20/40 s, at most a dozen entries) are nowhere
+# near either bound; anything above them is a misconfiguration, not policy.
+MAX_RECONNECT_DELAY_SEC = 600
+MAX_RECONNECT_ATTEMPTS = 32
+
 # Core 1 builds a per-device status structure before anything can be rejected
 # at the serialized-size ceiling — the bounded startup-log fallback calls
 # get_status_snapshot() before it reduces to counts, and the read-config
@@ -226,10 +235,24 @@ def _validate_delays(config, key):
         raise ConfigError(
             "{} must be a non-empty list".format(key), code="invalid_value"
         )
+    if len(delays) > MAX_RECONNECT_ATTEMPTS:
+        raise ConfigError(
+            "{} must contain at most {} entries".format(
+                key, MAX_RECONNECT_ATTEMPTS
+            ),
+            code="invalid_value",
+        )
     for index, delay in enumerate(delays):
         if isinstance(delay, bool) or not isinstance(delay, int) or delay < 0:
             raise ConfigError(
                 "{}[{}] must be a non-negative integer".format(key, index),
+                code="invalid_value",
+            )
+        if delay > MAX_RECONNECT_DELAY_SEC:
+            raise ConfigError(
+                "{}[{}] must be at most {} seconds".format(
+                    key, index, MAX_RECONNECT_DELAY_SEC
+                ),
                 code="invalid_value",
             )
 
@@ -381,10 +404,14 @@ def validate_config(config):
     # Timing values that become ticks_diff thresholds or ticks_add deltas
     # are bounded by the ticks delta ceiling (above it a threshold can
     # never be reached, or a deadline/scheduler re-anchor raises
-    # OverflowError). Socket-timeout-only values (reconnect delays, probe
-    # timeout, sliced retry delay) do not use ticks deltas and stay
-    # unbounded here. Runs after the type checks above so a wrong type
-    # still reports invalid_value, not a type error.
+    # OverflowError). Values that only drive sliced sleeps (reconnect
+    # delays, probe timeout, sliced retry delay) do not use ticks deltas:
+    # reconnect delays are additionally bounded for operational liveness
+    # (MAX_RECONNECT_DELAY_SEC / MAX_RECONNECT_ATTEMPTS) because a delay or
+    # sequence long enough to outlast any human diagnosis makes recovery
+    # indistinguishable from a hang, while the probe timeout and the sliced
+    # retry delay stay unbounded. Runs after the type checks above so a
+    # wrong type still reports invalid_value, not a type error.
     _require_ticks_safe_interval(config, "read_loop_sec", 1000)
     _require_ticks_safe_interval(config, "health_interval_sec", 1000)
     _require_ticks_safe_interval(config, "network_snapshot_interval_sec", 1000)

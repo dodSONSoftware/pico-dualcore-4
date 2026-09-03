@@ -39,12 +39,14 @@ class Wifi:
     def _current_status(self):
         """The current WLAN association state, or None if it cannot be read.
 
-        Callers treat None as "unknown" and let the observation timeout govern -- never as a failure."""
+        Callers treat None as "unknown" and let the observation timeout govern -- never as a failure.
+        Only a transport failure (OSError) reads as unknown; a programming failure must escape the
+        same way it does at the MQTT boundary, not be masked as "no state"."""
         try:
             status = self._wlan.status()
         except MemoryError:
             raise
-        except Exception:
+        except OSError:
             return None
         return status if isinstance(status, int) else None
 
@@ -59,11 +61,14 @@ class Wifi:
         )
 
     def is_connected(self):
+        # The same taxonomy as connect(): a transient driver state error
+        # (OSError) reads as "not connected"; a programming failure escapes
+        # to the recovery boundary instead of masking itself as False.
         try:
             return self._wlan is not None and self._wlan.isconnected()
         except MemoryError:
             raise
-        except Exception:
+        except OSError:
             return False
 
     def ip_address(self):
@@ -73,7 +78,7 @@ class Wifi:
             return self._wlan.ifconfig()[0]
         except MemoryError:
             raise
-        except Exception:
+        except OSError:
             return None
 
     def connect(self):
@@ -83,6 +88,12 @@ class Wifi:
                 self._wlan = network.WLAN(network.WLAN.IF_STA)
                 self._wlan.active(True)
 
+                # The PM_NONE probe keeps a deliberately broad catch: it is a
+                # compatibility fallback for an optional power-management
+                # feature, and a driver that lacks it reports the absence
+                # with no single portable exception type. This is the one
+                # broad catch in this module -- everything else follows the
+                # transport-failure taxonomy below.
                 try:
                     self._wlan.config(pm=self._wlan.PM_NONE)
                 except MemoryError:
@@ -132,7 +143,14 @@ class Wifi:
 
             except MemoryError:
                 raise
-            except Exception as err:
+            except OSError as err:
+                # The same taxonomy the MQTT boundary follows: a transport
+                # failure (OSError) is a link condition to retry, but a
+                # programming failure (a deterministic AttributeError/TypeError
+                # or an unexpected API incompatibility) must escape to
+                # main.py's controlled-reset boundary -- a broad catch here
+                # would hand Core0.establish_network() an infinite sequence
+                # of retries into the same deterministic fault.
                 if DEBUG:
                     print("[DEBUG] Wi-Fi attempt failed: {}".format(err))
 
@@ -178,14 +196,14 @@ class Wifi:
                 snapshot["dns"] = values[3]
             except MemoryError:
                 raise
-            except Exception as err:
+            except OSError as err:
                 if DEBUG:
                     print("[DEBUG] Wi-Fi ifconfig snapshot failed: {}".format(err))
             try:
                 snapshot["rssi"] = self._wlan.status("rssi")
             except MemoryError:
                 raise
-            except Exception as err:
+            except OSError as err:
                 if DEBUG:
                     print("[DEBUG] Wi-Fi RSSI snapshot failed: {}".format(err))
 

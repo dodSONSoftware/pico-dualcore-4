@@ -17,6 +17,8 @@ from config import (
     MAX_DEVICES,
     MAX_MQTT_KEEPALIVE_SEC,
     MAX_MQTT_TOPIC_BYTES,
+    MAX_RECONNECT_ATTEMPTS,
+    MAX_RECONNECT_DELAY_SEC,
     MAX_TICKS_SAFE_INTERVAL_MS,
     ConfigError,
     load_config,
@@ -141,6 +143,10 @@ def test_validate_config_accepts_valid_config_without_any_file():
         (lambda config: config.update({"config_schema_version": 999}), "invalid_config_schema_version"),
         (lambda config: config.update({"read_loop_sec": "20"}), "invalid_value"),
         (lambda config: config.update({"wifi_reconnect_delays_sec": []}), "invalid_value"),
+        (lambda config: config.update({"wifi_reconnect_delays_sec": [MAX_RECONNECT_DELAY_SEC + 1]}), "invalid_value"),
+        (lambda config: config.update({"wifi_reconnect_delays_sec": [5] * (MAX_RECONNECT_ATTEMPTS + 1)}), "invalid_value"),
+        (lambda config: config.update({"mqtt_reconnect_delays_sec": [MAX_RECONNECT_DELAY_SEC + 1]}), "invalid_value"),
+        (lambda config: config.update({"mqtt_reconnect_delays_sec": [5] * (MAX_RECONNECT_ATTEMPTS + 1)}), "invalid_value"),
         (lambda config: config.update({"devices": []}), "invalid_value"),
         (lambda config: config.update(
             {"devices": [dict(config["devices"][0], id="device-{}".format(i)) for i in range(MAX_DEVICES + 1)]}
@@ -163,6 +169,16 @@ def test_validate_config_rejects_bad_configs_with_stable_codes(mutate, code):
     assert excinfo.value.code == code
     # str(err) still carries the human-readable message for startup prints
     assert str(excinfo.value)
+
+
+def test_validate_config_reconnect_delay_bounds_are_inclusive():
+    """The liveness bounds are inclusive: exactly MAX_RECONNECT_DELAY_SEC per
+    delay and exactly MAX_RECONNECT_ATTEMPTS entries still validate; only
+    values beyond them are misconfiguration."""
+    config = _base_config()
+    config["wifi_reconnect_delays_sec"] = [MAX_RECONNECT_DELAY_SEC]
+    config["mqtt_reconnect_delays_sec"] = [5] * MAX_RECONNECT_ATTEMPTS
+    assert validate_config(config) is config
 
 
 def test_validate_config_source_is_bounded_at_protocol_scale():

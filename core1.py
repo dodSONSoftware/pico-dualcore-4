@@ -106,7 +106,7 @@ def _startup_log_message(intercore, startup_duration_ms, startup_summary, system
     return {
         "message_type": "log",
         "uptime_ms": startup_duration_ms,
-        "timestamp": _current_utc_timestamp(intercore),
+        "timestamp": _current_utc_timestamp(intercore, startup_duration_ms),
         "payload": {
             "level": "info",
             "event": "system_startup_completed",
@@ -228,19 +228,22 @@ def _admit_startup_log_with_fallback(intercore, message, fallback_builder):
         return _admit_startup_log(intercore, fallback_builder())
 
 
-def _current_utc_timestamp(intercore):
+def _current_utc_timestamp(intercore, uptime_ms):
     """Current UTC timestamp from the shared snapshot, or None if unsynchronized.
 
-    The snapshot is advanced by the elapsed local ticks so it tracks the clock between refreshes."""
+    The snapshot pins the UTC epoch to the shared boot base; adding this
+    sample's accumulated uptime tracks the clock between refreshes and stays
+    correct across the tick wrap, where a one-shot ticks_diff against the sync
+    tick would go stale once the snapshot is more than half a tick period old."""
     snapshot = intercore.state_mailboxes.get_utc_snapshot()
     if snapshot is None:
         return None
-    elapsed_ms = time.ticks_diff(time.ticks_ms(), snapshot["ticks_ms"])
-    return format_utc_epoch_ms(snapshot["utc_epoch_ms"] + elapsed_ms)
+    return format_utc_epoch_ms(snapshot["runtime_start_epoch_ms"] + uptime_ms)
 
 
 def _message_time(intercore, uptime_state):
-    return current_uptime_ms(uptime_state), _current_utc_timestamp(intercore)
+    uptime_ms = current_uptime_ms(uptime_state)
+    return uptime_ms, _current_utc_timestamp(intercore, uptime_ms)
 
 
 def _build_command_response(intercore, uptime_state, event, success, data=None, error=None):
@@ -584,11 +587,12 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     # Calculate heap headroom
     heap_headroom_bytes = free_heap - minimum_free_heap
 
-    # Calculate UTC sync age in seconds
+    # Calculate UTC sync age in seconds. current_uptime - sync_uptime, both on
+    # the shared boot base: correct for any duration, where ticks_diff(now,
+    # sync_ticks) would go stale past half a tick period and could go negative.
     utc_sync_age_sec = None
     if utc_snapshot is not None:
-        elapsed_ms = time.ticks_diff(now_ms, utc_snapshot["ticks_ms"])
-        utc_sync_age_sec = elapsed_ms // 1000  # Integer division for seconds
+        utc_sync_age_sec = (uptime_ms - utc_snapshot["sync_uptime_ms"]) // 1000
 
     # Calculate device failures from DeviceManager state
     device_failures = devices_configured - devices_active
@@ -624,7 +628,7 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
         timestamp = None
     else:
         timestamp = format_utc_epoch_ms(
-            utc_snapshot["utc_epoch_ms"] + time.ticks_diff(now_ms, utc_snapshot["ticks_ms"])
+            utc_snapshot["runtime_start_epoch_ms"] + uptime_ms
         )
     payload = {
         "uptime_ms": uptime_ms,
@@ -751,6 +755,12 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             config,
             system_information=system_information,
             activity_refresh=lambda: intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms()),
+            # Shared boot-relative uptime base: the device read-age fields are
+            # stored and measured on the same accumulated-uptime source of
+            # truth as the UTC timestamp, so they stay correct across a tick
+            # wrap (a device stuck in failure/reinit past half a tick period
+            # would otherwise report a wrong read age).
+            uptime_state=uptime_state,
         )
         system_information.set_device_manager(device_manager)
 

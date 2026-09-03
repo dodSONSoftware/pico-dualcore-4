@@ -128,10 +128,17 @@ def _reload_core1_under_fakes():
 
 
 def _valid_utc_snapshot(age_ms=10000):
-    """A valid UTC snapshot taken ``age_ms`` before "now"."""
+    """A valid UTC snapshot taken ``age_ms`` before the default "now" (NOW_MS).
+
+    Expressed on the accumulated-uptime base both cores share (boot_ticks =
+    BOOT_TICKS_MS): the sync happened at boot, so sync_uptime_ms is 0 and the
+    runtime-start epoch equals the sync epoch."""
+    utc_epoch_ms = 200000
+    sync_uptime_ms = (NOW_MS - age_ms) - BOOT_TICKS_MS
     return {
-        "utc_epoch_ms": 200000,
-        "ticks_ms": NOW_MS - age_ms,
+        "utc_epoch_ms": utc_epoch_ms,
+        "sync_uptime_ms": sync_uptime_ms,
+        "runtime_start_epoch_ms": utc_epoch_ms - sync_uptime_ms,
     }
 
 
@@ -433,10 +440,9 @@ def test_runtime_and_uptime_values(health):
 
     assert payload["message_type"] == "health"
     assert payload["uptime_ms"] == (NOW_MS + 25000) - BOOT_TICKS_MS  # 35000
-    # The timestamp is Core 1's: it is computed from the shared UTC snapshot,
-    # advanced by the elapsed local ticks (the snapshot was taken 10s before
-    # the clock at set_utc time, and the clock is now 25s past "now").
-    expected_epoch_ms = snapshot["utc_epoch_ms"] + (NOW_MS + 25000) - snapshot["ticks_ms"]
+    # The timestamp is Core 1's: the shared snapshot's runtime-start epoch
+    # plus this sample's accumulated uptime (the clock is now 35s past boot).
+    expected_epoch_ms = snapshot["runtime_start_epoch_ms"] + ((NOW_MS + 25000) - BOOT_TICKS_MS)
     assert payload["timestamp"] == format_utc_epoch_ms(expected_epoch_ms)
     # The envelope keys are Core 0's: Core 1 must not carry them, or the wire
     # document would repeat a member name when Core 0 splices them in.

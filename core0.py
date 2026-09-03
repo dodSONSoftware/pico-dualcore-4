@@ -158,8 +158,12 @@ class Core0:
         snapshot = self._utc_snapshot
         if snapshot is None:
             return None
-        elapsed_ms = time.ticks_diff(time.ticks_ms(), snapshot["ticks_ms"])
-        return format_utc_epoch_ms(snapshot["utc_epoch_ms"] + elapsed_ms)
+        # current = runtime_start + current_uptime: both accumulate from the
+        # shared boot base, so this stays correct across the tick wrap, where
+        # a one-shot ticks_diff against the sync tick would not.
+        return format_utc_epoch_ms(
+            snapshot["runtime_start_epoch_ms"] + self._uptime_ms()
+        )
 
     def _target_matches(self, target):
         # A target is a non-empty string within the protocol bound before any
@@ -898,12 +902,19 @@ class Core0:
                 print("[DEBUG] UTC response rejected - invalid epoch: {}".format(err))
             return
 
-        now_ticks = time.ticks_ms()
+        # Anchor the snapshot to the accumulated uptime, not a raw ticks_ms
+        # sample: elapsed since sync is computed later as current_uptime -
+        # sync_uptime, which stays correct across the tick-counter wrap. A
+        # one-shot ticks_diff(now, sync_ticks) is only guaranteed within half
+        # a tick period, so once the snapshot is that old it would mis-compute
+        # the elapsed time and could block the very refresh that repairs the
+        # clock.
+        sync_uptime_ms = self._uptime_ms()
         snapshot = {
             "timestamp": normalized_timestamp,
             "utc_epoch_ms": utc_epoch_ms,
-            "ticks_ms": now_ticks,
-            "runtime_start_epoch_ms": utc_epoch_ms - self._uptime_ms(),
+            "sync_uptime_ms": sync_uptime_ms,
+            "runtime_start_epoch_ms": utc_epoch_ms - sync_uptime_ms,
         }
         self._utc_snapshot = snapshot
         self._intercore.state_mailboxes.set_utc_snapshot(snapshot)
@@ -1335,8 +1346,12 @@ class Core0:
         if self._utc_snapshot is None:
             return True
         interval_ms = self._config["datetime_sync_interval_min"] * 60 * 1000
+        # Elapsed since sync as current_uptime - sync_uptime: correct for any
+        # duration (accumulated recent deltas), where ticks_diff(now,
+        # sync_ticks) is only valid within half a tick period and would go
+        # stale on a long outage and block the refresh that repairs the clock.
         return (
-            time.ticks_diff(time.ticks_ms(), self._utc_snapshot["ticks_ms"])
+            self._uptime_ms() - self._utc_snapshot["sync_uptime_ms"]
             >= interval_ms
         )
 

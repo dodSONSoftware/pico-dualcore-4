@@ -232,8 +232,9 @@ def test_no_retry_while_snapshot_is_fresh(make_core0):
 
     _FAKE_TIME.now_ms = interval_ms - 1000
     instance._utc_snapshot = {
-        "ticks_ms": 0,
         "utc_epoch_ms": 1767225600000,
+        "sync_uptime_ms": 0,
+        "runtime_start_epoch_ms": 1767225600000,
     }
     assert instance._utc_sync_due() is False
     assert instance._utc_should_send_request() is False

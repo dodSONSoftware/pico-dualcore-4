@@ -466,7 +466,8 @@ def test_publish_utc_snapshot_has_no_force_argument(make_core0):
     snapshot = {
         "timestamp": "2025-06-15T15:06:40Z",
         "utc_epoch_ms": 1750000000000,
-        "ticks_ms": 0,
+        "sync_uptime_ms": 0,
+        "runtime_start_epoch_ms": 1750000000000,
     }
     instance._utc_snapshot = snapshot
 

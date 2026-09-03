@@ -4,9 +4,9 @@
 
 """Host-side regression tests for the accumulated-uptime fix.
 
-MicroPython's time.ticks_diff is only guaranteed correct when the two samples are less than half a tick period apart. A long-running device (> ~12.4 days on the 30-bit clock of the 32-bit RP2 builds) violates that: a single ticks_diff(now, boot_ticks_ms) returns a negative or wrapped value even though the device is alive and well. The fix accumulates deltas between consecutive samples (each a recent pair) into a running total, so every individual ticks_diff stays within its guaranteed window and the total keeps increasing across the tick-counter wrap.
+MicroPython's time.ticks_diff is only guaranteed correct when the two samples are less than half a tick period apart. On the 30-bit millisecond counter of the 32-bit RP2 builds that is 2**29 ms, about 6.21 days (the full 2**30 period is about 12.4 days), so a device running longer than that half-period violates the guarantee: a single ticks_diff(now, boot_ticks_ms) returns a negative or wrapped value even though the device is alive and well. The fix accumulates deltas between consecutive samples (each a recent pair) into a running total, so every individual ticks_diff stays within its guaranteed window and the total keeps increasing across the tick-counter wrap.
 
-These tests drive the PRODUCTION uptime module (not a copy) under a clock that faithfully models MicroPython's 30-bit ticks -- including the signed two's-complement result of ticks_diff, the OverflowError ticks_add raises at half the period, and the counter wrapping past 2**30 -- plus one end-to-end check through Core 1's _message_time to confirm uptime and the UTC timestamp both survive a wrap."""
+These tests drive the PRODUCTION uptime module (not a copy) under a clock that faithfully models MicroPython's 30-bit ticks -- including the signed two's-complement result of ticks_diff, the OverflowError ticks_add raises at half the period, and the counter wrapping past 2**30 -- plus production-path checks: Core 1's _message_time with a recent UTC snapshot across a counter wrap, the stale-snapshot case where the snapshot is older than half a tick period (Core 1's timestamp and Core 0's _utc_sync_due refresh), and the per-device read-age fields on the same shared boot base."""
 
 import importlib
 import os as _real_os
@@ -217,7 +217,9 @@ def _reload_core1_under_fakes(fake_time):
 def test_core1_message_time_uptime_and_timestamp_survive_wrap():
     """Core 1's uptime and UTC timestamp both stay correct across a wrap.
 
-    The UTC snapshot is taken at boot (a recent sample, as in production where it is refreshed periodically). The tick counter then wraps past 2**30. Uptime must keep increasing and the timestamp must track utc_epoch_ms + elapsed_since_snapshot -- both of which rely on recent-sample diffs, not a diff against the boot tick."""
+    The UTC snapshot is taken at boot (a recent sample, as in production where it is refreshed periodically). The tick counter then wraps past 2**30. Uptime must keep increasing and the timestamp must track utc_epoch_ms + elapsed_since_snapshot -- both of which rely on recent-sample diffs, not a diff against the boot tick.
+
+    This covers the recent-snapshot case only; a UTC snapshot older than half a tick period (where the old one-shot ticks_diff against the sync tick was wrong) is covered by test_utc_aging_survives_elapsed_beyond_half_period."""
     from intercore import InterCore  # noqa: E402
 
     boot = TICKS_PERIOD - 1000  # near the top of the 30-bit counter
@@ -244,7 +246,8 @@ def test_core1_message_time_uptime_and_timestamp_survive_wrap():
         epoch_ms = 1_700_000_000_000
         bus.state_mailboxes.set_utc_snapshot({
             "utc_epoch_ms": epoch_ms,
-            "ticks_ms": boot,
+            "sync_uptime_ms": 0,
+            "runtime_start_epoch_ms": epoch_ms,
             "timestamp": "2023-11-14T22:13:20Z",
         })
 
@@ -261,5 +264,197 @@ def test_core1_message_time_uptime_and_timestamp_survive_wrap():
         # compare against the production formatter for the expected value.
         expected_ts = [format_utc_epoch_ms(epoch_ms + i * 500) for i in range(4)]
         assert [s[1] for s in samples] == expected_ts
+    finally:
+        _restore()
+
+
+def test_utc_aging_survives_elapsed_beyond_half_period():
+    """Regression (P1): a UTC snapshot older than half a tick period must still
+    yield a correct timestamp AND must not block the refresh that repairs the clock.
+
+    The old code computed elapsed as ``ticks_diff(now, snapshot_ticks)``. MicroPython
+    only guarantees that within half a tick period, so after a long network/server
+    outage the one-shot diff wraps: the timestamp goes wrong (can go negative) and
+    ``_utc_sync_due()`` computes the wrong delta, which can suppress the very
+    resync that would fix the clock. The fix measures elapsed from the accumulated
+    uptime (each delta between recent samples), which is correct for any duration.
+
+    The clock advances well past half a period, but in steps small enough that every
+    individual ``ticks_diff`` stays within its guaranteed window -- the regime the run
+    loops actually run, since they sample continuously."""
+    from unittest.mock import MagicMock  # noqa: E402
+    from intercore import InterCore  # noqa: E402
+
+    boot = 0
+    fake = WrappingFakeTime(boot)
+    epoch_ms = 1_700_000_000_000
+
+    saved = {
+        name: sys.modules.get(name)
+        for name in ("time", "machine", "os", "debug", "wifi", "mqtt")
+    }
+
+    def _restore():
+        for name, mod in saved.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+
+    try:
+        # Reuse the Core-1-under-fakes loader: installs the wrapping fake time and
+        # machine/os and reloads the core1 chain (including uptime) so they are
+        # authoritative, then adds the stand-ins core0 additionally needs.
+        core1 = _reload_core1_under_fakes(fake)
+        uptime = sys.modules["uptime"]
+
+        debug_mock = MagicMock()
+        debug_mock.DEBUG = False
+        sys.modules["debug"] = debug_mock
+        sys.modules["wifi"] = MagicMock()
+        sys.modules["mqtt"] = MagicMock()
+        core0 = (
+            importlib.import_module("core0")
+            if "core0" not in sys.modules
+            else importlib.reload(sys.modules["core0"])
+        )
+        from message_protocol import format_utc_epoch_ms  # noqa: E402
+
+        bus = InterCore(minimum_free_heap_bytes=65536)
+
+        # Snapshot taken at boot: sync_uptime 0, runtime-start epoch == sync epoch.
+        snapshot = {
+            "utc_epoch_ms": epoch_ms,
+            "sync_uptime_ms": 0,
+            "runtime_start_epoch_ms": epoch_ms,
+            "timestamp": "2023-11-14T22:13:20Z",
+        }
+        bus.state_mailboxes.set_utc_snapshot(snapshot)
+        core0_instance = core0.Core0(
+            bus,
+            {"datetime_sync_interval_min": 60, "wifi_reconnect_delays_sec": [1]},
+            {"wifi_ssid": "x", "wifi_password": "y"},
+            "rt", boot, MagicMock(), MagicMock(),
+        )
+        core0_instance._utc_snapshot = snapshot
+
+        # A quarter period per step: a valid single diff. Four steps cross BOTH
+        # the half-period line and the 2**30 wrap -- the regime where a one-shot
+        # ticks_diff(now, boot) is wrong but the accumulated total is not.
+        step = HALF_PERIOD // 2
+        core1_state = uptime.create_uptime_state(boot)
+        timestamps = []
+        for _ in range(4):
+            fake.advance(step)
+            # Sample both cores at the same instant, as their run loops do.
+            _uptime_ms, ts = core1._message_time(bus, core1_state)
+            core0_instance._uptime_ms()
+            timestamps.append(ts)
+
+        # Core 1's timestamp tracked the accumulated elapsed (positive, correct)
+        # across the half-period line and the counter wrap.
+        assert timestamps == [
+            format_utc_epoch_ms(epoch_ms + (i + 1) * step) for i in range(4)
+        ]
+        # Core 0 flags the refresh as due (far past the sync interval) -- the old
+        # one-shot diff would have computed a small/wrapped elapsed and suppressed
+        # this, blocking the resync that repairs the clock.
+        assert core0_instance._utc_sync_due() is True
+        # The one-shot diff the old code relied on is wrong in this regime.
+        assert fake.ticks_diff(fake.now_ms, boot) != (4 * step)
+    finally:
+        _restore()
+
+
+def test_device_read_age_survives_elapsed_beyond_half_period():
+    """Regression (P3): a device's read-age fields stay correct when the
+    device remains failed/reinitializing for longer than half a tick period.
+
+    ``last_read_ms`` / ``last_successful_read_ms`` are stored as boot-relative
+    accumulated uptime -- the same single source of truth Core 1 uses for its
+    UTC timestamp and uptime fields -- and the age is a plain subtraction on
+    that base. So a device stuck in failure/reinit past half a tick period
+    (where ``ticks_diff(now, last_read_ticks)`` wraps and corrupts the value)
+    still reports a positive, correct read age. The regression is
+    observability-only: it does not affect recovery decisions."""
+    boot = 0
+    fake = WrappingFakeTime(boot)
+    saved = {
+        name: sys.modules.get(name)
+        for name in ("time", "machine", "os")
+    }
+
+    def _restore():
+        for name, mod in saved.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+
+    try:
+        _reload_core1_under_fakes(fake)  # loads device_manager under the fakes
+        uptime = sys.modules["uptime"]
+        device_manager_mod = sys.modules["device_manager"]
+
+        config = {
+            "device_initialization_attempts": 1,
+            "device_initialization_retry_delay_ms": 0,
+            "device_read_failure_threshold": 3,
+            "devices": [
+                {
+                    "id": "dev",
+                    "device_type": "probe",
+                    "sensor_type": "s",
+                    "config": {},
+                }
+            ],
+        }
+
+        state = uptime.create_uptime_state(boot)
+        manager = device_manager_mod.DeviceManager(config, uptime_state=state)
+
+        class StubDriver:
+            def initialize(self, device_config):
+                pass
+
+            def read(self):
+                return {"probe": 1}
+
+        managed = device_manager_mod.ManagedDevice(
+            device_id="dev",
+            device_type="probe",
+            sensor_type="s",
+            driver=StubDriver(),
+        )
+        manager._active_devices.append(managed)
+
+        # One successful read records its timestamps on the accumulated-uptime
+        # base (== 0 at this instant, since boot is the anchor).
+        result = manager.process_device(managed)
+        assert result["status"] == device_manager_mod.DEVICE_RESULT_TELEMETRY
+        assert managed.last_read_ms == 0
+        assert managed.last_successful_read_ms == 0
+
+        # The device then stays failed/reinitializing for well past half a
+        # tick period. Advance in steps small enough that each individual
+        # ticks_diff stays within its guaranteed window -- the regime the
+        # uptime accumulator (and Core 1's run loop) actually runs.
+        step = HALF_PERIOD // 2
+        for _ in range(4):
+            fake.advance(step)
+            uptime.current_uptime_ms(state)
+        elapsed = 4 * step  # 2 * HALF_PERIOD: beyond the half-period line
+
+        snapshot = manager.get_status_snapshot(now_ms=fake.ticks_ms())
+        dev_status = snapshot["device_status"][0]
+        # The accumulated-uptime age is the full, positive elapsed time.
+        assert dev_status["last_read_age_ms"] == elapsed
+        assert dev_status["last_successful_read_age_ms"] == elapsed
+
+        # The one-shot ticks_diff the old code relied on is wrong in this
+        # regime (the read tick and the now tick are far more than half a
+        # period apart), so a raw-tick implementation could not reproduce the
+        # age above.
+        assert fake.ticks_diff(fake.now_ms, boot) != elapsed
     finally:
         _restore()

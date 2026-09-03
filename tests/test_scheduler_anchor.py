@@ -451,7 +451,8 @@ def test_reconnects_and_utc_resync_do_not_reset_anchor():
     def _utc_resync():
         bus.state_mailboxes.set_utc_snapshot({
             "utc_epoch_ms": 1735000000000,
-            "ticks_ms": fake_time.now_ms,
+            "sync_uptime_ms": 0,
+            "runtime_start_epoch_ms": 1735000000000,
         })
 
     events = [

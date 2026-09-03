@@ -71,7 +71,9 @@ class _FakeWLAN:
     def isconnected(self):
         return False
 
-    def status(self, key):
+    def status(self, key=None):
+        # No key -> the association state; a key -> a probe such as RSSI
+        # (the real WLAN API accepts both, as _StatusWLAN below does).
         return -50
 
     def ifconfig(self):
@@ -369,3 +371,152 @@ def test_wifi_got_ip_is_not_a_failure(ticks, monkeypatch):
     elapsed_ms = ticks.now_ms
     assert elapsed_ms >= backoff_ms + observation_ms - 2000
     assert len(service.calls) >= len(_RECONNECT_DELAYS_SEC) * 200
+
+
+# --- Exception taxonomy on the Wi-Fi boundary -------------------------------
+#
+# Wi-Fi follows the taxonomy the MQTT boundary already established
+# (MQTT_TRANSPORT_ERRORS): only a transport failure (OSError) is a link
+# condition to retry, MemoryError escapes, and a programming failure
+# (a deterministic AttributeError/TypeError, an unexpected API
+# incompatibility) must escape to main.py's controlled-reset boundary.
+# Before the fix, Wifi.connect()'s broad except-Exception converted a
+# programming failure into just another retryable attempt -- Core0.
+# establish_network() would then retry the same deterministic fault forever,
+# and the observation helpers (is_connected, _current_status, snapshot)
+# would mask the fault as False/None instead of surfacing it. The one
+# deliberate broad catch is the optional PM_NONE power-management probe,
+# whose compatibility fallback has no portable exception type.
+
+
+class _TaxonomyWLAN:
+    """A radio whose calls raise per-test-configured exceptions.
+
+    Class attributes let a test pick the failure type (or absence) for one
+    call; connect() associates when it is not told to fail, and isconnected()
+    reports that association. config() fails by default (as the other fakes
+    do), pinning the PM_NONE probe's tolerated broad catch."""
+
+    IF_STA = 0
+    PM_NONE = 0
+    associated = False
+    config_error = None
+    connect_error = None
+    isconnected_error = None
+    status_error = None
+    ifconfig_error = None
+
+    def __init__(self, interface):
+        pass
+
+    def active(self, value):
+        pass
+
+    def config(self, **kwargs):
+        error = type(self).config_error
+        raise error if error is not None else AttributeError("PM unsupported")
+
+    def connect(self, ssid, password):
+        if type(self).connect_error is not None:
+            raise type(self).connect_error
+        type(self).associated = True
+
+    def isconnected(self):
+        if type(self).isconnected_error is not None:
+            raise type(self).isconnected_error
+        return type(self).associated
+
+    def status(self, key=None):
+        if type(self).status_error is not None:
+            raise type(self).status_error
+        return -50
+
+    def ifconfig(self):
+        if type(self).ifconfig_error is not None:
+            raise type(self).ifconfig_error
+        return ("192.168.1.100", "255.255.255.0", "192.168.1.1", "8.8.8.8")
+
+
+def _wifi_wlan(monkeypatch, associated=False, **errors):
+    """Install _TaxonomyWLAN with a single no-backoff attempt; return a Wifi.
+
+    The class attributes are reset wholesale so tests never leak failures
+    into each other, and the WLAN instance is pre-bound so the observation
+    helpers can be exercised without a prior connect()."""
+    _TaxonomyWLAN.associated = associated
+    _TaxonomyWLAN.config_error = None
+    _TaxonomyWLAN.connect_error = None
+    _TaxonomyWLAN.isconnected_error = None
+    _TaxonomyWLAN.status_error = None
+    _TaxonomyWLAN.ifconfig_error = None
+    for name, error in errors.items():
+        setattr(_TaxonomyWLAN, name, error)
+    monkeypatch.setattr(wifi_mod.network, "WLAN", _TaxonomyWLAN)
+    wifi = wifi_mod.Wifi("test-ssid", "test-password", [0])
+    wifi._wlan = _TaxonomyWLAN(0)
+    return wifi
+
+
+def test_wifi_connect_transport_failure_still_retries(monkeypatch):
+    """An OSError from the radio is a link condition: the attempt fails and
+    the sequence completes as a clean False (establish_network retries)."""
+    wifi = _wifi_wlan(monkeypatch, connect_error=OSError("association refused"))
+    assert wifi.connect() is False
+
+
+def test_wifi_connect_memory_error_escapes(monkeypatch):
+    """A MemoryError is not retried: it reaches the recovery boundary."""
+    wifi = _wifi_wlan(monkeypatch, connect_error=MemoryError())
+    with pytest.raises(MemoryError):
+        wifi.connect()
+
+
+def test_wifi_connect_programming_failure_escapes(monkeypatch):
+    """A deterministic driver/programming failure must escape, not be
+    swallowed and retried into the same fault forever."""
+    wifi = _wifi_wlan(monkeypatch, connect_error=AttributeError("wlan.api.rename"))
+    with pytest.raises(AttributeError):
+        wifi.connect()
+
+
+def test_wifi_pm_none_probe_failure_is_a_compatibility_fallback(monkeypatch):
+    """Whatever type the optional PM_NONE probe raises, the attempt
+    continues and a workable radio still connects (the one broad catch)."""
+    wifi = _wifi_wlan(monkeypatch, config_error=RuntimeError("PM unsupported"))
+    assert wifi.connect() is True
+
+
+def test_wifi_is_connected_observation_taxonomy(monkeypatch):
+    """A transient driver state error (OSError) reads as 'not connected',
+    but a programming failure escapes instead of masking itself as False."""
+    wifi = _wifi_wlan(monkeypatch, isconnected_error=OSError("link down"))
+    assert wifi.is_connected() is False
+
+    wifi = _wifi_wlan(monkeypatch, isconnected_error=TypeError("bad isconnected"))
+    with pytest.raises(TypeError):
+        wifi.is_connected()
+
+
+def test_wifi_current_status_observation_taxonomy(monkeypatch):
+    """An OSError from status() reads as 'unknown' (timeout governs); a
+    programming failure escapes instead of being masked as None."""
+    wifi = _wifi_wlan(monkeypatch, status_error=OSError("status unavailable"))
+    assert wifi._current_status() is None
+
+    wifi = _wifi_wlan(monkeypatch, status_error=AttributeError("no status"))
+    with pytest.raises(AttributeError):
+        wifi._current_status()
+
+
+def test_wifi_snapshot_ifconfig_taxonomy(monkeypatch):
+    """On a connected radio: an OSError from ifconfig leaves the snapshot
+    fields unset; a programming failure escapes instead of being swallowed."""
+    wifi = _wifi_wlan(monkeypatch, associated=True, ifconfig_error=OSError("ifconfig refused"))
+    snapshot = wifi.snapshot(False)
+    assert snapshot["wifi_connected"] is True
+    assert snapshot["ip_address"] is None
+    assert snapshot["rssi"] is not None
+
+    wifi = _wifi_wlan(monkeypatch, associated=True, ifconfig_error=TypeError("bad ifconfig"))
+    with pytest.raises(TypeError):
+        wifi.snapshot(False)

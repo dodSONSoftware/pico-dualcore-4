@@ -280,7 +280,11 @@ def _queue_telemetry(instance, value):
 
 def _utc_synchronized(instance):
     """Mark UTC as already acquired so the run loop stays on the outbound path."""
-    instance._utc_snapshot = {"ticks_ms": 0, "utc_epoch_ms": 1767225600000}
+    instance._utc_snapshot = {
+        "utc_epoch_ms": 1767225600000,
+        "sync_uptime_ms": 0,
+        "runtime_start_epoch_ms": 1767225600000,
+    }
 
 
 def _run_to(instance, stop_ms):
