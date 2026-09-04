@@ -309,6 +309,74 @@ def test_publish_qos1_waits_for_matching_puback_and_restores_timeout():
     assert sock.timeout_value is None
 
 
+def test_publish_spliced_writes_segments_byte_identical_to_a_join():
+    """The spliced frame goes out as segment writes, byte-identical to a
+    single pre-joined buffer.
+
+    The remaining-length field covers the spliced body (body minus its
+    closing brace + comma + fragment + brace), and no single write is sized
+    to the whole spliced frame: after the startup imports the Pico W heap is
+    fragmented, and the old pre-joined write needed the full frame
+    contiguously -- the largest-free-block wall behind the deterministic
+    ~15.5 s boot-reset loop."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    # Body + fragment stay small enough for a one-byte remaining length.
+    body = b'{"message_type":"log","payload":{"x":1}}'
+    fragment = b'"sequence":1,"source":"s"'
+    sock = MockSocket(incoming=b"\x40\x02\x00\x01")  # PUBACK for pid 1
+    client.sock = sock
+
+    write_sizes = []
+    original_write = sock.write
+
+    def recording_write(data, size=None):
+        write_sizes.append(len(bytes(data[:size])) if size is not None else len(bytes(data)))
+        return original_write(data, size)
+
+    sock.write = recording_write
+
+    client.publish(b"t", body, qos=1, timeout_ms=4000, splice_fragment=fragment)
+
+    # Header (remaining covers 2-byte topic length + topic + spliced body +
+    # 2-byte packet id), topic, packet id 1, then body[:-1] + "," + fragment
+    # + "}" -- exactly the pre-joined frame.
+    remaining = 2 + 1 + (len(body) + len(fragment) + 1) + 2
+    expected = (
+        b"\x32" + bytes([remaining]) + b"\x00\x01t\x00\x01"
+        + body[:-1] + b"," + fragment + b"}"
+    )
+    assert bytes(sock.written) == expected
+    assert sock.timeout_value is None
+    # The frame was never allocated/written as one buffer: no single write
+    # is the whole spliced body.
+    assert all(size != len(body) + len(fragment) + 1 for size in write_sizes)
+    # And the body itself went out zero-copy-eligible as a view write
+    # (largest single write is the body without its closing brace).
+    assert max(write_sizes) == len(body) - 1
+
+
+def test_publish_without_splice_fragment_is_unchanged():
+    """The default path (no splice) still writes the message as one buffer."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"\x40\x02\x00\x01")  # PUBACK for pid 1
+    client.sock = sock
+
+    write_sizes = []
+    original_write = sock.write
+
+    def recording_write(data, size=None):
+        write_sizes.append(len(bytes(data[:size])) if size is not None else len(bytes(data)))
+        return original_write(data, size)
+
+    sock.write = recording_write
+
+    client.publish(b"t", b'{"a":1}', qos=1, timeout_ms=4000)
+
+    # remaining = 2 (topic-length field) + 1 (topic) + 7 (payload) + 2 (pid)
+    assert bytes(sock.written) == b"\x32\x0c\x00\x01t\x00\x01" + b'{"a":1}'
+    assert max(write_sizes) == len(b'{"a":1}')
+
+
 def test_publish_qos1_times_out_when_puback_never_arrives():
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket(incoming=b"")

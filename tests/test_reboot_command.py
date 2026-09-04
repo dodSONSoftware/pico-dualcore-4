@@ -50,7 +50,11 @@ class RecordingMqtt:
     def is_connected(self):
         return True
 
-    def publish_qos1(self, topic, message):
+    def publish_qos1(self, topic, message, splice_fragment=None):
+        if splice_fragment is not None:
+            # Mirror the client's segmented spliced write: the wire bytes
+            # are the body minus its closing brace, comma, fragment, brace.
+            message = message[:-1] + b"," + splice_fragment + b"}"
         self.events.append("publish")
         self.published.append((topic, message))
 

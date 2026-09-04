@@ -180,12 +180,16 @@ class FakeMqtt:
     def status(self):
         return {"connected": self.connected, "connect_count": 1, "disconnect_count": 0}
 
-    def publish_qos1(self, topic, message):
+    def publish_qos1(self, topic, message, splice_fragment=None):
         if self.fail_publishes:
             self.fail_publishes -= 1
             # A lost PUBACK is a socket timeout in the real client: a
             # transport failure (OSError), not a programming error.
             raise OSError("PUBACK timeout (simulated)")
+        if splice_fragment is not None:
+            # Mirror the client's segmented spliced write: the wire bytes
+            # are the body minus its closing brace, comma, fragment, brace.
+            message = message[:-1] + b"," + splice_fragment + b"}"
         self.published.append((topic, message, _FAKE_TIME.ticks_ms()))
         doc = json.loads(message)
         if doc.get("message_type") == "info_request":
@@ -624,11 +628,11 @@ def test_startup_drain_gives_each_log_its_own_window(make_core0):
     original_publish = instance._mqtt.publish_qos1
     calls = {"n": 0}
 
-    def slow_first_publish(topic, message):
+    def slow_first_publish(topic, message, splice_fragment=None):
         calls["n"] += 1
         if calls["n"] == 1:
             _FAKE_TIME.sleep_ms(3000)
-        original_publish(topic, message)
+        original_publish(topic, message, splice_fragment=splice_fragment)
 
     instance._mqtt.publish_qos1 = slow_first_publish
 
@@ -642,6 +646,77 @@ def test_startup_drain_gives_each_log_its_own_window(make_core0):
     # ...and the second log still got its own window: published after the
     # pacing slot (100 ms) following the first log's completion.
     assert times[1] >= 3100
+
+
+def test_startup_drain_dead_link_fails_the_pass_bounded(make_core0):
+    """A head log whose publish keeps failing must fail the pass, bounded.
+
+    The link is dead before the drain starts, so every attempt fails fast
+    with "MQTT is not connected". The old per-iteration deadline was re-armed
+    every ~100 ms and could never expire: the drain retried the same head
+    forever (a boot wedged inside start() for minutes, observed on hardware).
+    The head's window is now fixed for its lifetime, so the drain returns
+    False after the 2 s window and the contract re-establishes and retries."""
+    instance = make_core0(delay_ms=100)
+    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
+    instance._mqtt.connected = False
+
+    attempts = {"n": 0}
+
+    def dead_link_publish(topic, message, splice_fragment=None):
+        attempts["n"] += 1
+        # The pacing slice each retry waits in the real run.
+        _FAKE_TIME.sleep_ms(100)
+        raise OSError("MQTT is not connected")
+
+    instance._mqtt.publish_qos1 = dead_link_publish
+
+    assert instance._drain_startup_mqtt_work() is False
+
+    # Bounded by the head log's 2 s window (plus pacing slack)...
+    assert _FAKE_TIME.ticks_ms() <= 2200
+    assert attempts["n"] <= 21
+    # ...and the log is still pending for the re-established link.
+    assert len(instance._pending_connection_logs) == 1
+
+
+def test_startup_drain_etimedout_attempt_fails_the_pass_bounded(make_core0):
+    """A first attempt that burns the QoS 1 timeout on a blackholed link
+    also fails the pass once it returns, instead of re-arming a fresh window.
+
+    Models the observed hardware wedge: one 5 s ETIMEDOUT publish, the
+    session then down, every further attempt failing fast. The head's 2 s
+    window is checked after the slow attempt returns, so the drain exits
+    instead of entering the fast-fail retry storm with a fresh deadline
+    every ~100 ms."""
+    instance = make_core0(delay_ms=100)
+    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
+
+    original_publish = instance._mqtt.publish_qos1
+    attempts = {"n": 0}
+
+    def dead_link_publish(topic, message, splice_fragment=None):
+        attempts["n"] += 1
+        if not instance._mqtt.connected:
+            # Session down: the real client refuses fast.
+            _FAKE_TIME.sleep_ms(100)
+            raise OSError("MQTT is not connected")
+        # First attempt: the PUBLISH goes out on a blackholed link and the
+        # bounded wait loses the PUBACK (5 s), dropping the session.
+        _FAKE_TIME.sleep_ms(5000)
+        instance._mqtt.connected = False
+        original_publish(topic, message, splice_fragment=splice_fragment)
+
+    instance._mqtt.publish_qos1 = dead_link_publish
+    instance._mqtt.fail_publishes = 1  # only the first attempt loses its PUBACK
+
+    assert instance._drain_startup_mqtt_work() is False
+
+    # The slow attempt returned past the window's deadline; the fast-fail
+    # storm never starts (at most one pacing slice after the slow attempt).
+    assert _FAKE_TIME.ticks_ms() <= 5200
+    assert attempts["n"] <= 2
+    assert len(instance._pending_connection_logs) == 1
 
 
 def test_startup_utc_request_respects_preceding_publish(make_core0):

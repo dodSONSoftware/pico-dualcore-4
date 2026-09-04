@@ -188,8 +188,14 @@ class MQTTClient:
                 # into Core 0's recovery instead of marking the exchange done.
                 self.sock.settimeout(None)
 
-    def publish(self, topic, msg, retain=False, qos=0, packet_id=None, timeout_ms=None):
-        """Publish an application message; optional packet_id (else auto-increment) and timeout_ms bound the QoS 1 exchange."""
+    def publish(self, topic, msg, retain=False, qos=0, packet_id=None, timeout_ms=None, splice_fragment=None):
+        """Publish an application message; optional packet_id (else auto-increment) and timeout_ms bound the QoS 1 exchange.
+
+        With ``splice_fragment``, the frame's final bytes are written
+        segment by segment: ``msg`` without its closing brace, then a comma,
+        the fragment, then the brace. The wire bytes are identical to a
+        single pre-joined buffer, but no allocation is ever sized to the
+        whole spliced frame (see the write below)."""
         if qos == 2:
             # Reject before a single frame byte goes out (an assert here would
             # vanish under MicroPython bytecode optimization and the frame
@@ -198,6 +204,10 @@ class MQTTClient:
         pkt = bytearray(b"\x30\0\0\0")
         pkt[0] |= qos << 1 | retain
         sz = 2 + len(topic) + len(msg)
+        if splice_fragment is not None:
+            # The splice (comma + fragment + brace) replaces msg's closing
+            # brace: the spliced frame body is len(msg) + len(fragment) + 1.
+            sz += len(splice_fragment) + 1
         if qos > 0:
             sz += 2
         if sz > 2097151:
@@ -230,7 +240,24 @@ class MQTTClient:
                 # bytes already written (wire order: header, topic, packet id).
                 struct.pack_into("!H", pkt, 0, pid)
                 self.sock.write(pkt, 2)
-            self.sock.write(msg)
+            if splice_fragment is None:
+                self.sock.write(msg)
+            else:
+                # Segment the spliced tail: a zero-copy view of msg minus its
+                # closing brace, then the splice itself. TCP is a byte
+                # stream, so the broker receives exactly the pre-joined
+                # frame -- but no single allocation is sized to the whole
+                # frame. The old pre-joined write needed the full frame
+                # contiguously, and after the startup imports the heap is
+                # fragmented: the largest free block can be smaller than the
+                # frame even with tens of KiB total free, so the first
+                # post-startup publish (the startup log) hit a deterministic
+                # MemoryError and reset loop.
+                view = memoryview(msg)
+                self.sock.write(view[: len(msg) - 1])
+                self.sock.write(b",")
+                self.sock.write(splice_fragment)
+                self.sock.write(b"}")
             if qos == 1:
                 while 1:
                     op = self.wait_msg()

@@ -178,14 +178,22 @@ class Mqtt:
             self.mark_disconnected()
             raise
 
-    def publish_qos1(self, topic, message):
+    def publish_qos1(self, topic, message, splice_fragment=None):
         """Publish one application message and wait for its PUBACK (bounded by
-        mqtt_broker_response_timeout_sec, so a blackholed link fails fast)."""
+        mqtt_broker_response_timeout_sec, so a blackholed link fails fast).
+
+        With ``splice_fragment``, the frame's tail is spliced at the wire
+        (segment writes, no frame-sized allocation): see
+        ``MQTTClient.publish``."""
         if not self.is_connected():
             raise OSError("MQTT is not connected")
         try:
             self._client.publish(
-                topic, message, qos=1, timeout_ms=self._ack_timeout_ms
+                topic,
+                message,
+                qos=1,
+                timeout_ms=self._ack_timeout_ms,
+                splice_fragment=splice_fragment,
             )
         except MemoryError:
             raise

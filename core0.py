@@ -887,14 +887,14 @@ class Core0:
         payload = entry["payload_bytes"]
         if not isinstance(payload, (bytes, bytearray)) or bytes(payload[-1:]) != b"}":
             raise ValueError("queued payload must be a serialized JSON object")
-        # Normalize bytearray to bytes: MicroPython's bytes.join is strict
-        # about item types.
+        # Normalize bytearray to bytes: the wire view must be a stable
+        # buffer held for the whole QoS 1 exchange.
         body = payload if isinstance(payload, bytes) else bytes(payload)
         sequence = self._claim_wire_sequence(entry)
         fragment = self._envelope_fragment(sequence)
         # The spliced envelope is added on top of the admitted body: enforce
-        # the ceiling against the FINAL wire length, before the frame is
-        # allocated. Permanent for this entry (its bytes are fixed) -- callers
+        # the ceiling against the FINAL wire length, before the frame goes
+        # out. Permanent for this entry (its bytes are fixed) -- callers
         # answer a command response with the bounded substitute and discard
         # the other kinds.
         wire_length = len(body) + len(fragment) + 1
@@ -904,11 +904,17 @@ class Core0:
                     wire_length, MAX_OUTBOUND_MESSAGE_BYTES
                 )
             )
-        encoded = b"".join((body[:-1], b",", fragment, b"}"))
         topic = entry.get("topic")
         if topic is None:
             topic = self._topic_for_kind(entry["kind"])
-        self._mqtt.publish_qos1(topic, encoded)
+        # The splice happens at the wire as segment writes (zero-copy view of
+        # the body + the small fragment): the frame is never allocated as
+        # one contiguous buffer. After the startup imports the heap is
+        # fragmented, and a frame-sized allocation there hit the
+        # largest-free-block wall even with tens of KiB total free -- a
+        # deterministic MemoryError reset loop at the first post-startup
+        # publish (the startup log).
+        self._mqtt.publish_qos1(topic, body, splice_fragment=fragment)
         # PUBACK received: the publish is complete, so the pacing interval
         # begins (a failed publish raises before this line and records nothing).
         self._note_mqtt_publish_completed()
@@ -1263,22 +1269,37 @@ class Core0:
     def _drain_startup_mqtt_work(self):
         """Drain pending Core 0 MQTT work; True when none remains, False on timeout.
 
-        Each log gets its own grace window starting when the previous one
-        completed, so a slow-but-legal QoS 1 cycle (up to
-        mqtt_broker_response_timeout_sec) cannot consume the logs behind it."""
-        grace_ms = 2000  # per-log grace before that log may begin its publish
+        Each head log gets its own grace window: it starts when the head
+        changes and is NOT re-armed by failed attempts, so a dead or
+        blackholed link (whose publish fails and leaves the same head
+        pending) fails the pass -- which re-establishes the network and
+        retries the contract -- instead of retrying the same head forever
+        with a fresh window every ~100 ms. A slow-but-legal QoS 1 cycle on
+        one log (up to mqtt_broker_response_timeout_sec) completes it and
+        the next log starts its own fresh window, so it cannot consume the
+        logs behind it."""
+        grace_ms = 2000  # per-head-log grace before the pass times out
 
         while self._pending_connection_logs:
             deadline_ms = time.ticks_add(time.ticks_ms(), grace_ms)
-            self._wait_for_mqtt_publish_slot()
-            if time.ticks_diff(time.ticks_ms(), deadline_ms) >= 0:
-                print("[WARNING] Startup MQTT work drain timeout")
-                return False
-            # No wrapper of its own: _service_pending_connection_log()
-            # already owns MemoryError, the size rejection, and transport
-            # failures; a programming failure must escape to the top-level
-            # recovery boundary.
-            self._service_pending_connection_log()
+            while self._pending_connection_logs:
+                head = self._pending_connection_logs[0]
+                self._wait_for_mqtt_publish_slot()
+                if time.ticks_diff(time.ticks_ms(), deadline_ms) >= 0:
+                    print("[WARNING] Startup MQTT work drain timeout")
+                    return False
+                # No wrapper of its own: _service_pending_connection_log()
+                # already owns MemoryError, the size rejection, and transport
+                # failures; a programming failure must escape to the top-level
+                # recovery boundary.
+                self._service_pending_connection_log()
+                if (
+                    self._pending_connection_logs
+                    and self._pending_connection_logs[0] is not head
+                ):
+                    # The head log completed (published or discarded): the
+                    # next head starts its own fresh window.
+                    break
 
         return True
 

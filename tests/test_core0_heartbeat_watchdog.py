@@ -178,7 +178,7 @@ class FakeMqtt:
     def status(self):
         return {"connected": self.connected, "connect_count": 1, "disconnect_count": 0}
 
-    def publish_qos1(self, topic, message):
+    def publish_qos1(self, topic, message, splice_fragment=None):
         pass
 
     def check_msg(self):

@@ -161,7 +161,11 @@ class FakeMqtt:
     def get_next_packet_id(self):
         return 1
 
-    def publish_qos1(self, topic, message):
+    def publish_qos1(self, topic, message, splice_fragment=None):
+        if splice_fragment is not None:
+            # Mirror the client's segmented spliced write: the wire bytes
+            # are the body minus its closing brace, comma, fragment, brace.
+            message = message[:-1] + b"," + splice_fragment + b"}"
         outcome = self.publish_script.pop(0) if self.publish_script else "ok"
         # The frame is transmitted either way: even a "fail" means the PUBLISH
         # reached the broker; the failure is only that the PUBACK never came.

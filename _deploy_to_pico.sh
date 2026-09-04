@@ -57,8 +57,8 @@ Options:
   -h, --help            Show this help.
 
 The script:
-  1. Requires a clean Git working tree.
-  2. Builds and verifies a release artifact with release.py.
+  1. Records the current Git commit and warns about uncommitted changes.
+  2. Builds and verifies a release artifact from the current working tree with release.py.
   3. Erases the selected Pico's flash while it is in BOOTSEL mode.
   4. Flashes and verifies the selected MicroPython UF2 image.
   5. Provisions config.json and config-secrets.json.
@@ -93,7 +93,7 @@ configure_target() {
             TARGET_NAME="Raspberry Pi Pico W"
             UF2_FILE="$PICO_W_FIRMWARE_FILE"
             FLASH_ERASE_END="0x10200000"
-                        ;;
+            ;;
         2)
             TARGET="2"
             TARGET_NAME="Raspberry Pi Pico 2 W"
@@ -242,15 +242,19 @@ GIT_ROOT="$(cd "$GIT_ROOT" && pwd -P)"
 [[ "$GIT_ROOT" == "$REPO_DIR" ]] \
     || fail "Expected repository root $REPO_DIR, but Git reports $GIT_ROOT"
 
-GIT_STATUS="$(git -C "$REPO_DIR" status --porcelain --untracked-files=normal)"
-if [[ -n "$GIT_STATUS" ]]; then
-    printf '%s\n' "$GIT_STATUS" >&2
-    fail "Git working tree is not clean. Commit/stash source changes before releasing."
+GIT_STATUS_BEFORE="$(git -C "$REPO_DIR" status --porcelain --untracked-files=normal)"
+COMMIT_HASH="$(git -C "$REPO_DIR" rev-parse HEAD)"
+
+log "Target: $TARGET_NAME"
+
+if [[ -n "$GIT_STATUS_BEFORE" ]]; then
+    log "Source commit: $COMMIT_HASH (with uncommitted local changes)"
+    printf '\n[WARNING] Deploying from a dirty Git working tree:\n' >&2
+    printf '%s\n' "$GIT_STATUS_BEFORE" >&2
+else
+    log "Source commit: $COMMIT_HASH"
 fi
 
-COMMIT_HASH="$(git -C "$REPO_DIR" rev-parse HEAD)"
-log "Target: $TARGET_NAME"
-log "Source commit: $COMMIT_HASH"
 log "Provisioning mode: config.json and config-secrets.json WILL be overwritten on the Pico."
 
 mkdir -p -- "$RELEASE_DIR"
@@ -272,6 +276,7 @@ MANIFEST="$(sed -n 's/^[[:space:]]*Manifest:[[:space:]]*//p' "$RELEASE_LOG" | ta
 if [[ "$ARTIFACT" != /* ]]; then
     ARTIFACT="$REPO_DIR/$ARTIFACT"
 fi
+
 ARTIFACT="$(realpath "$ARTIFACT")"
 [[ -f "$ARTIFACT" ]] || fail "Release artifact not found: $ARTIFACT"
 
@@ -280,9 +285,25 @@ if [[ -n "$MANIFEST" && "$MANIFEST" != /* ]]; then
 fi
 
 POST_RELEASE_STATUS="$(git -C "$REPO_DIR" status --porcelain --untracked-files=normal)"
-if [[ -n "$POST_RELEASE_STATUS" ]]; then
-    printf '%s\n' "$POST_RELEASE_STATUS" >&2
-    fail "release.py left the source repository dirty; refusing deployment"
+
+if [[ "$POST_RELEASE_STATUS" != "$GIT_STATUS_BEFORE" ]]; then
+    printf '\nGit working tree changed while release.py was running.\n' >&2
+
+    printf '\nBefore release.py:\n' >&2
+    if [[ -n "$GIT_STATUS_BEFORE" ]]; then
+        printf '%s\n' "$GIT_STATUS_BEFORE" >&2
+    else
+        printf '(clean)\n' >&2
+    fi
+
+    printf '\nAfter release.py:\n' >&2
+    if [[ -n "$POST_RELEASE_STATUS" ]]; then
+        printf '%s\n' "$POST_RELEASE_STATUS" >&2
+    else
+        printf '(clean)\n' >&2
+    fi
+
+    fail "release.py modified the source working tree; refusing deployment"
 fi
 
 CURRENT_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)"
@@ -316,16 +337,21 @@ mapfile -t PACKAGE_DIR_FILES < <(release_query package-files)
 
 ((${#ROOT_FILES[@]} > 0)) \
     || fail "Could not determine root application files from release.py"
+
 ((${#PACKAGE_DIR_FILES[@]} > 0)) \
     || fail "Could not determine package files from release.py"
 
 ROOT_FILE_PATHS=()
 MAIN_SELECTED=false
+
 for filename in "${ROOT_FILES[@]}"; do
     staged="$STAGING_DIR/$filename"
+
     [[ -f "$staged" ]] \
         || fail "Required application file missing from release artifact: $filename"
+
     ROOT_FILE_PATHS+=("$staged")
+
     [[ "$filename" == "main.py" ]] && MAIN_SELECTED=true
 done
 
@@ -334,8 +360,10 @@ $MAIN_SELECTED || fail "release.py did not select main.py for deployment"
 # Track only the first path component for package deployment. This avoids
 # recursively copying the same package through both a parent and subpackage.
 declare -A PACKAGE_ROOTS
+
 for filename in "${PACKAGE_DIR_FILES[@]}"; do
     staged="$STAGING_DIR/$filename"
+
     if [[ -f "$staged" ]]; then
         package_root="${filename%%/*}"
         PACKAGE_ROOTS["$package_root"]=1
@@ -345,12 +373,19 @@ for filename in "${PACKAGE_DIR_FILES[@]}"; do
 done
 
 # Provision local configuration rather than the release artifact's config.json.
-ROOT_FILE_PATHS+=("$REPO_DIR/config.json" "$REPO_DIR/config-secrets.json")
-((${#ROOT_FILE_PATHS[@]} > 0)) || fail "No root-level files selected for deployment"
+ROOT_FILE_PATHS+=(
+    "$REPO_DIR/config.json"
+    "$REPO_DIR/config-secrets.json"
+)
+
+((${#ROOT_FILE_PATHS[@]} > 0)) \
+    || fail "No root-level files selected for deployment"
 
 PACKAGE_ROOT_PATHS=()
+
 for dir in "${!PACKAGE_ROOTS[@]}"; do
     staged_dir="$STAGING_DIR/$dir"
+
     if [[ -d "$staged_dir" ]]; then
         PACKAGE_ROOT_PATHS+=("$staged_dir")
     fi
@@ -389,11 +424,13 @@ wait_for_micropython 15
 # -----------------------------------------------------------------------------
 
 for dir in "${PACKAGE_ROOT_PATHS[@]}"; do
-    [[ -d "$dir" ]] || fail "Package root missing from release artifact: ${dir#$STAGING_DIR/}"
+    [[ -d "$dir" ]] \
+        || fail "Package root missing from release artifact: ${dir#$STAGING_DIR/}"
 done
 
 log "Deploying ${#ROOT_FILE_PATHS[@]} root files and ${#PACKAGE_ROOT_PATHS[@]} package roots with mpremote to '$DEVICE'"
 log "Use Ctrl-C to stop device output."
+
 printf '\n================================================================\n\n'
 
 mpremote connect "$DEVICE" \

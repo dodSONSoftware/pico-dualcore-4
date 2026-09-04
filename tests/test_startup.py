@@ -93,7 +93,7 @@ class MockMqtt:
     def check_msg(self):
         pass
 
-    def publish_qos1(self, topic, message):
+    def publish_qos1(self, topic, message, splice_fragment=None):
         pass
 
     def publish_qos1_with_packet_id(self, topic, message, packet_id, timeout_ms=None):

@@ -77,6 +77,18 @@ def test_invalid_response_is_replaced_with_response_invalid(make_core0):
     assert head["command"] == "read-config"
 
 
+def _wire_of_publish_call(call):
+    """Rebuild the wire bytes from a publish_qos1 call: Core 0 passes the
+    body and the envelope fragment separately (the client splices them as
+    segment writes), so the wire frame is body minus its closing brace,
+    comma, fragment, brace."""
+    body = call[0][1]
+    fragment = call[1].get("splice_fragment")
+    if fragment is None:
+        return json.loads(body)
+    return json.loads(body[:-1] + b"," + fragment + b"}")
+
+
 def test_substitute_publishes_and_the_channel_moves_on(make_core0):
     """A permanently invalid response cannot block the responses behind it:
     the substitute takes the failed response's slot, publishes on the next
@@ -97,7 +109,7 @@ def test_substitute_publishes_and_the_channel_moves_on(make_core0):
 
     # Pass 2: the substitute publishes; the original oversized bytes never go on the wire.
     core0._service_pending_core0_response()
-    frame = json.loads(core0._mqtt.publish_qos1.call_args_list[0][0][1])
+    frame = _wire_of_publish_call(core0._mqtt.publish_qos1.call_args_list[0])
     payload = frame["payload"]
     assert payload["success"] is False
     assert payload["error"]["code"] == "response_too_large"
@@ -108,7 +120,7 @@ def test_substitute_publishes_and_the_channel_moves_on(make_core0):
     # Pass 3: the response that was waiting behind it gets its turn.
     core0._service_pending_core0_response()
     assert core0._pending_core0_responses == []
-    frame2 = json.loads(core0._mqtt.publish_qos1.call_args_list[1][0][1])
+    frame2 = _wire_of_publish_call(core0._mqtt.publish_qos1.call_args_list[1])
     assert frame2["payload"]["success"] is True
     assert frame2["payload"]["command_id"] == "cfg-read-2"
 
