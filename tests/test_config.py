@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from command_protocol import MAX_SOURCE_LENGTH
+from command_protocol import MAX_COMMAND_ID_LENGTH, MAX_SOURCE_LENGTH
 from config import (
     MAX_DEVICE_INITIALIZATION_ATTEMPTS,
     MAX_DEVICES,
@@ -29,6 +29,7 @@ from config import (
 )
 from device_factory import MAX_DEVICE_ID_LENGTH, MAX_DEVICE_NAME_LENGTH, MAX_SENSOR_TYPE_LENGTH
 from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES, serialize_and_validate_message
+from mqtt_client import MAX_INBOUND_PACKET_BYTES
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 
 
@@ -325,10 +326,13 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
     every string field at its byte bound in the worst serialized form, every
     list at its entry bound, every device at every bound — still serializes
     its read-config response (including the Core 0 envelope splice) at or
-    under MAX_OUTBOUND_MESSAGE_BYTES. A valid configuration must be one the
-    firmware can send back; this pins that for every currently supported
-    device type, so a future field or driver string that breaks it fails
-    here instead of wedging read-config on a device."""
+    under MAX_OUTBOUND_MESSAGE_BYTES, and the worst serialized write-config
+    command carrying it (character-bounded command_id/target envelope) under
+    MAX_INBOUND_PACKET_BYTES. A valid configuration must be one the firmware
+    can send back AND receive back; this pins that for every currently
+    supported device type, so a future field or driver string that breaks it
+    fails here instead of wedging read-config on a device or dropping a
+    spec-valid write-config at the wire gate."""
     # 16 x 4-byte code points: 64 UTF-8 bytes, the inclusive field maximum,
     # and the worst serialized form (each code point escapes to 12 bytes).
     field_max = "\U0001F600" * (MAX_SOURCE_LENGTH // 4)
@@ -386,6 +390,30 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
     })[1:-1].encode("utf-8")
     spliced = len(body) - 1 + 1 + len(fragment) + 1  # body minus "}" + "," + fragment + "}"
     assert spliced <= MAX_OUTBOUND_MESSAGE_BYTES
+
+    # Inbound half of the invariant: the largest spec-valid inbound frame is
+    # a write-config command carrying this configuration, and its envelope
+    # bounds are CHARACTER-based (command_protocol: a 128-character
+    # command_id), so the worst serialized command must still pass
+    # mqtt_client's wire gate — a gate set below it (16,384 once was)
+    # disconnects on a command that validation would have accepted.
+    command = {
+        "message_type": "command",
+        "message_schema_version": MESSAGE_SCHEMA_VERSION,
+        # An executable target matches the 253-byte broker address.
+        "target": config["mqtt_broker_ip_address"],
+        # 128 4-byte code points: at the character bound, worst serialized form.
+        "command_id": "\U0001F600" * MAX_COMMAND_ID_LENGTH,
+        "command": "write-config",
+        "payload": {"config": config},
+    }
+    # The inbound frame is serialized by the PEER, not this firmware, so it
+    # is measured in the conservative wire form (ASCII-escaped, the larger of
+    # the two legal serializations) and deliberately NOT run through
+    # serialize_and_validate_message: a valid write-config command can
+    # legitimately exceed the 16 KiB OUTBOUND ceiling, which rejects it.
+    command_body = json.dumps(command).encode("utf-8")
+    assert len(command_body) <= MAX_INBOUND_PACKET_BYTES
 
 
 def test_validate_config_keepalive_is_bounded_by_the_wire_limit():

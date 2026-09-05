@@ -745,7 +745,7 @@ def test_wait_msg_rejects_oversized_inbound_packet():
     seen = []
     client.set_callback(lambda topic, msg: seen.append((topic, msg)))
 
-    # Remaining length 32768 (> the 16 KiB limit); the bytes that "would be"
+    # Remaining length 32768 (> the 20 KiB limit); the bytes that "would be"
     # the frame follow and must never be consumed, buffered, or delivered.
     sock = MockSocket(incoming=b"\x30\x80\x80\x02" + b"\x00\x01t" + b"x" * 32760)
     client.sock = sock
@@ -759,6 +759,19 @@ def test_wait_msg_rejects_oversized_inbound_packet():
     assert sock.closed
 
 
+def _remaining_length_varint(n):
+    """Encode n as an MQTT remaining-length varint (host-side test helper)."""
+    out = bytearray()
+    while True:
+        byte = n % 128
+        n //= 128
+        if n:
+            byte |= 0x80
+        out.append(byte)
+        if not n:
+            return bytes(out)
+
+
 def test_wait_msg_accepts_packet_at_inbound_limit():
     """A packet whose remaining length equals the limit is still delivered."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
@@ -766,9 +779,9 @@ def test_wait_msg_accepts_packet_at_inbound_limit():
     client.set_callback(lambda topic, msg: seen.append((topic, msg)))
 
     # Remaining length == limit: topic "t" takes 2 + 1 bytes, leaving
-    # limit - 3 payload bytes. 16384 encodes as the 4-byte varint \x80\x80\x01.
+    # limit - 3 payload bytes.
     payload = b"x" * (MAX_INBOUND_PACKET_BYTES - 3)
-    sock = MockSocket(incoming=b"\x30\x80\x80\x01\x00\x01t" + payload)
+    sock = MockSocket(incoming=b"\x30" + _remaining_length_varint(MAX_INBOUND_PACKET_BYTES) + b"\x00\x01t" + payload)
     client.sock = sock
 
     client.wait_msg()

@@ -7,11 +7,22 @@ import socket
 import struct
 from binascii import hexlify
 
-# Maximum remaining length (bytes) for an inbound MQTT packet. The inbound
-# topics (command, info-response) are always well under this; an oversized
-# frame must fail the connection instead of letting sock.read(sz) request an
-# allocation that could exhaust Pico RAM (256 KiB) — no hostile traffic needed.
-MAX_INBOUND_PACKET_BYTES = 16 * 1024
+# Maximum remaining length (bytes) for an inbound MQTT packet. Derived from
+# the protocol, not arbitrary: the largest spec-valid inbound frame is a
+# write-config command carrying the worst-case valid configuration (every
+# byte-bounded identity at 4-byte code points, which serialize 3x escaped,
+# 128-CHARACTER command_id/target bounds, 253-byte broker address, all 16
+# devices, all lists at their bounds) — 16,865 bytes in the conservative wire
+# form (ASCII-escaped, default separators), pinned by the serialized-size
+# invariant test in tests/test_config.py.
+# 20 KiB keeps every valid command deliverable (16,384 dropped the worst-case
+# command at the wire layer) while bounding what json.loads() can amplify:
+# the parse peak (decoded string plus object graph) is a bounded multiple of
+# this ceiling, and a MemoryError past it escapes to main.py's controlled-reset
+# boundary rather than exhausting the heap silently. An oversized frame must
+# fail the connection instead of letting sock.read(sz) request an allocation
+# that could exhaust Pico RAM (256 KiB) — no hostile traffic needed.
+MAX_INBOUND_PACKET_BYTES = 20 * 1024
 
 
 class MQTTException(Exception):

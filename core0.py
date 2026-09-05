@@ -227,6 +227,12 @@ class Core0:
                 print("[DEBUG] Ignoring invalid MQTT payload: {}".format(err))
             return
 
+        # Release the decoded frame now that the parse succeeded: otherwise
+        # the string (up to the inbound ceiling) stays alive across the whole
+        # command handler alongside the parsed graph, adding a full frame of
+        # heap to every response allocation the handler makes.
+        del payload
+
         if not isinstance(doc, dict):
             if DEBUG:
                 print("[DEBUG] Ignoring MQTT payload that is not an object")
