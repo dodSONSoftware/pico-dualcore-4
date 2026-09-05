@@ -115,15 +115,23 @@ def test_pure_validator_dispatches_to_the_device_validator():
 
 
 def test_pure_validator_binds_the_id_length():
-    """The bound is inclusive: 64 accepts, 65 rejects with the stable code."""
+    """The bound is inclusive and measured in UTF-8 bytes (the ceiling is a
+    wire bound): 64 bytes accepts, 65 bytes rejects with the stable code —
+    and a 64-character id of 4-byte code points is 256 bytes and rejects."""
     validate_device_definition(_definition(id="i" * MAX_DEVICE_ID_LENGTH))
+
+    # The worst serialized form: 4-byte code points at exactly 64 UTF-8 bytes.
+    validate_device_definition(_definition(id="\U0001F600" * (MAX_DEVICE_ID_LENGTH // 4)))
 
     with pytest.raises(DeviceValidationError) as excinfo:
         validate_device_definition(_definition(id="i" * (MAX_DEVICE_ID_LENGTH + 1)))
     assert excinfo.value.code == "invalid_value"
-    assert str(excinfo.value) == "device id must be at most {} characters".format(
+    assert str(excinfo.value) == "device id must be at most {} bytes".format(
         MAX_DEVICE_ID_LENGTH
     )
+
+    with pytest.raises(DeviceValidationError, match="device id must be at most"):
+        validate_device_definition(_definition(id="\U0001F600" * MAX_DEVICE_ID_LENGTH))
 
 
 @pytest.mark.parametrize(
@@ -135,7 +143,8 @@ def test_pure_validator_binds_the_id_length():
 )
 def test_pure_validator_binds_the_optional_field_lengths(key, max_length):
     """Optional fields keep their absent/null contract: present values are
-    bounded, missing or null ones stay valid."""
+    byte-bounded (the ceiling is a wire bound), missing or null ones stay
+    valid."""
     validate_device_definition(_definition(**{key: "v" * max_length}))
     validate_device_definition(_definition(**{key: None}))
     definition = _definition(**{key: "present"})
@@ -145,9 +154,14 @@ def test_pure_validator_binds_the_optional_field_lengths(key, max_length):
     with pytest.raises(DeviceValidationError) as excinfo:
         validate_device_definition(_definition(**{key: "v" * (max_length + 1)}))
     assert excinfo.value.code == "invalid_value"
-    assert str(excinfo.value) == "device {} must be at most {} characters".format(
+    assert str(excinfo.value) == "device {} must be at most {} bytes".format(
         key, max_length
     )
+
+    # 64 characters of 4-byte code points is 256 bytes: over the bound even
+    # though it fits a character-based reading of the same number.
+    with pytest.raises(DeviceValidationError, match="must be at most"):
+        validate_device_definition(_definition(**{key: "\U0001F600" * max_length}))
 
 
 def test_config_level_rejects_an_overlong_device_id():

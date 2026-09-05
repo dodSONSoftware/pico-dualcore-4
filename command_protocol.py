@@ -20,7 +20,9 @@ MAX_TARGET_LENGTH = 128
 # The configured source is spliced into every Core 0 outbound envelope, so it
 # is a protocol-scale identity (matched against a bounded target), not an
 # open-ended string: a huge identity would push even a tiny envelope past the
-# outbound wire ceiling.
+# outbound wire ceiling. The invariant is about wire bytes (the outbound
+# ceiling is UTF-8 bytes), so the bound is measured in UTF-8 bytes, not
+# characters — a 64-character string of 4-byte code points is 256 bytes.
 MAX_SOURCE_LENGTH = 64
 
 BROADCAST_TARGET = "*"

@@ -15,6 +15,7 @@ from command_protocol import MAX_SOURCE_LENGTH
 from config import (
     MAX_DEVICE_INITIALIZATION_ATTEMPTS,
     MAX_DEVICES,
+    MAX_MQTT_BROKER_ADDRESS_BYTES,
     MAX_MQTT_KEEPALIVE_SEC,
     MAX_MQTT_TOPIC_BYTES,
     MAX_RECONNECT_ATTEMPTS,
@@ -26,7 +27,9 @@ from config import (
     split_config,
     validate_config,
 )
-from device_factory import MAX_DEVICE_ID_LENGTH
+from device_factory import MAX_DEVICE_ID_LENGTH, MAX_DEVICE_NAME_LENGTH, MAX_SENSOR_TYPE_LENGTH
+from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES, serialize_and_validate_message
+from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -259,9 +262,17 @@ def test_validate_config_reconnect_delay_bounds_are_inclusive():
 
 def test_validate_config_source_is_bounded_at_protocol_scale():
     """source is spliced into every Core 0 outbound envelope, so it carries
-    an inclusive protocol-scale bound instead of an open-ended string length."""
+    an inclusive protocol-scale bound instead of an open-ended string length.
+    The ceiling is a wire bound, so the bound is UTF-8 bytes: a 64-character
+    source of 4-byte code points is 256 bytes and must be rejected."""
     config = _base_config()
     config["source"] = "S" * MAX_SOURCE_LENGTH
+    assert validate_config(config) is config
+
+    # The worst serialized form under the serializer's escaped output: 4-byte
+    # code points, exactly 64 UTF-8 bytes — the inclusive maximum.
+    config = _base_config()
+    config["source"] = "\U0001F600" * (MAX_SOURCE_LENGTH // 4)
     assert validate_config(config) is config
 
     config = _base_config()
@@ -269,9 +280,112 @@ def test_validate_config_source_is_bounded_at_protocol_scale():
     with pytest.raises(ConfigError) as excinfo:
         validate_config(config)
     assert excinfo.value.code == "invalid_value"
-    assert str(excinfo.value) == "source must be at most {} characters".format(
+    assert str(excinfo.value) == "source must be at most {} bytes".format(
         MAX_SOURCE_LENGTH
     )
+
+    # 64 characters but 256 UTF-8 bytes: over the bound even though it is
+    # within a character-based reading of the same number.
+    config = _base_config()
+    config["source"] = "\U0001F600" * MAX_SOURCE_LENGTH
+    with pytest.raises(ConfigError, match="source must be at most"):
+        validate_config(config)
+
+
+def test_validate_config_broker_address_is_byte_bounded():
+    """mqtt_broker_ip_address feeds socket.connect() (which also resolves
+    hostnames) and is spliced into the read-config response and connect logs;
+    it had no bound at all, so one ~15 KiB value made the read-config
+    response unsendable. DNS's hostname maximum is the inclusive bound, in
+    UTF-8 bytes."""
+    config = _base_config()
+    config["mqtt_broker_ip_address"] = "b" * MAX_MQTT_BROKER_ADDRESS_BYTES
+    assert validate_config(config) is config
+
+    config = _base_config()
+    config["mqtt_broker_ip_address"] = "b" * (MAX_MQTT_BROKER_ADDRESS_BYTES + 1)
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == (
+        "mqtt_broker_ip_address must be at most {} bytes".format(
+            MAX_MQTT_BROKER_ADDRESS_BYTES
+        )
+    )
+
+    # 253 characters of 2-byte code points is 506 bytes: rejected.
+    config = _base_config()
+    config["mqtt_broker_ip_address"] = "\u00e9" * MAX_MQTT_BROKER_ADDRESS_BYTES
+    with pytest.raises(ConfigError, match="mqtt_broker_ip_address must be at most"):
+        validate_config(config)
+
+
+def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
+    """The config-boundary invariant: the worst-case valid configuration —
+    every string field at its byte bound in the worst serialized form, every
+    list at its entry bound, every device at every bound — still serializes
+    its read-config response (including the Core 0 envelope splice) at or
+    under MAX_OUTBOUND_MESSAGE_BYTES. A valid configuration must be one the
+    firmware can send back; this pins that for every currently supported
+    device type, so a future field or driver string that breaks it fails
+    here instead of wedging read-config on a device."""
+    # 16 x 4-byte code points: 64 UTF-8 bytes, the inclusive field maximum,
+    # and the worst serialized form (each code point escapes to 12 bytes).
+    field_max = "\U0001F600" * (MAX_SOURCE_LENGTH // 4)
+    assert len(field_max.encode("utf-8")) == MAX_SOURCE_LENGTH
+
+    config = _base_config()
+    config["source"] = field_max
+    config["mqtt_broker_ip_address"] = "b" * MAX_MQTT_BROKER_ADDRESS_BYTES
+    for index, key in enumerate(_MQTT_TOPIC_KEYS):
+        config[key] = "t" * (MAX_MQTT_TOPIC_BYTES - 1) + str(index)
+    for key in ("wifi_reconnect_delays_sec", "mqtt_reconnect_delays_sec"):
+        config[key] = [MAX_RECONNECT_DELAY_SEC] * MAX_RECONNECT_ATTEMPTS
+    # ids must be pairwise distinct: 15 full code points + a unique one-char
+    # ASCII suffix keeps each id at exactly 64 UTF-8 bytes.
+    id_suffixes = [str(i) for i in range(10)] + ["a", "b", "c", "d", "e", "f"]
+    config["devices"] = [
+        {
+            "id": field_max[:15] + id_suffixes[index],
+            "device_type": "system-information",
+            "config": {
+                "include": [
+                    "network", "memory", "runtime", "devices", "cpu",
+                    "machine", "communications", "queues", "device_status",
+                ],
+            },
+            "name": field_max,
+            "sensor_type": field_max,
+        }
+        for index in range(MAX_DEVICES)
+    ]
+    validate_config(config)
+
+    # The read-config response shape (core0._handle_read_config_command):
+    # the committed configuration plus derived reboot state.
+    response = {
+        "command_id": "invariant-check",
+        "command": "read-config",
+        "success": True,
+        "targeted": True,
+        "data": {"config": config, "reboot_required": False},
+    }
+    body = serialize_and_validate_message(response)
+    assert len(body) <= MAX_OUTBOUND_MESSAGE_BYTES
+
+    # The wire boundary is the spliced envelope, not the admitted body:
+    # mirror core0._envelope_fragment() (a 24-hex-char runtime_id is the
+    # unique_id + nonce shape main._runtime_id() produces) and check the
+    # final length the splice would produce.
+    fragment = json.dumps({
+        "sequence": 0,
+        "runtime_id": "0123456789abcdef01234567",
+        "source": config["source"],
+        "firmware_version": FIRMWARE_VERSION,
+        "message_schema_version": MESSAGE_SCHEMA_VERSION,
+    })[1:-1].encode("utf-8")
+    spliced = len(body) - 1 + 1 + len(fragment) + 1  # body minus "}" + "," + fragment + "}"
+    assert spliced <= MAX_OUTBOUND_MESSAGE_BYTES
 
 
 def test_validate_config_keepalive_is_bounded_by_the_wire_limit():

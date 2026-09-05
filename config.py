@@ -27,6 +27,13 @@ MAX_MQTT_KEEPALIVE_SEC = 65535
 # simple policy: 1..N ASCII bytes, no NUL.)
 MAX_MQTT_TOPIC_BYTES = 122
 
+# The broker address feeds socket.connect(), which also resolves hostnames,
+# so the bound is DNS's 253-byte hostname maximum rather than IPv6's 45
+# characters. It is spliced into the read-config response and the connect
+# logs, and it had no bound at all — a single long value alone pushed a
+# "valid" configuration past the outbound wire ceiling.
+MAX_MQTT_BROKER_ADDRESS_BYTES = 253
+
 # The RP2 builds give time.ticks_* 30-bit values: ticks_diff only expresses
 # deltas below half the period (2^29 - 1 ms, ~6.21 days) and ticks_add raises
 # OverflowError at it. Any value that becomes a ticks_diff threshold or
@@ -51,10 +58,13 @@ MAX_RECONNECT_ATTEMPTS = 32
 
 # Core 1 builds a per-device status structure before anything can be rejected
 # at the serialized-size ceiling (the bounded startup-log fallback and the
-# read-config response both carry it). With per-field lengths bounded at
-# device_factory's MAX_DEVICE_*_LENGTH, this count keeps a worst-case valid
-# configuration in low single-digit KB — under MAX_OUTBOUND_MESSAGE_BYTES
-# (16 KiB) — so a valid configuration cannot exhaust heap during construction.
+# read-config response both carry it). The string fields are byte-bounded
+# (device_factory's MAX_DEVICE_*_LENGTH, MAX_SOURCE_LENGTH, and
+# MAX_MQTT_BROKER_ADDRESS_BYTES — UTF-8 bytes, since the ceiling is a wire
+# bound), so with the device count at this maximum a worst-case valid
+# configuration stays under MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) serialized.
+# The serialized-size invariant test in tests/test_config.py pins that for
+# every currently supported device type.
 MAX_DEVICES = 16
 
 
@@ -364,10 +374,24 @@ def validate_config(config):
 
     # source is the wire identity, spliced into every Core 0 envelope, so it
     # carries a protocol-scale bound: a huge identity would make even a tiny
-    # envelope fail the outbound wire ceiling.
-    if len(config["source"]) > MAX_SOURCE_LENGTH:
+    # envelope fail the outbound wire ceiling. Measured in UTF-8 bytes — the
+    # ceiling is a wire bound, and 64 characters of 4-byte code points are
+    # 256 bytes.
+    if len(config["source"].encode("utf-8")) > MAX_SOURCE_LENGTH:
         raise ConfigError(
-            "source must be at most {} characters".format(MAX_SOURCE_LENGTH),
+            "source must be at most {} bytes".format(MAX_SOURCE_LENGTH),
+            code="invalid_value",
+        )
+
+    # The broker address had no length bound at all: one ~15 KiB value fits
+    # a single inbound write-config packet, validates, and then makes the
+    # read-config response unsendable forever. DNS's hostname maximum keeps
+    # hostnames legal while bounding the wire contribution.
+    if len(config["mqtt_broker_ip_address"].encode("utf-8")) > MAX_MQTT_BROKER_ADDRESS_BYTES:
+        raise ConfigError(
+            "mqtt_broker_ip_address must be at most {} bytes".format(
+                MAX_MQTT_BROKER_ADDRESS_BYTES
+            ),
             code="invalid_value",
         )
 

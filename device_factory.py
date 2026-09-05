@@ -23,7 +23,10 @@ DEVICE_DEFINITION_KEYS = frozenset(("id", "device_type", "config", "name", "sens
 # id, name, and sensor_type are spliced into per-message payloads (telemetry
 # identity fields, startup-log device lists, the read-config response), so
 # they carry a length bound that keeps a worst-case valid message under
-# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB). 64 matches MAX_SOURCE_LENGTH. The bound
+# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB). 64 matches MAX_SOURCE_LENGTH. The
+# ceiling is a wire bound in UTF-8 bytes, so the bounds are measured in UTF-8
+# bytes, not characters — 64 characters of 4-byte code points are 256 bytes
+# (and 192 serialized bytes under the serializer's escaped output). The bound
 # belongs at this validation boundary — it must hold before Core 1 constructs
 # per-device structures (including the startup log's bounded fallback), not
 # where the message is serialized.
@@ -84,9 +87,9 @@ def validate_device_definition(device_definition):
         raise DeviceValidationError(
             "device id must be a non-empty string", code="invalid_value"
         )
-    if len(device_id) > MAX_DEVICE_ID_LENGTH:
+    if len(device_id.encode("utf-8")) > MAX_DEVICE_ID_LENGTH:
         raise DeviceValidationError(
-            "device id must be at most {} characters".format(MAX_DEVICE_ID_LENGTH),
+            "device id must be at most {} bytes".format(MAX_DEVICE_ID_LENGTH),
             code="invalid_value",
         )
 
@@ -112,9 +115,9 @@ def validate_device_definition(device_definition):
             raise DeviceValidationError(
                 "device {} must be a string".format(key), code="invalid_value"
             )
-        if len(value) > max_length:
+        if len(value.encode("utf-8")) > max_length:
             raise DeviceValidationError(
-                "device {} must be at most {} characters".format(key, max_length),
+                "device {} must be at most {} bytes".format(key, max_length),
                 code="invalid_value",
             )
 
