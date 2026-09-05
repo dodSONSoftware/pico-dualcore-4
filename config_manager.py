@@ -13,6 +13,7 @@ maintained separately. Core 0 orchestrates the HOT_RELOADED runtime
 apply/ack and tells this manager to commit or roll back.
 """
 
+import errno
 import json
 import os
 
@@ -163,8 +164,14 @@ class ConfigManager:
             return True
         except MemoryError:
             raise
-        except OSError:
-            return False
+        except OSError as err:
+            # Only ENOENT means "absent". Any other OSError (a flash/LittleFS
+            # I/O fault, corruption, ...) is a real storage failure that the
+            # recovery decision must not mistake for a missing file: propagate
+            # it with its error context intact.
+            if err.args and err.args[0] == errno.ENOENT:
+                return False
+            raise
 
     def _remove_if_exists(self, path):
         if self._path_exists(path):

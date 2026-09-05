@@ -11,6 +11,7 @@ files, exactly like the flash VFS it will drive on hardware.
 """
 
 import copy
+import errno
 import json
 import os
 import pathlib
@@ -295,6 +296,30 @@ def test_recovery_fails_when_all_files_are_absent(tmp_path):
     manager = ConfigManager(str(tmp_path / "config.json"))
     with pytest.raises(ConfigError):
         manager.recover()
+
+
+def test_path_exists_maps_enoent_to_absent(config_dir, monkeypatch):
+    """A missing path (ENOENT) is the only failure that means 'absent'."""
+
+    def stat_enoent(path):
+        raise OSError(errno.ENOENT, "No such file or directory")
+
+    monkeypatch.setattr(os, "stat", stat_enoent)
+    assert ConfigManager._path_exists(str(config_dir / "config.json")) is False
+
+
+def test_path_exists_propagates_a_real_storage_failure(config_dir, monkeypatch):
+    """An I/O fault (any non-ENOENT OSError) is not a missing file: it must
+    propagate with its error context instead of letting recovery select a
+    different artifact on a false premise."""
+
+    def stat_eio(path):
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(os, "stat", stat_eio)
+    with pytest.raises(OSError) as exc_info:
+        ConfigManager._path_exists(str(config_dir / "config.json"))
+    assert exc_info.value.args[0] == errno.EIO
 
 
 # ---------------------------------------------------------------------------
