@@ -107,7 +107,7 @@ The queues are heap-governed (no fixed capacity), so these are observability met
 
 - `config_schema_version` in `version.py` must match `config.json`
 - Unknown top-level keys in config are rejected (fail-fast)
-- MQTT topics (`mqtt_topic_*`) are exact channel names: `+`/`#` wildcards are rejected (invalid in a PUBLISH Topic Name; inbound dispatch matches delivered topics by exact equality)
+- MQTT topics (`mqtt_topic_*`) are exact channel names: `+`/`#` wildcards are rejected (invalid in a PUBLISH Topic Name; inbound dispatch matches delivered topics by exact equality) and the eight channels must be pairwise distinct (dispatch matches by exact equality and the first matching branch wins, so a shared name silently disables a channel — equal command/info_response names make the command path unreachable — and a name shared with a locally published topic self-echoes the device's own traffic)
 - All config values validated before network starts
 
 ## Common Tasks

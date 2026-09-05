@@ -21,6 +21,7 @@ from config import (
     MAX_RECONNECT_DELAY_SEC,
     MAX_TICKS_SAFE_INTERVAL_MS,
     ConfigError,
+    _MQTT_TOPIC_KEYS,
     load_config,
     split_config,
     validate_config,
@@ -197,6 +198,53 @@ def test_validate_config_rejects_wildcards_in_all_topics(key, wildcard):
     with pytest.raises(ConfigError) as excinfo:
         validate_config(config)
     assert excinfo.value.code == "invalid_value"
+
+
+def test_validate_config_rejects_identical_command_and_info_response_topics():
+    """The fatal pair: inbound dispatch checks the info_response topic first
+    and returns for any other message type, so an identical command name is
+    never reached — the whole command path dies (including write-config, the
+    repair channel) while the device still reports healthy."""
+    config = _base_config()
+    config["mqtt_topic_info_response"] = config["mqtt_topic_command"]
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "Duplicate MQTT topic '{}' used by {} and {}".format(
+        config["mqtt_topic_command"],
+        "mqtt_topic_command",
+        "mqtt_topic_info_response",
+    )
+
+
+@pytest.mark.parametrize(
+    "owner,other",
+    [
+        (owner, other)
+        for index, owner in enumerate(_MQTT_TOPIC_KEYS)
+        for other in _MQTT_TOPIC_KEYS[index + 1 :]
+    ],
+)
+def test_validate_config_rejects_any_pair_of_topics_sharing_a_name(owner, other):
+    """Every pair, not just the fatal one: a name shared with a locally
+    published topic re-delivers every own publication inbound (MQTT 3.1.1
+    self-echo), and dispatch can never disambiguate two channels by name."""
+    config = _base_config()
+    config[other] = config[owner]
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "Duplicate MQTT topic '{}' used by {} and {}".format(
+        config[owner], owner, other
+    )
+
+
+def test_validate_config_accepts_renamed_but_distinct_topics():
+    """The rule is distinctness, not the shipped names: renaming one channel
+    to a fresh name stays valid."""
+    config = _base_config()
+    config["mqtt_topic_command"] = "iot/v3/commands"
+    assert validate_config(config) is config
 
 
 def test_validate_config_reconnect_delay_bounds_are_inclusive():

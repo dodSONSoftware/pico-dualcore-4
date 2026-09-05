@@ -108,6 +108,20 @@ _REQUIRED_KEYS = (
 
 _ALLOWED_KEYS = frozenset(_REQUIRED_KEYS)
 
+# The eight protocol channels. Topic identity is the inbound routing
+# invariant (dispatch matches delivered topics by exact equality), so the
+# set also drives the pairwise-distinctness rule below.
+_MQTT_TOPIC_KEYS = (
+    "mqtt_topic_telemetry",
+    "mqtt_topic_log",
+    "mqtt_topic_command",
+    "mqtt_topic_command_response",
+    "mqtt_topic_info_request",
+    "mqtt_topic_info_response",
+    "mqtt_topic_network_probe",
+    "mqtt_topic_health",
+)
+
 
 def _unknown_config_paths(config):
     """All unknown configuration paths, sorted: top-level keys,
@@ -183,6 +197,28 @@ def _require_mqtt_topic(config, key):
             ),
             code="invalid_value",
         )
+
+
+def _require_distinct_mqtt_topics(config):
+    # A shared topic name is not "one channel, disambiguated by content":
+    # inbound dispatch matches by exact equality and the first matching
+    # branch wins, so the other channel's traffic is silently dropped —
+    # equal command/info_response names make the entire command path
+    # unreachable on a device that still reports healthy, and a name shared
+    # with a locally published topic re-delivers every own publication
+    # inbound. Each channel keeps its own name.
+    seen = {}
+    for key in _MQTT_TOPIC_KEYS:
+        value = config[key]
+        owner = seen.get(value)
+        if owner is not None:
+            raise ConfigError(
+                "Duplicate MQTT topic '{}' used by {} and {}".format(
+                    value, owner, key
+                ),
+                code="invalid_value",
+            )
+        seen[value] = key
 
 
 def _require_positive_integer(config, key):
@@ -320,18 +356,11 @@ def validate_config(config):
         _require_non_empty_string(config, key)
 
     # Topics carry the MQTT single-byte Remaining Length bound (subscribe)
-    # on top of the non-empty-string contract.
-    for key in (
-        "mqtt_topic_telemetry",
-        "mqtt_topic_log",
-        "mqtt_topic_command",
-        "mqtt_topic_command_response",
-        "mqtt_topic_info_request",
-        "mqtt_topic_info_response",
-        "mqtt_topic_network_probe",
-        "mqtt_topic_health",
-    ):
+    # on top of the non-empty-string contract, and the eight channel names
+    # must stay pairwise distinct (topic identity is the routing invariant).
+    for key in _MQTT_TOPIC_KEYS:
         _require_mqtt_topic(config, key)
+    _require_distinct_mqtt_topics(config)
 
     # source is the wire identity, spliced into every Core 0 envelope, so it
     # carries a protocol-scale bound: a huge identity would make even a tiny
