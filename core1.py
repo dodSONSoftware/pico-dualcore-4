@@ -48,8 +48,27 @@ class StartupLogTooLargeError(ValueError):
 
 def _collect_system_information_full(system_information):
     system_info = {}
+    # The devices and device_status sections share one snapshot source: take
+    # it once and derive both, instead of walking every device twice.
+    device_sections = None
+    device_sections_getter = getattr(system_information, "get_device_sections", None)
+    if device_sections_getter is not None:
+        try:
+            device_sections = device_sections_getter()
+        except MemoryError:
+            raise
+        except Exception as err:
+            device_sections = {
+                "devices": {"error": str(err)},
+                "device_status": {"error": str(err)},
+            }
     for section in SYSTEM_INFORMATION_SECTIONS:
         try:
+            if device_sections is not None and section in device_sections:
+                section_data = device_sections[section]
+                if is_json_safe(section_data):
+                    system_info[section] = section_data
+                continue
             getter_name = "get_{}".format(section)
             if hasattr(system_information, getter_name):
                 section_data = getattr(system_information, getter_name)()
@@ -106,7 +125,7 @@ def _startup_log_message(intercore, startup_duration_ms, startup_summary, system
     }
 
 
-def _build_startup_log(intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information=None):
+def _build_startup_log(intercore, device_manager, config, startup_duration_ms, system_information=None):
     """Build the detailed system_startup_completed log message (Core 1's own
     fields only)."""
     device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
@@ -428,7 +447,7 @@ def _process_intercore_event(intercore, uptime_state, system_information=None):
     )
 
 
-def _handle_device_result(intercore, config, uptime_state, result):
+def _handle_device_result(intercore, uptime_state, result):
     status = result["status"]
 
     if status == DEVICE_RESULT_TELEMETRY:
@@ -486,7 +505,7 @@ def _run_telemetry_read_pass(device_manager, intercore, uptime_state, config):
     initial at-anchor sample and the periodic read boundary."""
     for managed_device in device_manager.get_active_devices():
         result = device_manager.process_device(managed_device)
-        _handle_device_result(intercore, config, uptime_state, result)
+        _handle_device_result(intercore, uptime_state, result)
     gc.collect()
 
 
@@ -716,7 +735,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         startup_duration_ms = current_uptime_ms(uptime_state)
 
         startup_log_message = _build_startup_log(
-            intercore, boot_ticks_ms, device_manager, config, startup_duration_ms, system_information
+            intercore, device_manager, config, startup_duration_ms, system_information
         )
 
         # The startup log must be admitted before telemetry can begin. A

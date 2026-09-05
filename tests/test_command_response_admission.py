@@ -257,7 +257,7 @@ def test_oversized_telemetry_sample_is_discarded_not_retried():
     }
 
     with patch.object(core1, "_message_time", return_value=(1234, None)):
-        core1._handle_device_result(intercore, {}, object(), result)
+        core1._handle_device_result(intercore, object(), result)
 
     assert queue.admitted == []
 

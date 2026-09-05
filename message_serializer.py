@@ -121,7 +121,3 @@ def serialize_and_validate_message(message):
 
     return payload_bytes
 
-
-def get_max_message_bytes():
-    """Return the maximum outbound message payload size in bytes."""
-    return MAX_OUTBOUND_MESSAGE_BYTES

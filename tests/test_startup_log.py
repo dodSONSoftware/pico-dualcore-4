@@ -23,13 +23,14 @@ def _base_config():
     return json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
 
 
-def test_system_information_sections():
+def test_system_information_sections(monkeypatch):
     """Verify SYSTEM_INFORMATION_SECTIONS includes all required sections."""
-    # Mock machine module
-    sys.modules['machine'] = MagicMock()
-    sys.modules['gc'] = MagicMock()
-    sys.modules['os'] = MagicMock()
-    sys.modules['sys'] = MagicMock()
+    # Mock machine module; monkeypatch restores the real modules at teardown,
+    # so a later test file importing core1 cannot bind the mocks.
+    monkeypatch.setitem(sys.modules, 'machine', MagicMock())
+    monkeypatch.setitem(sys.modules, 'gc', MagicMock())
+    monkeypatch.setitem(sys.modules, 'os', MagicMock())
+    monkeypatch.setitem(sys.modules, 'sys', MagicMock())
 
     from system_information import SYSTEM_INFORMATION_SECTIONS
 
@@ -50,13 +51,13 @@ def test_system_information_sections():
             f"Required section '{section}' not in SYSTEM_INFORMATION_SECTIONS"
 
 
-def test_collect_system_information_includes_all_sections():
+def test_collect_system_information_includes_all_sections(monkeypatch):
     """Verify _collect_system_information_full includes all sections."""
-    # Mock all required modules
-    sys.modules['machine'] = MagicMock()
-    sys.modules['gc'] = MagicMock()
-    sys.modules['os'] = MagicMock()
-    sys.modules['sys'] = MagicMock()
+    # Mock all required modules (restored at teardown by monkeypatch)
+    monkeypatch.setitem(sys.modules, 'machine', MagicMock())
+    monkeypatch.setitem(sys.modules, 'gc', MagicMock())
+    monkeypatch.setitem(sys.modules, 'os', MagicMock())
+    monkeypatch.setitem(sys.modules, 'sys', MagicMock())
 
     from system_information import SYSTEM_INFORMATION_SECTIONS
     from core1 import _collect_system_information_full
@@ -122,21 +123,60 @@ def test_collect_system_information_includes_all_sections():
         assert section in result, f"Section '{section}' not in collected system information"
 
 
-def test_build_startup_log_structure():
-    """Verify _build_startup_log creates the correct message structure."""
-    # Mock all required modules
-    sys.modules['machine'] = MagicMock()
-    sys.modules['gc'] = MagicMock()
-    sys.modules['os'] = MagicMock()
-    sys.modules['sys'] = MagicMock()
-    sys.modules['time'] = MagicMock()
-    sys.modules['time'].ticks_ms = MagicMock(return_value=6000)
-    sys.modules['time'].ticks_diff = MagicMock(return_value=5000)
-    sys.modules['time'].ticks_add = MagicMock(return_value=11000)
-    sys.modules['time'].sleep_ms = MagicMock()
+def test_collect_system_information_takes_one_device_snapshot(monkeypatch):
+    """devices and device_status must both come from a single
+    get_device_sections() call, not from separate per-section getters."""
+    if "core1" not in sys.modules:
+        if "machine" not in sys.modules:
+            monkeypatch.setitem(sys.modules, "machine", MagicMock())
+        import importlib
 
-    sys.modules['debug'] = MagicMock()
-    sys.modules['debug'].DEBUG = False
+        importlib.import_module("core1")
+    from core1 import _collect_system_information_full
+
+    class CountingSystemInformation:
+        def __init__(self):
+            self.device_section_calls = 0
+            self.section_calls = []
+
+        def get_device_sections(self):
+            self.device_section_calls += 1
+            return {
+                "devices": {"configured": 1, "active": 1, "source": "shared-snapshot"},
+                "device_status": [{"id": "d1", "source": "shared-snapshot"}],
+            }
+
+        def get_network(self):
+            self.section_calls.append("network")
+            return {"ssid": "test"}
+
+    source = CountingSystemInformation()
+    result = _collect_system_information_full(source)
+
+    assert source.device_section_calls == 1
+    assert result["devices"]["source"] == "shared-snapshot"
+    assert result["device_status"][0]["source"] == "shared-snapshot"
+    assert result["network"] == {"ssid": "test"}
+    assert source.section_calls == ["network"]
+
+
+def test_build_startup_log_structure(monkeypatch):
+    """Verify _build_startup_log creates the correct message structure."""
+    # Mock all required modules (restored at teardown by monkeypatch)
+    monkeypatch.setitem(sys.modules, 'machine', MagicMock())
+    monkeypatch.setitem(sys.modules, 'gc', MagicMock())
+    monkeypatch.setitem(sys.modules, 'os', MagicMock())
+    monkeypatch.setitem(sys.modules, 'sys', MagicMock())
+    fake_time = MagicMock()
+    fake_time.ticks_ms = MagicMock(return_value=6000)
+    fake_time.ticks_diff = MagicMock(return_value=5000)
+    fake_time.ticks_add = MagicMock(return_value=11000)
+    fake_time.sleep_ms = MagicMock()
+    monkeypatch.setitem(sys.modules, 'time', fake_time)
+
+    fake_debug = MagicMock()
+    fake_debug.DEBUG = False
+    monkeypatch.setitem(sys.modules, 'debug', fake_debug)
 
     # Mock device_manager
     class MockDeviceManager:
@@ -249,16 +289,18 @@ def test_build_startup_log_structure():
     assert entry["retention_priority"] == RETENTION_PRIORITY_INFO, "Queue entry should have INFO priority"
 
 
-def test_startup_summary_uses_explicit_duration_ms():
+def test_startup_summary_uses_explicit_duration_ms(monkeypatch):
     """The startup summary names its duration explicitly (duration_ms), not the ambiguous 'uptime' key, while the envelope keeps device uptime as 'uptime_ms'.
 
     Drives the real _build_startup_log and verifies both."""
-    sys.modules['machine'] = MagicMock()
-    sys.modules['gc'] = MagicMock()
-    sys.modules['os'] = MagicMock()
-    sys.modules['sys'] = MagicMock()
-    sys.modules['debug'] = MagicMock()
-    sys.modules['debug'].DEBUG = False
+    # Mock modules (restored at teardown by monkeypatch)
+    monkeypatch.setitem(sys.modules, 'machine', MagicMock())
+    monkeypatch.setitem(sys.modules, 'gc', MagicMock())
+    monkeypatch.setitem(sys.modules, 'os', MagicMock())
+    monkeypatch.setitem(sys.modules, 'sys', MagicMock())
+    fake_debug = MagicMock()
+    fake_debug.DEBUG = False
+    monkeypatch.setitem(sys.modules, 'debug', fake_debug)
 
     import core1
 
@@ -284,7 +326,6 @@ def test_startup_summary_uses_explicit_duration_ms():
     try:
         payload = core1._build_startup_log(
             MockInterCore(),
-            boot_ticks_ms=1000,
             device_manager=MockDeviceManager(),
             config=_base_config(),
             startup_duration_ms=12782,
@@ -323,12 +364,18 @@ def test_split_config_core1_does_not_include_source():
 # its actual reason and only a genuinely transient one is retried.
 
 
-def _core1_module():
-    """The core1 module, importable on the host."""
+def _core1_module(monkeypatch):
+    """The core1 module, importable on the host.
+
+    The machine stub (needed only to import core1 on the host) is installed
+    via monkeypatch so it is restored at teardown; core1 keeps its own bound
+    reference either way, and later imports in other test files see the real
+    modules.
+    """
     if "core1" in sys.modules:
         return sys.modules["core1"]
     if "machine" not in sys.modules:
-        sys.modules["machine"] = MagicMock()
+        monkeypatch.setitem(sys.modules, "machine", MagicMock())
     import importlib
     return importlib.import_module("core1")
 
@@ -371,18 +418,18 @@ class _RecordingTime:
         self.sleeps.append(ms)
 
 
-def test_try_queue_startup_log_transient_rejection_returns_false():
+def test_try_queue_startup_log_transient_rejection_returns_false(monkeypatch):
     """A transient (heap-pressure) rejection returns False -- retryable."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
     queue = _ScriptedQueue([False])
     admitted = core1._try_queue_startup_log(_ScriptedBus(queue), _STARTUP_MESSAGE, 0)
     assert admitted is False
     assert queue.calls == 1
 
 
-def test_try_queue_startup_log_permanent_rejection_raises_valueerror():
+def test_try_queue_startup_log_permanent_rejection_raises_valueerror(monkeypatch):
     """A permanent queue rejection raises ValueError -- not retryable."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
     queue = _ScriptedQueue([ValueError("Message too large: 20000 > 16384")])
     with pytest.raises(ValueError):
         core1._try_queue_startup_log(_ScriptedBus(queue), _STARTUP_MESSAGE, 0)
@@ -391,7 +438,7 @@ def test_try_queue_startup_log_permanent_rejection_raises_valueerror():
 
 def test_try_queue_startup_log_serialization_failure_raises_valueerror(monkeypatch):
     """A deterministic serialization failure is permanent: ValueError."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
     from message_serializer import MessageTooLargeError
 
     def _too_large(message):
@@ -406,7 +453,7 @@ def test_try_queue_startup_log_serialization_failure_raises_valueerror(monkeypat
 
 def test_admit_startup_log_permanent_rejection_fails_fast_without_retry(monkeypatch):
     """A permanent rejection is never retried and never waits for queue space."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
     queue = _ScriptedQueue([ValueError("Startup log too large")])
     fake_time = _RecordingTime()
     monkeypatch.setattr(core1, "time", fake_time)
@@ -420,7 +467,7 @@ def test_admit_startup_log_permanent_rejection_fails_fast_without_retry(monkeypa
 
 def test_admit_startup_log_retries_transient_rejection_once(monkeypatch):
     """A transient rejection is retried exactly once, after a short delay."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
     queue = _ScriptedQueue([False, True])
     fake_time = _RecordingTime()
     monkeypatch.setattr(core1, "time", fake_time)
@@ -434,7 +481,7 @@ def test_admit_startup_log_retries_transient_rejection_once(monkeypatch):
 
 def test_admit_startup_log_exhausted_transient_retry_returns_false(monkeypatch):
     """Both attempts transiently rejected: False, exactly two submissions."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
     queue = _ScriptedQueue([False])
     fake_time = _RecordingTime()
     monkeypatch.setattr(core1, "time", fake_time)
@@ -509,9 +556,9 @@ def _too_large_for_detailed(message):
     return json.dumps(message).encode("utf-8")
 
 
-def test_build_startup_log_bounded_omits_unbounded_sections():
+def test_build_startup_log_bounded_omits_unbounded_sections(monkeypatch):
     """The bounded fallback keeps only statuses and counts -- no device names, no system_information."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
 
     class MockDeviceManager:
         def get_status_snapshot(self, now_ms=None):
@@ -552,7 +599,7 @@ def test_build_startup_log_bounded_omits_unbounded_sections():
 
 def test_try_queue_startup_log_too_large_raises_typed_error(monkeypatch):
     """The oversized case raises StartupLogTooLargeError (a ValueError subclass) so the caller can answer it with the bounded fallback."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
     from message_serializer import MessageTooLargeError
 
     def _too_large(message):
@@ -568,7 +615,7 @@ def test_try_queue_startup_log_too_large_raises_typed_error(monkeypatch):
 
 def test_admit_with_fallback_admits_bounded_summary_when_detailed_too_large(monkeypatch):
     """A size-only rejection is answered by the bounded fallback, which is then admitted."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
 
     monkeypatch.setattr(core1, "serialize_and_validate_message", _too_large_for_detailed)
     queue = _RecordingQueue()
@@ -593,7 +640,7 @@ def test_admit_with_fallback_admits_bounded_summary_when_detailed_too_large(monk
 
 def test_admit_with_fallback_non_size_permanent_rejection_escapes_without_fallback(monkeypatch):
     """A non-size permanent rejection cannot be answered by any fallback: it escapes and the fallback is never built."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
     from message_serializer import NonStringKeyError
 
     def _invalid(message):
@@ -614,7 +661,7 @@ def test_admit_with_fallback_non_size_permanent_rejection_escapes_without_fallba
 
 def test_admit_with_fallback_transient_rejection_on_fallback_retried_once(monkeypatch):
     """A transient rejection of the bounded fallback keeps the normal single transient retry."""
-    core1 = _core1_module()
+    core1 = _core1_module(monkeypatch)
 
     monkeypatch.setattr(core1, "serialize_and_validate_message", _too_large_for_detailed)
     queue = _ScriptedQueue([False, True])

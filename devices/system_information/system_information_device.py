@@ -14,30 +14,20 @@ class SystemInformationDevice(Device):
         self._include = None
         self._initialized = False
 
-    def _get_section(self, section):
-        """Get a system information section value."""
-        if section == "network":
-            return self._system_information.get_network()
-        if section == "memory":
-            return self._system_information.get_memory()
-        if section == "runtime":
-            return self._system_information.get_runtime()
-        if section == "devices":
-            return self._system_information.get_devices()
-        if section == "cpu":
-            return self._system_information.get_cpu()
-        if section == "machine":
-            return self._system_information.get_machine()
-        if section == "communications":
-            return self._system_information.get_communications()
-        if section == "queues":
-            return self._system_information.get_queues()
-        if section == "device_status":
-            return self._system_information.get_device_status()
+    # The sections that share one device status-snapshot source.
+    _DEVICE_SECTIONS = ("devices", "device_status")
 
-        raise ValueError(
-            "Unsupported system information section: {}".format(section)
+    def _get_section(self, section):
+        """Get a system information section value (same dispatch as Core 1's
+        full collection: a section is the ``get_<section>`` method)."""
+        getter = getattr(
+            self._system_information, "get_{}".format(section), None
         )
+        if getter is None:
+            raise ValueError(
+                "Unsupported system information section: {}".format(section)
+            )
+        return getter()
 
     def initialize(self, config):
         """Initialize with the shared pure validation (same rules as startup)."""
@@ -52,8 +42,15 @@ class SystemInformationDevice(Device):
             raise RuntimeError("System information device is not initialized")
 
         payload = {}
-
+        device_sections = None
         for section in self._include:
-            payload[section] = self._get_section(section)
+            if section in self._DEVICE_SECTIONS:
+                # Both device sections share one snapshot source: take it
+                # once when both are configured.
+                if device_sections is None:
+                    device_sections = self._system_information.get_device_sections()
+                payload[section] = device_sections[section]
+            else:
+                payload[section] = self._get_section(section)
 
         return payload

@@ -32,11 +32,6 @@ MAX_DEVICE_NAME_LENGTH = 64
 MAX_SENSOR_TYPE_LENGTH = 64
 
 
-def supported_device_types():
-    """The registered device types, sorted (stable for diagnostics)."""
-    return tuple(sorted(_DEVICE_REGISTRY))
-
-
 def is_supported_device_type(device_type):
     """True if device_type has a registered validator and constructor."""
     return device_type in _DEVICE_REGISTRY

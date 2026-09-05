@@ -207,8 +207,9 @@ def test_startup_drain_programming_failure_propagates(make_core0, monkeypatch):
     def _fail(*args, **kwargs):
         raise RuntimeError("message handling bug")
 
-    import message_serializer
-    monkeypatch.setattr(message_serializer, "serialize_and_validate_message", _fail)
+    # Patch where the call resolves: core0's module-level import (the
+    # suite's convention, matching the core1 serializer patches).
+    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", _fail)
 
     instance._pending_connection_logs.append(_connection_log())
 

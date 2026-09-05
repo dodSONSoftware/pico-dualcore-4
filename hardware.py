@@ -74,22 +74,3 @@ def detect_hardware():
         "preferred_free_heap_bytes": result["preferred_free_heap_bytes"],
         "minimum_free_heap_bytes": result["minimum_free_heap_bytes"],
     }
-
-
-def is_supported_hardware():
-    """Check if the current hardware is supported (Pico W or Pico 2 W)."""
-    try:
-        detect_hardware()
-        return True
-    except RuntimeError:
-        return False
-
-
-def get_minimum_free_heap(hardware_type):
-    """Get the minimum free-heap reserve (bytes) for a canonical hardware type. Raises ValueError if unrecognized."""
-    if hardware_type == HARDWARE_TYPE_PICO_W:
-        return PICO_W_MIN_FREE_HEAP_BYTES
-    elif hardware_type == HARDWARE_TYPE_PICO_2_W:
-        return PICO_2_W_MIN_FREE_HEAP_BYTES
-    else:
-        raise ValueError("Unknown hardware type: {}".format(hardware_type))

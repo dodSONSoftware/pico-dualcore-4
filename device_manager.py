@@ -332,7 +332,6 @@ class DeviceManager:
                 "telemetry": telemetry,
                 "recovered": previous_failures > 0,
                 "previous_consecutive_read_failures": previous_failures,
-                "remove": False,
             }
         except MemoryError:
             raise
@@ -351,7 +350,6 @@ class DeviceManager:
                 "total_read_failures": managed_device.total_read_failures,
                 "device_read_failure_threshold": self._device_read_failure_threshold,
                 "reinitialize_pending": managed_device.reinitialize_pending,
-                "remove": False,
             }
 
     def _refresh_system_information_self_status(self, managed_device, telemetry):
@@ -404,7 +402,6 @@ class DeviceManager:
                     "device_id": managed_device.device_id,
                     "device": managed_device.device_type,
                     "reinitialization_attempts_used": attempts_used,
-                    "remove": False,
                 }
             except MemoryError:
                 raise
@@ -429,7 +426,6 @@ class DeviceManager:
             "total_read_failures": managed_device.total_read_failures,
             "reinitialization_attempts_used": attempts_used,
             "log_failure_warning": log_failure_warning,
-            "remove": False,
         }
 
     def get_status_snapshot(self, now_ms=None):

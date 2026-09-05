@@ -164,7 +164,7 @@ class ReinitEnv:
         """Run one device cycle through the real device_manager + core1 paths."""
         result = self.dm.process_device(self.md)
         self.core1._handle_device_result(
-            self.bus, self.config, self.uptime_state, result
+            self.bus, self.uptime_state, result
         )
         return result
 

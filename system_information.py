@@ -68,16 +68,18 @@ class SystemInformation:
             "start_time": start_time,
         }
 
-    def _device_snapshot(self):
+    def get_device_sections(self):
+        """Both device report sections from one snapshot walk (they share a
+        single status-snapshot source)."""
         if self._device_manager is None:
             return {"devices": {"configured": 0, "active": 0}, "device_status": []}
         return self._device_manager.get_status_snapshot(now_ms=time.ticks_ms())
 
     def get_devices(self):
-        return self._device_snapshot()["devices"]
+        return self.get_device_sections()["devices"]
 
     def get_device_status(self):
-        return self._device_snapshot()["device_status"]
+        return self.get_device_sections()["device_status"]
 
     def get_cpu(self):
         try:

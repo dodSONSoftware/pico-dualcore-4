@@ -166,17 +166,19 @@ def _require_mqtt_topic(config, key):
     """A configured topic must be 1..MAX_MQTT_TOPIC_BYTES ASCII bytes with no
     NUL (see the bound's comment); ASCII-only keeps UTF-8 byte length equal to
     character count, so the single-byte Remaining Length arithmetic in
-    mqtt_client.subscribe() stays exact."""
+    mqtt_client.subscribe() stays exact. Wildcards (+/#) are rejected: they
+    are invalid in a PUBLISH Topic Name, and inbound dispatch matches
+    delivered topics by exact equality against the configured name."""
     value = config[key]
     if not isinstance(value, str) or not value:
         raise ConfigError(
             "{} must be a non-empty string".format(key), code="invalid_value"
         )
     if len(value) > MAX_MQTT_TOPIC_BYTES or any(
-        ch < "\u0001" or ch > "\u007f" for ch in value
+        ch < "\u0001" or ch > "\u007f" or ch in "+#" for ch in value
     ):
         raise ConfigError(
-            "{} must be 1-{} ASCII bytes with no NUL".format(
+            "{} must be 1-{} ASCII bytes with no NUL or wildcard (+/#)".format(
                 key, MAX_MQTT_TOPIC_BYTES
             ),
             code="invalid_value",

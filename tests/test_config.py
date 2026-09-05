@@ -171,6 +171,34 @@ def test_validate_config_rejects_bad_configs_with_stable_codes(mutate, code):
     assert str(excinfo.value)
 
 
+@pytest.mark.parametrize(
+    "key,wildcard",
+    [
+        (key, wildcard)
+        for key in (
+            "mqtt_topic_telemetry",
+            "mqtt_topic_log",
+            "mqtt_topic_command",
+            "mqtt_topic_command_response",
+            "mqtt_topic_info_request",
+            "mqtt_topic_info_response",
+            "mqtt_topic_network_probe",
+            "mqtt_topic_health",
+        )
+        for wildcard in ("+", "#")
+    ],
+)
+def test_validate_config_rejects_wildcards_in_all_topics(key, wildcard):
+    """Every configured topic is an exact protocol channel: +/# are invalid
+    in a PUBLISH Topic Name and inbound dispatch matches delivered topics by
+    exact equality, so a wildcard could never work for any of the eight."""
+    config = _base_config()
+    config[key] = "iot/v3/topic" + wildcard
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+
+
 def test_validate_config_reconnect_delay_bounds_are_inclusive():
     """The liveness bounds are inclusive: exactly MAX_RECONNECT_DELAY_SEC per
     delay and exactly MAX_RECONNECT_ATTEMPTS entries still validate; only

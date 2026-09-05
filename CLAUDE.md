@@ -107,6 +107,7 @@ The queues are heap-governed (no fixed capacity), so these are observability met
 
 - `config_schema_version` in `version.py` must match `config.json`
 - Unknown top-level keys in config are rejected (fail-fast)
+- MQTT topics (`mqtt_topic_*`) are exact channel names: `+`/`#` wildcards are rejected (invalid in a PUBLISH Topic Name; inbound dispatch matches delivered topics by exact equality)
 - All config values validated before network starts
 
 ## Common Tasks

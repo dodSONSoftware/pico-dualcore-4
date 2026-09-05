@@ -23,7 +23,6 @@ from device_factory import (
     MAX_SENSOR_TYPE_LENGTH,
     allowed_config_keys,
     is_supported_device_type,
-    supported_device_types,
     validate_device_definition,
 )
 from devices.device import DeviceValidationError
@@ -58,7 +57,6 @@ def _definition(device_type="system-information", config=None, **overrides):
 
 
 def test_registry_exposes_the_system_information_type():
-    assert "system-information" in supported_device_types()
     assert is_supported_device_type("system-information") is True
     assert is_supported_device_type("bme280") is False
     assert allowed_config_keys("system-information") == ALLOWED_CONFIG_KEYS

@@ -185,7 +185,6 @@ class Core0:
         if not self._pending_connection_logs:
             return
 
-        from message_serializer import serialize_and_validate_message
         message = self._pending_connection_logs[0]
         # The container is the persistent identity: uptime, timestamp, and
         # body are stamped/serialized once, and the wire sequence is claimed
@@ -1034,6 +1033,11 @@ class Core0:
             return False
         return True
 
+    def _reboot_publish_due(self):
+        # The reboot response is an outbound PUBLISH: hold (without
+        # resetting, without blocking) until the pacing gate is open.
+        return self._pending_reboot is not None and self._mqtt_publish_ready()
+
     def _perform_reboot(self):
         request = self._pending_reboot
         if request is None:
@@ -1487,12 +1491,7 @@ class Core0:
             # accumulate here.
             self._resolve_pending_config_update()
 
-            # The reboot response is an outbound PUBLISH: hold (without
-            # resetting, without blocking) until the pacing gate is open.
-            if (
-                self._pending_reboot is not None
-                and self._mqtt_publish_ready()
-            ):
+            if self._reboot_publish_due():
                 self._perform_reboot()
 
             self._recover_network_if_needed()
@@ -1529,12 +1528,7 @@ class Core0:
                         print("[DEBUG] MQTT check failed: {}".format(err))
                 self._last_command_poll_ms = now_ms
 
-            # The reboot response is an outbound PUBLISH: hold (without
-            # resetting, without blocking) until the pacing gate is open.
-            if (
-                self._pending_reboot is not None
-                and self._mqtt_publish_ready()
-            ):
+            if self._reboot_publish_due():
                 self._perform_reboot()
 
             if (

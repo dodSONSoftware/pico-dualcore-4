@@ -496,9 +496,9 @@ def test_protocol_string_bounds_are_inclusive():
 def test_broadcast_policy_constants():
     """write-config is the only supported command that rejects the *
     broadcast target."""
-    for command in ("reboot", "get-details", "read-config"):
-        assert command_protocol.is_broadcast_allowed(command)
-    assert not command_protocol.is_broadcast_allowed("write-config")
+    assert command_protocol.BROADCAST_EXCLUDED_COMMANDS == frozenset(
+        (command_protocol.COMMAND_WRITE_CONFIG,)
+    )
 
 
 def test_supported_registry_membership():
@@ -507,9 +507,7 @@ def test_supported_registry_membership():
     for command in ("reboot", "get-details", "read-config", "write-config"):
         assert command_protocol.is_supported_command(command)
     assert not command_protocol.is_supported_command("set-brightness")
-    assert command_protocol.is_core1_owned_command("get-details")
-    for command in ("reboot", "read-config", "write-config"):
-        assert not command_protocol.is_core1_owned_command(command)
+    assert command_protocol.CORE1_OWNED_COMMANDS == (command_protocol.COMMAND_GET_DETAILS,)
 
 
 def test_unknown_field_names_is_sorted_and_complete():

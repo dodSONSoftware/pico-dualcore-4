@@ -59,16 +59,6 @@ def is_supported_command(command):
     return command in SUPPORTED_COMMANDS
 
 
-def is_core1_owned_command(command):
-    """True when command execution belongs to Core 1 (a dispatched bounded event)."""
-    return command in CORE1_OWNED_COMMANDS
-
-
-def is_broadcast_allowed(command):
-    """True when the * broadcast target is valid for this command."""
-    return command not in BROADCAST_EXCLUDED_COMMANDS
-
-
 def is_bounded_command_id(value):
     """A command_id is a non-empty string within the protocol length bound."""
     return isinstance(value, str) and 0 < len(value) <= MAX_COMMAND_ID_LENGTH

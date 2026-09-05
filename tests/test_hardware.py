@@ -129,44 +129,6 @@ class TestDetectHardware:
         with pytest.raises(RuntimeError):
             hardware.detect_hardware()
 
-    def test_get_minimum_free_heap_pico_w(self):
-        """Verify get_minimum_free_heap returns correct value for Pico W."""
-        assert hardware.get_minimum_free_heap("pico_w") == 49152
-
-    def test_get_minimum_free_heap_pico_2_w(self):
-        """Verify get_minimum_free_heap returns correct value for Pico 2 W."""
-        assert hardware.get_minimum_free_heap("pico_2_w") == 131072
-
-    def test_get_minimum_free_heap_unknown_raises_value_error(self):
-        """get_minimum_free_heap should raise ValueError for unknown hardware."""
-        with pytest.raises(ValueError) as exc_info:
-            hardware.get_minimum_free_heap("unknown_hardware")
-
-        assert "Unknown hardware type" in str(exc_info.value)
-
-
-class TestIsSupportedHardware:
-    """Test is_supported_hardware() function."""
-
-    def test_pico_w_is_supported(self, monkeypatch):
-        """Pico W should be reported as supported."""
-        monkeypatch.setattr(hardware.os, "uname", lambda: type("Uname", (), {"machine": "RPI_PICO_W with RP2040"})())
-
-        assert hardware.is_supported_hardware() is True
-
-    def test_pico_2_w_is_supported(self, monkeypatch):
-        """Pico 2 W should be reported as supported."""
-        monkeypatch.setattr(hardware.os, "uname", lambda: type("Uname", (), {"machine": "RPI_PICO2_W with RP2350"})())
-
-        assert hardware.is_supported_hardware() is True
-
-    def test_unsupported_hardware_not_supported(self, monkeypatch):
-        """Unsupported hardware should be reported as not supported."""
-        monkeypatch.setattr(hardware.os, "uname", lambda: type("Uname", (), {"machine": "UNKNOWN_BOARD"})())
-
-        assert hardware.is_supported_hardware() is False
-
-
 class TestMachinePatterns:
     """Test machine string pattern constants."""
 

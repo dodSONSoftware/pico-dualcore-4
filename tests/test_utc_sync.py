@@ -72,9 +72,25 @@ def _install_mocks():
     sys.modules["mqtt"] = _MQTT_MOCK
 
 
+# The mocks are only needed to make the core0 import below host-importable.
+# Restore the original sys.modules entries immediately after it, so the
+# mocks cannot leak into test files collected later in any but the default
+# alphabetical order (the fixture re-installs them at test time, per the
+# note above).
+_saved_modules = {
+    name: sys.modules.get(name)
+    for name in ("time", "machine", "debug", "wifi", "mqtt")
+}
 _install_mocks()
+try:
+    import core0 as core0_module  # noqa: E402
+finally:
+    for _name, _module in _saved_modules.items():
+        if _module is None:
+            del sys.modules[_name]
+        else:
+            sys.modules[_name] = _module
 
-import core0 as core0_module  # noqa: E402
 from config import split_config  # noqa: E402
 from config_manager import ConfigManager  # noqa: E402
 from version import MESSAGE_SCHEMA_VERSION  # noqa: E402

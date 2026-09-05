@@ -17,11 +17,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import message_protocol  # noqa: E402
 import message_serializer  # noqa: E402
 from message_serializer import (  # noqa: E402
+    MAX_OUTBOUND_MESSAGE_BYTES,
     MessageTooLargeError,
     NonFiniteFloatError,
     NonStringKeyError,
     UnsupportedValueError,
-    get_max_message_bytes,
     serialize_and_validate_message,
 )
 
@@ -82,6 +82,6 @@ def test_unsupported_type_nested_raises():
 
 
 def test_oversized_message_rejected():
-    big = {"blob": "x" * (get_max_message_bytes() + 1)}
+    big = {"blob": "x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1)}
     with pytest.raises(MessageTooLargeError):
         serialize_and_validate_message(big)

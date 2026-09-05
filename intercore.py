@@ -1,17 +1,18 @@
-# intercore.py - Three-lane inter-core communication boundary
+# intercore.py - Four-lane inter-core communication boundary
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
 import _thread
 import gc
 
-from debug import DEBUG_QUEUE_MEMORY
-
 
 KIND_TELEMETRY = "telemetry"
 KIND_COMMAND_RESPONSE = "command_response"
 KIND_HEALTH = "health"
 KIND_LOG = "log"
+
+# The admitted message kinds (the put()/put_with_kind() validation target).
+_KNOWN_KINDS = (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG)
 
 # Lower numeric values are more important and are retained preferentially.
 RETENTION_PRIORITY_CRITICAL = 10
@@ -28,37 +29,6 @@ RETENTION_PRIORITY_MAX = RETENTION_PRIORITY_HEALTH
 def _require_positive_integer(value, name):
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("{} must be a positive integer".format(name))
-
-
-def _debug_queue_memory(prefix, queue, event, extra=None):
-    """Temporary heap-reserve validation instrumentation (DEBUG_QUEUE_MEMORY); remove after validation.
-
-    One grep-friendly line of heap and queue state at a meaningful queue event; call while holding the queue's lock where the event touches queue state."""
-    if not DEBUG_QUEUE_MEMORY:
-        return
-    heap_free_bytes = gc.mem_free()
-    parts = ["event={}".format(event)]
-    if extra:
-        for key, value in extra:
-            parts.append("{}={}".format(key, value))
-    parts.extend(
-        (
-            "heap_alloc_bytes={}".format(gc.mem_alloc()),
-            "heap_free_bytes={}".format(heap_free_bytes),
-            "minimum_free_heap_bytes={}".format(queue._minimum_free_heap_bytes),
-            "heap_headroom_bytes={}".format(
-                heap_free_bytes - queue._minimum_free_heap_bytes
-            ),
-            "queue_count={}".format(len(queue._queue)),
-            "queue_high_watermark={}".format(queue._high_watermark),
-        )
-    )
-    # The event queue does not track retained payload bytes (events are not
-    # pre-serialized), so that field is omitted for it.
-    queued_bytes = getattr(queue, "_queued_bytes", None)
-    if queued_bytes is not None:
-        parts.append("queued_bytes={}".format(queued_bytes))
-    print("[DEBUG] {} {}".format(prefix, " ".join(parts)))
 
 
 class OutboundMessageTooLargeError(ValueError):
@@ -105,10 +75,6 @@ class OutboundQueue:
         self._high_watermark = 0
         self._high_watermark_bytes = 0
         self._queued_bytes = 0
-        # Entries admitted since the last full drain: lets the
-        # DEBUG_QUEUE_MEMORY "drained" event skip steady-state single-entry
-        # completion.
-        self._backlog_depth = 0
         self._messages_evicted = 0
         self._telemetry_evicted = 0
         self._messages_rejected = 0
@@ -153,7 +119,6 @@ class OutboundQueue:
             gc.collect()
             return False
         self._queued_bytes += len(payload_bytes)
-        self._backlog_depth += 1
         # Same retained-entry definition as the current depth metric: queued
         # plus the in-flight entry, so the peak can never be below the depth.
         depth = len(self._queue) + (1 if self._in_flight is not None else 0)
@@ -220,33 +185,18 @@ class OutboundQueue:
                 if not gc_attempted:
                     # First failure: reclaim collectable garbage before
                     # discarding any queued data.
-                    _debug_queue_memory(
-                        "outbound_queue", self, "serialization_memory_error"
-                    )
                     gc.collect()
                     gc_attempted = True
                     continue
                 with self._lock:
-                    evicted, evicted_priority = self._evict_one_eligible_locked(
+                    evicted, _ = self._evict_one_eligible_locked(
                         retention_priority
                     )
                 if not evicted:
                     # Nothing this message may reclaim: not queue pressure --
                     # propagate it, do not convert it into a transient
                     # rejection.
-                    _debug_queue_memory(
-                        "outbound_queue",
-                        self,
-                        "serialization_memory_error",
-                        (("outcome", "unrecovered"),),
-                    )
                     raise
-                _debug_queue_memory(
-                    "outbound_queue",
-                    self,
-                    "evict",
-                    (("evicted_priority", evicted_priority),),
-                )
                 gc.collect()
             except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
                 raise ValueError("Message validation failed: {}".format(err))
@@ -279,96 +229,48 @@ class OutboundQueue:
             if not self._preferred_restored():
                 # Pressure band crossed: give GC the first chance to reclaim
                 # unreachable objects, before any queued data.
-                _debug_queue_memory("outbound_queue", self, "memory_pressure")
-                _debug_queue_memory("outbound_queue", self, "gc_before_admission")
                 gc.collect()
-                _debug_queue_memory("outbound_queue", self, "gc_after_admission")
             if self._preferred_restored():
                 # NORMAL: normal admission (the append still carries the
                 # post-admission hard-floor check in _append_locked).
                 with self._lock:
                     if self._append_locked(kind, payload_bytes, retention_priority):
-                        # Log after the append: the line reports the
-                        # post-admission state (including the admitted entry).
-                        _debug_queue_memory("outbound_queue", self, "admit")
                         return True
                 # The append's own allocations crossed the hard floor and
                 # were undone: the displacement path below decides.
-                _debug_queue_memory(
-                    "outbound_queue",
-                    self,
-                    "append_crossed",
-                    (("priority", retention_priority),),
-                )
             elif self._reserve_restored():
                 # MEMORY PRESSURE (soft): the preferred reserve does not
                 # reject an otherwise-valid entry -- reclaim one eligible
                 # entry, if any, then admit.
                 with self._lock:
-                    evicted, evicted_priority = self._evict_one_eligible_locked(
-                        retention_priority
-                    )
-                if evicted:
-                    _debug_queue_memory(
-                        "outbound_queue",
-                        self,
-                        "evict",
-                        (("evicted_priority", evicted_priority),),
-                    )
+                    self._evict_one_eligible_locked(retention_priority)
                 with self._lock:
                     if self._append_locked(kind, payload_bytes, retention_priority):
-                        _debug_queue_memory("outbound_queue", self, "admit")
                         return True
                 # The append still crosses the hard floor: the displacement
                 # path below decides.
-                _debug_queue_memory(
-                    "outbound_queue",
-                    self,
-                    "append_crossed",
-                    (("priority", retention_priority),),
-                )
 
             # HARD PRESSURE: displace the least-important eligible entries
             # one at a time (reclaiming after each) until the entry is
             # retained or nothing eligible remains.
             while True:
                 with self._lock:
-                    evicted, detail = self._evict_one_eligible_locked(
+                    evicted, _ = self._evict_one_eligible_locked(
                         retention_priority
                     )
                     if not evicted:
                         # Nothing eligible can be displaced: reject as
                         # transient -- the producer retains and retries.
                         self._messages_rejected += 1
-                        _debug_queue_memory(
-                            "outbound_queue",
-                            self,
-                            "reject",
-                            (("reason", detail),
-                             ("priority", retention_priority)),
-                        )
                         return False
-                _debug_queue_memory(
-                    "outbound_queue",
-                    self,
-                    "evict",
-                    (("evicted_priority", detail),),
-                )
                 gc.collect()
                 if self._reserve_restored():
                     with self._lock:
                         if self._append_locked(kind, payload_bytes, retention_priority):
-                            _debug_queue_memory("outbound_queue", self, "admit")
                             return True
                     # The eviction restored the floor, but the append still
                     # crosses it: displace the next eligible entry (or reject
                     # once none remain).
-                    _debug_queue_memory(
-                        "outbound_queue",
-                        self,
-                        "append_crossed",
-                        (("priority", retention_priority),),
-                    )
 
     def put(self, kind, message, retention_priority):
         """Admit one MQTT-bound message after validation, serialization, and
@@ -377,7 +279,7 @@ class OutboundQueue:
         True if admitted, False on transient heap pressure (a later retry may
         succeed); ValueError (or OutboundMessageTooLargeError for the size
         case) on a permanent failure of the message itself."""
-        if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
+        if kind not in _KNOWN_KINDS:
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(message, dict):
             raise ValueError("outbound message must be a dictionary")
@@ -400,7 +302,7 @@ class OutboundQueue:
         """Admit one MQTT-bound message from pre-serialized, UTF-8 encoded JSON bytes.
 
         The per-message ceiling is enforced here, not by the caller: a payload beyond MAX_OUTBOUND_MESSAGE_BYTES raises OutboundMessageTooLargeError (a ValueError subclass). Returns True if admitted, False on transient heap pressure."""
-        if kind not in (KIND_TELEMETRY, KIND_COMMAND_RESPONSE, KIND_HEALTH, KIND_LOG):
+        if kind not in _KNOWN_KINDS:
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(payload_bytes, (bytes, bytearray)):
             raise ValueError("payload_bytes must be bytes")
@@ -452,12 +354,6 @@ class OutboundQueue:
                 self._queued_bytes -= len(entry["payload_bytes"])
                 if discarded:
                     self._oversized_discarded += 1
-                if not self._queue:
-                    # Fully drained: log only if a backlog (more than this
-                    # one in-flight entry) flowed through since the last drain.
-                    if self._backlog_depth > 1:
-                        _debug_queue_memory("outbound_queue", self, "drained")
-                    self._backlog_depth = 0
                 return True
             return False
 
@@ -513,10 +409,7 @@ class InterCoreEventQueue:
         # After successful admission, event is immutable.
         with self._heap_admission_lock:
             if gc.mem_free() < self._minimum_free_heap_bytes:
-                _debug_queue_memory("event_queue", self, "memory_pressure")
-                _debug_queue_memory("event_queue", self, "gc_before_admission")
                 gc.collect()
-                _debug_queue_memory("event_queue", self, "gc_after_admission")
             if gc.mem_free() >= self._minimum_free_heap_bytes:
                 with self._lock:
                     self._queue.append(event)
@@ -527,27 +420,14 @@ class InterCoreEventQueue:
                         self._queue.pop()
                         gc.collect()
                         self._rejected += 1
-                        _debug_queue_memory(
-                            "event_queue",
-                            self,
-                            "reject",
-                            (("reason", "post_admission_reserve"),),
-                        )
                         return False
                     depth = len(self._queue)
                     if depth > self._high_watermark:
                         self._high_watermark = depth
-                    _debug_queue_memory("event_queue", self, "admit")
                     return True
             # Admitted events are never evicted: reject the new event and let
             # the caller report the memory-pressure failure.
             self._rejected += 1
-            _debug_queue_memory(
-                "event_queue",
-                self,
-                "reject",
-                (("reason", "memory_pressure"),),
-            )
             return False
 
     def take(self):
