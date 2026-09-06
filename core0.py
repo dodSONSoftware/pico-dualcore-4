@@ -70,6 +70,22 @@ _RECENT_COMMAND_ID_CAPACITY = 16
 # threshold, so a dead Core 1 resets the board. Static constant; not a config key.
 _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS = 30000
 
+# Hardware watchdog (machine.WDT) timeout: the one supervision layer for
+# Core 0 itself — nothing else can detect a Core 0 that is alive but no
+# longer making progress (a wedged driver, a deadlock, a native hang).
+#
+# The budget is derived, not arbitrary: every single blocking operation
+# Core 0 performs must fail on its OWN timeout before this one can fire, so
+# a watchdog reset means "Core 0 is wedged", never "the link was slow". The
+# longest such operation is one bounded MQTT exchange wait, capped at
+# max(MQTT's 5 s response-timeout bound in config.py, mqtt.py's 5 s PINGRESP
+# bound) — both checked against this constant by a test. Every longer wait
+# in Core 0's paths is sliced at 100 ms with _service_wait() between slices,
+# which feeds the watchdog. 8 s stays under the RP2 hardware maximum
+# (8388 ms) while keeping 60% margin over the 5 s wait ceiling.
+# Static constant; not a config key.
+WDT_TIMEOUT_MS = 8000
+
 # HOT_RELOADED settings Core 0 applies to its live config at commit time;
 # Core 1's two HOT settings cross as an internal config-update event.
 _HOT_APPLY_CORE0_KEYS = (
@@ -131,6 +147,11 @@ class Core0:
         self._last_command_poll_ms = time.ticks_ms()
         self._next_sequence = 0
         self._network_stack_ready = False
+        # Hardware watchdog, armed by start() once the startup contract has
+        # passed (startup itself is unbounded and must not be supervised);
+        # None when the build lacks machine.WDT (degraded, see
+        # _enable_watchdog).
+        self._wdt = None
 
     def _uptime_ms(self):
         return current_uptime_ms(self._uptime_state)
@@ -217,8 +238,10 @@ class Core0:
         try:
             if isinstance(topic, bytes):
                 topic = topic.decode()
-            if isinstance(payload, bytes):
-                payload = payload.decode()
+            # The parser reads the frame bytes directly (MicroPython's
+            # json.loads takes any buffer): no decoded-string copy sits
+            # alongside the parsed object graph at the 20 KiB inbound
+            # ceiling.
             doc = json.loads(payload)
         except MemoryError:
             raise
@@ -227,8 +250,8 @@ class Core0:
                 print("[DEBUG] Ignoring invalid MQTT payload: {}".format(err))
             return
 
-        # Release the decoded frame now that the parse succeeded: otherwise
-        # the string (up to the inbound ceiling) stays alive across the whole
+        # Release the raw frame now that the parse succeeded: otherwise the
+        # frame bytes (up to the inbound ceiling) stay alive across the whole
         # command handler alongside the parsed graph, adding a full frame of
         # heap to every response allocation the handler makes.
         del payload
@@ -1406,10 +1429,40 @@ class Core0:
             print("[FATAL] Core 1 heartbeat stale ({} ms) - resetting".format(age_ms))
             machine.reset()
 
+    def _feed_watchdog(self):
+        """Feed the hardware watchdog; a no-op before arming (or when the
+        build lacks machine.WDT). Fed only from Core 0's own execution —
+        the run loop and the sliced waits it drives — never by an
+        independent timer or Core 1, so a subsystem that keeps running can
+        never mask a dead Core 0. A feed() failure is a real failure and
+        escapes to the top-level recovery boundary (no catch here)."""
+        if self._wdt is not None:
+            self._wdt.feed()
+
+    def _enable_watchdog(self):
+        """Arm the hardware watchdog once the startup contract has passed:
+        from here on, a Core 0 that stops making progress resets the board
+        within WDT_TIMEOUT_MS instead of idling until a power cycle.
+
+        Arming is the one intentional capability probe (the Wi-Fi PM_NONE
+        precedent): a build without machine.WDT degrades to no hardware
+        supervision plus a warning instead of a deterministic reset loop —
+        making absence fatal would reboot into the same missing attribute
+        forever."""
+        try:
+            self._wdt = machine.WDT(timeout=WDT_TIMEOUT_MS)
+        except MemoryError:
+            raise
+        except Exception as err:
+            self._wdt = None
+            print("[WARNING] Hardware watchdog unavailable; Core 0 runs without hardware supervision: {}".format(err))
+
     def _service_wait(self):
         """Core 0 servicing hook for each 100 ms slice of long network waits:
-        keeps the Core 1 heartbeat check firing through backoffs."""
+        keeps the Core 1 heartbeat check firing and the hardware watchdog
+        fed through backoffs and observation windows."""
         self._watch_core_1_heartbeat()
+        self._feed_watchdog()
 
     def _sleep_and_service(self, delay_sec):
         if delay_sec <= 0:
@@ -1453,6 +1506,13 @@ class Core0:
 
         self._led_manager.set_connecting(False)
 
+        # Arm hardware supervision only now: the connect/verification loops
+        # above are deliberately unbounded (self-healing retries), and a
+        # watchdog would reset them into the same waits. From here on every
+        # long wait is sliced and fed, and the bounded waits fail under the
+        # watchdog budget.
+        self._enable_watchdog()
+
         print("[INFO] Core 0 startup complete - network stack verified and ready")
 
     def _verify_startup_contract(self):
@@ -1490,8 +1550,11 @@ class Core0:
         while True:
             # First each pass: a dead Core 1 wedges the whole sensor and
             # cannot report itself, so Core 0 resets the board before doing
-            # any other work.
+            # any other work. Feeding the hardware watchdog here proves this
+            # pass of the loop executed; the longest un-fed stretch after
+            # this point is one bounded MQTT wait (under WDT_TIMEOUT_MS).
             self._watch_core_1_heartbeat()
+            self._feed_watchdog()
 
             # Resolve a pending HOT apply now that the watchdog has run: if
             # Core 1 is dead it has already reset, so no unbounded wait can

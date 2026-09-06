@@ -368,7 +368,14 @@ class ConfigManager:
         os.sync()
 
     def _write_candidate_tmp(self, candidate):
-        """Fully write the candidate to .tmp (closed) -- a crash after this leaves a promotable artifact."""
-        text = json.dumps(candidate)
+        """Fully write the candidate to .tmp (closed) -- a crash after this leaves a promotable artifact.
+
+        json.dump() streams the serialization straight into the file object
+        (MicroPython's dump writes through the stream, no pre-built string),
+        so a configuration-sized allocation never coexists with the rest of
+        the write-config peak (inbound frame + parsed graph + candidate +
+        active config). A mid-write failure leaves a partial .tmp, which is
+        already the tolerated artifact: the read-back re-validation before
+        promotion is what decides, never the write itself."""
         with open(self._tmp_path(), "w") as handle:
-            handle.write(text)
+            json.dump(candidate, handle)

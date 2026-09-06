@@ -289,6 +289,56 @@ def test_wrong_schema_version_info_response_does_not_touch_utc_state(make_core0)
     assert core0._utc_last_attempt_ms is None
 
 
+# --- Inbound frame encoding -------------------------------------------------
+
+
+def test_bytes_payload_and_topic_are_handled_like_str(make_core0):
+    """The wire always delivers bytes (topic and payload): the frame must be
+    parsed directly from the byte buffer (MicroPython's json.loads takes any
+    buffer) instead of via a decoded-string copy that would sit alongside
+    the parsed object graph at the 20 KiB inbound ceiling. A bytes frame is
+    handled identically to the equivalent str frame."""
+    core0 = make_core0()
+    doc = _command(command_id="bytes-001")
+
+    core0._on_mqtt_message(
+        core0._config["mqtt_topic_command"].encode("utf-8"),
+        json.dumps(doc).encode("utf-8"),
+    )
+
+    assert len(core0._intercore.event_queue.events) == 1
+    assert _responses(core0) == []
+    assert core0._recent_command_ids == ["bytes-001"]
+
+
+def test_malformed_json_bytes_are_ignored(make_core0):
+    """A frame that is not JSON is dropped at ingress (the same silent
+    ignore as a malformed str payload): no response, no event, no
+    debounce-cache entry, and no escape from the handler."""
+    core0 = make_core0()
+
+    core0._on_mqtt_message(core0._config["mqtt_topic_command"], b"not json")
+
+    assert core0._intercore.event_queue.events == []
+    assert _responses(core0) == []
+    assert core0._recent_command_ids == []
+
+
+def test_invalid_utf8_payload_is_ignored_without_crash(make_core0):
+    """Invalid UTF-8 inside the frame is dropped, not a handler crash: on
+    CPython the parser rejects the bytes (UnicodeDecodeError), and on
+    MicroPython the parsed document carries no message_schema_version, so
+    the global gate ignores it either way — no response, no event, no
+    state change."""
+    core0 = make_core0()
+
+    core0._on_mqtt_message(core0._config["mqtt_topic_command"], b"\xff\xfe{}")
+
+    assert core0._intercore.event_queue.events == []
+    assert _responses(core0) == []
+    assert core0._recent_command_ids == []
+
+
 # --- Target policy ----------------------------------------------------------
 
 

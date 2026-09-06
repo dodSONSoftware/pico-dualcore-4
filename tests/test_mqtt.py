@@ -1357,8 +1357,9 @@ def test_ping_sends_pingreq_through_client_and_resets_clock(ticks):
 
     mqtt.ping()
 
-    # Wait is bounded by the cap (10 s), never the full keepalive window.
-    assert client.ping_calls == [10]
+    # Wait is bounded by the cap (5 s — under the Core 0 hardware watchdog
+    # budget), never the full keepalive window.
+    assert client.ping_calls == [5]
     assert mqtt.ping_due() is False
 
 
@@ -1516,8 +1517,9 @@ def test_wait_msg_rejects_invalid_qos3_publish_before_callback():
 
 
 def test_publish_size_above_remaining_length_maximum_is_rejected():
-    """A publish whose frame exceeds MQTT's 2097151-byte remaining length is
-    rejected instead of underflowing the length encoding loop."""
+    """A publish whose frame exceeds this client's three-byte remaining-length
+    encoding limit (2097151; the protocol maximum is 268435455) is rejected
+    instead of underflowing the length encoding loop."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket()
     client.sock = sock

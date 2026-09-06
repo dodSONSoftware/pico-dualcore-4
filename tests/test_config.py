@@ -14,10 +14,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from command_protocol import MAX_COMMAND_ID_LENGTH, MAX_SOURCE_LENGTH
 from config import (
     MAX_DEVICE_INITIALIZATION_ATTEMPTS,
+    MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS,
+    MAX_DEVICE_READ_FAILURE_THRESHOLD,
     MAX_DEVICES,
     MAX_MQTT_BROKER_ADDRESS_BYTES,
+    MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC,
     MAX_MQTT_KEEPALIVE_SEC,
     MAX_MQTT_TOPIC_BYTES,
+    MAX_NETWORK_PROBE_TIMEOUT_SEC,
     MAX_RECONNECT_ATTEMPTS,
     MAX_RECONNECT_DELAY_SEC,
     MAX_TICKS_SAFE_INTERVAL_MS,
@@ -456,12 +460,44 @@ def test_validate_config_device_initialization_attempts_is_bounded():
 
 
 @pytest.mark.parametrize(
+    "key,max_value",
+    [
+        ("mqtt_broker_response_timeout_sec", MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC),
+        ("network_probe_timeout_sec", MAX_NETWORK_PROBE_TIMEOUT_SEC),
+        ("device_initialization_retry_delay_ms", MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS),
+        ("device_read_failure_threshold", MAX_DEVICE_READ_FAILURE_THRESHOLD),
+    ],
+)
+def test_validate_config_operational_liveness_bounds(key, max_value):
+    """These keys gate recovery timing, so they carry operational liveness
+    bounds on top of their type/positivity checks: a value can be
+    representable (even ticks-safe) while still defeating recovery — a
+    multi-day broker-response timeout, an all-day initialization retry
+    delay. The inclusive maximum validates; one more is rejected with the
+    stable code and exact message, and the shipped values sit well below
+    every bound."""
+    config = _base_config()
+    config[key] = max_value
+    assert validate_config(config) is config
+
+    config = _base_config()
+    config[key] = max_value + 1
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "{} must be at most {}".format(key, max_value)
+
+
+@pytest.mark.parametrize(
     "key,ms_per_unit",
     [
         ("read_loop_sec", 1000),
         ("health_interval_sec", 1000),
         ("network_snapshot_interval_sec", 1000),
-        ("mqtt_broker_response_timeout_sec", 1000),
+        # mqtt_broker_response_timeout_sec is NOT here: its operational
+        # liveness bound (MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC) is far tighter
+        # than the ticks ceiling and is pinned in
+        # test_validate_config_operational_liveness_bounds.
         ("datetime_sync_interval_min", 60 * 1000),
         ("mqtt_command_poll_ms", 1),
         ("mqtt_outbound_publish_delay_ms", 1),

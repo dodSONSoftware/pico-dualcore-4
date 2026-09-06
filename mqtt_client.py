@@ -222,8 +222,14 @@ class MQTTClient:
         if qos > 0:
             sz += 2
         if sz > 2097151:
-            # The MQTT remaining-length field tops out at 2097151.
-            raise MQTTException("Publish size exceeds the MQTT remaining-length maximum")
+            # 2097151 is the limit of THIS client's encoder: it emits at most
+            # three remaining-length bytes (the loop above). The MQTT
+            # protocol maximum is 268435455 (four bytes) — never reachable
+            # here, since the application outbound ceiling is far below
+            # either limit.
+            raise MQTTException(
+                "Publish size exceeds this client's remaining-length encoding limit"
+            )
         i = 1
         while sz > 0x7F:
             pkt[i] = (sz & 0x7F) | 0x80

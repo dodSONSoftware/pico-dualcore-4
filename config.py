@@ -56,6 +56,35 @@ MAX_DEVICE_INITIALIZATION_ATTEMPTS = 10
 MAX_RECONNECT_DELAY_SEC = 600
 MAX_RECONNECT_ATTEMPTS = 32
 
+# Operational liveness bounds — in contrast to MAX_TICKS_SAFE_INTERVAL_MS
+# above, a representability bound. These stop a representable value from
+# defeating recovery: a stalled link must fail on its own timeout in
+# seconds, and a retry delay must not space re-attempts days apart. Shipped
+# values (4 s / 5 s / 250 ms / 3) sit well below every bound below.
+
+# Scales every bounded MQTT wait (the CONNACK/SUBACK handshake, the PUBACK,
+# check_msg completion, the UTC request deadline). Each single wait must stay
+# under the Core 0 hardware watchdog budget (core0.py WDT_TIMEOUT_MS, 8 s —
+# itself under the RP2 hardware maximum of 8388 ms), so a stalled link times
+# out on its own before the watchdog can fire: a watchdog reset means "Core 0
+# is not making progress", never "the broker was slow".
+MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC = 5
+
+# Startup-only (the network probe runs before the watchdog arms): bounds how
+# long one verification attempt can hold the device out of service. The worst
+# case per pass (two probes plus backoff) stays in minutes, not hours.
+MAX_NETWORK_PROBE_TIMEOUT_SEC = 30
+
+# Core 1's initialization retry pacing (a sliced sleep that refreshes the
+# liveness stamp, so no ticks or watchdog pressure): purely operational — a
+# 24-hour "delay" would leave the device declaring itself alive while making
+# no progress for a day.
+MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS = 60 * 1000
+
+# Consecutive read failures before a device reinit: above this, automatic
+# reinit is effectively disabled for any realistic read loop.
+MAX_DEVICE_READ_FAILURE_THRESHOLD = 1000
+
 # Core 1 builds a per-device status structure before anything can be rejected
 # at the serialized-size ceiling (the bounded startup-log fallback and the
 # read-config response both carry it). The string fields are byte-bounded
@@ -421,6 +450,41 @@ def validate_config(config):
 
     _require_nonnegative_integer(config, "device_initialization_retry_delay_ms")
     _require_nonnegative_integer(config, "mqtt_outbound_publish_delay_ms")
+
+    # Operational liveness bounds (see the MAX_ constants): all four keys are
+    # type-checked above, so a wrong type still reports from the _require_*
+    # helpers, and only a representable-but-unusable value reaches here.
+    if config["mqtt_broker_response_timeout_sec"] > MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC:
+        raise ConfigError(
+            "mqtt_broker_response_timeout_sec must be at most {}".format(
+                MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC
+            ),
+            code="invalid_value",
+        )
+    if config["network_probe_timeout_sec"] > MAX_NETWORK_PROBE_TIMEOUT_SEC:
+        raise ConfigError(
+            "network_probe_timeout_sec must be at most {}".format(
+                MAX_NETWORK_PROBE_TIMEOUT_SEC
+            ),
+            code="invalid_value",
+        )
+    if (
+        config["device_initialization_retry_delay_ms"]
+        > MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS
+    ):
+        raise ConfigError(
+            "device_initialization_retry_delay_ms must be at most {}".format(
+                MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS
+            ),
+            code="invalid_value",
+        )
+    if config["device_read_failure_threshold"] > MAX_DEVICE_READ_FAILURE_THRESHOLD:
+        raise ConfigError(
+            "device_read_failure_threshold must be at most {}".format(
+                MAX_DEVICE_READ_FAILURE_THRESHOLD
+            ),
+            code="invalid_value",
+        )
 
     # Values that become ticks_diff thresholds or ticks_add deltas are bounded
     # by the ticks ceiling; values that only drive sliced sleeps (reconnect

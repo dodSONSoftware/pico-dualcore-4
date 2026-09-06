@@ -9,8 +9,11 @@ from debug import DEBUG
 from mqtt_client import MQTTClient, MQTTException
 
 # Bounded wait for PINGRESP so a dead link surfaces quickly instead of
-# blocking the Core 0 run loop for the full keepalive window.
-_MAX_PINGRESP_WAIT_SEC = 10
+# blocking the Core 0 run loop for the full keepalive window. The bound sits
+# under the Core 0 hardware watchdog budget (core0.py WDT_TIMEOUT_MS): every
+# single blocking wait Core 0 performs must fail on its own timeout before
+# the watchdog can fire.
+_MAX_PINGRESP_WAIT_SEC = 5
 
 # Expected failure classes at the MQTT boundary: transport (OSError) and
 # wire-protocol (MQTTException) failures are link conditions — mark the

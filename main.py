@@ -93,11 +93,12 @@ def main():
     # Recovery boundary for the operational phase. Everything above is
     # deterministic startup validation that intentionally fails fast: a
     # misconfigured or unsupported board must stay down with a diagnosable
-    # error, not reboot forever. From here on supervision is one-directional
-    # (Core 0's watchdog recovers a dead Core 1; nothing supervises Core 0),
-    # so a terminating Core 0 would leave the board with no networking, no
-    # Core 1 supervision, and no recovery. An unrecoverable Core 0 exception
-    # is therefore a controlled board reset, not application termination.
+    # error, not reboot forever. From here on every layer has a supervisor:
+    # Core 0's heartbeat watchdog recovers a dead Core 1, and the hardware
+    # watchdog (armed at the end of core0.start()) recovers a Core 0 that is
+    # alive but no longer making progress — the exception boundary below
+    # covers what a reset cannot: an unrecoverable Core 0 exception, which is
+    # a controlled board reset, not application termination.
     try:
         # Core 0 establishes the network before any Core 1 module is imported.
         core0.start()

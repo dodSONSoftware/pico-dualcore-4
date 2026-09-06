@@ -356,6 +356,31 @@ def test_unchanged_preserves_pending_reboot_state(config_dir):
 
 
 # ---------------------------------------------------------------------------
+# Persistence write: streamed, no configuration-sized string allocation
+# ---------------------------------------------------------------------------
+
+
+def test_persistence_write_never_builds_a_full_serialization_string(config_dir, monkeypatch):
+    """begin_write() streams the candidate to .tmp (json.dump into the file
+    object): a configuration-sized string must never be allocated alongside
+    the write-config peak (inbound frame + parsed graph + candidate + active
+    config). Booby-trapping json.dumps proves the persistence path does not
+    depend on it, and the streamed bytes still round-trip through the
+    read-back re-validation before promotion."""
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("persistence path built a full serialization string")
+
+    monkeypatch.setattr(json, "dumps", _boom)
+    manager = ConfigManager(str(config_dir / "config.json"))
+
+    result = manager.begin_write(_hot_candidate())
+
+    assert result["classification"] == CLASSIFICATION_HOT_RELOADED
+    assert json.loads((config_dir / "config.json").read_text()) == _hot_candidate()
+
+
+# ---------------------------------------------------------------------------
 # REBOOT_REQUIRED: snapshot lifecycle and reboot-state derivation
 # ---------------------------------------------------------------------------
 

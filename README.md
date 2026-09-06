@@ -222,6 +222,7 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 - **Tick-Wrap-Safe Uptime**: Uptime is accumulated from recent sample deltas, staying correct on long-running devices
 - **UTC Synchronization**: Mandatory at startup; non-blocking steady-state re-sync with deadline and retry throttling
 - **Core 1 Liveness**: Deadline-based heartbeat drives the `core_1_active` health field; the Core 0 watchdog resets the board if Core 1 stops refreshing — including while Core 0 is stuck in network recovery
+- **Core 0 Hardware Watchdog**: `machine.WDT` (8 s, armed once the startup contract has passed) is fed only from Core 0's own execution, so a Core 0 that is alive but no longer making progress resets the board — complementing the exception boundary that covers Core 0 failures that raise
 - **Startup Log**: One-time full system startup log published before telemetry
 - **LED Status**: Flashing during connection, pulse on telemetry send
 - **Reboot Command**: JSON command triggers clean reboot with acknowledgment
