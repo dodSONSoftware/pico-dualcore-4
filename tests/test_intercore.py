@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 sys.modules.setdefault("machine", MagicMock())
 
+import intercore  # noqa: E402
 from intercore import (  # noqa: E402
     RETENTION_PRIORITY_CRITICAL,
     RETENTION_PRIORITY_ERROR,
@@ -254,14 +255,13 @@ def test_put_rejects_unsupported_type(monkeypatch):
 
 
 def test_put_memoryerror_from_serialization_propagates(monkeypatch):
-    import message_serializer
 
     ic, _ = _queue(monkeypatch)
 
     def _exhaust(*args, **kwargs):
         raise MemoryError
 
-    monkeypatch.setattr(message_serializer, "serialize_and_validate_message", _exhaust)
+    monkeypatch.setattr(intercore, "serialize_and_validate_message", _exhaust)
     with pytest.raises(MemoryError):
         ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
 
@@ -846,7 +846,6 @@ def test_put_does_not_evict_for_the_obsolete_worst_case_gate(monkeypatch):
 def test_serialization_memory_error_recovers_with_gc_before_eviction(monkeypatch):
     """First serialization MemoryError: gc.collect() alone resolves it, so no
     queued data is discarded -- the retry happens before any eviction."""
-    import message_serializer
 
     ic, heap = _queue(monkeypatch)
     queue = ic.outbound_queue
@@ -858,7 +857,7 @@ def test_serialization_memory_error_recovers_with_gc_before_eviction(monkeypatch
         )
         is True
     )
-    original = message_serializer.serialize_and_validate_message
+    original = intercore.serialize_and_validate_message
     attempts = {"n": 0}
 
     def _oom_then_ok(message):
@@ -868,7 +867,7 @@ def test_serialization_memory_error_recovers_with_gc_before_eviction(monkeypatch
         return original(message)
 
     monkeypatch.setattr(
-        message_serializer, "serialize_and_validate_message", _oom_then_ok
+        intercore, "serialize_and_validate_message", _oom_then_ok
     )
     assert (
         queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
@@ -884,7 +883,6 @@ def test_serialization_memory_error_reclaims_one_eligible_entry(monkeypatch):
     """A serialization MemoryError that survives the gc.collect() retry
     reclaims one eligible lower-retention-priority entry (TELEMETRY, via the
     regular eviction metrics) and then succeeds -- eviction only after GC."""
-    import message_serializer
 
     ic, heap = _queue(monkeypatch)
     queue = ic.outbound_queue
@@ -894,7 +892,7 @@ def test_serialization_memory_error_reclaims_one_eligible_entry(monkeypatch):
         )
         is True
     )
-    original = message_serializer.serialize_and_validate_message
+    original = intercore.serialize_and_validate_message
     attempts = {"n": 0}
 
     def _oom_twice_then_ok(message):
@@ -904,7 +902,7 @@ def test_serialization_memory_error_reclaims_one_eligible_entry(monkeypatch):
         return original(message)
 
     monkeypatch.setattr(
-        message_serializer, "serialize_and_validate_message", _oom_twice_then_ok
+        intercore, "serialize_and_validate_message", _oom_twice_then_ok
     )
     # Incoming is more important than the queued TELEMETRY entry, so the
     # retention policy allows the displacement.
@@ -924,7 +922,6 @@ def test_serialization_memory_error_reclaims_exactly_as_many_entries_as_needed(m
     """Recovery is incremental, not bulk-destructive: one entry per failed
     attempt, stopping as soon as serialization succeeds -- here exactly two
     of the three eligible entries are reclaimed."""
-    import message_serializer
 
     ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
@@ -935,7 +932,7 @@ def test_serialization_memory_error_reclaims_exactly_as_many_entries_as_needed(m
     )
     for kind, priority, payload in seeded:
         assert queue.put_with_kind(kind, payload, priority) is True
-    original = message_serializer.serialize_and_validate_message
+    original = intercore.serialize_and_validate_message
     attempts = {"n": 0}
 
     def _fail_until_two_evictions(message):
@@ -948,7 +945,7 @@ def test_serialization_memory_error_reclaims_exactly_as_many_entries_as_needed(m
         return original(message)
 
     monkeypatch.setattr(
-        message_serializer,
+        intercore,
         "serialize_and_validate_message",
         _fail_until_two_evictions,
     )
@@ -970,7 +967,6 @@ def test_serialization_recovery_does_not_evict_a_critical_entry(monkeypatch):
     must not displace a retained CRITICAL: nothing eligible remains, so the
     MemoryError propagates instead of the retention floor being discarded or
     the incoming message silently rejected."""
-    import message_serializer
 
     ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
@@ -986,7 +982,7 @@ def test_serialization_recovery_does_not_evict_a_critical_entry(monkeypatch):
         raise MemoryError
 
     monkeypatch.setattr(
-        message_serializer, "serialize_and_validate_message", _always_oom
+        intercore, "serialize_and_validate_message", _always_oom
     )
     with pytest.raises(MemoryError):
         queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
@@ -1002,7 +998,6 @@ def test_serialization_recovery_does_not_evict_critical_for_critical(monkeypatch
     """The retention floor also holds on the recovery path: an admitted
     CRITICAL cannot be displaced by another CRITICAL's failed serialization --
     the MemoryError propagates rather than discarding the earlier response."""
-    import message_serializer
 
     ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
@@ -1018,7 +1013,7 @@ def test_serialization_recovery_does_not_evict_critical_for_critical(monkeypatch
         raise MemoryError
 
     monkeypatch.setattr(
-        message_serializer, "serialize_and_validate_message", _always_oom
+        intercore, "serialize_and_validate_message", _always_oom
     )
     with pytest.raises(MemoryError):
         queue.put(
@@ -1036,7 +1031,6 @@ def test_serialization_recovery_equal_priority_matches_admission_policy(monkeypa
     incoming entry to displace a same-priority queued entry, and the
     serialization recovery path uses that same rule -- no new equal-priority
     semantics are invented for recovery."""
-    import message_serializer
 
     ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
@@ -1046,7 +1040,7 @@ def test_serialization_recovery_equal_priority_matches_admission_policy(monkeypa
         )
         is True
     )
-    original = message_serializer.serialize_and_validate_message
+    original = intercore.serialize_and_validate_message
     attempts = {"n": 0}
 
     def _oom_twice_then_ok(message):
@@ -1056,7 +1050,7 @@ def test_serialization_recovery_equal_priority_matches_admission_policy(monkeypa
         return original(message)
 
     monkeypatch.setattr(
-        message_serializer, "serialize_and_validate_message", _oom_twice_then_ok
+        intercore, "serialize_and_validate_message", _oom_twice_then_ok
     )
     assert (
         queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY) is True
@@ -1072,7 +1066,6 @@ def test_unrecoverable_serialization_memory_error_propagates(monkeypatch):
     """Empty queue: no queue-owned memory to reclaim, so an unrecovered
     serialization MemoryError propagates to the firmware recovery boundary
     rather than being converted into a transient (False) queue rejection."""
-    import message_serializer
 
     ic, _ = _queue(monkeypatch)
 
@@ -1080,7 +1073,7 @@ def test_unrecoverable_serialization_memory_error_propagates(monkeypatch):
         raise MemoryError
 
     monkeypatch.setattr(
-        message_serializer, "serialize_and_validate_message", _always_oom
+        intercore, "serialize_and_validate_message", _always_oom
     )
     with pytest.raises(MemoryError):
         ic.outbound_queue.put(
@@ -1094,7 +1087,6 @@ def test_non_memory_serializer_failures_propagate_without_eviction(monkeypatch):
     or ValueError from the serializer itself) propagates unchanged, evicting
     nothing and never being converted into queue pressure -- fail-fast is
     preserved."""
-    import message_serializer
 
     ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
@@ -1109,7 +1101,7 @@ def test_non_memory_serializer_failures_propagate_without_eviction(monkeypatch):
         raise TypeError("serializer defect")
 
     monkeypatch.setattr(
-        message_serializer, "serialize_and_validate_message", _type_error
+        intercore, "serialize_and_validate_message", _type_error
     )
     with pytest.raises(TypeError):
         queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
@@ -1118,7 +1110,7 @@ def test_non_memory_serializer_failures_propagate_without_eviction(monkeypatch):
         raise ValueError("serializer defect")
 
     monkeypatch.setattr(
-        message_serializer, "serialize_and_validate_message", _value_error
+        intercore, "serialize_and_validate_message", _value_error
     )
     with pytest.raises(ValueError):
         queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
@@ -1150,7 +1142,6 @@ def test_put_with_kind_never_serializes(monkeypatch):
     """put_with_kind() receives already-final bytes: the serializer and the
     serialization-recovery path are never invoked, and only the existing
     admission rules apply."""
-    import message_serializer
 
     ic, _ = _queue(monkeypatch)
     queue = ic.outbound_queue
@@ -1159,7 +1150,7 @@ def test_put_with_kind_never_serializes(monkeypatch):
         raise AssertionError("the serializer must not run on put_with_kind()")
 
     monkeypatch.setattr(
-        message_serializer, "serialize_and_validate_message", _boom
+        intercore, "serialize_and_validate_message", _boom
     )
     assert (
         queue.put_with_kind(

@@ -5,6 +5,16 @@
 import _thread
 import gc
 
+from message_serializer import (
+    MAX_OUTBOUND_MESSAGE_BYTES,
+    MessageTooLargeError,
+    NonFiniteFloatError,
+    NonStringKeyError,
+    SerializationError,
+    UnsupportedValueError,
+    serialize_and_validate_message,
+)
+
 
 KIND_TELEMETRY = "telemetry"
 KIND_COMMAND_RESPONSE = "command_response"
@@ -169,14 +179,6 @@ class OutboundQueue:
         recovery boundary. Bounded by the eligible entries, so it terminates
         without a retry count. No locks are held across the serializer or
         gc.collect()."""
-        from message_serializer import (
-            serialize_and_validate_message,
-            MessageTooLargeError,
-            UnsupportedValueError,
-            NonStringKeyError,
-            NonFiniteFloatError,
-            SerializationError,
-        )
         gc_attempted = False
         while True:
             try:
@@ -322,7 +324,6 @@ class OutboundQueue:
 
         # Enforce the same per-message ceiling the put() serialization path
         # enforces; the bytes are already final, only their length matters.
-        from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
         if len(payload_bytes) > MAX_OUTBOUND_MESSAGE_BYTES:
             # Oversized is a permanent failure of the message: raise, the
             # same as the put() serialization path (queue state untouched).

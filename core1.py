@@ -500,7 +500,7 @@ def _handle_device_result(intercore, uptime_state, result):
             ))
 
 
-def _run_telemetry_read_pass(device_manager, intercore, uptime_state, config):
+def _run_telemetry_read_pass(device_manager, intercore, uptime_state):
     """One telemetry read pass across all active devices; shared by the
     initial at-anchor sample and the periodic read boundary."""
     for managed_device in device_manager.get_active_devices():
@@ -808,7 +808,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # at boot sees current data. Telemetry first, then health, so the
         # health report reflects queue state that already includes the fresh
         # samples. The periodic schedulers are untouched (not a second grid).
-        _run_telemetry_read_pass(device_manager, intercore, uptime_state, config)
+        _run_telemetry_read_pass(device_manager, intercore, uptime_state)
         _try_queue_health_message_intercore(intercore, uptime_state, config, system_information)
 
         pending_command_response = None
@@ -834,7 +834,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
             now_ms = time.ticks_ms()
             if time.ticks_diff(now_ms, schedulers["next_read_ms"]) >= 0:
-                _run_telemetry_read_pass(device_manager, intercore, uptime_state, config)
+                _run_telemetry_read_pass(device_manager, intercore, uptime_state)
 
                 # Skip boundaries that elapsed while the read ran, never
                 # replay them: telemetry is a current sample, not historical

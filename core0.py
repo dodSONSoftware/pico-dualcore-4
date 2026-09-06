@@ -1139,7 +1139,11 @@ class Core0:
 
         self._pending_reboot = None
         print("[INFO] Rebooting in 5000 milliseconds")
-        time.sleep_ms(5000)
+        # Sliced, like every other long run-loop wait: a monolithic sleep plus
+        # the publish wait that preceded it could stretch past WDT_TIMEOUT_MS,
+        # and the board would reset via the hardware watchdog instead of this
+        # explicit path (a watchdog trip that was really a planned reboot).
+        self._sleep_and_service(5)
         print("[INFO] machine.reset()")
         machine.reset()
         return True

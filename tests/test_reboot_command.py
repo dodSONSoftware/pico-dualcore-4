@@ -147,6 +147,10 @@ class RecordingEventQueue:
 class MockInterCore:
     def __init__(self):
         self.state_mailboxes = MagicMock()
+        # No Core 1 stamp: the heartbeat check (run from the sliced reboot
+        # grace sleep) is a no-op, as with the real mailbox before Core 1
+        # stamps one.
+        self.state_mailboxes.get_core_1_activity_ms.return_value = None
         self.outbound_queue = MagicMock()
         self.event_queue = RecordingEventQueue()
 
