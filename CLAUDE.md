@@ -99,7 +99,7 @@ The queues are heap-governed (no fixed capacity), so these are observability met
 
 - 4 spaces indentation, no tabs
 - `snake_case` for functions/variables, `PascalCase` for classes
-- All modules must have module-level docstring and copyright header
+- Every module starts with the three-line `#` header (file title, copyright, SPDX-License-Identifier); a module-level docstring is added only where there is substantive module-level context, otherwise docstrings live on the functions and classes whose contract needs stating
 - Import order: standard library, then local modules
 - Use `time.ticks_*` for all time calculations (monotonic)
 
@@ -185,7 +185,7 @@ Check for:
 ## Hardware Notes
 
 - **Pico W**: Wi-Fi only, 256KB RAM
-- **Pico 2 W**: Wi-Fi, 264KB RAM, faster CPU
+- **Pico 2 W**: Wi-Fi, 520KB RAM (RP2350), faster CPU
 - Onboard LED is Core 0-only via `LEDManager`
 - Never call `machine.reset()` from Core 1
 

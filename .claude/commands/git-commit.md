@@ -41,7 +41,7 @@ Uncommitted changes should not cause an automatic abort. The workflow's purpose 
 
 If version.py is missing, fail with error message.
 
-### 1. UPDATE CLAUDE.md IF NEEDED (README.md NOT ASSUMED)
+### 1. UPDATE PROJECT DOCS IF NEEDED (README.md NOT ASSUMED; CHANGELOG.md in step 3b)
 
 Check if documentation needs updating based on changes:
 
@@ -50,6 +50,9 @@ Check if documentation needs updating based on changes:
 - **Modified commands/skills** — update references or descriptions
 - **Removed files** — remove stale entries
 - **Architecture/config changes** — update architecture notes or commands
+
+**For ARCHITECTURE.md:**
+- **Documented-contract changes** — if the diff changes behavior ARCHITECTURE.md documents (run-loop semantics and publish-path contracts, core ownership boundaries, inter-core lanes, health fields, the command protocol, MQTT boundary behavior, recovery/watchdog semantics, memory-pressure policy), verify the affected sections and fix the wording the change invalidated — in place, no new sections for small fixes
 
 **For README.md:** Only if it exists (check first). Do not assume it exists.
 - **New features** — add feature highlights or usage examples
@@ -85,15 +88,36 @@ Examples:
 - `AM` = Added to index, modified in working tree
 - `??` = Untracked file
 
-### 3. DETERMINE VERSION BUMP FROM CURRENT CHANGES
+### 3. DETERMINE VERSION (SMART BUMP)
 
-**DO NOT use recent commit history to determine version bump.** The current diff, changed files, and intended commit determine the version impact.
+The commit type and increment class come **only from the current changes** — never from history (two consecutive `fix:` commits each earn their own patch bump; a `feat:` after a `fix:` earns a minor regardless of what came before). The last commit and the two `version.py` values are read to establish version state and verify the arithmetic, as below.
 
 Analyze the current changes to classify the commit type:
 - **Breaking change**: Any change with `BREAKING CHANGE:` in commit message OR explicit API/protocol breaking changes in the diff
 - **New features** (`feat:`): New functionality added (new files, new APIs, new configuration options)
 - **Bug fixes** (`fix:`): Correcting broken behavior
 - **Other** (`chore:`, `docs:`, `refactor:`, `test:`, `perf:`, `ci:`): Minor changes that don't affect API
+
+**Establish the version state (last commit + version.py):**
+
+```bash
+git log -1 --format=%s              # last subject: "[X.Y.Z] type: ..."
+git diff HEAD -- version.py         # if non-empty: "-" line = V_head, "+" line = V_tree; if empty: V_head == V_tree
+grep "^FIRMWARE_VERSION = " version.py
+```
+
+- `V_head` — `FIRMWARE_VERSION` at HEAD
+- `V_last` — bracketed version in the last commit's subject line
+- `V_tree` — `FIRMWARE_VERSION` in the working tree
+
+**Invariant:** `V_last == V_head` — repo convention: a commit's bracketed version equals the `version.py` committed with it. If violated, the state is ambiguous (an earlier bump and its message desynced): report the drift and stop for human review — do not guess which value is canonical, and do not "repair" it with a bump.
+
+**Case A — `version.py` is already bumped in the working tree** (this project's convention: the version bump and the CHANGELOG entry are authored as part of the changeset, before the commit runs):
+- Do NOT bump again — that would double-bump (e.g. an authored 0.4.79 → 0.4.80 becoming 0.4.81) and desync the commit message, `version.py`, and the CHANGELOG entry. Use `V_tree` as the commit version.
+- Verify the authored increment: `V_tree` must be **strictly greater than** `V_head` (compared as semantic versions, prerelease suffix included — a no-op or down-bump is an authoring error) and its class must match the commit type (fix/other → patch, feat → minor, breaking → major). If either check fails, report the mismatch and stop for human review — never silently re-bump over an authored bump.
+- The bracketed version in the commit message and the CHANGELOG entry (step 3b) must both equal `V_tree`.
+
+**Case B — `version.py` is not part of the diff:** compute the bump from `V_head` per the commit type and apply it (rules below), then continue.
 
 **Version format support:**
 - Base version: `X.Y.Z` (semantic versioning)
@@ -133,6 +157,17 @@ with open("version.py", "r") as f:
 with open("version.py", "w") as f:
     f.write(content)
 ```
+
+### 3b. UPDATE CHANGELOG.md
+
+This project maintains CHANGELOG.md, and every release-worthy commit gets an entry (in this project that is every commit, including docs and test-only changes). This step runs after step 3 because the entry names the resolved firmware version.
+
+- If the diff already adds or updates a Version History entry for this change: verify it in place — correct firmware version, accurate summary, and any new or changed tests named. Fix it; do not add a duplicate.
+- Otherwise add a new entry at the top of Version History, matching the shape of a recent entry: `- **Unreleased** (firmware <version>): **<bold summary>** — <what changed, why, the behavioral effect, and which tests pin it>`, ending with the schema-version note the existing entries carry (`config_schema_version` unchanged / changed). Do not invent fields the file does not use.
+- The firmware version in the entry must equal the final `version.py` value from step 3.
+- Never relabel or rewrite existing entries.
+
+Do NOT stage documentation files yet.
 
 ### 4. GENERATE COMMIT MESSAGE
 
@@ -257,7 +292,7 @@ After successful commit, return:
    ```
    - <file_path>: <description>
    ```
-3. **Documentation updates**: CLAUDE.md (if applicable). README.md only if it exists and was updated.
+3. **Documentation updates**: CLAUDE.md, ARCHITECTURE.md, CHANGELOG.md (if applicable). README.md only if it exists and was updated.
 4. **Version bump**: old → new
 5. **Summary** of notable changes
 

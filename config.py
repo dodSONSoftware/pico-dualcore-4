@@ -372,21 +372,12 @@ def validate_config(config):
         _require_mqtt_topic(config, key)
     _require_distinct_mqtt_topics(config)
 
-    # source is the wire identity, spliced into every Core 0 envelope, so it
-    # carries a protocol-scale bound: a huge identity would make even a tiny
-    # envelope fail the outbound wire ceiling. Measured in UTF-8 bytes — the
-    # ceiling is a wire bound, and 64 characters of 4-byte code points are
-    # 256 bytes.
     if len(config["source"].encode("utf-8")) > MAX_SOURCE_LENGTH:
         raise ConfigError(
             "source must be at most {} bytes".format(MAX_SOURCE_LENGTH),
             code="invalid_value",
         )
 
-    # The broker address had no length bound at all: one ~15 KiB value fits
-    # a single inbound write-config packet, validates, and then makes the
-    # read-config response unsendable forever. DNS's hostname maximum keeps
-    # hostnames legal while bounding the wire contribution.
     if len(config["mqtt_broker_ip_address"].encode("utf-8")) > MAX_MQTT_BROKER_ADDRESS_BYTES:
         raise ConfigError(
             "mqtt_broker_ip_address must be at most {} bytes".format(

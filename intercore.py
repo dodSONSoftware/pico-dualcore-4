@@ -214,20 +214,15 @@ class OutboundQueue:
     def _admit_heap_governed(self, kind, payload_bytes, retention_priority):
         """Apply the two-threshold heap admission decision (no locks held on entry).
 
-        NORMAL (at/above the preferred reserve): admit, no GC, no eviction.
-        MEMORY PRESSURE (down to the hard floor): gc.collect() first, else one
-        eligible entry may be reclaimed (gc.collect() after the reclamation)
-        and the entry is still admitted -- the preferred reserve is not a
-        rejection wall. HARD PRESSURE (below the hard floor after GC, or an
-        append whose own allocations cross it): each pass re-measures the
-        floor first (a rolled-back append's own reclaim, or the prior
-        pass's collect, may have restored it) and admits the entry when it
-        is intact; only otherwise does it displace the least-important
-        eligible entry, gc.collect(), and repeat -- until the entry can be
-        retained with the hard floor intact, or reject as transient (the
-        producer retains and retries) when nothing eligible remains. A more important admission is never rejected while
-        a less important entry is retained, and no state evicts a retained
-        CRITICAL."""
+        The preferred reserve is not a rejection wall: pressure reclaims
+        (GC first, then at most one eligible entry) and still admits. The
+        hard floor is re-measured before every displacement -- the append's
+        own rollback or the prior collection may have restored it, so no
+        eviction is decided on a pre-collection measurement. A more
+        important admission is never rejected while a less important entry
+        is retained, and no state evicts a retained CRITICAL. False is the
+        only rejection (nothing eligible remained) and is transient: the
+        producer retains and retries."""
         with self._heap_admission_lock:
             if not self._preferred_restored():
                 # Pressure band crossed: give GC the first chance to reclaim

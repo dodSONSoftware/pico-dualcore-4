@@ -303,7 +303,6 @@ class DeviceManager:
     def _process_normal_read(self, managed_device):
         """Process a normal read for a device; validate the telemetry and record the outcome."""
         try:
-            # Timestamp on the boot-relative uptime base (correct age past half a tick period).
             managed_device.read_count += 1
             managed_device.last_read_ms = self._now_ms()
 
@@ -364,7 +363,6 @@ class DeviceManager:
         if not isinstance(device_status, list):
             return
 
-        # Same boot-relative uptime base as the stored read timestamps.
         now_ms = self._now_ms()
         fresh_status = managed_device.get_status_snapshot(now_ms=now_ms)
 

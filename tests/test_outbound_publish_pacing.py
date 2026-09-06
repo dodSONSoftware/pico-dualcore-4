@@ -577,6 +577,53 @@ def test_reboot_holds_for_publish_slot_then_resets(make_core0):
     assert instance._pending_reboot is None
 
 
+def test_reboot_holds_during_outage_then_acks_after_reconnect(make_core0):
+    """A pending reboot survives an outage with zero publish attempts.
+
+    The gate is the same conjunction as every other run-loop publish path:
+    a down session is never attempted (it would fail fast, so the response
+    would be rebuilt only to be thrown away), and the acknowledgement goes
+    out on the first pass after the link returns. Recovery itself is
+    suppressed: with the fake's always-success connect() it would queue a
+    spurious connection log every pass, and the recovery path has its own
+    suite."""
+    instance = make_core0(delay_ms=100)
+    _utc_synchronized(instance)
+    instance._pending_reboot = {
+        "command_id": "rb-1",
+        "command": "reboot",
+        "targeted": False,
+    }
+    instance._mqtt.connected = False
+    instance._recover_network_if_needed = lambda: None
+
+    attempts = {"n": 0}
+    original_publish = instance._mqtt.publish_qos1
+
+    def counting_publish(topic, message, splice_fragment=None):
+        attempts["n"] += 1
+        return original_publish(topic, message, splice_fragment=splice_fragment)
+
+    instance._mqtt.publish_qos1 = counting_publish
+
+    # Outage passes: nothing is attempted, the reboot stays held.
+    _run_to(instance, 100)
+    assert attempts["n"] == 0
+    assert instance._pending_reboot is not None
+
+    # Link returns: the ack publishes on the first pass and the reboot
+    # proceeds (response + the existing 5 s grace sleep, then reset()).
+    del instance._recover_network_if_needed
+    instance._mqtt.connected = True
+    _FAKE_TIME.stop_after_ms = None  # _run_to left the stop marker armed
+    with pytest.raises(_MachineReset):
+        instance.run()
+
+    assert attempts["n"] == 1
+    assert _MACHINE.reset_calls == 1
+    assert instance._pending_reboot is None
+
+
 # --- Startup: the same interval, and a bounded wait is allowed ------------
 
 

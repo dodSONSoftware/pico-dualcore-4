@@ -497,9 +497,15 @@ def test_admit_startup_log_exhausted_transient_retry_returns_false(monkeypatch):
 # Bounded fallback when the detailed startup log exceeds the outbound ceiling
 # ---------------------------------------------------------------------------
 #
-# Device definitions carry no practical length or count bound for id, name,
-# or sensor_type, so the detailed startup log can exceed the 16 KiB outbound
-# ceiling on an otherwise valid configuration. The invariant this protects:
+# The configuration boundary pins the configuration-driven part of the log
+# (64-byte device id/name/sensor_type, 16 devices: a worst-case valid
+# configuration stays under the 16 KiB ceiling, pinned by the
+# serialized-size invariant test in tests/test_config.py), but the detailed
+# log also carries non-config growth no bound can pin: driver-supplied
+# failure_reason/error strings and the full system_information dump. So a
+# detailed log built from an entirely valid configuration can still exceed
+# the ceiling, and the admission path must defend against it regardless of
+# validation. The invariant this protects:
 # failure to emit the verbose diagnostics must not keep the device from
 # entering normal operation. Only the size rejection is answered by a
 # different object -- the bounded fallback summary (statuses and device

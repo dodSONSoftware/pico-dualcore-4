@@ -531,8 +531,6 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     devices_configured = devices["configured"]
     devices_active = devices["active"]
 
-    # Queue status: heap-governed (no fixed capacity), so the metrics are
-    # depth, retained bytes, watermarks, and eviction/rejection counters.
     outbound_status = intercore.outbound_queue.status()
 
     try:
@@ -596,7 +594,6 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
 
     status = "healthy" if not degraded_reasons else "degraded"
 
-    # The timestamp comes from the shared UTC snapshot (fetched above).
     if utc_snapshot is None:
         timestamp = None
     else:

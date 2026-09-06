@@ -912,13 +912,8 @@ class Core0:
         topic = entry.get("topic")
         if topic is None:
             topic = self._topic_for_kind(entry["kind"])
-        # The splice happens at the wire as segment writes (zero-copy view of
-        # the body + the small fragment): the frame is never allocated as
-        # one contiguous buffer. After the startup imports the heap is
-        # fragmented, and a frame-sized allocation there hit the
-        # largest-free-block wall even with tens of KiB total free -- a
-        # deterministic MemoryError reset loop at the first post-startup
-        # publish (the startup log).
+        # Segment the spliced write at the wire: no frame-sized allocation
+        # on the fragmented post-startup heap (rationale: MQTTClient.publish).
         self._mqtt.publish_qos1(topic, body, splice_fragment=fragment)
         # PUBACK received: the publish is complete, so the pacing interval
         # begins (a failed publish raises before this line and records nothing).
@@ -1041,8 +1036,14 @@ class Core0:
 
     def _reboot_publish_due(self):
         # The reboot response is an outbound PUBLISH: hold (without
-        # resetting, without blocking) until the pacing gate is open.
-        return self._pending_reboot is not None and self._mqtt_publish_ready()
+        # resetting, without blocking) until the link is up and the
+        # pacing gate is open — like every other publish path, an attempt
+        # on a down link would fail immediately, so it is not one.
+        return (
+            self._pending_reboot is not None
+            and self._mqtt.is_connected()
+            and self._mqtt_publish_ready()
+        )
 
     def _perform_reboot(self):
         request = self._pending_reboot
