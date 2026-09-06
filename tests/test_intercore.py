@@ -85,9 +85,11 @@ class FakeHeap:
         monkeypatch.setattr(queue, "_evict_oldest_by_priority_locked", evict_and_release)
 
 
-def _queue(monkeypatch, free_bytes=HEAPY, garbage_bytes=0, alloc_per_entry=0):
-    """An InterCore bus whose fake heap starts at free_bytes (each retained entry optionally costing alloc_per_entry)."""
-    ic = InterCore(RESERVE)
+def _queue(monkeypatch, free_bytes=HEAPY, garbage_bytes=0, alloc_per_entry=0, minimum=RESERVE, preferred=None):
+    """An InterCore bus whose fake heap starts at free_bytes (each retained entry optionally costing alloc_per_entry). preferred=None means single-threshold (the floor is also the preferred reserve); pass the board's two thresholds to exercise the soft band (minimum <= free < preferred)."""
+    if preferred is None:
+        preferred = minimum
+    ic = InterCore(minimum, preferred)
     heap = FakeHeap(free_bytes, garbage_bytes, alloc_per_entry)
     heap.install(monkeypatch, ic.outbound_queue)
     return ic, heap
@@ -375,8 +377,11 @@ def test_post_admission_invariant_undoes_a_crossing_append(monkeypatch):
     assert status["messages_rejected"] == 1
     assert status["messages_evicted"] == 0
     # The undo was reclaimed, so the heap is measurable and back above the
-    # reserve with nothing retained by the queue.
-    assert heap.collects == 1
+    # reserve with nothing retained by the queue. Two collects: the
+    # rolled-back append's own reclaim, then the pre-eviction re-measure's
+    # retry (which crosses again -- the 512 B headroom does not cover the
+    # 1 KiB append) reclaiming its own undo.
+    assert heap.collects == 2
     assert gc.mem_free() >= RESERVE
 
 
@@ -461,6 +466,105 @@ def test_append_crossing_still_rejects_lower_priority_incoming(monkeypatch):
     assert status["queued_bytes"] == len(b"t" * 8 * KB)
     assert status["messages_evicted"] == 0
     assert status["messages_rejected"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Two-threshold soft band (minimum <= free < preferred)
+# ---------------------------------------------------------------------------
+
+
+def test_soft_band_eviction_collects_before_admitting(monkeypatch):
+    """The production two-threshold soft band: an eligible entry is
+    reclaimed, gc.collect() runs after the reclamation (as the
+    hard-pressure path does after each displacement), the entry is
+    admitted, and nothing further is evicted or rejected."""
+    MIN, PREFERRED = 48 * KB, 64 * KB
+    ic, heap = _queue(monkeypatch, minimum=MIN, preferred=PREFERRED)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_HEALTH, b"h" * 8 * KB, RETENTION_PRIORITY_HEALTH) is True
+    # The heap lands in the soft band: below the preferred reserve, at the
+    # floor.
+    heap.free_bytes = MIN + 4 * KB
+    heap.collects = 0
+    assert (
+        queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":1}', RETENTION_PRIORITY_CRITICAL)
+        is True
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == len(b'{"r":1}')
+    assert status["messages_evicted"] == 1
+    assert status["telemetry_evicted"] == 0
+    assert status["messages_rejected"] == 0
+    # Two collections: the pressure-band entry collect, then the one after
+    # the reclamation (the pre-fix soft path ran only the former).
+    assert heap.collects == 2
+    taken = queue.take()
+    assert taken["payload_bytes"] == b'{"r":1}'
+    queue.complete_in_flight(taken)
+
+
+def test_appends_own_reclaim_admits_without_second_eviction(monkeypatch):
+    """An append whose own allocations cross the hard floor rolls back and
+    reclaims its garbage; the floor is re-measured before any further
+    displacement, so an entry whose rollback made it admissible is admitted
+    without a transient rejection (pre-fix: the displacement loop rejected
+    it because the queue had nothing eligible to evict)."""
+    MIN, PREFERRED = 48 * KB, 64 * KB
+    ic, heap = _queue(
+        monkeypatch,
+        free_bytes=PREFERRED,
+        garbage_bytes=8 * KB,
+        alloc_per_entry=20 * KB,
+        minimum=MIN,
+        preferred=PREFERRED,
+    )
+    queue = ic.outbound_queue
+    assert (
+        queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":1}', RETENTION_PRIORITY_CRITICAL)
+        is True
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 0
+    taken = queue.take()
+    assert taken["payload_bytes"] == b'{"r":1}'
+    queue.complete_in_flight(taken)
+
+
+def test_soft_band_rejects_when_nothing_eligible_and_append_crosses(monkeypatch):
+    """Soft-band rejection path: nothing the incoming entry may displace is
+    queued (CRITICAL floor), and the entry's own allocations cross the hard
+    floor even after the reclamation -- rejected as transient, with no
+    eviction and no further collection."""
+    MIN, PREFERRED = 48 * KB, 64 * KB
+    ic, heap = _queue(
+        monkeypatch, alloc_per_entry=8 * KB, minimum=MIN, preferred=PREFERRED
+    )
+    queue = ic.outbound_queue
+    assert (
+        queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":1}', RETENTION_PRIORITY_CRITICAL)
+        is True
+    )
+    # Soft band once the retained entry's allocations are counted (free -
+    # 8 KiB = 52 KiB: at the floor, below the preferred reserve), and the
+    # incoming entry's own allocations cross the floor.
+    heap.free_bytes = MIN + 12 * KB
+    heap.collects = 0
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b'{"v":1}', RETENTION_PRIORITY_TELEMETRY)
+        is False
+    )
+    status = queue.status()
+    assert status["pending"] == 1
+    assert status["queued_bytes"] == len(b'{"r":1}')
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 1
+    # Three collects: the pressure-band entry collect, the soft append's
+    # rollback, and the pre-eviction re-measure's retry (which crosses
+    # again). The rejection itself collects nothing.
+    assert heap.collects == 3
 
 
 def test_critical_evicts_lower_priority_until_reserve_restored(monkeypatch):

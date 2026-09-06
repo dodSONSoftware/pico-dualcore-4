@@ -216,13 +216,16 @@ class OutboundQueue:
 
         NORMAL (at/above the preferred reserve): admit, no GC, no eviction.
         MEMORY PRESSURE (down to the hard floor): gc.collect() first, else one
-        eligible entry may be reclaimed and the entry is still admitted --
-        the preferred reserve is not a rejection wall. HARD PRESSURE (below
-        the hard floor after GC, or an append whose own allocations cross
-        it): reclaim eligible entries one at a time, gc.collect() after each,
-        until the entry can be retained with the hard floor intact -- or
-        reject as transient (the producer retains and retries) when nothing
-        eligible remains. A more important admission is never rejected while
+        eligible entry may be reclaimed (gc.collect() after the reclamation)
+        and the entry is still admitted -- the preferred reserve is not a
+        rejection wall. HARD PRESSURE (below the hard floor after GC, or an
+        append whose own allocations cross it): each pass re-measures the
+        floor first (a rolled-back append's own reclaim, or the prior
+        pass's collect, may have restored it) and admits the entry when it
+        is intact; only otherwise does it displace the least-important
+        eligible entry, gc.collect(), and repeat -- until the entry can be
+        retained with the hard floor intact, or reject as transient (the
+        producer retains and retries) when nothing eligible remains. A more important admission is never rejected while
         a less important entry is retained, and no state evicts a retained
         CRITICAL."""
         with self._heap_admission_lock:
@@ -243,17 +246,31 @@ class OutboundQueue:
                 # reject an otherwise-valid entry -- reclaim one eligible
                 # entry, if any, then admit.
                 with self._lock:
-                    self._evict_one_eligible_locked(retention_priority)
+                    evicted, _ = self._evict_one_eligible_locked(retention_priority)
+                if evicted:
+                    # Reclaim before the append measures the floor, as the
+                    # hard-pressure path does after each displacement.
+                    gc.collect()
                 with self._lock:
                     if self._append_locked(kind, payload_bytes, retention_priority):
                         return True
                 # The append still crosses the hard floor: the displacement
                 # path below decides.
 
-            # HARD PRESSURE: displace the least-important eligible entries
-            # one at a time (reclaiming after each) until the entry is
-            # retained or nothing eligible remains.
+            # HARD PRESSURE: measure the floor before displacing anything --
+            # an append that just rolled itself back reclaimed its garbage,
+            # and so did the prior iteration's collect, so the entry may be
+            # admissible without another displacement. Then displace the
+            # least-important eligible entry, reclaim, and repeat, until the
+            # entry is retained or nothing eligible remains.
             while True:
+                if self._reserve_restored():
+                    with self._lock:
+                        if self._append_locked(kind, payload_bytes, retention_priority):
+                            return True
+                    # The floor is intact, but the append's own allocations
+                    # still cross it: displace the next eligible entry (or
+                    # reject once none remain).
                 with self._lock:
                     evicted, _ = self._evict_one_eligible_locked(
                         retention_priority
@@ -264,13 +281,6 @@ class OutboundQueue:
                         self._messages_rejected += 1
                         return False
                 gc.collect()
-                if self._reserve_restored():
-                    with self._lock:
-                        if self._append_locked(kind, payload_bytes, retention_priority):
-                            return True
-                    # The eviction restored the floor, but the append still
-                    # crosses it: displace the next eligible entry (or reject
-                    # once none remain).
 
     def put(self, kind, message, retention_priority):
         """Admit one MQTT-bound message after validation, serialization, and
