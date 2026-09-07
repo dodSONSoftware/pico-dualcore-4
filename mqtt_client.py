@@ -7,21 +7,13 @@ import socket
 import struct
 from binascii import hexlify
 
-# Maximum remaining length (bytes) for an inbound MQTT packet. Derived from
-# the protocol, not arbitrary: the largest spec-valid inbound frame is a
-# write-config command carrying the worst-case valid configuration (every
-# byte-bounded identity at 4-byte code points, which serialize 3x escaped,
-# 128-CHARACTER command_id/target bounds, 253-byte broker address, all 16
-# devices, all lists at their bounds) — 16,865 bytes in the conservative wire
-# form (ASCII-escaped, default separators), pinned by the serialized-size
-# invariant test in tests/test_config.py.
-# 20 KiB keeps every valid command deliverable (16,384 dropped the worst-case
-# command at the wire layer) while bounding what json.loads() can amplify:
-# the parse peak (decoded string plus object graph) is a bounded multiple of
-# this ceiling, and a MemoryError past it escapes to main.py's controlled-reset
-# boundary rather than exhausting the heap silently. An oversized frame must
-# fail the connection instead of letting sock.read(sz) request an allocation
-# that could exhaust Pico RAM (256 KiB) — no hostile traffic needed.
+# Maximum remaining length (bytes) for an inbound MQTT packet. Derived, not
+# arbitrary: the worst-case spec-valid inbound frame (a write-config command
+# carrying the worst-case valid configuration) is 16,865 bytes, pinned by the
+# serialized-size invariant test in tests/test_config.py — 20 KiB keeps every
+# valid command deliverable while bounding what json.loads() can amplify at
+# the parse peak. An oversized frame must fail the connection instead of
+# letting sock.read(sz) request an allocation that could exhaust Pico RAM.
 MAX_INBOUND_PACKET_BYTES = 20 * 1024
 
 
@@ -77,11 +69,10 @@ class MQTTClient:
         raise MQTTException(reason)
 
     def _read_required(self, size):
-        # Read exactly `size` bytes, failing as a transport error on a short or
-        # empty read. At EOF read(n) may return fewer bytes: that means the
-        # link ended mid-frame and must surface as OSError (Core 0 reconnects
-        # over it), not as the caller indexing short bytes (IndexError escapes
-        # Core 0's recovery boundary and resets the MCU).
+        # A short or empty read is a transport failure: at EOF read(n) may
+        # return fewer bytes, and that must surface as OSError (Core 0
+        # reconnects over it), not IndexError from the caller indexing short
+        # bytes (which escapes the recovery boundary and resets the MCU).
         data = self.sock.read(size)
         if data is None or len(data) != size:
             raise OSError(-1)
@@ -130,9 +121,8 @@ class MQTTClient:
         self.sock = socket.socket()
         self.sock.settimeout(timeout)
         # Filter the lookup to the profile the default socket constructs
-        # (AF_INET/SOCK_STREAM): an unfiltered getaddrinfo can return a first
-        # record (IPv6, datagram) that socket cannot use even when a usable
-        # record follows, for a hostname resolving to multiple records.
+        # (AF_INET/SOCK_STREAM): an unfiltered multi-record hostname can hand
+        # connect() an unusable first record even when a usable one follows.
         addr = socket.getaddrinfo(
             self.server, self.port, socket.AF_INET, socket.SOCK_STREAM
         )[0][-1]
@@ -190,7 +180,6 @@ class MQTTClient:
         timeout-bounded); a failed timeout installation propagates into
         recovery rather than falling through to an unbounded wait."""
         if timeout_sec is not None:
-            # The bounded wait depends on this timeout being active.
             self.sock.settimeout(timeout_sec)
         try:
             self.sock.write(b"\xc0\0")
@@ -200,9 +189,9 @@ class MQTTClient:
                     return
         finally:
             if timeout_sec is not None:
-                # Restoring blocking mode is not best-effort: the next
-                # operation assumes it, so a failed restoration propagates
-                # into Core 0's recovery instead of marking the exchange done.
+                # Not best-effort: the next operation assumes blocking mode,
+                # so a failed restore fails the ping instead of marking it
+                # done.
                 self.sock.settimeout(None)
 
     def publish(self, topic, msg, retain=False, qos=0, packet_id=None, timeout_ms=None, splice_fragment=None):
@@ -214,9 +203,8 @@ class MQTTClient:
         single pre-joined buffer, but no allocation is ever sized to the
         whole spliced frame (see the write below)."""
         if qos == 2:
-            # Reject before a single frame byte goes out (an assert here would
-            # vanish under MicroPython bytecode optimization and the frame
-            # would be transmitted unacked).
+            # Reject before a single frame byte goes out (an assert would
+            # vanish under MicroPython bytecode optimization >= 1).
             raise MQTTException("QoS 2 is not supported")
         pkt = bytearray(b"\x30\0\0\0")
         pkt[0] |= qos << 1 | retain
@@ -228,10 +216,9 @@ class MQTTClient:
         if qos > 0:
             sz += 2
         if sz > 2097151:
-            # 2097151 is the limit of THIS client's encoder: it emits at most
-            # three remaining-length bytes (the loop above). The MQTT
-            # protocol maximum is 268435455 (four bytes) — never reachable
-            # here, since the application outbound ceiling is far below
+            # This encoder emits at most three remaining-length bytes (the
+            # loop below); the protocol's four-byte maximum (268435455) is
+            # never reachable — the application outbound ceiling is far below
             # either limit.
             raise MQTTException(
                 "Publish size exceeds this client's remaining-length encoding limit"
@@ -247,11 +234,11 @@ class MQTTClient:
                 pid = self.next_packet_id()
             else:
                 pid = packet_id
-        # Bound the WHOLE QoS 1 exchange — the PUBLISH frame writes included:
-        # a blackholed link whose writes stop making progress then surfaces
-        # as a bounded error (connection dead, Core 0 recovery fires) instead
-        # of wedging Core 0 inside sock.write(). The timeout is installed
-        # before byte 1 goes out and restored only after the exchange.
+        # Bound the WHOLE QoS 1 exchange (frame writes included): a blackholed
+        # link whose writes stop making progress then fails the publish
+        # bounded, into Core 0's recovery, instead of wedging inside
+        # sock.write(). Installed before byte 1; restored only after the
+        # exchange.
         timed = qos == 1 and timeout_ms is not None
         if timed:
             self.sock.settimeout(timeout_ms / 1000.0)
@@ -268,14 +255,11 @@ class MQTTClient:
             else:
                 # Segment the spliced tail: a zero-copy view of msg minus its
                 # closing brace, then the splice itself. TCP is a byte
-                # stream, so the broker receives exactly the pre-joined
-                # frame -- but no single allocation is sized to the whole
-                # frame. The old pre-joined write needed the full frame
-                # contiguously, and after the startup imports the heap is
-                # fragmented: the largest free block can be smaller than the
-                # frame even with tens of KiB total free, so the first
-                # post-startup publish (the startup log) hit a deterministic
-                # MemoryError and reset loop.
+                # stream, so the broker receives the pre-joined frame -- but
+                # no single allocation is sized to the whole frame: the
+                # largest free heap block can be smaller than the frame even
+                # with tens of KiB total free (a pre-joined copy would
+                # MemoryError on a fragmented post-startup heap).
                 view = memoryview(msg)
                 self.sock.write(view[: len(msg) - 1])
                 self.sock.write(b",")
@@ -297,19 +281,18 @@ class MQTTClient:
                             return
         finally:
             if timed:
-                # Restoring blocking mode is not best-effort: the next
-                # operation assumes it, so a failed restoration propagates
-                # into Core 0's recovery instead of reporting the publish done.
+                # Not best-effort: the next operation assumes blocking mode,
+                # so a failed restore fails the publish instead of reporting
+                # it done.
                 self.sock.settimeout(None)
 
     def subscribe(self, topic, qos=0):
         if self.cb is None:
             raise MQTTException("Subscribe callback is not set")
-        # The Remaining Length is encoded in one byte (valid through 127), and
-        # the body is topic + 5 (2 packet-id + 2 topic-length + 1 QoS), so
-        # above 122 topic bytes the length byte would gain the continuation
-        # bit and the packet would be malformed. config.py (MAX_MQTT_TOPIC_BYTES)
-        # is the authoritative boundary; this is defensive transport validation.
+        # The remaining-length byte is single (valid through 127): the body
+        # is topic + 5, so above 122 topic bytes the length would gain a
+        # continuation bit and the packet would be malformed. config.py
+        # (MAX_MQTT_TOPIC_BYTES) is authoritative; this is defensive.
         if len(topic) > 122:
             raise MQTTException(
                 "Subscribe topic exceeds the single-byte remaining-length bound"
@@ -325,11 +308,9 @@ class MQTTClient:
             if op == 0x90:
                 sz = self._read_required(1)
                 if sz != b"\x03":
-                    # A SUBACK for this client's single-topic subscription is
-                    # exactly 2-byte packet id + 1 return code. Trusting any
-                    # other declared length would leave stray bytes in the
-                    # stream (or over-consume the next packet's bytes) and
-                    # desynchronize every later frame.
+                    # Exactly 2-byte packet id + 1 return code for this
+                    # client's single-topic subscription; any other declared
+                    # length desynchronizes the stream.
                     self._abort_corrupt_inbound(
                         "SUBACK with unexpected remaining length"
                     )
@@ -345,15 +326,13 @@ class MQTTClient:
                     self._abort_corrupt_inbound("Invalid SUBACK return code")
                 return
 
-    # Wait for a single incoming MQTT message and process it: subscribed
-    # messages go to the callback set via set_callback(), internal messages
-    # are processed here.
+    # Process one incoming MQTT packet: PUBLISH goes to the callback,
+    # internal messages are handled here.
     def wait_msg(self):
-        # Read in the caller's socket mode: publish/ping/subscribe and
-        # check_msg run in blocking-with-timeout mode, so every read here is
-        # bounded and returns a full length. wait_msg must not change the
-        # mode: setblocking(True) == settimeout(None) in MicroPython, which
-        # would silently clear the caller's timeout.
+        # Read in the caller's socket mode and never change it: every caller
+        # runs in blocking-with-timeout mode, and setblocking(True) ==
+        # settimeout(None) in MicroPython, which would clear the caller's
+        # timeout.
         res = self.sock.read(1)
         if res is None:
             return None
@@ -370,30 +349,26 @@ class MQTTClient:
         op = res[0]
         if op & 0xF0 != 0x30:
             return op
-        # Validate the QoS bits before the payload is read and before the
-        # callback runs (which feeds the command protocol): QoS 2 is outside
-        # this client's profile and QoS 3 is spec-invalid for PUBLISH, so a
-        # nonconforming frame is dropped at the wire layer, never delivered.
+        # Inbound QoS 2/3 is rejected from the opcode — before the payload is
+        # read and before the callback (which feeds the command protocol)
+        # runs: a nonconforming frame never reaches the command protocol.
         if op & 6 == 4:
             self._abort_corrupt_inbound("Inbound QoS 2 is not supported")
         if op & 6 == 6:
             self._abort_corrupt_inbound("Invalid PUBLISH QoS")
         sz = self._recv_len()
         if sz > MAX_INBOUND_PACKET_BYTES:
-            # Oversized inbound packet: sock.read(sz) would request an
-            # allocation large enough to exhaust Pico RAM. Drop before
-            # any payload is allocated.
+            # Drop before sock.read(sz) requests an allocation that could
+            # exhaust Pico RAM.
             self._abort_corrupt_inbound(
                 "Inbound packet remaining length {} exceeds {}".format(
                     sz, MAX_INBOUND_PACKET_BYTES
                 )
             )
         # Validate the declared topic length against the remaining length
-        # *before* reading: a corrupt stream can declare a topic length far
-        # larger than it carries (remaining 2 with a 65535-byte topic), and
-        # trusting that would request a sock.read() allocation approaching
-        # 64 KiB on a 256 KB device. Inconsistent frames are dropped the same
-        # as oversized ones, before any payload is allocated.
+        # before reading: a corrupt stream can declare a topic length far
+        # larger than it carries, and trusting it would request a sock.read()
+        # allocation approaching 64 KiB on a 256 KB device.
         if sz < 2:
             self._abort_corrupt_inbound(
                 "Inbound packet too short for a topic length field"
@@ -449,11 +424,9 @@ class MQTTClient:
     # wait_msg.
     def check_msg(self, timeout_sec):
         # Readiness is decided with a poll, not a non-blocking read: one
-        # readable byte only means a packet has *started* arriving, and the
-        # rest of the parse must run where read(n) is guaranteed to return n
-        # bytes — MicroPython documents that read(n) may return fewer in
-        # non-blocking mode, so a PUBLISH split across TCP reads would
-        # short-read and deliver a corrupt frame.
+        # readable byte only means a packet has started, and MicroPython's
+        # read(n) may return fewer bytes in non-blocking mode — a PUBLISH
+        # split across reads would short-read and deliver a corrupt frame.
         if not self._socket_ready(self._ready_poller()):
             # No packet started: return, leaving the socket mode untouched.
             return None
@@ -463,6 +436,6 @@ class MQTTClient:
         try:
             return self.wait_msg()
         finally:
-            # Restore blocking mode: a finite timeout left behind would
-            # corrupt the next operation's bounded wait.
+            # Restore blocking mode: a finite timeout left behind would defeat
+            # the next operation's bounded wait.
             self.sock.settimeout(None)

@@ -61,16 +61,22 @@ def main():
     config_manager = ConfigManager("config.json")
     config = config_manager.recover()
     wifi_config = load_wifi_config("config-secrets.json")
+    # A bus property (like the board heap thresholds), read before the per-core
+    # split discards the full config: the outbound queue's deterministic count
+    # ceiling, subordinate to the heap policy.
+    outbound_queue_max_messages = config["outbound_queue_max_messages"]
     core0_config, core1_config = split_config(config)
     config = None
 
     # The bus is heap-governed: its admission thresholds are the board-specific
     # preferred free-heap reserve (start of pressure handling) and the hard
     # survival floor (hardware.py is the single source of truth), shared by
-    # both queues through one heap-admission lock.
+    # both queues through one heap-admission lock, plus a configured count
+    # ceiling on the outbound queue.
     intercore = InterCore(
         minimum_free_heap_bytes=hardware["minimum_free_heap_bytes"],
         preferred_free_heap_bytes=hardware["preferred_free_heap_bytes"],
+        outbound_queue_max_messages=outbound_queue_max_messages,
     )
 
     from core0 import Core0

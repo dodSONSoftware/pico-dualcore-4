@@ -38,14 +38,14 @@ Core 1 periodically publishes health messages to `iot/v3/health` containing diag
 - `device_failures`: devices_configured - devices_active
 
 **Queue Fields:**
-The queues are heap-governed (no fixed capacity), so these are observability metrics, not utilization against a limit:
-- `outbound_queue_depth`: Current queued + in-flight entries
+The queues are heap-governed; the outbound queue is additionally bounded by a deterministic entry-count ceiling (`outbound_queue_max_messages`, evaluated after the heap policy, in-flight included, `REBOOT_REQUIRED`), so these are observability metrics: the depth and high-water-mark are utilization against that count ceiling (depth/watermark ≤ max), while the byte metrics remain heap-governed only:
+- `outbound_queue_depth`: Current queued + in-flight entries (≤ `outbound_queue_max_messages`)
 - `outbound_queued_bytes`: Retained payload bytes (queued FIFO plus the in-flight entry)
-- `outbound_queue_high_watermark`: Peak queue depth since boot
+- `outbound_queue_high_watermark`: Peak queue depth since boot (≤ `outbound_queue_max_messages`)
 - `outbound_queue_high_watermark_bytes`: Peak retained payload bytes since boot
-- `outbound_evicted`: Entries evicted under memory pressure (all kinds)
+- `outbound_evicted`: Entries evicted under memory pressure or to relieve the count ceiling (all kinds)
 - `telemetry_evicted`: Evicted entries of the telemetry kind
-- `outbound_rejected`: Admissions rejected because the hard free-heap floor could not be restored
+- `outbound_rejected`: Admissions rejected because the hard free-heap floor could not be restored or no eligible entry was available to relieve the count ceiling
 
 **UTC Fields:**
 - `utc_valid`: Boolean indicating UTC time is valid

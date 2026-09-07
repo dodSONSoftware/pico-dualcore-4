@@ -22,6 +22,7 @@ from config import (
     MAX_MQTT_KEEPALIVE_SEC,
     MAX_MQTT_TOPIC_BYTES,
     MAX_NETWORK_PROBE_TIMEOUT_SEC,
+    MAX_OUTBOUND_QUEUE_MAX_MESSAGES,
     MAX_RECONNECT_ATTEMPTS,
     MAX_RECONNECT_DELAY_SEC,
     MAX_TICKS_SAFE_INTERVAL_MS,
@@ -486,6 +487,41 @@ def test_validate_config_operational_liveness_bounds(key, max_value):
         validate_config(config)
     assert excinfo.value.code == "invalid_value"
     assert str(excinfo.value) == "{} must be at most {}".format(key, max_value)
+
+
+@pytest.mark.parametrize("value", [1, 32, 64, 256])
+def test_validate_config_outbound_queue_max_messages_valid(value):
+    """The inclusive range 1..256 validates (the shipped value is 64): a
+    positive integer at or under the ceiling is accepted and preserved."""
+    config = _base_config()
+    config["outbound_queue_max_messages"] = value
+    assert validate_config(config) is config
+    assert config["outbound_queue_max_messages"] == value
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [0, -1, 257, 1.5, "64", True, None],
+)
+def test_validate_config_outbound_queue_max_messages_invalid(bad_value):
+    """Anything outside the positive-integer 1..256 range is rejected with the
+    stable code: zero/negative (no queue), above the ceiling, a float, a
+    string, a boolean, or null."""
+    config = _base_config()
+    config["outbound_queue_max_messages"] = bad_value
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert "outbound_queue_max_messages" in str(excinfo.value)
+
+
+def test_validate_config_outbound_queue_max_messages_required_under_schema_8():
+    """Schema v8 makes the key required: a config missing it fails fast (the
+    bus is constructed with it at boot, so there is no code-side default)."""
+    config = _base_config()
+    del config["outbound_queue_max_messages"]
+    with pytest.raises(ConfigError, match="outbound_queue_max_messages"):
+        validate_config(config)
 
 
 @pytest.mark.parametrize(

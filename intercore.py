@@ -51,17 +51,14 @@ class OutboundQueue:
     """Core 1 -> Core 0 queue for MQTT-bound messages only.
 
     Payload bytes are immutable once put() succeeds (pre-serialized UTF-8
-    JSON); the Core 0 envelope keys are injected at publish time, not carried
-    at the top level. No fixed capacity: the preferred reserve marks where
-    memory-pressure handling begins (GC, then reclaiming eligible
-    low-retention entries) and is never a rejection wall by itself; the hard
-    floor is the survival boundary admission must protect, re-measured after
-    the append's own allocations. CRITICAL is the non-evictable retention
-    floor: an admitted CRITICAL entry is never displaced, not even by another
-    CRITICAL. All decisions run under the shared heap-admission lock."""
+    JSON); the Core 0 envelope keys are injected at publish time. No fixed
+    capacity: the preferred reserve marks where memory-pressure handling
+    begins and is never a rejection wall; the hard floor is the survival
+    boundary admission must protect; CRITICAL is the non-evictable retention
+    floor. All decisions run under the shared heap-admission lock."""
 
     def __init__(self, minimum_free_heap_bytes, heap_admission_lock,
-                 preferred_free_heap_bytes=None):
+                 preferred_free_heap_bytes=None, max_messages=None):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
         if preferred_free_heap_bytes is None:
             # Single-threshold callers: no pressure band; the hard floor is
@@ -74,9 +71,14 @@ class OutboundQueue:
             raise ValueError(
                 "preferred_free_heap_bytes must be >= minimum_free_heap_bytes"
             )
+        # None is unbounded (the historical behavior); a positive integer is a
+        # deterministic count ceiling subordinate to the heap policy.
+        if max_messages is not None:
+            _require_positive_integer(max_messages, "max_messages")
         self._minimum_free_heap_bytes = minimum_free_heap_bytes
         self._preferred_free_heap_bytes = preferred_free_heap_bytes
         self._heap_admission_lock = heap_admission_lock
+        self._max_messages = max_messages
         self._queue = []
         self._in_flight = None
         self._lock = _thread.allocate_lock()
@@ -100,6 +102,16 @@ class OutboundQueue:
 
     def _preferred_restored(self):
         return gc.mem_free() >= self._preferred_free_heap_bytes
+
+    def _below_count_limit_locked(self):
+        """True when one more append keeps the retained-entry depth (queued
+        plus the in-flight entry, the same definition as depth/high_watermark)
+        at or under the configured count ceiling. Unbounded (no ceiling) is
+        always below. Caller holds self._lock."""
+        if self._max_messages is None:
+            return True
+        depth = len(self._queue) + (1 if self._in_flight is not None else 0)
+        return depth < self._max_messages
 
     def _evict_oldest_by_priority_locked(self, retention_priority):
         for index, entry in enumerate(self._queue):
@@ -138,15 +150,39 @@ class OutboundQueue:
             self._high_watermark_bytes = self._queued_bytes
         return True
 
+    def _try_append_with_count_gate(self, kind, payload_bytes, retention_priority):
+        """Append one entry after making count room (caller holds the
+        heap-admission lock, NOT the queue lock). The heap floor is checked by
+        _append_locked; the count ceiling is enforced here, subordinate to it
+        (it is only reached where the heap floor already allowed the append):
+        at the ceiling, displace one eligible entry under the same retention
+        rule as the heap path, else the append is not made. Returns True if
+        appended, False if the append's own allocations crossed the hard floor
+        (the caller's displacement path decides) or the ceiling left nothing
+        eligible (the displacement path is the single rejection point, so a
+        rejected message is counted exactly once)."""
+        with self._lock:
+            if self._below_count_limit_locked():
+                # Room available: the append carries the post-admission floor
+                # check and watermark update in _append_locked.
+                return self._append_locked(kind, payload_bytes, retention_priority)
+            evicted, _ = self._evict_one_eligible_locked(retention_priority)
+            if not evicted:
+                return False
+        # Count relief reclaimed an entry: reclaim its garbage before the
+        # append re-measures the floor, as the heap path does after each
+        # displacement (gc is never run under the queue lock).
+        gc.collect()
+        with self._lock:
+            return self._append_locked(kind, payload_bytes, retention_priority)
+
     def _evict_one_eligible_locked(self, retention_priority):
         """Evict the oldest entry in the least-important class this priority
         may displace (caller holds self._lock). Shared eligibility rule for
         admission and serialization recovery: no eviction on an empty queue,
         an incoming entry less important than everything queued, or CRITICAL
         (non-evictable floor). Returns (True, worst_priority) on eviction
-        (counted by the regular eviction metrics), else (False, reason) with
-        reason "memory_pressure", "lower_priority_than_queued", or
-        "critical_not_evictable"."""
+        (counted by the regular eviction metrics), else (False, reason)."""
         if not self._queue:
             return (False, "memory_pressure")
         # Explicit loop: no generator/list allocation in the
@@ -171,14 +207,12 @@ class OutboundQueue:
     def _serialize_with_recovery(self, message, retention_priority):
         """Serialize the message, recovering a MemoryError before discarding
         queued data. Only a serializer MemoryError triggers recovery (other
-        failures raise immediately); the first failure runs gc.collect() and
-        retries, then reclaims one eligible entry per persistent attempt
-        (same eligibility as admission, CRITICAL never displaced),
-        gc.collect() after each, until serialization succeeds or nothing
-        eligible remains -- then the MemoryError propagates to the firmware
-        recovery boundary. Bounded by the eligible entries, so it terminates
-        without a retry count. No locks are held across the serializer or
-        gc.collect()."""
+        failures raise immediately): gc.collect() and retry first, then one
+        eligible entry per persistent attempt (same eligibility as admission,
+        CRITICAL never displaced), gc.collect() after each, until
+        serialization succeeds or nothing eligible remains -- then the
+        MemoryError propagates to the firmware recovery boundary. No locks
+        are held across the serializer or gc.collect()."""
         gc_attempted = False
         while True:
             try:
@@ -218,13 +252,15 @@ class OutboundQueue:
 
         The preferred reserve is not a rejection wall: pressure reclaims
         (GC first, then at most one eligible entry) and still admits. The
-        hard floor is re-measured before every displacement -- the append's
-        own rollback or the prior collection may have restored it, so no
-        eviction is decided on a pre-collection measurement. A more
-        important admission is never rejected while a less important entry
-        is retained, and no state evicts a retained CRITICAL. False is the
-        only rejection (nothing eligible remained) and is transient: the
-        producer retains and retries."""
+        hard floor is re-measured before every displacement, so no eviction
+        is decided on a pre-collection measurement. A configured count
+        ceiling (_max_messages) is a second, subordinate constraint: it is
+        enforced at each append via _try_append_with_count_gate(), only where
+        the heap floor already allows the append, so it can add a rejection or
+        a retention-aware eviction to make room but never admit what the heap
+        policy would reject. False is the only
+        rejection (nothing eligible remained) and is transient: the producer
+        retains and retries."""
         with self._heap_admission_lock:
             if not self._preferred_restored():
                 # Pressure band crossed: give GC the first chance to reclaim
@@ -233,9 +269,10 @@ class OutboundQueue:
             if self._preferred_restored():
                 # NORMAL: normal admission (the append still carries the
                 # post-admission hard-floor check in _append_locked).
-                with self._lock:
-                    if self._append_locked(kind, payload_bytes, retention_priority):
-                        return True
+                if self._try_append_with_count_gate(
+                    kind, payload_bytes, retention_priority
+                ):
+                    return True
                 # The append's own allocations crossed the hard floor and
                 # were undone: the displacement path below decides.
             elif self._reserve_restored():
@@ -248,23 +285,23 @@ class OutboundQueue:
                     # Reclaim before the append measures the floor, as the
                     # hard-pressure path does after each displacement.
                     gc.collect()
-                with self._lock:
-                    if self._append_locked(kind, payload_bytes, retention_priority):
-                        return True
+                if self._try_append_with_count_gate(
+                    kind, payload_bytes, retention_priority
+                ):
+                    return True
                 # The append still crosses the hard floor: the displacement
                 # path below decides.
 
             # HARD PRESSURE: measure the floor before displacing anything --
-            # an append that just rolled itself back reclaimed its garbage,
-            # and so did the prior iteration's collect, so the entry may be
-            # admissible without another displacement. Then displace the
-            # least-important eligible entry, reclaim, and repeat, until the
-            # entry is retained or nothing eligible remains.
+            # the last rollback/collect may have restored it. Then displace
+            # the least-important eligible entry, reclaim, and repeat, until
+            # the entry is retained or nothing eligible remains.
             while True:
                 if self._reserve_restored():
-                    with self._lock:
-                        if self._append_locked(kind, payload_bytes, retention_priority):
-                            return True
+                    if self._try_append_with_count_gate(
+                        kind, payload_bytes, retention_priority
+                    ):
+                        return True
                     # The floor is intact, but the append's own allocations
                     # still cross it: displace the next eligible entry (or
                     # reject once none remain).
@@ -377,6 +414,9 @@ class OutboundQueue:
                 "pending": len(self._queue),
                 "depth": len(self._queue) + (1 if in_flight else 0),
                 "in_flight": in_flight,
+                # The configured count ceiling (None when unbounded); the
+                # high_watermark it bounds is the metric just below.
+                "max_messages": self._max_messages,
                 "queued_bytes": self._queued_bytes,
                 "high_watermark": self._high_watermark,
                 "high_watermark_bytes": self._high_watermark_bytes,
@@ -553,7 +593,8 @@ class InterCore:
 
     The two FIFO lanes are heap-governed by the same board-specific free-heap thresholds -- the preferred reserve (start of pressure handling) and the minimum (hard survival floor) -- serialized on one shared heap-admission lock (the heap is global to both cores); the latest-value lanes (state snapshots, config-update request/result) are plain allocate_lock-guarded mailboxes."""
 
-    def __init__(self, minimum_free_heap_bytes, preferred_free_heap_bytes=None):
+    def __init__(self, minimum_free_heap_bytes, preferred_free_heap_bytes=None,
+                 outbound_queue_max_messages=None):
         _require_positive_integer(minimum_free_heap_bytes, "minimum_free_heap_bytes")
         if preferred_free_heap_bytes is None:
             # Single-threshold callers: the hard floor is also the preferred
@@ -573,6 +614,7 @@ class InterCore:
             minimum_free_heap_bytes,
             self._heap_admission_lock,
             preferred_free_heap_bytes,
+            outbound_queue_max_messages,
         )
         # The event lane has no evictable retained traffic (admitted events
         # are never displaced), so it gates on the hard survival floor alone.

@@ -58,6 +58,10 @@ _CHANGE_POLICY = {
     "mqtt_topic_health": CHANGE_POLICY_REBOOT_REQUIRED,
     "wifi_reconnect_delays_sec": CHANGE_POLICY_REBOOT_REQUIRED,
     "mqtt_reconnect_delays_sec": CHANGE_POLICY_REBOOT_REQUIRED,
+    # A bus property read once when InterCore is constructed at boot (like the
+    # board heap thresholds): no steady-state runtime applies it live, so a
+    # change takes effect on the next reboot.
+    "outbound_queue_max_messages": CHANGE_POLICY_REBOOT_REQUIRED,
     "devices": CHANGE_POLICY_REBOOT_REQUIRED,
 }
 

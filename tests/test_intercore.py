@@ -86,11 +86,11 @@ class FakeHeap:
         monkeypatch.setattr(queue, "_evict_oldest_by_priority_locked", evict_and_release)
 
 
-def _queue(monkeypatch, free_bytes=HEAPY, garbage_bytes=0, alloc_per_entry=0, minimum=RESERVE, preferred=None):
-    """An InterCore bus whose fake heap starts at free_bytes (each retained entry optionally costing alloc_per_entry). preferred=None means single-threshold (the floor is also the preferred reserve); pass the board's two thresholds to exercise the soft band (minimum <= free < preferred)."""
+def _queue(monkeypatch, free_bytes=HEAPY, garbage_bytes=0, alloc_per_entry=0, minimum=RESERVE, preferred=None, max_messages=None):
+    """An InterCore bus whose fake heap starts at free_bytes (each retained entry optionally costing alloc_per_entry). preferred=None means single-threshold (the floor is also the preferred reserve); pass the board's two thresholds to exercise the soft band (minimum <= free < preferred). max_messages=None leaves the count ceiling unbounded (the historical behavior); a positive integer sets it."""
     if preferred is None:
         preferred = minimum
-    ic = InterCore(minimum, preferred)
+    ic = InterCore(minimum, preferred, max_messages)
     heap = FakeHeap(free_bytes, garbage_bytes, alloc_per_entry)
     heap.install(monkeypatch, ic.outbound_queue)
     return ic, heap
@@ -1277,6 +1277,203 @@ def test_memoryerror_during_admission_propagates(monkeypatch):
     with pytest.raises(MemoryError):
         ic.outbound_queue.put(KIND_TELEMETRY, {"v": 1}, RETENTION_PRIORITY_TELEMETRY)
     assert ic.outbound_queue.get_depth() == 0
+
+
+# ---------------------------------------------------------------------------
+# Outbound admission: the count ceiling (outbound_queue_max_messages)
+#
+# A second, deterministic constraint subordinate to the heap policy: the heap
+# floor is evaluated first, and the count ceiling is enforced only at each
+# append, reusing the same retention-aware eviction. It can add a rejection or
+# an eviction to make room, but never admit what the heap policy rejects.
+# ---------------------------------------------------------------------------
+
+
+def test_count_below_limit_appends_without_eviction(monkeypatch):
+    """Below the ceiling: admissions append with no count-driven eviction, up
+    to and including exactly the limit."""
+    ic, _ = _queue(monkeypatch, max_messages=4)
+    queue = ic.outbound_queue
+    for i in range(3):
+        assert queue.put_with_kind(KIND_TELEMETRY, b'{"i":%d}' % i, RETENTION_PRIORITY_TELEMETRY) is True
+    status = queue.status()
+    assert status["depth"] == 3
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 0
+    # The fourth admission lands exactly at the limit.
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"i":3}', RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.get_depth() == 4
+    assert queue.status()["messages_evicted"] == 0
+
+
+def test_count_at_limit_evicts_one_eligible_and_admits(monkeypatch):
+    """At the ceiling: one eligible entry is displaced (the retention rule),
+    the incoming entry is admitted, and the count stays at the limit."""
+    ic, _ = _queue(monkeypatch, max_messages=4)
+    queue = ic.outbound_queue
+    for i in range(4):
+        assert queue.put_with_kind(KIND_TELEMETRY, b'{"i":%d}' % i, RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.get_depth() == 4
+    # Incoming CRITICAL (more important than the queued TELEMETRY) at the limit.
+    assert queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":1}', RETENTION_PRIORITY_CRITICAL) is True
+    status = queue.status()
+    assert status["depth"] == 4
+    assert status["messages_evicted"] == 1
+    assert status["telemetry_evicted"] == 1
+    assert status["messages_rejected"] == 0
+    _assert_watermark_at_least_depth(queue)
+
+
+def test_count_eviction_preserves_retention_selection(monkeypatch):
+    """The count ceiling reuses the existing retention selection (not FIFO):
+    a higher-priority incoming entry displaces the least-important eligible
+    class, here HEALTH (70), not the FIFO-head TELEMETRY (40)."""
+    ic, _ = _queue(monkeypatch, max_messages=3)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b"t", RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.put_with_kind(KIND_HEALTH, b"h", RETENTION_PRIORITY_HEALTH) is True
+    assert queue.put_with_kind(KIND_TELEMETRY, b"i", RETENTION_PRIORITY_INFO) is True
+    assert queue.get_depth() == 3
+    # Incoming ERROR (20): worst queued priority is HEALTH (70); that is evicted.
+    assert queue.put_with_kind(KIND_COMMAND_RESPONSE, b"e", RETENTION_PRIORITY_ERROR) is True
+    payloads = []
+    for _ in range(3):
+        entry = queue.take()
+        payloads.append(entry["payload_bytes"])
+        queue.complete_in_flight(entry)
+    assert payloads == [b"t", b"i", b"e"]  # HEALTH (b"h") was displaced
+    status = queue.status()
+    assert status["messages_evicted"] == 1
+    assert status["telemetry_evicted"] == 0  # the displaced entry was HEALTH
+
+
+def test_count_at_limit_rejects_when_nothing_eligible(monkeypatch):
+    """At the ceiling with nothing the incoming entry may displace (all queued
+    entries more important): the incoming entry is rejected, the count is
+    unchanged, and the rejection is counted exactly once."""
+    ic, _ = _queue(monkeypatch, max_messages=3)
+    queue = ic.outbound_queue
+    for i in range(3):
+        assert queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":%d}' % i, RETENTION_PRIORITY_CRITICAL) is True
+    assert queue.get_depth() == 3
+    assert queue.put_with_kind(KIND_TELEMETRY, b"t", RETENTION_PRIORITY_TELEMETRY) is False
+    status = queue.status()
+    assert status["depth"] == 3
+    assert status["messages_evicted"] == 0
+    assert status["messages_rejected"] == 1
+
+
+def test_count_critical_saturation_rejects_without_overflow(monkeypatch):
+    """CRITICAL saturation: a queue full of non-evictable CRITICAL entries
+    rejects a further CRITICAL (the non-evictable floor) and the count never
+    exceeds the ceiling -- no hidden overflow or reserved emergency slot."""
+    ic, _ = _queue(monkeypatch, max_messages=4)
+    queue = ic.outbound_queue
+    for i in range(4):
+        assert queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":%d}' % i, RETENTION_PRIORITY_CRITICAL) is True
+    assert queue.get_depth() == 4
+    assert queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":4}', RETENTION_PRIORITY_CRITICAL) is False
+    status = queue.status()
+    assert status["depth"] == 4
+    assert status["high_watermark"] == 4
+    assert status["messages_rejected"] == 1
+    assert status["messages_evicted"] == 0
+
+
+def test_count_and_heap_pressure_evict_once_not_twice(monkeypatch):
+    """The load-bearing ordering guard: with the queue at the count limit AND
+    under heap pressure, the heap stage evicts one entry (restoring the floor),
+    which also brings the count below the limit, so the count stage performs NO
+    additional eviction -- exactly one eviction total and the final count
+    equals the limit. Never two evictions because both constraints were active."""
+    MIN = RESERVE  # single threshold: the soft band does not apply
+    ic, heap = _queue(monkeypatch, free_bytes=HEAPY, minimum=MIN, preferred=MIN, max_messages=3)
+    queue = ic.outbound_queue
+    for i in range(3):
+        assert queue.put_with_kind(KIND_TELEMETRY, b"t" * 8 * KB, RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.get_depth() == 3
+    # Heap falls below the floor (one 8 KiB entry short of the reserve).
+    heap.free_bytes = RESERVE - 8 * KB
+    assert queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":1}', RETENTION_PRIORITY_CRITICAL) is True
+    status = queue.status()
+    assert status["depth"] == 3
+    assert status["messages_evicted"] == 1  # one (heap), not two
+    assert status["telemetry_evicted"] == 1
+    assert status["messages_rejected"] == 0
+    _assert_watermark_at_least_depth(queue)
+
+
+def test_count_does_not_override_heap_rejection(monkeypatch):
+    """Heap rejection is authoritative: with the heap unrecoverable and the
+    queue below the count limit, the message is rejected -- the count ceiling
+    cannot admit what the heap policy rejects."""
+    ic, _ = _queue(monkeypatch, free_bytes=0, max_messages=8)
+    queue = ic.outbound_queue
+    # Queue is empty (count 0 < 8) but the heap cannot be restored and there is
+    # nothing to evict.
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"v":1}', RETENTION_PRIORITY_TELEMETRY) is False
+    status = queue.status()
+    assert status["depth"] == 0
+    assert status["messages_rejected"] == 1
+    assert status["messages_evicted"] == 0
+
+
+def test_high_watermark_never_exceeds_count_limit(monkeypatch):
+    """Repeated admissions past the ceiling each displace one entry to stay at
+    the limit, so the depth high watermark never exceeds the configured max."""
+    ic, _ = _queue(monkeypatch, max_messages=4)
+    queue = ic.outbound_queue
+    for i in range(10):
+        assert queue.put_with_kind(KIND_TELEMETRY, b'{"i":%d}' % i, RETENTION_PRIORITY_TELEMETRY) is True
+    status = queue.status()
+    assert status["depth"] == 4
+    assert status["high_watermark"] == 4  # == max, never above
+    _assert_watermark_at_least_depth(queue)
+
+
+def test_heap_governs_before_count_on_small_heap(monkeypatch):
+    """Pico-W shape: a large count ceiling (256) that never binds, but heap
+    pressure is reached first. The heap policy evicts to restore the floor
+    while the queue holds only a handful of entries -- the count ceiling must
+    not let the queue retain what the heap policy reclaims."""
+    MIN, PREFERRED = 48 * KB, 64 * KB
+    ic, heap = _queue(monkeypatch, free_bytes=HEAPY, minimum=MIN, preferred=PREFERRED, max_messages=256)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_HEALTH, b"h" * 16 * KB, RETENTION_PRIORITY_HEALTH) is True
+    assert queue.put_with_kind(KIND_TELEMETRY, b"t" * 16 * KB, RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.get_depth() == 2
+    # Heap falls hard below the floor: admission is governed by heap reclaim
+    # (evicting the least-important entry), far below the 256 count ceiling.
+    heap.free_bytes = MIN - 16 * KB
+    assert queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":1}', RETENTION_PRIORITY_CRITICAL) is True
+    status = queue.status()
+    assert status["depth"] == 2  # HEALTH evicted; TELEMETRY + CRITICAL remain
+    assert status["messages_evicted"] == 1
+    assert status["telemetry_evicted"] == 0  # the displaced entry was HEALTH
+    assert status["depth"] < 256  # the count ceiling never engaged
+
+
+def test_in_flight_entry_counts_toward_count_limit(monkeypatch):
+    """The in-flight entry is retained by the outbound queue, so it counts
+    toward the ceiling: with one queued and one in flight (depth 2 == max), a
+    new admission displaces a queued entry (never the in-flight one) so depth
+    stays at the limit rather than exceeding it."""
+    ic, _ = _queue(monkeypatch, max_messages=2)
+    queue = ic.outbound_queue
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is True
+    assert queue.put_with_kind(KIND_TELEMETRY, b'{"b":2}', RETENTION_PRIORITY_TELEMETRY) is True
+    in_flight = queue.take()  # one in flight, one queued: depth 2 == max
+    assert queue.has_in_flight() is True
+    # depth is 2 (queued 1 + in-flight 1). A new CRITICAL admission is at the
+    # limit: it displaces the queued TELEMETRY, so depth stays at 2, never 3.
+    assert queue.put_with_kind(KIND_COMMAND_RESPONSE, b'{"r":1}', RETENTION_PRIORITY_CRITICAL) is True
+    status = queue.status()
+    assert status["depth"] == 2
+    assert status["high_watermark"] == 2
+    assert status["messages_evicted"] == 1
+    assert queue.has_in_flight() is True  # the in-flight entry was not displaced
+    queue.complete_in_flight(in_flight)
+    _assert_watermark_at_least_depth(queue)
 
 
 # ---------------------------------------------------------------------------

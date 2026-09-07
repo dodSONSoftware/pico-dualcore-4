@@ -59,9 +59,8 @@ _UTC_PROMPT_RETRY_DELAY_MS = 500
 
 # Command-ID debounce cache: stops repeated copies of one message (broker
 # redelivery, sender retry) from producing repeated responses and executions.
-# FIFO eviction, RAM-only, deliberately not heap-governed; a repeated ID is
-# ignored until it evicts and a duplicate never refreshes its position (not
-# LRU). Not durable idempotency or exactly-once. Static constant; not a config key.
+# FIFO eviction, RAM-only, deliberately not heap-governed; a duplicate never
+# refreshes its position (not LRU). Not durable idempotency or exactly-once.
 _RECENT_COMMAND_ID_CAPACITY = 16
 
 # Core 1 heartbeat watchdog timeout: Core 1 refreshes the stamp on a 5 s
@@ -71,19 +70,13 @@ _RECENT_COMMAND_ID_CAPACITY = 16
 _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS = 30000
 
 # Hardware watchdog (machine.WDT) timeout: the one supervision layer for
-# Core 0 itself — nothing else can detect a Core 0 that is alive but no
-# longer making progress (a wedged driver, a deadlock, a native hang).
-#
-# The budget is derived, not arbitrary: every single blocking operation
-# Core 0 performs must fail on its OWN timeout before this one can fire, so
-# a watchdog reset means "Core 0 is wedged", never "the link was slow". The
-# longest such operation is one bounded MQTT exchange wait, capped at
-# max(MQTT's 5 s response-timeout bound in config.py, mqtt.py's 5 s PINGRESP
-# bound) — both checked against this constant by a test. Every longer wait
-# in Core 0's paths is sliced at 100 ms with _service_wait() between slices,
-# which feeds the watchdog. 8 s stays under the RP2 hardware maximum
-# (8388 ms) while keeping 60% margin over the 5 s wait ceiling.
-# Static constant; not a config key.
+# Core 0 itself. The budget is derived, not arbitrary: every single blocking
+# operation Core 0 performs must fail on its OWN timeout before this one can
+# fire (a watchdog reset means "Core 0 is wedged", never "the link was slow"),
+# and every longer wait is sliced at 100 ms with _service_wait() between
+# slices, which feeds the watchdog. See ARCHITECTURE.md, "Core 0 hardware
+# watchdog", for the full budget derivation; a test pins both 5 s wait
+# ceilings under this constant.
 WDT_TIMEOUT_MS = 8000
 
 # HOT_RELOADED settings Core 0 applies to its live config at commit time;
@@ -127,10 +120,9 @@ class Core0:
         self._pending_core0_responses = []
         self._pending_connection_logs = []
         # A HOT_RELOADED write-config is one transaction across both cores:
-        # Core 0 applies its subset, Core 1's is requested on the
-        # config-update lane, and the response + commit are held until
-        # Core 1's ack (the run loop resolves it). _transaction_active stays
-        # True for the same window (single-flight).
+        # the response + commit are held until Core 1's ack (the run loop
+        # resolves it); _transaction_active stays True for the same window
+        # (single-flight).
         self._pending_config_update = None
         # Monotonic generation for config-update requests/results; a stale
         # result can never be read as the current one.
@@ -207,10 +199,9 @@ class Core0:
             return
 
         message = self._pending_connection_logs[0]
-        # The container is the persistent identity: uptime, timestamp, and
-        # body are stamped/serialized once, and the wire sequence is claimed
-        # once (by _publish_entry) -- a transport retry redelivers ONE
-        # (runtime_id, sequence) pair with the same document.
+        # The container is the persistent identity: stamped/serialized once,
+        # wire sequence claimed once (by _publish_entry) — a transport retry
+        # redelivers ONE (runtime_id, sequence) pair with the same document.
         if "payload_bytes" not in message:
             message["uptime_ms"] = self._uptime_ms()
             message["timestamp"] = self._current_utc_timestamp()
@@ -250,10 +241,9 @@ class Core0:
                 print("[DEBUG] Ignoring invalid MQTT payload: {}".format(err))
             return
 
-        # Release the raw frame now that the parse succeeded: otherwise the
-        # frame bytes (up to the inbound ceiling) stay alive across the whole
-        # command handler alongside the parsed graph, adding a full frame of
-        # heap to every response allocation the handler makes.
+        # Release the raw frame now that the parse succeeded: otherwise it
+        # stays alive across the whole command handler alongside the parsed
+        # graph, adding a full frame of heap to every response allocation.
         del payload
 
         if not isinstance(doc, dict):
@@ -372,10 +362,9 @@ class Core0:
             ))
             return
 
-        # Ownership dispatch: only a supported name proceeds. An unregistered
-        # bounded name is answered here (Core 1 is not the generic
-        # fallback); the actual name rides in the standard command field,
-        # not duplicated inside error.
+        # Ownership dispatch: only a supported name proceeds; an unregistered
+        # bounded name is answered here (Core 1 is not the generic fallback),
+        # with the actual name in the standard command field.
         if not is_supported_command(command):
             self._queue_core0_response(self._command_error(
                 command_id, targeted, command, {
@@ -922,9 +911,7 @@ class Core0:
         fragment = self._envelope_fragment(sequence)
         # The spliced envelope is added on top of the admitted body: enforce
         # the ceiling against the FINAL wire length, before the frame goes
-        # out. Permanent for this entry (its bytes are fixed) -- callers
-        # answer a command response with the bounded substitute and discard
-        # the other kinds.
+        # out.
         wire_length = len(body) + len(fragment) + 1
         if wire_length > MAX_OUTBOUND_MESSAGE_BYTES:
             raise OutboundMessageTooLargeError(
@@ -1058,10 +1045,9 @@ class Core0:
         return True
 
     def _reboot_publish_due(self):
-        # The reboot response is an outbound PUBLISH: hold (without
-        # resetting, without blocking) until the link is up and the
-        # pacing gate is open — like every other publish path, an attempt
-        # on a down link would fail immediately, so it is not one.
+        # The reboot response is an outbound PUBLISH: hold (without resetting,
+        # without blocking) until the link is up and the pacing gate is open
+        # -- an attempt on a down link would just fail immediately.
         return (
             self._pending_reboot is not None
             and self._mqtt.is_connected()
@@ -1281,8 +1267,6 @@ class Core0:
 
         timeout_ms = self._config["network_probe_timeout_sec"] * 1000
         try:
-            # publish_qos1_with_packet_id will block until matching PUBACK arrives
-            # or timeout occurs (via socket timeout)
             result = self._mqtt.publish_qos1_with_packet_id(
                 self._config["mqtt_topic_network_probe"],
                 probe_message,
@@ -1307,15 +1291,12 @@ class Core0:
     def _drain_startup_mqtt_work(self):
         """Drain pending Core 0 MQTT work; True when none remains, False on timeout.
 
-        Each head log gets its own grace window: it starts when the head
-        changes and is NOT re-armed by failed attempts, so a dead or
-        blackholed link (whose publish fails and leaves the same head
-        pending) fails the pass -- which re-establishes the network and
-        retries the contract -- instead of retrying the same head forever
-        with a fresh window every ~100 ms. A slow-but-legal QoS 1 cycle on
-        one log (up to mqtt_broker_response_timeout_sec) completes it and
-        the next log starts its own fresh window, so it cannot consume the
-        logs behind it."""
+        Each head log gets its own grace window, not re-armed by failed
+        attempts: a dead or blackholed link (whose publish fails and leaves
+        the same head pending) fails the pass -- which re-establishes the
+        network and retries the contract -- instead of retrying the same
+        head forever. A slow-but-legal QoS 1 cycle on one log completes it
+        and the next log starts its own fresh window."""
         grace_ms = 2000  # per-head-log grace before the pass times out
 
         while self._pending_connection_logs:
@@ -1511,10 +1492,9 @@ class Core0:
         self._led_manager.set_connecting(False)
 
         # Arm hardware supervision only now: the connect/verification loops
-        # above are deliberately unbounded (self-healing retries), and a
-        # watchdog would reset them into the same waits. From here on every
-        # long wait is sliced and fed, and the bounded waits fail under the
-        # watchdog budget.
+        # above are deliberately unbounded, and a watchdog would reset them
+        # into the same waits. From here on every long wait is sliced and
+        # fed, and the bounded waits fail under the watchdog budget.
         self._enable_watchdog()
 
         print("[INFO] Core 0 startup complete - network stack verified and ready")
@@ -1570,9 +1550,13 @@ class Core0:
 
             self._recover_network_if_needed()
 
+            # Like the command-response path below, hold a connection log
+            # while an outbound entry is still in flight (a retry after a
+            # transport failure): the two publish paths never interleave.
             if (
                 self._mqtt.is_connected()
                 and self._pending_connection_logs
+                and not self._intercore.outbound_queue.has_in_flight()
                 and self._mqtt_publish_ready()
             ):
                 try:

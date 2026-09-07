@@ -132,7 +132,7 @@ Core 1 queues messages for MQTT; Core 0 publishes them.
 | INFO | 50 | Informational messages |
 | HEALTH | 70 | Health checks |
 
-The queue has no fixed capacity: under heap pressure it evicts the oldest message of the least-important eligible priority class to make room, and rejects the new message transiently (for the producer to retry) when no eligible entry remains.
+The queue is heap-governed and additionally bounded by a configured entry-count ceiling (`outbound_queue_max_messages`, 1–256): admission is decided against the board's heap thresholds first (the heap stays authoritative — the count ceiling can only add a rejection or a retention-aware eviction, never admit what the heap would reject), and once the heap floor is satisfied the entry count (queued + in-flight) is checked against the ceiling. At the limit it evicts the oldest message of the least-important eligible priority class to make room, and rejects the new message transiently (for the producer to retry) when no eligible entry remains.
 
 ### 2. Event Queue (Core 0 → Core 1)
 
@@ -180,14 +180,14 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 - `device_failures`: devices_configured - devices_active
 
 ### Queue
-The queues are heap-governed (no fixed capacity), so these are observability metrics:
-- `outbound_queue_depth`: Current queued + in-flight entries
+The outbound queue is heap-governed **and** bounded by the `outbound_queue_max_messages` entry-count ceiling (evaluated after the heap policy, in-flight included), so these are observability metrics: the depth and high-water-mark are utilization against that ceiling (≤ `outbound_queue_max_messages`), while the byte metrics remain heap-governed only:
+- `outbound_queue_depth`: Current queued + in-flight entries (≤ `outbound_queue_max_messages`)
 - `outbound_queued_bytes`: Retained payload bytes (queued FIFO plus in-flight entry)
-- `outbound_queue_high_watermark`: Peak queue depth since boot
+- `outbound_queue_high_watermark`: Peak queue depth since boot (≤ `outbound_queue_max_messages`)
 - `outbound_queue_high_watermark_bytes`: Peak retained payload bytes since boot
-- `outbound_evicted`: Entries evicted under memory pressure (all kinds)
+- `outbound_evicted`: Entries evicted under memory pressure or to relieve the count ceiling (all kinds)
 - `telemetry_evicted`: Evicted entries of the telemetry kind
-- `outbound_rejected`: Admissions rejected because the hard free-heap floor could not be restored
+- `outbound_rejected`: Admissions rejected because the hard free-heap floor could not be restored or no eligible entry was available to relieve the count ceiling
 
 ### UTC
 - `utc_valid`: Boolean indicating UTC time is valid
@@ -238,7 +238,7 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 
 ### Schema Version
 
-The firmware expects `config_schema_version: 7`. Unknown top-level keys are rejected.
+The firmware expects `config_schema_version: 8`. Unknown top-level keys are rejected.
 
 ### Key Settings
 
@@ -248,6 +248,7 @@ The firmware expects `config_schema_version: 7`. Unknown top-level keys are reje
 | `device_initialization_attempts` | Retry count for device init |
 | `device_initialization_retry_delay_ms` | Delay between device init retries (ms) |
 | `device_read_failure_threshold` | Consecutive failures before reinit |
+| `outbound_queue_max_messages` | Outbound queue entry-count ceiling (1–256); the heap policy is evaluated first |
 | `mqtt_keepalive_sec` | MQTT keepalive interval (seconds) |
 | `mqtt_command_poll_ms` | MQTT receive pump interval (ms) |
 | `mqtt_outbound_publish_delay_ms` | Minimum delay (ms) after a successful outbound MQTT PUBLISH before another may begin; 0 disables pacing |

@@ -165,6 +165,9 @@ class FakeMqtt:
         # Scripted failures: the next N publish_qos1 calls raise, the way a
         # lost PUBACK fails the exchange.
         self.fail_publishes = 0
+        # Topics whose publish_qos1 ALWAYS raises (a persistent lost PUBACK),
+        # so one entry's retries fail without failing other topics' publishes.
+        self.fail_topics = set()
         self._last_info_request = None
         self._utc_deliver = False
 
@@ -185,6 +188,8 @@ class FakeMqtt:
             self.fail_publishes -= 1
             # A lost PUBACK is a socket timeout in the real client: a
             # transport failure (OSError), not a programming error.
+            raise OSError("PUBACK timeout (simulated)")
+        if topic in self.fail_topics:
             raise OSError("PUBACK timeout (simulated)")
         if splice_fragment is not None:
             # Mirror the client's segmented spliced write: the wire bytes
@@ -505,6 +510,38 @@ def test_connection_log_then_queued_telemetry_paced(make_core0):
     # ...and the two PUBLISHes are separated by the configured interval.
     assert times[0] == 0
     assert times[1] >= 100
+
+
+def test_connection_log_held_while_outbound_entry_in_flight(make_core0):
+    """Symmetry with the command-response path: a pending connection log is
+    not published while an outbound entry is still in flight (a retry after a
+    transport failure), and publishes once that entry clears."""
+    instance = make_core0(delay_ms=100)
+    _utc_synchronized(instance)
+    instance._queue_connection_log(
+        "mqtt_connection_established", "Connected to MQTT broker", "mqtt", {}
+    )
+
+    # An in-flight outbound entry whose re-publish keeps losing its PUBACK
+    # (topic-selective, so the connection log's own publish would succeed if
+    # the gate were open): has_in_flight() stays True across passes, the
+    # state a transport failure leaves the head in.
+    instance._mqtt.fail_topics.add(instance._config["mqtt_topic_telemetry"])
+    _queue_telemetry(instance, 7)
+    entry = instance._intercore.outbound_queue.take()
+
+    # While the entry is in flight the connection log stays pending...
+    _run_to(instance, 200)
+    assert instance._pending_connection_logs
+    assert instance._intercore.outbound_queue.has_in_flight()
+
+    # ...and once it clears, the log publishes.
+    instance._mqtt.fail_topics.clear()
+    instance._intercore.outbound_queue.complete_in_flight(entry)
+    _run_to(instance, 300)
+
+    assert not instance._pending_connection_logs
+    assert instance._mqtt.published[0][0] == instance._config["mqtt_topic_log"]
 
 
 def test_core0_response_then_queued_telemetry_paced(make_core0):

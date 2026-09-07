@@ -13,34 +13,29 @@ from device_factory import (
 from devices.device import DeviceValidationError
 from version import CONFIG_SCHEMA_VERSION
 
-# MQTT 3.1.1 encodes Keep Alive as a 16-bit word: above 65535 s the
-# CONNECT packet is unrepresentable. This key is reboot-required, so a
-# rejected write would brick the MQTT channel used to fix it.
+# Keep Alive is a 16-bit word in CONNECT: above 65535 s the packet is
+# unrepresentable. The key is reboot-required, so a rejected write would
+# brick the MQTT channel used to fix it.
 MAX_MQTT_KEEPALIVE_SEC = 65535
 
-# mqtt_client.subscribe() encodes the SUBSCRIBE Remaining Length in one byte
-# (valid through 127) and the body is topic + 5, so above 122 topic bytes the
-# length byte gains the continuation bit and the subscription silently never
-# completes. Both subscribed topics are the repair channel for a bad
-# configuration, so the bound sits at the config boundary. (Publish uses full
-# variable-length encoding; the same bound is applied to every topic for one
-# simple policy: 1..N ASCII bytes, no NUL.)
+# subscribe() encodes the SUBSCRIBE Remaining Length in one byte (valid
+# through 127); the body is topic + 5, so above 122 topic bytes the length
+# byte gains the continuation bit and the subscription never completes. Both
+# subscribed topics are the repair channel for a bad configuration, so the
+# bound sits at the config boundary (publish uses full variable-length
+# encoding; the bound applies to every topic for one simple policy).
 MAX_MQTT_TOPIC_BYTES = 122
 
-# The broker address feeds socket.connect(), which also resolves hostnames,
-# so the bound is DNS's 253-byte hostname maximum rather than IPv6's 45
-# characters. It is spliced into the read-config response and the connect
-# logs, and it had no bound at all — a single long value alone pushed a
-# "valid" configuration past the outbound wire ceiling.
+# Feeds socket.connect(), which also resolves hostnames: the bound is DNS's
+# 253-byte hostname maximum rather than IPv6's 45 characters.
 MAX_MQTT_BROKER_ADDRESS_BYTES = 253
 
 # The Wi-Fi secrets sit in config-secrets.json (boot provisioning, not
 # write-config) and feed network.WLAN.connect(). The SSID bound is IEEE
-# 802.11's 32-octet SSID limit; the password bound covers a 63-character
-# WPA2-PSK passphrase and a 64-hex-character raw PSK. Both are measured in
-# UTF-8 bytes like the other protocol-scale strings, and a misprovisioned
-# file must fail fast here instead of surfacing deep in the Wi-Fi retry
-# machinery (and holding an oversized string in heap).
+# 802.11's 32-octet SSID limit; the password covers a 63-character WPA2-PSK
+# passphrase and a 64-hex raw PSK. Measured in UTF-8 bytes like the other
+# protocol-scale strings: a misprovisioned file must fail fast here instead
+# of surfacing deep in the Wi-Fi retry machinery.
 MAX_WIFI_SSID_BYTES = 32
 MAX_WIFI_PASSWORD_BYTES = 64
 
@@ -52,25 +47,20 @@ MAX_WIFI_PASSWORD_BYTES = 64
 MAX_TICKS_SAFE_INTERVAL_MS = (1 << 29) - 1
 
 # Retries ride out a transient driver.initialize() failure; a device that
-# fails all of them is broken, so a handful is enough (shipped: 3). The
-# bound also keeps a misconfigured huge value from stalling startup for
-# attempts x retry delay and growing retained init diagnostics on the
-# startup-failure path where heap must stay flat.
+# fails all of them is broken, so a handful is enough (shipped: 3). Above
+# this, a misconfigured value stalls startup for attempts x retry delay.
 MAX_DEVICE_INITIALIZATION_ATTEMPTS = 10
 
 # Reconnect delays are bounded for operational liveness, not the ticks
-# ceiling (they only drive sliced sleeps): a delay long enough to outlast any
-# human diagnosis, or a sequence long enough to loop for days, makes recovery
-# indistinguishable from a hang. The shipped sequences (3/5/10/20/40 s) are
-# nowhere near either bound; above them is misconfiguration, not policy.
+# ceiling (they only drive sliced sleeps): a delay or sequence long enough to
+# loop for days makes recovery indistinguishable from a hang.
 MAX_RECONNECT_DELAY_SEC = 600
 MAX_RECONNECT_ATTEMPTS = 32
 
 # Operational liveness bounds — in contrast to MAX_TICKS_SAFE_INTERVAL_MS
-# above, a representability bound. These stop a representable value from
-# defeating recovery: a stalled link must fail on its own timeout in
-# seconds, and a retry delay must not space re-attempts days apart. Shipped
-# values (4 s / 5 s / 250 ms / 3) sit well below every bound below.
+# above, a representability bound: these stop a representable value from
+# defeating recovery. Shipped values (4 s / 5 s / 250 ms / 3) sit well below
+# every bound below.
 
 # Scales every bounded MQTT wait (the CONNACK/SUBACK handshake, the PUBACK,
 # check_msg completion, the UTC request deadline). Each single wait must stay
@@ -97,23 +87,27 @@ MAX_DEVICE_READ_FAILURE_THRESHOLD = 1000
 
 # Core 1 builds a per-device status structure before anything can be rejected
 # at the serialized-size ceiling (the bounded startup-log fallback and the
-# read-config response both carry it). The string fields are byte-bounded
-# (device_factory's MAX_DEVICE_*_LENGTH, MAX_SOURCE_LENGTH, and
-# MAX_MQTT_BROKER_ADDRESS_BYTES — UTF-8 bytes, since the ceiling is a wire
-# bound), so with the device count at this maximum a worst-case valid
-# configuration stays under MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) serialized.
-# The serialized-size invariant test in tests/test_config.py pins that for
-# every currently supported device type.
+# read-config response both carry it). The string fields are byte-bounded,
+# so at this device count a worst-case valid configuration stays under
+# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) serialized — pinned by the
+# serialized-size invariant test in tests/test_config.py.
 MAX_DEVICES = 16
+
+# Deterministic ceiling on the number of outbound-queue entries retained
+# (queued + in-flight). This is an observability/stability bound, NOT a memory
+# bound: the heap policy (preferred reserve / hard floor) remains the memory
+# guard and is evaluated first, so on a memory-constrained board the queue is
+# limited by heap pressure well before this count. The ceiling is the maximum
+# a config may set (1..256), not the maximum the queue can ever hold.
+MAX_OUTBOUND_QUEUE_MAX_MESSAGES = 256
 
 
 class ConfigError(Exception):
     """Configuration load/validation failure with a stable machine-readable
-    code. ``str(err)`` stays the full human-readable message; ``code`` and
-    ``unknown_fields`` let the command handler answer with a stable cause
-    rather than parsing the message; ``details`` is a small flat key/value
-    map the command handler merges as-is (e.g. expected/received schema
-    versions). ``code`` is None only for errors raised outside this module."""
+    code: ``code`` and ``unknown_fields`` let the command handler answer with
+    a stable cause without parsing the message; ``details`` is a small flat
+    key/value map merged as-is (e.g. expected/received schema versions).
+    ``code`` is None only for errors raised outside this module."""
 
     def __init__(self, message, code=None, unknown_fields=None, details=None):
         super().__init__(message)
@@ -153,6 +147,7 @@ _REQUIRED_KEYS = (
     "health_interval_sec",
     "wifi_reconnect_delays_sec",
     "mqtt_reconnect_delays_sec",
+    "outbound_queue_max_messages",
 )
 
 _ALLOWED_KEYS = frozenset(_REQUIRED_KEYS)
@@ -227,11 +222,10 @@ def _require_non_empty_string(config, key):
 
 def _require_mqtt_topic(config, key):
     """A configured topic must be 1..MAX_MQTT_TOPIC_BYTES ASCII bytes with no
-    NUL (see the bound's comment); ASCII-only keeps UTF-8 byte length equal to
-    character count, so the single-byte Remaining Length arithmetic in
-    mqtt_client.subscribe() stays exact. Wildcards (+/#) are rejected: they
-    are invalid in a PUBLISH Topic Name, and inbound dispatch matches
-    delivered topics by exact equality against the configured name."""
+    NUL (see the bound's comment); ASCII-only keeps byte length equal to
+    character count for the single-byte Remaining Length arithmetic.
+    Wildcards (+/#) are invalid in a PUBLISH Topic Name, and inbound dispatch
+    matches delivered topics by exact equality."""
     value = config[key]
     if not isinstance(value, str) or not value:
         raise ConfigError(
@@ -249,13 +243,10 @@ def _require_mqtt_topic(config, key):
 
 
 def _require_distinct_mqtt_topics(config):
-    # A shared topic name is not "one channel, disambiguated by content":
-    # inbound dispatch matches by exact equality and the first matching
-    # branch wins, so the other channel's traffic is silently dropped —
-    # equal command/info_response names make the entire command path
-    # unreachable on a device that still reports healthy, and a name shared
-    # with a locally published topic re-delivers every own publication
-    # inbound. Each channel keeps its own name.
+    # Inbound dispatch matches by exact equality and the first matching
+    # branch wins: a shared name silently disables one channel (equal
+    # command/info_response names make the command path unreachable on a
+    # healthy-looking device) or self-echoes the device's own publications.
     seen = {}
     for key in _MQTT_TOPIC_KEYS:
         value = config[key]
@@ -404,9 +395,6 @@ def validate_config(config):
     for key in ("source", "mqtt_broker_ip_address"):
         _require_non_empty_string(config, key)
 
-    # Topics carry the MQTT single-byte Remaining Length bound (subscribe)
-    # on top of the non-empty-string contract, and the eight channel names
-    # must stay pairwise distinct (topic identity is the routing invariant).
     for key in _MQTT_TOPIC_KEYS:
         _require_mqtt_topic(config, key)
     _require_distinct_mqtt_topics(config)
@@ -436,20 +424,16 @@ def validate_config(config):
         "network_snapshot_interval_sec",
         "network_probe_timeout_sec",
         "health_interval_sec",
+        "outbound_queue_max_messages",
     ):
         _require_positive_integer(config, key)
 
-    # Keep Alive is a 16-bit word on the wire; above the maximum the CONNECT
-    # packet is unrepresentable. config.py is authoritative; mqtt_client.py
-    # keeps its check only as defensive transport validation.
     if config["mqtt_keepalive_sec"] > MAX_MQTT_KEEPALIVE_SEC:
         raise ConfigError(
             "mqtt_keepalive_sec must be at most {}".format(MAX_MQTT_KEEPALIVE_SEC),
             code="invalid_value",
         )
 
-    # See MAX_DEVICE_INITIALIZATION_ATTEMPTS: retries ride out transient
-    # initialize() failures; a device that fails them all is broken.
     if config["device_initialization_attempts"] > MAX_DEVICE_INITIALIZATION_ATTEMPTS:
         raise ConfigError(
             "device_initialization_attempts must be at most {}".format(
@@ -461,9 +445,6 @@ def validate_config(config):
     _require_nonnegative_integer(config, "device_initialization_retry_delay_ms")
     _require_nonnegative_integer(config, "mqtt_outbound_publish_delay_ms")
 
-    # Operational liveness bounds (see the MAX_ constants): all four keys are
-    # type-checked above, so a wrong type still reports from the _require_*
-    # helpers, and only a representable-but-unusable value reaches here.
     if config["mqtt_broker_response_timeout_sec"] > MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC:
         raise ConfigError(
             "mqtt_broker_response_timeout_sec must be at most {}".format(
@@ -495,12 +476,16 @@ def validate_config(config):
             ),
             code="invalid_value",
         )
+    if config["outbound_queue_max_messages"] > MAX_OUTBOUND_QUEUE_MAX_MESSAGES:
+        raise ConfigError(
+            "outbound_queue_max_messages must be at most {}".format(
+                MAX_OUTBOUND_QUEUE_MAX_MESSAGES
+            ),
+            code="invalid_value",
+        )
 
     # Values that become ticks_diff thresholds or ticks_add deltas are bounded
-    # by the ticks ceiling; values that only drive sliced sleeps (reconnect
-    # delays, probe timeout, sliced retry delay) are not — reconnect delays
-    # get their own operational-liveness bounds instead. Runs after the type
-    # checks so a wrong type still reports invalid_value, not a type error.
+    # by the ticks ceiling; values that only drive sliced sleeps are not.
     _require_ticks_safe_interval(config, "read_loop_sec", 1000)
     _require_ticks_safe_interval(config, "health_interval_sec", 1000)
     _require_ticks_safe_interval(config, "network_snapshot_interval_sec", 1000)
@@ -564,8 +549,10 @@ def load_wifi_config(path="config-secrets.json"):
 
 def split_config(config):
     """Create the immutable-by-convention per-core startup configuration. The
-    bus carries no configuration: its heap-reserve bound is a board property
-    owned by hardware.py, passed to InterCore directly."""
+    bus is not part of the per-core split: its heap-reserve bound is a board
+    property owned by hardware.py and its outbound count ceiling is
+    outbound_queue_max_messages, both read by main.py and passed to InterCore
+    directly at construction."""
     core0 = {
         "source": config["source"],
         "mqtt_broker_ip_address": config["mqtt_broker_ip_address"],

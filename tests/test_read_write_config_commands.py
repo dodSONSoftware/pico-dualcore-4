@@ -80,7 +80,7 @@ def _install_mocks():
 # collection, and mocked entries in sys.modules would shadow them.
 from config import split_config  # noqa: E402
 from config_manager import ConfigManager  # noqa: E402
-from version import MESSAGE_SCHEMA_VERSION  # noqa: E402
+from version import CONFIG_SCHEMA_VERSION, MESSAGE_SCHEMA_VERSION  # noqa: E402
 
 
 def _full_config():
@@ -906,7 +906,7 @@ def test_write_config_wrong_schema_version_is_rejected(make_core0, tmp_path):
     assert response["success"] is False
     assert response["error"]["code"] == "invalid_config_schema_version"
     assert response["error"]["message"] == "Unsupported config_schema_version"
-    assert response["error"]["expected"] == 7
+    assert response["error"]["expected"] == CONFIG_SCHEMA_VERSION
     assert response["error"]["received"] == 6
 
 
