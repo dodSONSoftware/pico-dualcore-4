@@ -129,7 +129,13 @@ class MQTTClient:
     def connect(self, clean_session=True, timeout=None):
         self.sock = socket.socket()
         self.sock.settimeout(timeout)
-        addr = socket.getaddrinfo(self.server, self.port)[0][-1]
+        # Filter the lookup to the profile the default socket constructs
+        # (AF_INET/SOCK_STREAM): an unfiltered getaddrinfo can return a first
+        # record (IPv6, datagram) that socket cannot use even when a usable
+        # record follows, for a hostname resolving to multiple records.
+        addr = socket.getaddrinfo(
+            self.server, self.port, socket.AF_INET, socket.SOCK_STREAM
+        )[0][-1]
         self.sock.connect(addr)
         if self.ssl:
             self.sock = self.ssl.wrap_socket(self.sock, server_hostname=self.server)
@@ -317,11 +323,26 @@ class MQTTClient:
         while 1:
             op = self.wait_msg()
             if op == 0x90:
-                resp = self._read_required(4)
-                if resp[1] != pkt[2] or resp[2] != pkt[3]:
+                sz = self._read_required(1)
+                if sz != b"\x03":
+                    # A SUBACK for this client's single-topic subscription is
+                    # exactly 2-byte packet id + 1 return code. Trusting any
+                    # other declared length would leave stray bytes in the
+                    # stream (or over-consume the next packet's bytes) and
+                    # desynchronize every later frame.
+                    self._abort_corrupt_inbound(
+                        "SUBACK with unexpected remaining length"
+                    )
+                resp = self._read_required(3)
+                if resp[0] != pkt[2] or resp[1] != pkt[3]:
                     raise MQTTException("Invalid SUBACK packet identifier")
-                if resp[3] == 0x80:
-                    raise MQTTException(resp[3])
+                if resp[2] == 0x80:
+                    raise MQTTException(resp[2])
+                if resp[2] not in (0x00, 0x01, 0x02):
+                    # Only granted-QoS codes 0x00-0x02 and 0x80 (failure) are
+                    # valid; a reserved code is a protocol violation, not a
+                    # grant.
+                    self._abort_corrupt_inbound("Invalid SUBACK return code")
                 return
 
     # Wait for a single incoming MQTT message and process it: subscribed

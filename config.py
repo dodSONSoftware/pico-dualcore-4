@@ -34,6 +34,16 @@ MAX_MQTT_TOPIC_BYTES = 122
 # "valid" configuration past the outbound wire ceiling.
 MAX_MQTT_BROKER_ADDRESS_BYTES = 253
 
+# The Wi-Fi secrets sit in config-secrets.json (boot provisioning, not
+# write-config) and feed network.WLAN.connect(). The SSID bound is IEEE
+# 802.11's 32-octet SSID limit; the password bound covers a 63-character
+# WPA2-PSK passphrase and a 64-hex-character raw PSK. Both are measured in
+# UTF-8 bytes like the other protocol-scale strings, and a misprovisioned
+# file must fail fast here instead of surfacing deep in the Wi-Fi retry
+# machinery (and holding an oversized string in heap).
+MAX_WIFI_SSID_BYTES = 32
+MAX_WIFI_PASSWORD_BYTES = 64
+
 # The RP2 builds give time.ticks_* 30-bit values: ticks_diff only expresses
 # deltas below half the period (2^29 - 1 ms, ~6.21 days) and ticks_add raises
 # OverflowError at it. Any value that becomes a ticks_diff threshold or
@@ -530,6 +540,24 @@ def load_wifi_config(path="config-secrets.json"):
         raise WifiConfigError("wifi_ssid must be a non-empty string")
     if not isinstance(password, str):
         raise WifiConfigError("wifi_password must be a string")
+    # An embedded NUL would be truncated by the C radio driver's string
+    # handling: the connection would then fail with an opaque driver error
+    # instead of a provisioning error that names the field.
+    if "\x00" in ssid:
+        raise WifiConfigError("wifi_ssid must not contain an embedded NUL")
+    if "\x00" in password:
+        raise WifiConfigError("wifi_password must not contain an embedded NUL")
+    if len(ssid.encode("utf-8")) > MAX_WIFI_SSID_BYTES:
+        raise WifiConfigError(
+            "wifi_ssid must be at most {} bytes".format(MAX_WIFI_SSID_BYTES)
+        )
+    # The empty string stays legal: an open network has no passphrase.
+    if len(password.encode("utf-8")) > MAX_WIFI_PASSWORD_BYTES:
+        raise WifiConfigError(
+            "wifi_password must be at most {} bytes".format(
+                MAX_WIFI_PASSWORD_BYTES
+            )
+        )
 
     return {"wifi_ssid": ssid, "wifi_password": password}
 

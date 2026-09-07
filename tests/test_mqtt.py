@@ -92,6 +92,7 @@ class MockSocket:
         # state after a bounded exchange, while installs still succeed.
         self.restore_error = None
         self.closed = False
+        self.connected_to = None
         # When set, a write attempted in infinite-blocking mode (no finite
         # timeout installed) would stall forever on a real blackholed link;
         # with a finite timeout installed the write is bounded and completes
@@ -168,7 +169,7 @@ class MockSocket:
     def connect(self, addr):
         # In-memory: no transport to stall. On the real socket this call is
         # bounded by the timeout installed before it.
-        pass
+        self.connected_to = addr
 
     def close(self):
         self.closed = True
@@ -937,6 +938,41 @@ def _mock_broker_socket(monkeypatch, sock):
     )
 
 
+def test_connect_filters_resolver_to_ipv4_stream(monkeypatch):
+    """connect() must filter getaddrinfo to AF_INET/SOCK_STREAM and connect to
+    the filtered record: the config contract allows a broker hostname, and an
+    UNFILTERED lookup can return a first record (IPv6, datagram) that the
+    default stream socket cannot use even when a usable record exists."""
+    import socket as real_socket
+    import mqtt_client
+
+    calls = []
+
+    def fake_getaddrinfo(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [(
+            real_socket.AF_INET,
+            real_socket.SOCK_STREAM,
+            real_socket.IPPROTO_TCP,
+            ("10.0.0.7", 1883),
+        )]
+
+    sock = MockSocket(incoming=b"\x20\x02\x00\x00")  # CONNACK, connection granted
+    monkeypatch.setattr(mqtt_client.socket, "socket", lambda *a, **k: sock)
+    monkeypatch.setattr(mqtt_client.socket, "getaddrinfo", fake_getaddrinfo)
+
+    client = MQTTClient("pico_test", "broker.example", 1883, keepalive=30)
+    client.connect(timeout=5)
+
+    # The default socket is AF_INET/SOCK_STREAM, so the lookup must ask for
+    # exactly that profile instead of trusting the first unfiltered result.
+    assert calls == [(
+        ("broker.example", 1883, real_socket.AF_INET, real_socket.SOCK_STREAM),
+        {},
+    )]
+    assert sock.connected_to == ("10.0.0.7", 1883)
+
+
 def test_mqtt_connect_times_out_when_connack_never_arrives(ticks, monkeypatch):
     """TCP connects, the broker never sends CONNACK: fail within the timeout."""
     sock = MockSocket(incoming=b"")  # link up, then silent
@@ -1206,6 +1242,66 @@ def test_subscribe_uses_wrapped_packet_id():
 
     assert sock.buffer == b""
     assert client.pid == 1
+
+
+def test_subscribe_rejects_suback_with_unexpected_remaining_length():
+    """A SUBACK whose declared remaining length is not 3 (this client's
+    single-topic subscription: 2-byte packet id + 1 return code) must drop
+    the connection: accepting it leaves a stray byte in the stream, and the
+    next frame then parses from a desynchronized position."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+
+    # Declared length 4: the client's own pid (1) and a granted-QoS code, but
+    # carrying a stray byte (0xAA) a valid SUBACK cannot have. Before the
+    # length check this frame returned success with 0xAA left in the stream.
+    sock = MockSocket(incoming=b"\x90\x04\x00\x01\x00\xaa")
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.subscribe(b"t", qos=1)
+
+    # A corrupt frame, not a refused one: the socket is closed so Core 0's
+    # recovery path reconnects instead of parsing the desynced stream.
+    assert sock.closed
+
+
+def test_subscribe_suback_short_length_does_not_consume_next_packet():
+    """A SUBACK declaring fewer than 3 body bytes must not let _read_required
+    over-consume the following packet's bytes: the old 4-byte read swallowed
+    the next packet's opcode and still reported success."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+
+    # Declared length 1, then a PINGRESP that a valid parse would leave in
+    # the stream for the next operation.
+    sock = MockSocket(incoming=b"\x90\x01\x00\x01" + b"\xd0\x00")
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.subscribe(b"t", qos=1)
+
+    assert sock.closed
+    # The PINGRESP must be intact in the stream, not half-consumed into the
+    # SUBACK (the old 4-byte read swallowed its opcode and reported success).
+    assert b"\xd0\x00" in bytes(sock.buffer)
+
+
+def test_subscribe_rejects_reserved_suback_return_code():
+    """Only 0x00-0x02 (granted QoS) and 0x80 (failure) are valid SUBACK
+    return codes; a reserved code is a protocol violation, not a grant."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+
+    # Correct length, correct pid, but reserved return code 0x03: before the
+    # check this returned success.
+    sock = MockSocket(incoming=b"\x90\x03\x00\x01\x03")
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.subscribe(b"t", qos=1)
+
+    assert sock.closed
 
 
 def test_mqtt_get_next_packet_id_advances_and_wraps(ticks):
