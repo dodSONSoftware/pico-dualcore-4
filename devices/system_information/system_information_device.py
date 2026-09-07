@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 from devices.device import Device
-from devices.system_information.validation import validate_config
+from devices.system_information.validation import SYSTEM_INFORMATION_SECTIONS, validate_config
 
 
 class SystemInformationDevice(Device):
@@ -33,7 +33,10 @@ class SystemInformationDevice(Device):
         """Initialize with the shared pure validation (same rules as startup)."""
         # Hardware is untouched until after the config is known-valid.
         validate_config(config)
-        self._include = tuple(config["include"])
+        # An empty include list is the "all sections" shorthand: expand it to
+        # the authoritative section list here so _include always holds the
+        # concrete sections (the config itself stays as written).
+        self._include = tuple(config["include"]) or SYSTEM_INFORMATION_SECTIONS
         self._initialized = True
 
     def read(self):

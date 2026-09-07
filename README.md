@@ -377,6 +377,8 @@ Example:
 }
 ```
 
+An empty `"include": []` list means all sections.
+
 | Section          | Information returned                         |
 | ---------------- | -------------------------------------------- |
 | `communications` | Wi-Fi/MQTT connection state and counters     |

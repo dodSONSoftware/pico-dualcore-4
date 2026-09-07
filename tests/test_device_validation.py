@@ -218,7 +218,6 @@ def test_si_validator_rejects_missing_include():
 @pytest.mark.parametrize(
     "bad",
     [
-        {"include": []},
         {"include": "memory"},
         {"include": [1]},
         {"include": ["nope"]},
@@ -229,6 +228,11 @@ def test_si_validator_rejects_bad_include(bad):
     with pytest.raises(DeviceValidationError) as excinfo:
         validate_system_information_config(bad)
     assert excinfo.value.code == "invalid_value"
+
+
+def test_si_validator_accepts_an_empty_include():
+    """An empty include list is the "all sections" shorthand."""
+    validate_system_information_config({"include": []})
 
 
 # ---------------------------------------------------------------------------
@@ -242,11 +246,16 @@ def test_initialize_reuses_the_pure_validator_and_applies_it():
     assert device._include == ("memory",)
 
 
+def test_initialize_expands_an_empty_include_to_all_sections():
+    device = SystemInformationDevice(None)
+    device.initialize({"include": []})
+    assert device._include == tuple(SYSTEM_INFORMATION_SECTIONS)
+
+
 @pytest.mark.parametrize(
     "bad",
     [
         {},
-        {"include": []},
         {"include": ["nope"]},
         {"include": ["memory", "memory"]},
         {"include": ["memory"], "bogus": 1},

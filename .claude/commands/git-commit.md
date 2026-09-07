@@ -179,7 +179,7 @@ Format the commit message:
 - <change 1>
 - <change 2>
 
-Copyright (c) 2026 dodson Software ( dodson labs )
+developed by dodson labs and AI
 ```
 
 Rules:
@@ -188,7 +188,7 @@ Rules:
 - Overview is brief summary
 - One-line descriptions per file/group of changes
 - If breaking change, add `BREAKING CHANGE:` footer with migration notes
-- The message ends with the copyright footer above (blank line, then footer). Do NOT end the commit message with `Co-Authored-By: Claude Code <noreply@anthropic.com>` — the copyright line replaces it
+- The message ends with the attribution line above (`developed by dodson labs and AI`), as the last line after a blank line. Do NOT end the commit message with `Co-Authored-By: Claude Code <noreply@anthropic.com>` — that attribution line replaces it
 
 ### 5. PRE-COMMIT TEST VALIDATION
 
@@ -247,7 +247,7 @@ git commit -m "$(cat <<'EOF'
 - <change 1>
 - <change 2>
 
-Copyright (c) 2026 dodson Software ( dodson labs )
+developed by dodson labs and AI
 EOF
 )"
 ```

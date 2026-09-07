@@ -18,6 +18,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from devices.system_information.system_information_device import (  # noqa: E402
     SystemInformationDevice,
 )
+from devices.system_information.validation import (  # noqa: E402
+    SYSTEM_INFORMATION_SECTIONS,
+)
 
 
 class CountingSystemInformation:
@@ -42,6 +45,42 @@ class CountingSystemInformation:
     def get_memory(self):
         self.section_calls.append("memory")
         return {"heap_free_bytes": 1, "source": "direct"}
+
+
+class AllSectionsSystemInformation:
+    """SystemInformation stand-in implementing every section getter plus the
+    shared device-section snapshot, for the empty-include all-sections read."""
+
+    def __init__(self):
+        self.device_section_calls = 0
+
+    def get_device_sections(self):
+        self.device_section_calls += 1
+        return {
+            "devices": {"configured": 2, "active": 2},
+            "device_status": [{"id": "d1"}],
+        }
+
+    def get_network(self):
+        return {"section": "network"}
+
+    def get_memory(self):
+        return {"section": "memory"}
+
+    def get_runtime(self):
+        return {"section": "runtime"}
+
+    def get_cpu(self):
+        return {"section": "cpu"}
+
+    def get_machine(self):
+        return {"section": "machine"}
+
+    def get_communications(self):
+        return {"section": "communications"}
+
+    def get_queues(self):
+        return {"section": "queues"}
 
 
 def _initialized_device(include):
@@ -84,3 +123,19 @@ def test_read_without_device_sections_never_takes_the_snapshot():
     assert source.device_section_calls == 0
     assert payload["network"]["source"] == "direct"
     assert payload["memory"]["source"] == "direct"
+
+
+def test_read_with_empty_include_reports_every_section():
+    """An empty include list is the "all sections" shorthand: read() reports
+    every SYSTEM_INFORMATION_SECTIONS section, and the shared snapshot is
+    still taken exactly once."""
+    source = AllSectionsSystemInformation()
+    device = SystemInformationDevice(source)
+    device.initialize({"include": []})
+
+    payload = device.read()
+
+    assert source.device_section_calls == 1
+    assert list(payload) == list(SYSTEM_INFORMATION_SECTIONS)
+    assert payload["devices"]["configured"] == 2
+    assert payload["device_status"][0]["id"] == "d1"

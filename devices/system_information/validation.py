@@ -31,7 +31,8 @@ ALLOWED_CONFIG_KEYS = frozenset(("include",))
 
 def validate_config(config):
     """Pure validation of a system-information device config (no hardware):
-    accepts the ``include`` list and nothing else; raises
+    accepts the ``include`` list and nothing else (an empty list is the
+    "all sections" shorthand, expanded by the driver); raises
     ``DeviceValidationError`` (a ``ValueError``) with a stable ``code`` on the
     first violation. Touches no hardware: a valid definition with no physical
     backing passes — physical absence is an operational failure
@@ -58,11 +59,13 @@ def validate_config(config):
         )
 
     include = config["include"]
-    if not isinstance(include, list) or not include:
+    if not isinstance(include, list):
         raise DeviceValidationError(
-            "system-information device include must be a non-empty list",
+            "system-information device include must be a list",
             code="invalid_value",
         )
+    # An empty list is the "all sections" shorthand: the driver expands it
+    # to SYSTEM_INFORMATION_SECTIONS in initialize().
 
     seen = set()
     for entry in include:
