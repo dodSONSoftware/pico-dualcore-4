@@ -79,10 +79,43 @@ def main():
         outbound_queue_max_messages=outbound_queue_max_messages,
     )
 
-    from core0 import Core0
-
     # One runtime ID for this boot; both cores must agree on it.
     runtime_id = _runtime_id()
+
+    # Core 1's worker thread is spawned here, before the core0 import and the
+    # network bring-up: the thread's default ~4 KiB stack needs one contiguous
+    # run in the GC pool, and on the Pico W (256 KB) no such run survives
+    # core0's import set plus the CYW43/lwIP buffers (a spawn that late raised
+    # MemoryError into the silent reset boundary below and reboot-looped the
+    # board). The worker stays idle until Core 0's network snapshot reports
+    # the full startup contract verified, then imports the core1 chain and
+    # runs it -- Core 1 is still gated on the startup contract, and its
+    # modules are imported on Core 1 itself.
+    # start_new_thread(func, args, kwargs): the third positional argument is
+    # the keyword-args dict forwarded to the thread function itself -- this
+    # MicroPython _thread has no stack-size parameter, so the thread always
+    # runs on the MicroPython-default stack.
+    import _thread
+
+    def _core1_thread_entry(bus, cfg, boot_ms, rid):
+        # Stamp liveness at spawn so a thread death in the wait or the import
+        # is bounded by Core 0's stale-heartbeat watchdog (armed at the end
+        # of core0.start()) instead of leaving Core 0 running with no Core 1.
+        bus.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
+        while True:
+            snapshot = bus.state_mailboxes.get_network_snapshot()
+            if snapshot is not None and snapshot.get("network_stack_ready"):
+                break
+            time.sleep_ms(100)
+            bus.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
+        from core1 import core1_main
+        core1_main(bus, cfg, boot_ms, rid)
+
+    _thread.start_new_thread(_core1_thread_entry, (intercore, core1_config, boot_ticks_ms, runtime_id))
+    core1_config = None
+    print("[INFO] Core 1 worker spawned; starts when the network stack reports ready")
+
+    from core0 import Core0
 
     core0 = Core0(
         intercore,
@@ -106,21 +139,10 @@ def main():
     # covers what a reset cannot: an unrecoverable Core 0 exception, which is
     # a controlled board reset, not application termination.
     try:
-        # Core 0 establishes the network before any Core 1 module is imported.
+        # Core 0 establishes the network before Core 1's modules are imported:
+        # the worker spawned above imports core1 only after the network
+        # snapshot reports the startup contract verified.
         core0.start()
-
-        gc.collect()
-        import _thread
-        from core1 import core1_main
-
-        # start_new_thread(func, args, kwargs): the third positional argument
-        # is the keyword-args dict forwarded to the thread function itself --
-        # this MicroPython _thread has no stack-size parameter, so the thread
-        # always runs on the MicroPython-default stack. core1_main takes no
-        # keyword arguments, so the dict is omitted (2-arg form).
-        _thread.start_new_thread(core1_main, (intercore, core1_config, boot_ticks_ms, runtime_id))
-        core1_config = None
-        print("[INFO] Core 1 started after Wi-Fi + MQTT")
 
         core0.run()
     except MemoryError:

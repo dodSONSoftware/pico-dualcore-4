@@ -217,13 +217,26 @@ def _admit_startup_log(intercore, message):
 
 def _admit_startup_log_with_fallback(intercore, message, fallback_builder):
     """Admit the startup log; if the detailed message is rejected for
-    exceeding the outbound ceiling only, admit the bounded fallback summary
-    instead. Every other permanent rejection escapes with its actual reason
-    so the caller fails fast (each admission keeps the single transient retry)."""
+    exceeding the outbound ceiling or fails serialization with MemoryError
+    (a memory-tight board's fragmented pool), admit the bounded fallback
+    summary instead. Every other permanent rejection escapes with its actual
+    reason so the caller fails fast (each admission keeps the single
+    transient retry)."""
     try:
         return _admit_startup_log(intercore, message)
     except StartupLogTooLargeError:
         print("[WARN] Startup log exceeds the outbound ceiling; admitting the bounded summary instead")
+        return _admit_startup_log(intercore, fallback_builder())
+    except MemoryError:
+        # The detailed message's serialization buffers do not fit on a
+        # memory-tight board: a fragmented pool can hold tens of KiB in total
+        # yet no run large enough for the serialized form, so the size check
+        # never sees the bytes. The bounded summary is the smaller object that
+        # answers it, so the verbose diagnostics cannot keep an otherwise
+        # valid configuration from entering normal operation. If the summary
+        # cannot be admitted either, the MemoryError propagates to the
+        # recovery boundary.
+        print("[WARN] Startup log serialization exhausted the heap; admitting the bounded summary instead")
         return _admit_startup_log(intercore, fallback_builder())
 
 
@@ -764,6 +777,12 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         startup_duration_ms = current_uptime_ms(uptime_state)
 
+        # Reclaim the import/initialization residue before the startup log's
+        # serialization buffers are needed: on a memory-tight board (Pico W)
+        # the pool is fragmented after the device init pass, and this
+        # allocation-light gc is the difference between the detailed log (or
+        # its bounded fallback) fitting and a MemoryError.
+        gc.collect()
         startup_log_message = _build_startup_log(
             intercore, device_manager, config, startup_duration_ms, system_information
         )

@@ -507,10 +507,15 @@ def test_admit_startup_log_exhausted_transient_retry_returns_false(monkeypatch):
 # the ceiling, and the admission path must defend against it regardless of
 # validation. The invariant this protects:
 # failure to emit the verbose diagnostics must not keep the device from
-# entering normal operation. Only the size rejection is answered by a
-# different object -- the bounded fallback summary (statuses and device
-# counts only, no ready_devices/failed_devices, no system_information);
-# every other permanent rejection still fails fast with its actual reason.
+# entering normal operation. Two failures are answered by a different
+# object -- the bounded fallback summary (statuses and device counts only,
+# no ready_devices/failed_devices, no system_information): the size
+# rejection (the detailed form exceeds the outbound ceiling) and a
+# serialization MemoryError (a memory-tight board's fragmented pool holds
+# enough in total but no run for the serialized form, so the size check
+# never sees the bytes); every other permanent rejection still fails fast
+# with its actual reason, and a MemoryError on the fallback itself
+# propagates to the recovery boundary.
 
 
 _DETAIL_MESSAGE = {
@@ -681,3 +686,56 @@ def test_admit_with_fallback_transient_rejection_on_fallback_retried_once(monkey
     assert admitted is True
     assert queue.calls == 2, "the fallback gets its own single transient retry"
     assert fake_time.sleeps == [100]
+
+
+def _memory_error_for_detailed(message):
+    """Serialization stand-in for the memory-tight board: the detailed message's buffers do not fit (a fragmented pool holds enough in total but no run), the bounded summary does."""
+    import json
+
+    startup = message.get("payload", {}).get("data", {}).get("startup", {})
+    if "ready_devices" in startup:
+        raise MemoryError("could not allocate")
+    return json.dumps(message).encode("utf-8")
+
+
+def test_admit_with_fallback_admits_bounded_summary_when_detailed_memory_error(monkeypatch):
+    """A serialization MemoryError on the detailed message (the Pico W's fragmented pool after device init) is answered by the bounded fallback, which is then admitted."""
+    core1 = _core1_module(monkeypatch)
+
+    monkeypatch.setattr(core1, "serialize_and_validate_message", _memory_error_for_detailed)
+    queue = _RecordingQueue()
+    fallback = {
+        "message_type": "log",
+        "uptime_ms": 1000,
+        "timestamp": None,
+        "payload": {
+            "level": "info",
+            "event": "system_startup_completed",
+            "data": {"startup": {"duration_ms": 1000, "devices_configured": 1}},
+        },
+    }
+
+    admitted = core1._admit_startup_log_with_fallback(
+        _ScriptedBus(queue), _DETAIL_MESSAGE, lambda: fallback
+    )
+
+    assert admitted is True
+    assert queue.entries == [fallback], "the admitted entry must be the bounded summary, not the detailed log"
+
+
+def test_admit_with_fallback_memory_error_on_fallback_propagates(monkeypatch):
+    """If the bounded summary's serialization fails with MemoryError too, it propagates to the recovery boundary -- no retry, no loop."""
+    core1 = _core1_module(monkeypatch)
+
+    def _always_memory_error(message):
+        raise MemoryError("could not allocate")
+
+    monkeypatch.setattr(core1, "serialize_and_validate_message", _always_memory_error)
+    queue = _RecordingQueue()
+
+    with pytest.raises(MemoryError):
+        core1._admit_startup_log_with_fallback(
+            _ScriptedBus(queue), _DETAIL_MESSAGE, lambda: _STARTUP_MESSAGE
+        )
+
+    assert queue.entries == [], "nothing is admitted when serialization fails on both attempts"
