@@ -101,7 +101,7 @@ class ManagedDevice:
 class DeviceManager:
     """Manages device lifecycle for Core 1."""
 
-    def __init__(self, config, system_information=None, activity_refresh=None, uptime_state=None):
+    def __init__(self, config, system_information=None, activity_refresh=None, uptime_state=None, i2c_bus_factory=None):
         self._active_devices = []
         self._failed_devices = {}
 
@@ -111,6 +111,11 @@ class DeviceManager:
         self._devices_config = config["devices"]
 
         self._system_information = system_information
+
+        # Core 1's I2C bus factory (builds/dedupes machine.I2C per bus config).
+        # Injected so this module stays host-importable; None for configs with
+        # no I2C device, in which case create_device never asks for a bus.
+        self._i2c_bus_factory = i2c_bus_factory
 
         # Core 1's accumulated-uptime state, the source of truth for the
         # read-age fields; raw ticks when not wired (host tests).
@@ -174,7 +179,14 @@ class DeviceManager:
 
     def _create_driver(self, device_def):
         try:
-            driver = create_device(device_def, self._system_information)
+            if self._i2c_bus_factory is None:
+                # No I2C bus factory wired (no I2C device configured): the
+                # classic two-argument construction path.
+                driver = create_device(device_def, self._system_information)
+            else:
+                driver = create_device(
+                    device_def, self._system_information, self._i2c_bus_factory
+                )
             return driver, None
         except MemoryError:
             raise

@@ -58,9 +58,10 @@ def _definition(device_type="system-information", config=None, **overrides):
 
 def test_registry_exposes_the_system_information_type():
     assert is_supported_device_type("system-information") is True
-    assert is_supported_device_type("bme280") is False
+    assert is_supported_device_type("bme280") is True
+    assert is_supported_device_type("acme-9000") is False
     assert allowed_config_keys("system-information") == ALLOWED_CONFIG_KEYS
-    assert allowed_config_keys("bme280") is None
+    assert allowed_config_keys("acme-9000") is None
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +85,7 @@ def test_pure_validator_never_constructs_the_driver(monkeypatch):
 
 def test_pure_validator_rejects_an_unsupported_device_type():
     with pytest.raises(DeviceValidationError) as excinfo:
-        validate_device_definition(_definition(device_type="bme280", config={}))
+        validate_device_definition(_definition(device_type="acme-9000", config={}))
     assert excinfo.value.code == "unsupported_device_type"
 
 
@@ -274,8 +275,8 @@ def test_initialize_rejects_the_same_invalid_configs(bad):
 
 def test_config_rejects_an_unsupported_device_type():
     candidate = _base_config()
-    candidate["devices"][0]["device_type"] = "bme280"
-    candidate["devices"][0]["config"] = {"i2c_address": 0x76}
+    candidate["devices"][0]["device_type"] = "acme-9000"
+    candidate["devices"][0]["config"] = {"some_key": 1}
     with pytest.raises(ConfigError) as excinfo:
         validate_config(candidate)
     assert excinfo.value.code == "unsupported_device_type"

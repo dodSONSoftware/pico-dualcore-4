@@ -37,6 +37,24 @@
           "device_status"
         ]
       }
+    },
+    {
+      "id": "iAdZlw7PSOE5s85MEs1lWrqUNRjR",
+      "device_type": "bme280",
+      "name": "BME280 Environmental Sensor",
+      "sensor_type": "bme280",
+      "config": {
+        "i2c_bus": 0,
+        "i2c_sda_pin": 0,
+        "i2c_scl_pin": 1,
+        "i2c_address_candidates": [ 118, 119 ],
+        "sea_level_pressure_pa": 101325,
+        "offsets": {
+          "temperature_c": 0,
+          "humidity_percent": 0,
+          "pressure_pascal": 0
+        }
+      }
     }
   ]
 }

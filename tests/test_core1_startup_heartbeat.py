@@ -214,7 +214,7 @@ def test_core1_registers_activity_stamp_before_device_initialization():
         probe = ProbeDriver(bus)
         stamp_at_construction, real_si = _capturing_system_information(core1, bus)
         saved_create = dm.create_device
-        dm.create_device = lambda device_def, system_information: probe
+        dm.create_device = lambda device_def, system_information, i2c_bus_factory=None: probe
         try:
             # Before Core 1 runs, the stamp must not exist (fresh mailbox).
             assert bus.state_mailboxes.get_core_1_activity_ms() is None

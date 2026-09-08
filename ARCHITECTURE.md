@@ -459,11 +459,27 @@ The current device framework is retained:
 - `DeviceManager`
 - `Device` interface
 - `SystemInformationDevice`
+- `BME280Device`
 - initialization retry behavior
 - read-failure/reinitialization behavior
 - reinitialization failure logging: the first reinit failure for a device is warned once; repeats while the same device stays in pending-reinit are suppressed until a successful reinit clears the flag, so a stuck device warns once instead of every cycle (a later independent failure warns again)
 
-The baseline test device is the software-only `system-information` sensor.
+The supported `device_type` registry (`device_factory._DEVICE_REGISTRY`) maps each type to its pure config validator and allowed config keys. Two types are registered:
+
+- `system-information` — the software-only baseline test device; no hardware.
+- `bme280` — the first hardware (I2C) device: a Bosch BME280 temperature/pressure/humidity sensor.
+
+### BME280 device
+
+The `bme280` device is the first I2C sensor, split into a low-level protocol class and a `Device` adapter:
+
+- `BME280` (`devices/bme280/bme280_device.py`) owns the register protocol and Bosch compensation: chip-ID verification (register `0xD0` must read `0x60`; a BMP280 shares the addresses, so an ACK alone is not enough), the software reset, the finite NVM-copy wait, the two-block calibration read (little-endian, signed 16/12/8-bit; `dig_H4`/`dig_H5` share register `0xE5`), the `ctrl_hum` → `config` → `ctrl_meas` write-latch order, the temperature/`t_fine`-then-pressure/humidity compensation, and the single coherent 8-byte burst read from `0xF7`. It returns `(temperature_c, pressure_pa, humidity_percent)` with a skipped channel as `None` (never a sentinel).
+- `BME280Device` is the `Device` adapter that applies the application-layer policy the spec keeps out of the fundamental compensation: user offsets (`offsets.{temperature_c, humidity_percent, pressure_pascal}`) applied after Bosch compensation, and a derived `altitude_m` from the offset-adjusted pressure and `sea_level_pressure_pa`. Telemetry is `{temperature_c, pressure_pa, humidity_percent, altitude_m}` (pressure stays in Pa; the presentation layer converts to hPa).
+- Both classes stay host-importable: `BME280` receives an injected I2C object and `BME280Device` imports no `machine` API, so the pure compensation and decode logic are unit-testable without hardware.
+
+**I2C bus ownership.** Core 1 owns its I2C buses (see Ownership invariants); a driver never creates one. The bus is configured **per device** (`i2c_bus`, optional `i2c_sda_pin`/`i2c_scl_pin`/`i2c_freq_hz`). `core1_main` hands `DeviceManager` a bus factory that builds one `machine.I2C` per distinct `(bus, sda, scl, freq)` and caches it, so two devices on the same bus share one object; the factory imports `machine` lazily (inside the closure) so a config with no I2C device allocates no bus or pins. `create_device` resolves a device's bus through the factory (the factory is injected, so `device_factory`/`device_manager` stay host-importable). The bus is created at driver construction (peripheral + pins only); the sensor protocol — and therefore the failure that a missing/miswired sensor surfaces — runs in `initialize()`, which the retry/reinit machinery wraps, so an absent BME280 degrades to a failed device rather than a boot halt.
+
+The device defaults to the spec's recommended forced-mode profile (temperature/pressure/humidity ×1, IIR filter off); each `read()` triggers one forced conversion and leaves the sensor asleep. Oversampling and the filter are per-device config knobs; the pure validator enforces that a fresh pressure/humidity compensation always has the temperature channel enabled (its `t_fine` feeds both) and that at least one channel is enabled.
 
 Core 1 starts only after Core 0 has completed the deterministic startup contract:
 

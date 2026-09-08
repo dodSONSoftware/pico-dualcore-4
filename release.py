@@ -42,6 +42,9 @@ REQUIRED_PACKAGES = {
     "devices/system_information/__init__.py",
     "devices/system_information/validation.py",
     "devices/system_information/system_information_device.py",
+    "devices/bme280/__init__.py",
+    "devices/bme280/validation.py",
+    "devices/bme280/bme280_device.py",
 }
 
 FILES = REQUIRED_FILES | REQUIRED_PACKAGES

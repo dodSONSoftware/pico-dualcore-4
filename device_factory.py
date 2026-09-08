@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 from devices.device import DeviceValidationError
+from devices.bme280 import validation as bme280_validation
 from devices.system_information.system_information_device import SystemInformationDevice
 from devices.system_information.validation import ALLOWED_CONFIG_KEYS, validate_config
 
@@ -13,6 +14,10 @@ from devices.system_information.validation import ALLOWED_CONFIG_KEYS, validate_
 # Adding a device type is adding one entry here plus its pure validator.
 _DEVICE_REGISTRY = {
     "system-information": (validate_config, ALLOWED_CONFIG_KEYS),
+    "bme280": (
+        bme280_validation.validate_config,
+        bme280_validation.ALLOWED_CONFIG_KEYS,
+    ),
 }
 
 # The complete set of keys a device definition may carry; anything beyond is
@@ -124,12 +129,37 @@ def validate_device_definition(device_definition):
     validate_device_config(device_type, device_definition["config"])
 
 
-def create_device(device_definition, system_information=None):
+def create_device(device_definition, system_information=None, i2c_bus_factory=None):
     device_type = device_definition["device_type"]
 
     if device_type == "system-information":
         if system_information is None:
             raise ValueError("system-information requires system_information")
         return SystemInformationDevice(system_information)
+
+    if device_type == "bme280":
+        # The driver never owns the bus: Core 1 supplies a factory that builds
+        # (and dedupes) one machine.I2C per (bus, sda, scl, freq). sda/scl are
+        # None when the config relies on the bus's default pins. The bus is
+        # created here (peripheral + pins only); the sensor protocol runs in
+        # initialize(), which the retry/reinit machinery wraps.
+        if i2c_bus_factory is None:
+            raise ValueError("bme280 requires an i2c_bus_factory")
+        cfg = device_definition["config"]
+        i2c = i2c_bus_factory(
+            cfg["i2c_bus"],
+            cfg.get("i2c_sda_pin"),
+            cfg.get("i2c_scl_pin"),
+            cfg.get("i2c_freq_hz", bme280_validation.DEFAULT_I2C_FREQ_HZ),
+        )
+        # Imported here, not at module top: Core 0 pulls in this module for the
+        # validator during config validation, and a module-top driver import
+        # would load the float-heavy driver resident on the shared heap from
+        # startup -- before Core 1 (which alone constructs and runs it) exists.
+        # Deferring it to this Core 1 construction point keeps that ~8 KB off
+        # the pre-spawn heap. The validator (line 6) stays module-level: config
+        # validation needs it on Core 0.
+        from devices.bme280.bme280_device import BME280Device
+        return BME280Device(i2c)
 
     raise ValueError("Unsupported device type: {}".format(device_type))

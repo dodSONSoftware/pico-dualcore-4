@@ -113,6 +113,11 @@ def main():
         import _thread
         from core1 import core1_main
 
+        # start_new_thread(func, args, kwargs): the third positional argument
+        # is the keyword-args dict forwarded to the thread function itself --
+        # this MicroPython _thread has no stack-size parameter, so the thread
+        # always runs on the MicroPython-default stack. core1_main takes no
+        # keyword arguments, so the dict is omitted (2-arg form).
         _thread.start_new_thread(core1_main, (intercore, core1_config, boot_ticks_ms, runtime_id))
         core1_config = None
         print("[INFO] Core 1 started after Wi-Fi + MQTT")

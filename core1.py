@@ -688,6 +688,36 @@ def _try_queue_health_message_intercore(intercore, uptime_state, config, system_
     _try_queue_health_message(intercore, health_payload)
 
 
+def _build_i2c_bus_factory():
+    """Core 1 owns its I2C buses (ARCHITECTURE ownership invariant). Returns a
+    factory that builds one machine.I2C per distinct (bus, sda, scl, freq) and
+    caches it, so two devices on the same bus share one object. sda/scl are
+    None when a device config relies on the bus's default pins.
+
+    The machine import is inside the closure (not here) so building the factory
+    is side-effect-free: the bus -- and the machine import -- only happen when a
+    configured I2C device first requests one. Host tests that run core1_main
+    under a minimal fake machine never touch I2C/Pin, and pass a fake factory
+    directly for I2C device tests.
+    """
+    cache = {}
+
+    def create(bus, sda, scl, freq_hz):
+        from machine import I2C, Pin
+
+        key = (bus, sda, scl, freq_hz)
+        if key not in cache:
+            kwargs = {"freq": freq_hz}
+            if sda is not None:
+                kwargs["sda"] = Pin(sda)
+            if scl is not None:
+                kwargs["scl"] = Pin(scl)
+            cache[key] = I2C(bus, **kwargs)
+        return cache[key]
+
+    return create
+
+
 def core1_main(intercore, config, boot_ticks_ms, runtime_id):
     """Core 1 entry point; this core never imports or touches network/MQTT."""
     try:
@@ -717,6 +747,9 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             # stay correct across a tick wrap (past half a tick period, raw
             # ticks would report a wrong age).
             uptime_state=uptime_state,
+            # Core 1 owns its I2C buses; create_device pulls a bus from this
+            # factory only for I2C devices (never for system-information).
+            i2c_bus_factory=_build_i2c_bus_factory(),
         )
         system_information.set_device_manager(device_manager)
 
