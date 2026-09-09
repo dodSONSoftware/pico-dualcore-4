@@ -95,7 +95,6 @@ def _add_system_information_device(manager, device_id):
     managed = dm.ManagedDevice(
         device_id=device_id,
         device_type="system-information",
-        sensor_type="unknown",
         driver=None,
     )
     manager._active_devices.append(managed)
@@ -155,7 +154,6 @@ def test_other_device_entries_are_not_rewritten(fake_time):
     other = dm.ManagedDevice(
         device_id="other",
         device_type="test",
-        sensor_type="test",
         driver=None,
     )
     manager._active_devices.append(other)
@@ -255,7 +253,6 @@ def test_non_system_information_device_unchanged(fake_time):
     managed = dm.ManagedDevice(
         device_id="dev1",
         device_type="test",
-        sensor_type="test",
         driver=None,
     )
     manager._active_devices.append(managed)

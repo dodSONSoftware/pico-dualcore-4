@@ -168,7 +168,6 @@ def _valid_definition(config=None):
         "id": "bme280-1",
         "device_type": "bme280",
         "name": "BME280 Environmental Sensor",
-        "sensor_type": "bme280",
         "config": config
         if config is not None
         else {"i2c_bus": 0, "sea_level_pressure_pa": 101325},

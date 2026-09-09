@@ -22,10 +22,9 @@ DEVICE_RESULT_REINITIALIZATION_FAILED = "reinitialization_failed"
 class ManagedDevice:
     """Runtime wrapper around a successfully initialized device."""
 
-    def __init__(self, device_id, device_type, sensor_type, driver, name=None):
+    def __init__(self, device_id, device_type, driver, name=None):
         self.device_id = device_id
         self.device_type = device_type
-        self.sensor_type = sensor_type
         self.driver = driver
         self.name = name
 
@@ -77,9 +76,6 @@ class ManagedDevice:
             "read_count": self.read_count,
             "successful_read_count": self.successful_read_count,
         }
-
-        if self.state == DEVICE_STATE_READY:
-            snapshot["sensor_type"] = self.sensor_type
 
         if self.name is not None:
             snapshot["name"] = self.name
@@ -157,7 +153,6 @@ class DeviceManager:
     def _initialize_single_device(self, device_def):
         device_id = device_def["id"]
         device_type = device_def["device_type"]
-        sensor_type = device_def.get("sensor_type", "unknown")
         name = device_def.get("name")
 
         driver, driver_error = self._create_driver(device_def)
@@ -174,7 +169,7 @@ class DeviceManager:
             )
 
         return self._record_success(
-            device_id, device_type, sensor_type, driver, attempts_used, name=name
+            device_id, device_type, driver, attempts_used, name=name
         )
 
     def _create_driver(self, device_def):
@@ -260,11 +255,10 @@ class DeviceManager:
             "failed_details": failed_details,
         }
 
-    def _record_success(self, device_id, device_type, sensor_type, driver, attempts_used, name=None):
+    def _record_success(self, device_id, device_type, driver, attempts_used, name=None):
         managed_device = ManagedDevice(
             device_id=device_id,
             device_type=device_type,
-            sensor_type=sensor_type,
             driver=driver,
             name=name,
         )
@@ -338,7 +332,6 @@ class DeviceManager:
                 "status": DEVICE_RESULT_TELEMETRY,
                 "device_id": managed_device.device_id,
                 "device": managed_device.device_type,
-                "sensor_type": managed_device.sensor_type,
                 "name": managed_device.name,
                 "telemetry": telemetry,
                 "recovered": previous_failures > 0,

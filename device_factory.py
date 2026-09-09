@@ -23,11 +23,11 @@ _DEVICE_REGISTRY = {
 # The complete set of keys a device definition may carry; anything beyond is
 # unknown and reported as a qualified path. Shared with config.py's
 # aggregation so the definition shape has one source.
-DEVICE_DEFINITION_KEYS = frozenset(("id", "device_type", "config", "name", "sensor_type"))
+DEVICE_DEFINITION_KEYS = frozenset(("id", "device_type", "config", "name"))
 
-# id, name, and sensor_type are spliced into per-message payloads (telemetry
-# identity fields, startup-log device lists, the read-config response), so
-# they carry a length bound that keeps a worst-case valid message under
+# id and name are spliced into per-message payloads (telemetry identity
+# fields, startup-log device lists, the read-config response), so they carry
+# a length bound that keeps a worst-case valid message under
 # MAX_OUTBOUND_MESSAGE_BYTES (16 KiB). 64 matches MAX_SOURCE_LENGTH. The
 # ceiling is a wire bound in UTF-8 bytes, so the bounds are measured in UTF-8
 # bytes, not characters — 64 characters of 4-byte code points are 256 bytes
@@ -37,7 +37,6 @@ DEVICE_DEFINITION_KEYS = frozenset(("id", "device_type", "config", "name", "sens
 # where the message is serialized.
 MAX_DEVICE_ID_LENGTH = 64
 MAX_DEVICE_NAME_LENGTH = 64
-MAX_SENSOR_TYPE_LENGTH = 64
 
 
 def is_supported_device_type(device_type):
@@ -107,22 +106,19 @@ def validate_device_definition(device_definition):
     if not isinstance(device_definition["config"], dict):
         raise DeviceValidationError("device config must be an object", code="invalid_value")
 
-    # name and sensor_type are optional: absent (or None) stays valid, a
-    # present value must be a string within the length bound.
-    for key, max_length in (
-        ("name", MAX_DEVICE_NAME_LENGTH),
-        ("sensor_type", MAX_SENSOR_TYPE_LENGTH),
-    ):
-        value = device_definition.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, str):
+    # name is optional: absent (or None) stays valid, a present value must be
+    # a string within the length bound.
+    name = device_definition.get("name")
+    if name is not None:
+        if not isinstance(name, str):
             raise DeviceValidationError(
-                "device {} must be a string".format(key), code="invalid_value"
+                "device name must be a string", code="invalid_value"
             )
-        if len(value.encode("utf-8")) > max_length:
+        if len(name.encode("utf-8")) > MAX_DEVICE_NAME_LENGTH:
             raise DeviceValidationError(
-                "device {} must be at most {} bytes".format(key, max_length),
+                "device name must be at most {} bytes".format(
+                    MAX_DEVICE_NAME_LENGTH
+                ),
                 code="invalid_value",
             )
 

@@ -252,7 +252,6 @@ def test_oversized_telemetry_sample_is_discarded_not_retried():
         "status": "telemetry",
         "device_id": "dev-1",
         "device": "system-information",
-        "sensor_type": "information",
         "telemetry": {"blob": "x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1)},
     }
 

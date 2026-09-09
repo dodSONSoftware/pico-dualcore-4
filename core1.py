@@ -151,7 +151,6 @@ def _build_startup_log(intercore, device_manager, startup_duration_ms):
         device_info = {
             "device": status.get("device", "unknown"),
             "name": status.get("name") or status.get("id", "unknown"),
-            "sensor_type": status.get("sensor_type", "unknown"),
         }
         if status["state"] == DEVICE_STATE_READY:
             ready_devices.append(device_info)
@@ -634,7 +633,6 @@ def _handle_device_result(intercore, uptime_state, result):
             "timestamp": timestamp,
             "device_id": result["device_id"],
             "device": result["device"],
-            "sensor_type": result["sensor_type"],
             "name": result.get("name"),
             "payload": result["telemetry"],
         }

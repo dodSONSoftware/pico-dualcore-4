@@ -32,7 +32,7 @@ from config import (
     split_config,
     validate_config,
 )
-from device_factory import MAX_DEVICE_ID_LENGTH, MAX_DEVICE_NAME_LENGTH, MAX_SENSOR_TYPE_LENGTH
+from device_factory import MAX_DEVICE_ID_LENGTH, MAX_DEVICE_NAME_LENGTH
 from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES, serialize_and_validate_message
 from mqtt_client import MAX_INBOUND_PACKET_BYTES
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
@@ -364,7 +364,6 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
                 ],
             },
             "name": field_max,
-            "sensor_type": field_max,
         }
         for index in range(MAX_DEVICES)
     ]

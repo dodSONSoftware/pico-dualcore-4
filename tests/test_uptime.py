@@ -404,7 +404,6 @@ def test_device_read_age_survives_elapsed_beyond_half_period():
                 {
                     "id": "dev",
                     "device_type": "probe",
-                    "sensor_type": "s",
                     "config": {},
                 }
             ],
@@ -423,7 +422,6 @@ def test_device_read_age_survives_elapsed_beyond_half_period():
         managed = device_manager_mod.ManagedDevice(
             device_id="dev",
             device_type="probe",
-            sensor_type="s",
             driver=StubDriver(),
         )
         manager._active_devices.append(managed)

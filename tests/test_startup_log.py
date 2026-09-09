@@ -497,7 +497,7 @@ def test_admit_startup_log_exhausted_transient_retry_returns_false(monkeypatch):
 # ---------------------------------------------------------------------------
 #
 # The configuration boundary pins the configuration-driven part of the log
-# (64-byte device id/name/sensor_type, 16 devices: a worst-case valid
+# (64-byte device id/name, 16 devices: a worst-case valid
 # configuration stays under the 16 KiB ceiling, pinned by the
 # serialized-size invariant test in tests/test_config.py), but the event log
 # also carries non-config growth no bound can pin: the per-device
@@ -533,13 +533,12 @@ _DETAIL_MESSAGE = {
                 "devices_failed": 0,
                 "diagnostics_parts": 9,
                 "ready_devices": [
-                    {"device": "d", "name": "n" * 5000, "sensor_type": "s"}
+                    {"device": "d", "name": "n" * 5000}
                 ],
                 "failed_devices": [
                     {
                         "device": "f",
                         "name": "n" * 5000,
-                        "sensor_type": "s",
                         "failure_reason": "e" * 5000,
                     }
                 ],
@@ -583,8 +582,8 @@ def test_build_startup_log_bounded_omits_unbounded_sections(monkeypatch):
             return {
                 "devices": {"configured": 3, "active": 2, "initialization_failed": 1},
                 "device_status": [
-                    {"device": "a", "name": "x" * 5000, "sensor_type": "t", "state": "ready"},
-                    {"device": "b", "name": "y" * 5000, "sensor_type": "t", "state": "init_failed"},
+                    {"device": "a", "name": "x" * 5000, "state": "ready"},
+                    {"device": "b", "name": "y" * 5000, "state": "init_failed"},
                 ],
             }
 
@@ -760,7 +759,7 @@ def test_build_startup_log_event_shape_has_no_system_information(monkeypatch):
             return {
                 "devices": {"configured": 2, "active": 1, "initialization_failed": 1},
                 "device_status": [
-                    {"device": "bme280", "state": "ready", "sensor_type": "bme280", "name": "ok", "id": "ok"},
+                    {"device": "bme280", "state": "ready", "name": "ok", "id": "ok"},
                     {"device": "bme280", "state": "initialization_failed", "name": "bad", "id": "bad", "failure_reason": "I2C device not found"},
                 ],
             }
@@ -781,9 +780,9 @@ def test_build_startup_log_event_shape_has_no_system_information(monkeypatch):
     assert set(data) == {"startup"}, "the event log must not embed the system_information snapshot"
     startup = data["startup"]
     assert startup["diagnostics_parts"] == len(core1._STARTUP_INFORMATION_PARTS)
-    assert startup["ready_devices"] == [{"device": "bme280", "name": "ok", "sensor_type": "bme280"}]
+    assert startup["ready_devices"] == [{"device": "bme280", "name": "ok"}]
     assert startup["failed_devices"] == [
-        {"device": "bme280", "name": "bad", "sensor_type": "unknown", "failure_reason": "I2C device not found"}
+        {"device": "bme280", "name": "bad", "failure_reason": "I2C device not found"}
     ], "failed devices carry their failure_reason; ready devices do not"
 
 

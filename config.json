@@ -1,6 +1,6 @@
 {
   "source": "Test-Pico-1",
-  "config_schema_version": 8,
+  "config_schema_version": 9,
   "outbound_queue_max_messages": 32,
   "read_loop_sec": 20,
   "health_interval_sec": 60,
@@ -30,7 +30,6 @@
       "id": "p5h3DLqmWjCkLcXUtaFRq8yBsucEuY4A",
       "device_type": "system-information",
       "name": "System Information Sensor",
-      "sensor_type": "system-info",
       "config": {
         "include": [
           "queues",
@@ -42,7 +41,6 @@
       "id": "iAdZlw7PSOE5s85MEs1lWrqUNRjR",
       "device_type": "bme280",
       "name": "BME280 Environmental Sensor",
-      "sensor_type": "bme280",
       "config": {
         "i2c_bus": 0,
         "i2c_sda_pin": 0,

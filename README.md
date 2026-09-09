@@ -353,7 +353,7 @@ remaining sections are still returned.
 
 ## Built-in Device
 
-There is one built-in device, it has a device type of "system_information" and a sensor_type of "system-info".
+There is one built-in device, it has a device type of "system_information".
 
 Example:
 ```
@@ -361,7 +361,6 @@ Example:
   "id": "p5h3DLqmWjCkLcXUtaFRq8yBsucEuY4A",
   "device_type": "system-information",
   "name": "System Information Sensor",
-  "sensor_type": "system-info",
   "config": {
     "include": [
       "communications",  

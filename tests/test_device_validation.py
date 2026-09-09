@@ -20,7 +20,6 @@ from config import ConfigError, validate_config
 from device_factory import (
     MAX_DEVICE_ID_LENGTH,
     MAX_DEVICE_NAME_LENGTH,
-    MAX_SENSOR_TYPE_LENGTH,
     allowed_config_keys,
     is_supported_device_type,
     validate_device_definition,
@@ -111,7 +110,7 @@ def test_pure_validator_dispatches_to_the_device_validator():
 
 
 # ---------------------------------------------------------------------------
-# Length bounds: id, name, sensor_type stay protocol-scale
+# Length bounds: id, name stay protocol-scale
 # ---------------------------------------------------------------------------
 
 
@@ -139,7 +138,6 @@ def test_pure_validator_binds_the_id_length():
     "key,max_length",
     [
         ("name", MAX_DEVICE_NAME_LENGTH),
-        ("sensor_type", MAX_SENSOR_TYPE_LENGTH),
     ],
 )
 def test_pure_validator_binds_the_optional_field_lengths(key, max_length):
@@ -188,7 +186,6 @@ def test_worst_case_bounded_device_sections_stay_under_the_message_ceiling():
     entry = {
         "device": "system-information",
         "name": "n" * MAX_DEVICE_NAME_LENGTH,
-        "sensor_type": "s" * MAX_SENSOR_TYPE_LENGTH,
     }
     worst_case_entry = len(json.dumps(entry).encode("utf-8"))
     device_sections = MAX_DEVICES * worst_case_entry

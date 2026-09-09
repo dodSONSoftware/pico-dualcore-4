@@ -150,7 +150,6 @@ class ReinitEnv:
         self.md = self.dm_mod.ManagedDevice(
             device_id="dev1",
             device_type="test",
-            sensor_type="test",
             driver=self.driver,
         )
 

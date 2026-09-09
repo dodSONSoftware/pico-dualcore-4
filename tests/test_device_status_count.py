@@ -48,7 +48,6 @@ def _add_managed_device(manager, device_id="dev1"):
     managed = dm.ManagedDevice(
         device_id=device_id,
         device_type="test",
-        sensor_type="test",
         driver=FailingDriver(),
     )
     manager._active_devices.append(managed)
