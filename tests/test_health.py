@@ -35,6 +35,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BOOT_TICKS_MS = 100000
 NOW_MS = 110000
 
+# Sentinel: build() was called without an explicit system_information source.
+_UNSET = object()
+
 
 class FakeTime:
     """Controllable monotonic clock for the host (mirrors MicroPython ticks)."""
@@ -85,14 +88,18 @@ class FakeOs:
 
 
 class FakeSystemInformation:
-    """Minimal stand-in exposing only the device-status hook the builder uses."""
+    """Minimal stand-in exposing only the hooks the builder uses."""
 
-    def __init__(self, configured, active):
+    def __init__(self, configured, active, cpu_temperature=None):
         self._configured = configured
         self._active = active
+        self._cpu_temperature = cpu_temperature
 
     def get_devices(self):
         return {"configured": self._configured, "active": self._active}
+
+    def get_cpu_temperature(self):
+        return self._cpu_temperature
 
 
 def _install_fakes(fake_time):
@@ -152,6 +159,7 @@ class HealthEnv:
         self._free_heap = 100000
         self._configured = 1
         self._active = 1
+        self._cpu_temperature = None
 
         self._saved_modules = {
             name: sys.modules.get(name) for name in ("time", "machine", "os")
@@ -196,6 +204,9 @@ class HealthEnv:
     def set_free_heap(self, value):
         self._free_heap = value
 
+    def set_cpu_temperature(self, value):
+        self._cpu_temperature = value
+
     def set_clock(self, now_ms):
         self._fake_time.now_ms = now_ms
 
@@ -218,8 +229,11 @@ class HealthEnv:
         self.set_clock(NOW_MS)
 
     # -- run the production builder -----------------------------------
-    def build(self, boot_ticks_ms=BOOT_TICKS_MS):
-        system_information = FakeSystemInformation(self._configured, self._active)
+    def build(self, boot_ticks_ms=BOOT_TICKS_MS, system_information=_UNSET):
+        if system_information is _UNSET:
+            system_information = FakeSystemInformation(
+                self._configured, self._active, self._cpu_temperature
+            )
         uptime_state = self.core1.create_uptime_state(boot_ticks_ms)
         return self.core1._build_health_payload(
             self.bus,
@@ -469,7 +483,7 @@ def test_payload_structure_matches_spec(health):
 
     p = payload["payload"]
     for field in (
-        "status", "degraded_reasons", "hardware_type", "machine",
+        "status", "degraded_reasons", "hardware_type", "machine", "cpu_temperature_c",
         "network_stack_ready", "wifi_connected", "wifi_rssi_dbm", "mqtt_connected",
         "core_1_active", "core_1_activity_age_ms", "free_heap_bytes",
         "minimum_free_heap_bytes", "heap_headroom_bytes", "devices_configured",
@@ -547,7 +561,42 @@ def test_hardware_type_and_machine_fields(health):
     assert p["hardware_type"] == "pico_2_w"
     assert p["machine"] == "Raspberry Pi Pico 2 W with RP2350"
     assert p["minimum_free_heap_bytes"] == 131072
+
+
+def test_cpu_temperature_field(health):
+    """The die temperature passes through from the system-information source."""
+    health.set_healthy_baseline()
+    health.set_utc(_valid_utc_snapshot())
+    health.set_cpu_temperature(41.2)
+
+    payload = health.build()
+
+    assert payload["payload"]["cpu_temperature_c"] == 41.2
+
+
+def test_cpu_temperature_field_unavailable(health):
+    """A null die channel (no ADC core-temp) nulls the field, not the report."""
+    health.set_healthy_baseline()
+    health.set_utc(_valid_utc_snapshot())
+    health.set_cpu_temperature(None)
+
+    payload = health.build()
+
+    p = payload["payload"]
+    assert p["cpu_temperature_c"] is None
     assert p["status"] == "healthy"
+
+
+def test_cpu_temperature_field_no_source(health):
+    """With no system-information source at all the field is null."""
+    health.set_healthy_baseline()
+    health.set_utc(_valid_utc_snapshot())
+    health.set_cpu_temperature(41.2)
+
+    payload = health.build(system_information=None)
+
+    assert payload["payload"]["cpu_temperature_c"] is None
+    assert payload["payload"]["status"] == "healthy"
 
 
 def test_wifi_rssi_dbm_field(health):

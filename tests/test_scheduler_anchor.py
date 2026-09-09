@@ -4,7 +4,7 @@
 
 """Host-side regression tests for the shared normal-runtime scheduling anchor.
 
-All periodic Core 1 work (telemetry and health) must derive its fixed boundaries from one anchor, normal_runtime_start_ticks_ms, captured exactly once, immediately after system_startup_completed has been successfully admitted to the outbound queue:
+All periodic Core 1 work (telemetry and health) must derive its fixed boundaries from one anchor, normal_runtime_start_ticks_ms, captured exactly once, after the startup log stream completes (the system_startup_completed event log admitted, then the best-effort system_information section stream emitted):
 
 - a one-shot initial sample is emitted at the anchor moment (one telemetry read pass and one health report, after startup-log admission, before the run loop)
 - telemetry boundaries fall at anchor + n * read_loop_sec
@@ -32,6 +32,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from config import split_config  # noqa: E402
+from devices.system_information.validation import STARTUP_INFORMATION_PARTS  # noqa: E402
 from intercore import (  # noqa: E402
     InterCore,
     KIND_COMMAND_RESPONSE,
@@ -272,9 +273,16 @@ def test_telemetry_and_health_share_the_same_anchor():
     _run_core1(fake_time, bus, _core1_config(), boot_ticks_ms)
 
     telemetry, health, others = _drain_outbound(bus)
-    assert len(others) == 1
+    # The startup event log is admitted first, then the best-effort
+    # system_information part stream (one log per part).
+    assert len(others) == 1 + len(STARTUP_INFORMATION_PARTS)
     startup_log = json.loads(others[0]["payload_bytes"].decode("utf-8"))
     assert others[0]["kind"] == KIND_LOG
+    assert startup_log["payload"]["event"] == "system_startup_completed"
+    for index, entry in enumerate(others[1:], start=1):
+        part_log = json.loads(entry["payload_bytes"].decode("utf-8"))
+        assert part_log["payload"]["event"] == "system_information"
+        assert part_log["payload"]["data"]["part"] == index
     # Under the fake clock no time elapses between admission and the
     # anchor capture, so the startup log's uptime IS the anchor offset.
     anchor_uptime = startup_log["uptime_ms"]

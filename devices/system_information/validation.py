@@ -24,6 +24,21 @@ SYSTEM_INFORMATION_SECTIONS = (
     "device_status",
 )
 
+# The bootup system_information stream's grouping: one log per part, with the
+# cpu/machine and devices/device_status pairs each combined into a single part
+# (its value maps section name -> value), so the stream is 7 parts instead of
+# the 9 sections above. Startup-stream-only -- get-details and the config
+# `include` list still expose every SYSTEM_INFORMATION_SECTIONS entry.
+STARTUP_INFORMATION_PARTS = (
+    ("network",),
+    ("memory",),
+    ("runtime",),
+    ("devices", "device_status"),
+    ("cpu", "machine"),
+    ("communications",),
+    ("queues",),
+)
+
 # The complete set of keys a system-information device config may contain.
 # Anything beyond this is unknown and reported as a qualified path.
 ALLOWED_CONFIG_KEYS = frozenset(("include",))

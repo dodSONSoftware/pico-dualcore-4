@@ -157,6 +157,7 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 ### Hardware
 - `hardware_type`: Canonical hardware type ("pico_w" or "pico_2_w")
 - `machine`: Human-readable machine identifier
+- `cpu_temperature_c`: On-chip die temperature (°C, 0.1 °C resolution) via the datasheet conversion (Vbe = 0.706 V at 27 °C, slope −1.721 mV/°C; VREF- and device-sensitive, roughly ±5 °C — a trend indicator, not a calibrated absolute); `null` when the ADC core-temp channel is unavailable
 
 ### Network
 - `wifi_rssi_dbm`: Current Wi-Fi signal strength (dBm)
@@ -212,7 +213,7 @@ Health messages are controlled by:
 - `mqtt_topic_health`: MQTT topic for health messages (default: `iot/v3/health`)
 - `health_interval_sec`: Interval between health messages (default: 60 seconds)
 
-The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` from a single runtime anchor captured once, after the startup log is admitted. Telemetry shares the same anchor (`anchor + n × read_loop_sec`) but keeps its own independent scheduler. Boundaries missed during startup or an outage are skipped, never replayed, and deadlines advance from the previous deadline so processing delay cannot accumulate drift. See the scheduling sections in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` from a single runtime anchor captured once, after the startup log stream completes (the event log admitted, the best-effort part stream emitted). Telemetry shares the same anchor (`anchor + n × read_loop_sec`) but keeps its own independent scheduler. Boundaries missed during startup or an outage are skipped, never replayed, and deadlines advance from the previous deadline so processing delay cannot accumulate drift. See the scheduling sections in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Features
 
@@ -225,7 +226,7 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 - **UTC Synchronization**: Mandatory at startup; non-blocking steady-state re-sync with deadline and retry throttling
 - **Core 1 Liveness**: Deadline-based heartbeat drives the `core_1_active` health field; the Core 0 watchdog resets the board if Core 1 stops refreshing — including while Core 0 is stuck in network recovery
 - **Core 0 Hardware Watchdog**: `machine.WDT` (8 s, armed once the startup contract has passed) is fed only from Core 0's own execution, so a Core 0 that is alive but no longer making progress resets the board — complementing the exception boundary that covers Core 0 failures that raise
-- **Startup Log**: One-time full system startup log published before telemetry
+- **Startup Log**: One-time startup log stream published before telemetry — the `system_startup_completed` event log (the gate that halts boot if it cannot be admitted) followed by best-effort per-section `system_information` diagnostics, each a small log that skips on failure instead of taking the whole log down
 - **LED Status**: Flashing during connection, pulse on telemetry send
 - **Reboot Command**: JSON command triggers clean reboot with acknowledgment
 - **Device Lifecycle**: Auto-retry initialization and read failures
@@ -382,7 +383,7 @@ An empty `"include": []` list means all sections.
 | Section          | Information returned                         |
 | ---------------- | -------------------------------------------- |
 | `communications` | Wi-Fi/MQTT connection state and counters     |
-| `cpu`            | CPU frequency                                |
+| `cpu`            | CPU frequency and on-chip die temperature    |
 | `device_status`  | Detailed status for each configured device   |
 | `devices`        | Aggregate device counts/status               |
 | `machine`        | Hardware/platform/MicroPython information    |

@@ -17,7 +17,23 @@ import hardware
 class MockMachine:
     freq = staticmethod(lambda: 125000000)
 
-sys.modules['machine'] = MockMachine()
+    class ADC:
+        CORE_TEMP = 4
+        raw = 891
+        read_error = None
+
+        def __init__(self, channel):
+            pass
+
+        def read_u16(self):
+            if self.read_error is not None:
+                raise self.read_error
+            # The real read_u16() returns the 12-bit reading scaled to 16 bits
+            # (raw << 4); `raw` below is the 12-bit value.
+            return self.raw << 4
+
+_MOCK_MACHINE = MockMachine()
+sys.modules['machine'] = _MOCK_MACHINE
 
 from system_information import SystemInformation
 
@@ -259,3 +275,62 @@ class TestGetMachineConsumesSharedClassifier:
 
         assert result["hardware_type"] == "unknown"
         assert result["minimum_free_heap_bytes"] is None
+
+
+class TestGetCpuTemperature:
+    """system_information.get_cpu() must report the die temperature via the
+    ADC core-temp channel, nulling only the temperature when the channel is
+    unavailable. Pin system_information.machine to this file's mock in every
+    test: other test files reload the module under their own machine fakes."""
+
+    def _system_information(self):
+        return SystemInformation(MockInterCore(), MockConfig())
+
+    def _pin_machine(self, monkeypatch):
+        import system_information
+
+        monkeypatch.setattr(system_information, "machine", _MOCK_MACHINE)
+
+    def test_get_cpu_temperature_reference_value(self, monkeypatch):
+        # Raw 891 -> 20.1 C is the RP2040/RP2350 datasheet's own worked
+        # example (Vbe = 0.706 V at 27 C, slope -1.721 mV/C, 3.3 V reference).
+        self._pin_machine(monkeypatch)
+
+        assert self._system_information().get_cpu_temperature() == 20.1
+
+    def test_get_cpu_temperature_conversion(self, monkeypatch):
+        self._pin_machine(monkeypatch)
+        monkeypatch.setattr(_MOCK_MACHINE.ADC, "raw", 850)
+
+        # 27 - (850 * 3.3 / 4096 - 0.706) / 0.001721 = 39.31 -> 39.3 rounded
+        assert self._system_information().get_cpu_temperature() == 39.3
+
+    def test_get_cpu_reports_frequency_and_temperature(self, monkeypatch):
+        self._pin_machine(monkeypatch)
+        monkeypatch.setattr(_MOCK_MACHINE.ADC, "raw", 850)
+
+        assert self._system_information().get_cpu() == {
+            "frequency_hz": 125000000,
+            "temperature_c": 39.3,
+        }
+
+    def test_get_cpu_temperature_memory_error_propagates(self, monkeypatch):
+        self._pin_machine(monkeypatch)
+        monkeypatch.setattr(_MOCK_MACHINE.ADC, "read_error", MemoryError())
+
+        with pytest.raises(MemoryError):
+            self._system_information().get_cpu_temperature()
+
+    def test_get_cpu_without_adc_nulls_temperature_only(self, monkeypatch):
+        # A machine without the ADC core-temp channel: temperature nulls,
+        # frequency is unaffected.
+        import system_information
+
+        monkeypatch.setattr(
+            system_information, "machine", SimpleNamespace(freq=lambda: 125000000)
+        )
+
+        assert self._system_information().get_cpu() == {
+            "frequency_hz": 125000000,
+            "temperature_c": None,
+        }

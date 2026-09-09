@@ -16,6 +16,9 @@ from device_manager import (
     DEVICE_STATE_READY,
     DEVICE_STATE_INITIALIZATION_FAILED,
 )
+from devices.system_information.validation import (
+    STARTUP_INFORMATION_PARTS as _STARTUP_INFORMATION_PARTS,
+)
 from intercore import (
     KIND_TELEMETRY,
     KIND_COMMAND_RESPONSE,
@@ -40,8 +43,12 @@ from message_serializer import (
 )
 
 
+# The bootup stream's 7-part grouping (STARTUP_INFORMATION_PARTS) is defined in
+# devices/system_information/validation.py next to SYSTEM_INFORMATION_SECTIONS.
+
+
 class StartupLogTooLargeError(ValueError):
-    """The detailed startup log exceeds MAX_OUTBOUND_MESSAGE_BYTES; the one
+    """The startup event log exceeds MAX_OUTBOUND_MESSAGE_BYTES; the one
     permanent rejection a different object (the bounded fallback summary)
     can answer."""
 
@@ -82,7 +89,7 @@ def _collect_system_information_full(system_information):
 
 
 def _startup_summary(device_status, startup_duration_ms):
-    """Startup statuses and device counts, shared by the detailed startup log
+    """Startup statuses and device counts, shared by the startup event log
     and its bounded fallback. Subscription readiness is reported without topic
     names (topic ownership belongs to Core 0), and the startup duration is
     named duration_ms so it is not confused with the envelope's uptime_ms."""
@@ -102,15 +109,18 @@ def _startup_summary(device_status, startup_duration_ms):
     startup_summary["devices_configured"] = device_status["devices"]["configured"]
     startup_summary["devices_ready"] = device_status["devices"]["active"]
     startup_summary["devices_failed"] = device_status["devices"].get("initialization_failed", 0)
+    # The number of system_information part logs that follow this event log
+    # (and its bounded fallback): it pins the total for the consumer even if
+    # the first best-effort part is skipped.
+    startup_summary["diagnostics_parts"] = len(_STARTUP_INFORMATION_PARTS)
     return startup_summary
 
 
-def _startup_log_message(intercore, startup_duration_ms, startup_summary, system_information=None):
-    """Message envelope shared by the detailed startup log and its bounded
-    fallback; the system_information key is omitted entirely when None."""
+def _startup_log_message(intercore, startup_duration_ms, startup_summary):
+    """Envelope for the startup event log and its bounded fallback; the
+    system_information sections travel as their own best-effort logs, not in
+    this message."""
     data = {"startup": startup_summary}
-    if system_information is not None:
-        data["system_information"] = system_information
     return {
         "message_type": "log",
         "uptime_ms": startup_duration_ms,
@@ -125,9 +135,13 @@ def _startup_log_message(intercore, startup_duration_ms, startup_summary, system
     }
 
 
-def _build_startup_log(intercore, device_manager, config, startup_duration_ms, system_information=None):
-    """Build the detailed system_startup_completed log message (Core 1's own
-    fields only)."""
+def _build_startup_log(intercore, device_manager, startup_duration_ms):
+    """Build the system_startup_completed event log (Core 1's own fields
+    only). The full system_information snapshot is no longer embedded: it
+    travels as the best-effort part logs admitted after this one.
+    Failed devices carry their failure_reason here so the one diagnosis that
+    matters at boot survives even when the device_status section is skipped
+    on a memory-tight board."""
     device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
     startup_summary = _startup_summary(device_status, startup_duration_ms)
 
@@ -142,32 +156,26 @@ def _build_startup_log(intercore, device_manager, config, startup_duration_ms, s
         if status["state"] == DEVICE_STATE_READY:
             ready_devices.append(device_info)
         elif status["state"] == DEVICE_STATE_INITIALIZATION_FAILED:
+            device_info["failure_reason"] = status.get("failure_reason")
             failed_devices.append(device_info)
 
     startup_summary["ready_devices"] = ready_devices
     startup_summary["failed_devices"] = failed_devices
 
-    # Use the provided system_information if available, else create one for
-    # host-side testing.
-    if system_information is None:
-        system_information = SystemInformation(intercore, config)
-    system_info = _collect_system_information_full(system_information)
-
-    return _startup_log_message(intercore, startup_duration_ms, startup_summary, system_info)
+    return _startup_log_message(intercore, startup_duration_ms, startup_summary)
 
 
 def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms):
     """Build the bounded startup-log fallback: only the startup statuses and
-    device counts -- no per-device lists, no system_information -- so it fits
-    when the detailed log (which carries non-config growth no bound can pin)
-    cannot. Losing the verbose diagnostics must not keep the device from
-    entering normal operation."""
+    device counts -- no per-device lists, no failure reasons -- so it fits
+    when the event log (which carries device lists and driver failure reasons
+    no bound can pin) cannot. Losing the verbose diagnostics must not keep
+    the device from entering normal operation."""
     device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
     return _startup_log_message(
         intercore,
         startup_duration_ms,
         _startup_summary(device_status, startup_duration_ms),
-        None,
     )
 
 
@@ -238,6 +246,161 @@ def _admit_startup_log_with_fallback(intercore, message, fallback_builder):
         # recovery boundary.
         print("[WARN] Startup log serialization exhausted the heap; admitting the bounded summary instead")
         return _admit_startup_log(intercore, fallback_builder())
+
+
+def _build_startup_information_section(intercore, uptime_state, section, value, part, parts):
+    """One system_information part log message (a best-effort diagnostics
+    part). `section` is the part label -- a single section name, or the
+    comma-joined names of a combined part whose `value` maps each section name
+    to its value. Each part carries a fresh uptime/timestamp so the stream's
+    envelope times are honest and monotonic, and part/parts so a skipped part
+    is detectable as a gap."""
+    uptime_ms = current_uptime_ms(uptime_state)
+    return {
+        "message_type": "log",
+        "uptime_ms": uptime_ms,
+        "timestamp": _current_utc_timestamp(intercore, uptime_ms),
+        "payload": {
+            "level": "info",
+            "event": "system_information",
+            "module": "system",
+            "message": "System information section: {}".format(section),
+            "data": {
+                "section": section,
+                "value": value,
+                "part": part,
+                "parts": parts,
+            },
+        },
+    }
+
+
+def _take_section_value(system_information, section, state):
+    """Return one section's value, or {"error": ...} on a non-MemoryError
+    getter failure (mirroring _collect_system_information_full's per-section
+    contract). The two device sections share one get_device_sections() walk,
+    cached in state["device_sections"] so the device snapshot is taken once,
+    not twice. A MemoryError propagates to the caller's best-effort boundary."""
+    if section in ("devices", "device_status"):
+        if state["device_sections"] is None:
+            try:
+                state["device_sections"] = system_information.get_device_sections()
+            except MemoryError:
+                raise
+            except Exception as err:
+                state["device_sections"] = {
+                    "devices": {"error": str(err)},
+                    "device_status": {"error": str(err)},
+                }
+        if section in state["device_sections"]:
+            return state["device_sections"][section]
+    # Per-section getter (also the fallback when the shared device walk lacks
+    # the key, mirroring _collect_system_information_full).
+    getter_name = "get_{}".format(section)
+    try:
+        return getattr(system_information, getter_name)()
+    except MemoryError:
+        raise
+    except Exception as err:
+        return {"error": str(err)}
+
+
+def _admit_startup_information_section(intercore, uptime_state, section, value, part, parts):
+    """Build, serialize, and admit one system_information part log with the
+    single-transient-retry discipline. Best-effort: a permanent rejection
+    (over-ceiling, validation, other serialization failure) or a serialization
+    MemoryError (gc + one retry) skips the part with a warning and returns
+    False -- a diagnostic must never halt boot or reach the recovery boundary,
+    and the section's data stays retrievable via get-details. True if
+    admitted."""
+    try:
+        message = _build_startup_information_section(
+            intercore, uptime_state, section, value, part, parts
+        )
+    except MemoryError:
+        print("[WARN] Startup information section '{}' skipped: MemoryError".format(section))
+        return False
+
+    payload_bytes = None
+    for attempt in (1, 2):
+        try:
+            payload_bytes = serialize_and_validate_message(message)
+            break
+        except MemoryError:
+            # A memory-tight board cannot hold even one section's serialized
+            # buffer: reclaim and retry once, then skip the section. This is
+            # the deliberate local MemoryError boundary -- the Pico W
+            # fragmentation case is exactly a serialization MemoryError a
+            # retry cannot fix, and a diagnostic must not reboot the board.
+            gc.collect()
+            if attempt == 2:
+                print("[WARN] Startup information section '{}' skipped: serialization MemoryError".format(section))
+                return False
+        except ValueError as err:
+            # Permanent rejection (over-ceiling / validation): retrying cannot
+            # succeed; skip the section.
+            print("[WARN] Startup information section '{}' skipped: {}".format(section, err))
+            return False
+
+    for attempt in (1, 2):
+        try:
+            if intercore.outbound_queue.put_with_kind(
+                KIND_LOG, payload_bytes, RETENTION_PRIORITY_INFO
+            ):
+                return True
+        except ValueError as err:
+            print("[WARN] Startup information section '{}' skipped: {}".format(section, err))
+            return False
+        if attempt == 2:
+            print("[WARN] Startup information section '{}' skipped: transient rejection".format(section))
+            return False
+        time.sleep_ms(100)
+    return False
+
+
+def _take_startup_part_value(system_information, sections, state):
+    """Gather one bootup part's value: the section's own value for a single
+    section, or a dict keyed by section name for a combined part. The shared
+    device_sections cache means the (devices, device_status) part walks the
+    device snapshot once, not twice. A MemoryError from any section's getter
+    propagates to the caller's per-part boundary, which skips the whole part."""
+    if len(sections) == 1:
+        return _take_section_value(system_information, sections[0], state)
+    value = {}
+    for section in sections:
+        value[section] = _take_section_value(system_information, section, state)
+    return value
+
+
+def _admit_startup_information_sections(intercore, uptime_state, system_information):
+    """Emit the best-effort system_information part stream: one small log per
+    entry in _STARTUP_INFORMATION_PARTS order, after the startup event log is
+    admitted. Each entry is a single section or a combined pair (its value maps
+    each section name to that section's value), so the bootup stream is 7 parts
+    instead of the 9 in SYSTEM_INFORMATION_SECTIONS. Each part is built and
+    serialized individually (one value graph + one buffer, never the full
+    snapshot) so a memory-tight board can still emit the parts it can.
+    Best-effort by contract: any per-part failure skips the affected part (with
+    a warning) and the stream continues; this function never raises."""
+    parts = len(_STARTUP_INFORMATION_PARTS)
+    state = {"device_sections": None}
+    for part, sections in enumerate(_STARTUP_INFORMATION_PARTS, start=1):
+        label = ",".join(sections)
+        try:
+            value = _take_startup_part_value(system_information, sections, state)
+        except MemoryError:
+            print("[WARN] Startup information part '{}' skipped: MemoryError".format(label))
+            value = None
+        if value is not None:
+            if is_json_safe(value):
+                _admit_startup_information_section(
+                    intercore, uptime_state, label, value, part, parts
+                )
+            else:
+                print("[WARN] Startup information part '{}' skipped: not JSON-safe".format(label))
+        # Release the shared device snapshot once the part holding device_status is done.
+        if "device_status" in sections:
+            state["device_sections"] = None
 
 
 def _current_utc_timestamp(intercore, uptime_ms):
@@ -543,6 +706,7 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     devices = system_information.get_devices() if system_information else {"configured": 0, "active": 0}
     devices_configured = devices["configured"]
     devices_active = devices["active"]
+    cpu_temperature_c = system_information.get_cpu_temperature() if system_information else None
 
     outbound_status = intercore.outbound_queue.status()
 
@@ -622,6 +786,7 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
             "degraded_reasons": degraded_reasons,
             "hardware_type": hardware_type,
             "machine": machine,
+            "cpu_temperature_c": cpu_temperature_c,
             "network_stack_ready": network_stack_ready,
             "wifi_connected": wifi_connected,
             "wifi_rssi_dbm": wifi_rssi_dbm,
@@ -780,15 +945,16 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # Reclaim the import/initialization residue before the startup log's
         # serialization buffers are needed: on a memory-tight board (Pico W)
         # the pool is fragmented after the device init pass, and this
-        # allocation-light gc is the difference between the detailed log (or
-        # its bounded fallback) fitting and a MemoryError.
+        # allocation-light gc is the difference between the event log (or its
+        # bounded fallback) and the per-section diagnostics fitting and a
+        # MemoryError.
         gc.collect()
         startup_log_message = _build_startup_log(
-            intercore, device_manager, config, startup_duration_ms, system_information
+            intercore, device_manager, startup_duration_ms
         )
 
-        # The startup log must be admitted before telemetry can begin. A
-        # permanent rejection fails fast with its actual reason; only heap
+        # The startup event log must be admitted before telemetry can begin.
+        # A permanent rejection fails fast with its actual reason; only heap
         # pressure is retried. The oversized case is the one a different
         # object can answer: the bounded fallback summary.
         try:
@@ -809,11 +975,20 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         print("[INFO] Startup log admitted to outbound queue")
 
+        # The best-effort system_information part stream: one small log per
+        # part (the two section pairs combined), each built and serialized
+        # individually. A permanent rejection or serialization MemoryError
+        # skips the part (warning) and never halts boot -- the gate is the
+        # event log above, and the section data stays retrievable via
+        # get-details.
+        _admit_startup_information_sections(intercore, uptime_state, system_information)
+
         # The single normal-runtime scheduling anchor, captured exactly once,
-        # after the startup log is admitted. All periodic Core 1 work derives
-        # its fixed boundaries from this moment (not boot_ticks_ms). A
-        # reconnect, UTC resync, device reinit, or queue drain must never
-        # re-capture it; only a true reboot creates a new one.
+        # after the startup log stream (event log admitted, part stream
+        # emitted) completes. All periodic Core 1 work derives its fixed
+        # boundaries from this moment (not boot_ticks_ms). A reconnect, UTC
+        # resync, device reinit, or queue drain must never re-capture it; only
+        # a true reboot creates a new one.
         normal_runtime_start_ticks_ms = time.ticks_ms()
 
         try:

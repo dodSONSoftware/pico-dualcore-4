@@ -82,15 +82,29 @@ def main():
     # One runtime ID for this boot; both cores must agree on it.
     runtime_id = _runtime_id()
 
+    # Core 1's modules are imported here, on the main thread, BEFORE the core0
+    # import and the network bring-up. Importing core1 parses its source, and
+    # that parse working buffer is a C-heap (non-GC) allocation; by the time
+    # the network snapshot reports ready the CYW43/lwIP buffers plus the
+    # worker's ~4 KiB stack have consumed the C heap, so a late parse
+    # MemoryErrors on a ~2 KiB buffer while gc.mem_free() still shows ~102 KiB
+    # (gc.collect() compacts only the GC heap and cannot recover the C heap).
+    # Importing now, while the C heap is clear, keeps the worker's ready path
+    # to a sys.modules cache hit. core1_main still RUNS on the worker thread,
+    # so Core 1's device ownership is unchanged; the modules have no
+    # import-time side effects, so loading them here is safe.
+    from core1 import core1_main
+    print("[INFO] Core 1 modules imported pre-network (free heap {} bytes)".format(gc.mem_free()))
+
     # Core 1's worker thread is spawned here, before the core0 import and the
     # network bring-up: the thread's default ~4 KiB stack needs one contiguous
-    # run in the GC pool, and on the Pico W (256 KB) no such run survives
-    # core0's import set plus the CYW43/lwIP buffers (a spawn that late raised
-    # MemoryError into the silent reset boundary below and reboot-looped the
-    # board). The worker stays idle until Core 0's network snapshot reports
-    # the full startup contract verified, then imports the core1 chain and
-    # runs it -- Core 1 is still gated on the startup contract, and its
-    # modules are imported on Core 1 itself.
+    # run, and on the Pico W (256 KB) no such run survives core0's import set
+    # plus the CYW43/lwIP buffers (a spawn that late raised MemoryError into
+    # the silent reset boundary below and reboot-looped the board). The worker
+    # stays idle until Core 0's network snapshot reports the full startup
+    # contract verified, then runs core1_main -- Core 1 is still gated on the
+    # startup contract (its modules are already loaded, so the ready path is a
+    # sys.modules cache hit, not a parse).
     # start_new_thread(func, args, kwargs): the third positional argument is
     # the keyword-args dict forwarded to the thread function itself -- this
     # MicroPython _thread has no stack-size parameter, so the thread always
@@ -98,9 +112,9 @@ def main():
     import _thread
 
     def _core1_thread_entry(bus, cfg, boot_ms, rid):
-        # Stamp liveness at spawn so a thread death in the wait or the import
-        # is bounded by Core 0's stale-heartbeat watchdog (armed at the end
-        # of core0.start()) instead of leaving Core 0 running with no Core 1.
+        # Stamp liveness at spawn so a thread death in the wait is bounded by
+        # Core 0's stale-heartbeat watchdog (armed at the end of core0.start())
+        # instead of leaving Core 0 running with no Core 1.
         bus.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
         while True:
             snapshot = bus.state_mailboxes.get_network_snapshot()
@@ -108,7 +122,7 @@ def main():
                 break
             time.sleep_ms(100)
             bus.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
-        from core1 import core1_main
+        print("[INFO] Core 1 ready; running core1_main (free heap {} bytes)".format(gc.mem_free()))
         core1_main(bus, cfg, boot_ms, rid)
 
     _thread.start_new_thread(_core1_thread_entry, (intercore, core1_config, boot_ticks_ms, runtime_id))

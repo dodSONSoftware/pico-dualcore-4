@@ -4,7 +4,7 @@
 
 """Host-side regression tests for normal-runtime-anchored health scheduling.
 
-The health cadence is defined relative to the normal-runtime anchor, normal_runtime_start_ticks_ms -- captured exactly once, immediately after system_startup_completed has been successfully admitted to the outbound queue:
+The health cadence is defined relative to the normal-runtime anchor, normal_runtime_start_ticks_ms -- captured exactly once, after the startup log stream completes (the system_startup_completed event log admitted, then the best-effort system_information section stream emitted):
 
 - boundaries fall at health_interval_sec multiples from the anchor;
 - one immediate health report is emitted at the anchor (the moment startup-log admission completes), then periodic boundaries at ~73s uptime with a 13s startup and a 60s interval -- not 60s (the old boot anchor) and not a second, independently captured post-admission delay;
@@ -27,6 +27,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from config import split_config  # noqa: E402
+from devices.system_information.validation import STARTUP_INFORMATION_PARTS  # noqa: E402
 from intercore import InterCore, KIND_HEALTH, KIND_LOG  # noqa: E402
 
 
@@ -235,13 +236,15 @@ def test_immediate_health_after_startup_log_admission():
             break
         entries.append(entry)
         bus.outbound_queue.complete_in_flight(entry)
-    assert [e["kind"] for e in entries] == [KIND_LOG, KIND_HEALTH]
+    # The startup event log is admitted first, then the best-effort
+    # system_information section stream, then the at-anchor health.
+    assert [e["kind"] for e in entries] == [KIND_LOG] * (1 + len(STARTUP_INFORMATION_PARTS)) + [KIND_HEALTH]
 
     startup_log = json.loads(entries[0]["payload_bytes"].decode("utf-8"))
     assert startup_log["payload"]["event"] == "system_startup_completed"
     assert startup_log["uptime_ms"] == 13000
 
-    health = json.loads(entries[1]["payload_bytes"].decode("utf-8"))
+    health = json.loads(entries[-1]["payload_bytes"].decode("utf-8"))
     # The immediate report lands at the anchor moment (~13s uptime)...
     assert 13000 <= health["uptime_ms"] <= 13000 + LOOP_STEP_MS
 
@@ -262,7 +265,7 @@ def test_first_health_immediate_then_anchor_plus_interval():
 
     health, others = _drain_outbound(bus)
     assert len(health) == 2
-    assert len(others) == 1  # startup log only
+    assert len(others) == 1 + len(STARTUP_INFORMATION_PARTS)  # event log + part stream
     # First health: the immediate at-anchor report, at ~13s uptime...
     assert 13000 <= health[0]["uptime_ms"] <= 13000 + LOOP_STEP_MS
     # ...second health: within one loop step of the normal-runtime-anchored
