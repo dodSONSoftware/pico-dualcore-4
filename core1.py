@@ -88,6 +88,13 @@ def _collect_system_information_full(system_information):
     return system_info
 
 
+# The get-details fallback's drop order when the full snapshot cannot be
+# serialized: the device sections are the only two that grow with the device
+# count, and device_status carries the unbounded failure_reason strings, so
+# dropping them first keeps every bounded form a fixed small size.
+_GET_DETAILS_FALLBACK_DROP_ORDER = ("device_status", "devices")
+
+
 def _startup_summary(device_status, startup_duration_ms):
     """Startup statuses and device counts, shared by the startup event log
     and its bounded fallback. Subscription readiness is reported without topic
@@ -446,7 +453,8 @@ def _try_queue_response(intercore, response):
     """Queue a command response at CRITICAL retention priority.
 
     True if admitted; False if transiently rejected (retry on a later pass);
-    ValueError on a permanent rejection (oversized: OutboundMessageTooLargeError)."""
+    ValueError on a permanent rejection (oversized: OutboundMessageTooLargeError);
+    MemoryError if the serializer's own gc + eviction recovery exhausts."""
     return intercore.outbound_queue.put(
         response["kind"],
         response["message"],
@@ -481,11 +489,91 @@ def _admit_substitute(intercore, uptime_state, response, code, message, warning)
     return substitute
 
 
+def _build_get_details_response_without(intercore, uptime_state, response, section):
+    """The same get-details response with one section dropped; the
+    omitted_sections marker names what the response no longer carries (a
+    missing section is a detectable gap, the part stream's idiom)."""
+    payload = response["message"]["payload"]
+    data = dict(payload["data"])
+    del data[section]
+    omitted = list(data.get("omitted_sections") or [])
+    omitted.append(section)
+    data["omitted_sections"] = omitted
+    return _build_command_response(intercore, uptime_state, payload, True, data=data)
+
+
+def _admit_after_serialization_memory_error(intercore, uptime_state, response):
+    """A persistent serialization MemoryError: the queue's own recovery
+    (gc.collect() first, then one eligible eviction per failure) has already
+    exhausted, so the heap cannot form the contiguous run the serialized form
+    needs, now. A MemoryError escaping the admission used to kill Core 1's
+    worker thread -- the 0.4.91 Pico W died exactly here on a get-details
+    full snapshot (2,360 bytes with ~57 KiB free), and Core 0's heartbeat
+    watchdog reset the board 30 s later, the command unanswered. The full
+    get-details snapshot is the one response large enough to hit that wall:
+    answer it one section smaller at a time, dropping the device sections in
+    order (each attempt follows the queue's own gc.collect(), so the pool is
+    coalesced when the strictly smaller form is retried), until one is
+    admitted; the response stays a success and names what it omitted. Any
+    other response -- or a get-details whose device sections are already
+    gone -- takes the small error substitute. A MemoryError on a bounded
+    form's or the substitute's own admission propagates to the recovery
+    boundary (the 0.4.87 bounded-summary precedent: nothing loops)."""
+    if response["message"]["payload"].get("command") == COMMAND_GET_DETAILS:
+        candidate = response
+        for section in _GET_DETAILS_FALLBACK_DROP_ORDER:
+            if section not in (candidate["message"]["payload"].get("data") or {}):
+                continue
+            candidate = _build_get_details_response_without(
+                intercore, uptime_state, candidate, section
+            )
+            print(
+                "[WARNING] get-details response could not be serialized "
+                "(MemoryError); answering without the {} section".format(section)
+            )
+            try:
+                if _try_queue_response(intercore, candidate):
+                    return None
+                return candidate
+            except MemoryError:
+                # The pool still has no run for this form: the next, strictly
+                # smaller form is the next attempt.
+                continue
+            except OutboundMessageTooLargeError as err:
+                return _admit_substitute(
+                    intercore,
+                    uptime_state,
+                    candidate,
+                    "response_too_large",
+                    "Command response exceeded the per-message size limit",
+                    "get-details bounded response too large: {}".format(err),
+                )
+            except ValueError as err:
+                return _admit_substitute(
+                    intercore,
+                    uptime_state,
+                    candidate,
+                    "response_invalid",
+                    "Command response could not be serialized for transmission",
+                    "get-details bounded response invalid: {}".format(err),
+                )
+    return _admit_substitute(
+        intercore,
+        uptime_state,
+        response,
+        "response_invalid",
+        "Command response could not be serialized for transmission",
+        "Command response could not be serialized (MemoryError); answering "
+        "with the error response",
+    )
+
+
 def _admit_or_substitute_command_response(intercore, uptime_state, response):
-    """Admit a command response, or a small error substitute for it (code
-    "response_too_large" for oversized, "response_invalid" for a
-    validation/serialization failure); either way the channel moves on.
-    Returns the response still pending, or None if one was admitted."""
+    """Admit a command response, or a bounded form of it / a small error
+    substitute for it (code "response_too_large" for oversized,
+    "response_invalid" for a validation/serialization failure); either way
+    the channel moves on. Returns the response still pending, or None if one
+    was admitted."""
     try:
         if _try_queue_response(intercore, response):
             return None
@@ -508,6 +596,8 @@ def _admit_or_substitute_command_response(intercore, uptime_state, response):
             "Command response could not be serialized for transmission",
             "Command response invalid: {}".format(err),
         )
+    except MemoryError:
+        return _admit_after_serialization_memory_error(intercore, uptime_state, response)
 
 
 def _regrid_next_boundary(anchor, now, interval_ms):

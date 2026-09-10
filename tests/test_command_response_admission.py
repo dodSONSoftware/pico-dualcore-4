@@ -19,6 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 sys.modules.setdefault("machine", MagicMock())
 
 import core1  # noqa: E402
+import intercore as intercore_module  # noqa: E402
 from intercore import (  # noqa: E402
     InterCore,
     KIND_COMMAND_RESPONSE,
@@ -32,9 +33,12 @@ from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES  # noqa: E402
 # Sentinels for "permanently reject" in a ScriptedQueue outcome list: the
 # real queue raises OutboundMessageTooLargeError (a ValueError subclass) for
 # an oversized message and a plain ValueError for a validation or
-# serialization failure.
+# serialization failure; a MemoryError is raised when the serializer's own
+# gc + eviction recovery exhausts (the pool cannot form the run the
+# serialized form needs, now).
 RAISE = object()
 RAISE_TOO_LARGE = object()
+RAISE_MEMORY = object()
 
 
 class ScriptedQueue:
@@ -52,6 +56,8 @@ class ScriptedQueue:
             raise ValueError("Message validation failed: unsupported value at data")
         if outcome is RAISE_TOO_LARGE:
             raise OutboundMessageTooLargeError("Message too large: exceeds the per-message limit")
+        if outcome is RAISE_MEMORY:
+            raise MemoryError("memory allocation failed, allocating 2360 bytes")
         if outcome:
             self.admitted.append((kind, message, retention_priority))
         return outcome
@@ -75,6 +81,46 @@ def _success_response():
                 "targeted": True,
                 "success": True,
                 "data": {"memory": {"free_heap_bytes": 123}},
+            },
+        },
+    }
+
+
+def _full_get_details_response():
+    """A get-details success response carrying the full nine-section
+    snapshot -- the shape whose ~2.4 KiB serialized form hit the Pico W's
+    fragmented pool in 0.4.91."""
+    return {
+        "kind": KIND_COMMAND_RESPONSE,
+        "message": {
+            "message_type": "command_response",
+            "uptime_ms": 1234,
+            "timestamp": None,
+            "payload": {
+                "command_id": "details-001",
+                "command": "get-details",
+                "targeted": True,
+                "success": True,
+                "data": {
+                    "network": {"wifi_connected": True, "wifi_rssi_dbm": -60},
+                    "memory": {"free_heap_bytes": 57000},
+                    "runtime": {"uptime_ms": 1234},
+                    "devices": {"configured": 3, "active": 1},
+                    "cpu": {"frequency_hz": 133000000, "temperature_c": 41.2},
+                    "machine": "Raspberry Pi Pico W",
+                    "communications": {"mqtt_connected": True},
+                    "queues": {"outbound_queue_depth": 0},
+                    "device_status": [
+                        {
+                            "id": "bme280",
+                            "status": "initialization_failed",
+                            "failure_reason": (
+                                "BME280 not found at candidates [118, 119]: "
+                                "BME280 read failed at register 0xD0: [Errno 5] EIO"
+                            ),
+                        }
+                    ],
+                },
             },
         },
     }
@@ -343,3 +389,219 @@ def test_queue_raises_the_size_type_only_for_size_failures():
         queue.put_with_kind(KIND_TELEMETRY, b"x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1), 40)
     with pytest.raises(ValueError):
         queue.put_with_kind(KIND_TELEMETRY, b"x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1), 40)
+
+
+def test_persistent_memory_error_answers_get_details_with_the_bounded_snapshot():
+    """The 0.4.91 Pico W board regression (scripted): the full snapshot's
+    serialization MemoryError persists after the queue's own gc + eviction
+    recovery (an empty queue has nothing eligible to discard), and the
+    command is answered with the snapshot minus the device_status section
+    instead of the MemoryError killing Core 1's worker thread."""
+    queue = ScriptedQueue([RAISE_MEMORY, True])
+    intercore = FakeInterCore(queue)
+    response = _full_get_details_response()
+
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        pending = core1._admit_or_substitute_command_response(
+            intercore, object(), response
+        )
+
+    # The channel moved on: nothing stays pending, one bounded form admitted.
+    assert pending is None
+    assert len(queue.admitted) == 1
+    kind, message, priority = queue.admitted[0]
+    assert kind == KIND_COMMAND_RESPONSE
+    assert priority == RETENTION_PRIORITY_CRITICAL
+
+    payload = message["payload"]
+    # The command identity is preserved, and the response is still a success.
+    assert payload["success"] is True
+    assert payload["command_id"] == "details-001"
+    assert payload["command"] == "get-details"
+    assert payload["targeted"] is True
+    data = payload["data"]
+    # device_status (the unbounded failure_reason section) is dropped and
+    # named; the rest of the snapshot is still carried.
+    assert data["omitted_sections"] == ["device_status"]
+    assert "device_status" not in data
+    assert "devices" in data
+    assert data["memory"] == {"free_heap_bytes": 57000}
+
+
+def test_memory_error_drops_the_sections_in_order_until_one_is_admitted():
+    queue = ScriptedQueue([RAISE_MEMORY, RAISE_MEMORY, True])
+    intercore = FakeInterCore(queue)
+    response = _full_get_details_response()
+
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        pending = core1._admit_or_substitute_command_response(
+            intercore, object(), response
+        )
+
+    assert pending is None
+    assert len(queue.admitted) == 1
+    data = queue.admitted[0][1]["payload"]["data"]
+    # device_status first (the unbounded failure_reason strings), then
+    # devices: the marker accumulates what the response no longer carries.
+    assert data["omitted_sections"] == ["device_status", "devices"]
+    assert "device_status" not in data
+    assert "devices" not in data
+    # The fixed-size sections survive all the drops.
+    assert data["memory"] == {"free_heap_bytes": 57000}
+    assert "queues" in data
+
+
+def test_memory_error_on_every_form_is_answered_with_the_error_response():
+    """When even the last bounded form cannot serialize, the small error
+    substitute answers the command -- the channel still moves on. (Only a
+    MemoryError on the substitute's own admission propagates.)"""
+    queue = ScriptedQueue([RAISE_MEMORY, RAISE_MEMORY, RAISE_MEMORY, True])
+    intercore = FakeInterCore(queue)
+    response = _full_get_details_response()
+
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        pending = core1._admit_or_substitute_command_response(
+            intercore, object(), response
+        )
+
+    assert pending is None
+    assert len(queue.admitted) == 1
+    payload = queue.admitted[0][1]["payload"]
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "response_invalid"
+    assert "data" not in payload
+    assert payload["command_id"] == "details-001"
+    assert payload["command"] == "get-details"
+
+
+def test_transient_rejection_of_the_bounded_form_stays_pending():
+    queue = ScriptedQueue([RAISE_MEMORY, False, True])
+    intercore = FakeInterCore(queue)
+    response = _full_get_details_response()
+
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        pending = core1._admit_or_substitute_command_response(
+            intercore, object(), response
+        )
+
+    # The bounded form (not the full snapshot) is what stays pending.
+    assert pending is not response
+    assert pending["message"]["payload"]["data"]["omitted_sections"] == ["device_status"]
+
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        assert core1._admit_or_substitute_command_response(
+            intercore, object(), pending
+        ) is None
+    assert len(queue.admitted) == 1
+
+
+def test_memory_error_on_a_failure_response_is_answered_with_the_error_response():
+    """The bounded get-details form exists only for a successful get-details
+    (the one response with a full snapshot in its data): a MemoryError on
+    any other response takes the small error substitute."""
+    queue = ScriptedQueue([RAISE_MEMORY, True])
+    intercore = FakeInterCore(queue)
+    response = {
+        "kind": KIND_COMMAND_RESPONSE,
+        "message": {
+            "message_type": "command_response",
+            "uptime_ms": 1234,
+            "timestamp": None,
+            "payload": {
+                "command_id": "details-001",
+                "command": "get-details",
+                "targeted": True,
+                "success": False,
+                "error": {
+                    "code": "system_information_unavailable",
+                    "message": "System information is unavailable",
+                },
+            },
+        },
+    }
+
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        pending = core1._admit_or_substitute_command_response(
+            intercore, object(), response
+        )
+
+    assert pending is None
+    assert len(queue.admitted) == 1
+    payload = queue.admitted[0][1]["payload"]
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "response_invalid"
+    assert payload["command_id"] == "details-001"
+
+
+def test_memory_error_fallback_end_to_end_with_the_real_queue(monkeypatch):
+    """The 0.4.91 Pico W board regression, end to end with the real queue:
+    the full get-details snapshot's serialization MemoryErrors (a fragmented
+    pool cannot form the run) and the queue's own gc + eviction recovery has
+    an empty queue to draw on, so the MemoryError reaches Core 1's admission
+    -- and the command is answered with the bounded snapshot instead of the
+    worker thread dying."""
+    intercore = InterCore(64 * 1024)
+    queue = intercore.outbound_queue
+    monkeypatch.setattr(gc, "mem_free", lambda: 256 * 1024, raising=False)
+
+    real_serialize = intercore_module.serialize_and_validate_message
+
+    def flaky_serialize(message):
+        # The pool has a run for everything but the full snapshot: the
+        # device_status section (the unbounded failure_reason strings) is
+        # what does not fit. The omitted_sections marker names the section
+        # without a colon, so it does not trip this check.
+        if '"device_status":' in json.dumps(message):
+            raise MemoryError("memory allocation failed, allocating 2360 bytes")
+        return real_serialize(message)
+
+    monkeypatch.setattr(
+        intercore_module, "serialize_and_validate_message", flaky_serialize
+    )
+
+    monkeypatch.setattr(
+        core1,
+        "_collect_system_information_full",
+        lambda system_information: _full_get_details_response()["message"]["payload"]["data"],
+    )
+
+    event = {
+        "command_id": "details-001",
+        "command": core1.COMMAND_GET_DETAILS,
+        "payload": {},
+        "targeted": True,
+    }
+
+    class EventQueue:
+        def __init__(self, event):
+            self._event = event
+
+        def take(self):
+            taken = self._event
+            self._event = None
+            return taken
+
+    intercore.event_queue = EventQueue(event)
+
+    with patch.object(core1, "_message_time", return_value=(1234, None)):
+        response = core1._process_intercore_event(intercore, object(), object())
+        assert response is not None
+
+        pending = core1._admit_or_substitute_command_response(
+            intercore, object(), response
+        )
+
+    # The command was answered (not lost): exactly one bounded entry.
+    assert pending is None
+    assert queue.get_depth() == 1
+
+    entry = queue.take()
+    wire = json.loads(entry["payload_bytes"])
+    payload = wire["payload"]
+    assert payload["success"] is True
+    assert payload["command_id"] == "details-001"
+    assert payload["command"] == "get-details"
+    assert "device_status" not in payload["data"]
+    assert payload["data"]["omitted_sections"] == ["device_status"]
+    assert "devices" in payload["data"]
+    queue.complete_in_flight(entry)
