@@ -58,6 +58,7 @@ def _definition(device_type="system-information", config=None, **overrides):
 def test_registry_exposes_the_system_information_type():
     assert is_supported_device_type("system-information") is True
     assert is_supported_device_type("bme280") is True
+    assert is_supported_device_type("ltr390") is True
     assert is_supported_device_type("acme-9000") is False
     assert allowed_config_keys("system-information") == ALLOWED_CONFIG_KEYS
     assert allowed_config_keys("acme-9000") is None

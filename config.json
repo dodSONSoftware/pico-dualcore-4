@@ -53,6 +53,20 @@
           "pressure_pascal": 0
         }
       }
+    },
+    {
+      "id": "qX8vK2mWdNt5Rj3ZpA7yLc4BhFs6E",
+      "device_type": "ltr390",
+      "name": "LTR390 Light/UV Sensor",
+      "config": {
+        "i2c_bus": 0,
+        "i2c_sda_pin": 0,
+        "i2c_scl_pin": 1,
+        "offsets": {
+          "lux": 0,
+          "uv_index": 0
+        }
+      }
     }
   ]
 }

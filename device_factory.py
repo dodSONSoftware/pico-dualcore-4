@@ -4,6 +4,7 @@
 
 from devices.device import DeviceValidationError
 from devices.bme280 import validation as bme280_validation
+from devices.ltr390 import validation as ltr390_validation
 from devices.system_information.system_information_device import SystemInformationDevice
 from devices.system_information.validation import ALLOWED_CONFIG_KEYS, validate_config
 
@@ -17,6 +18,10 @@ _DEVICE_REGISTRY = {
     "bme280": (
         bme280_validation.validate_config,
         bme280_validation.ALLOWED_CONFIG_KEYS,
+    ),
+    "ltr390": (
+        ltr390_validation.validate_config,
+        ltr390_validation.ALLOWED_CONFIG_KEYS,
     ),
 }
 
@@ -157,5 +162,29 @@ def create_device(device_definition, system_information=None, i2c_bus_factory=No
         # validation needs it on Core 0.
         from devices.bme280.bme280_device import BME280Device
         return BME280Device(i2c)
+
+    if device_type == "ltr390":
+        # Same bus ownership as bme280: the driver never creates the bus; Core 1
+        # hands this point a factory that builds (and dedupes) one machine.I2C
+        # per (bus, sda, scl, freq), so two I2C devices on the same bus share
+        # one object. The sensor protocol runs in initialize(), which the
+        # retry/reinit machinery wraps.
+        if i2c_bus_factory is None:
+            raise ValueError("ltr390 requires an i2c_bus_factory")
+        cfg = device_definition["config"]
+        i2c = i2c_bus_factory(
+            cfg["i2c_bus"],
+            cfg.get("i2c_sda_pin"),
+            cfg.get("i2c_scl_pin"),
+            cfg.get("i2c_freq_hz", ltr390_validation.DEFAULT_I2C_FREQ_HZ),
+        )
+        # Same lazy-import rationale as the bme280 branch above: Core 0 pulls
+        # in this module for the validator during config validation, and a
+        # module-top driver import would load the float-heavy driver resident
+        # on the shared heap from startup -- before Core 1 (which alone
+        # constructs and runs it) exists. The validator (line 7) stays
+        # module-level: config validation needs it on Core 0.
+        from devices.ltr390.ltr390_device import LTR390Device
+        return LTR390Device(i2c)
 
     raise ValueError("Unsupported device type: {}".format(device_type))
