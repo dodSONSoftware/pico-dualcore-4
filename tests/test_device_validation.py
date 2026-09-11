@@ -92,6 +92,11 @@ def test_registry_imports_no_validation_package_at_module_top():
         name.startswith("devices.bme280") or name.startswith("devices.ltr390")
         for name in top_level_modules
     )
+    # The firmware may only module-top import modules the board's MicroPython
+    # (README floor: 1.20) ships: importlib does not, and a module-top import
+    # of it ImportError'd the Pico W at startup (0.4.101 hardware catch — the
+    # host CPython suite cannot see it).
+    assert "importlib" not in top_level_modules
 
 
 # ---------------------------------------------------------------------------

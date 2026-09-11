@@ -2,8 +2,6 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
-import importlib
-
 from devices.device import DeviceValidationError
 
 # The supported device_type registry: device_type -> (validation package,
@@ -44,11 +42,14 @@ MAX_DEVICE_NAME_LENGTH = 64
 def _validation_module(device_type):
     """The validation module for a supported device_type, imported on first
     use (an import cache hit afterwards); None for an unsupported type, which
-    imports nothing."""
+    imports nothing. The dynamic import goes through the __import__ builtin,
+    not the importlib module: the board's MicroPython (the README pins
+    1.20+) ships no importlib, and __import__ with a non-empty fromlist
+    returns the named leaf module on both CPython and MicroPython."""
     entry = _DEVICE_REGISTRY.get(device_type)
     if entry is None:
         return None
-    return importlib.import_module(entry[0])
+    return __import__(entry[0], fromlist=["__name__"])
 
 
 def allowed_config_keys(device_type):
