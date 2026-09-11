@@ -129,7 +129,7 @@ class _FailingClient:
     def connect(self, timeout=None):
         raise OSError("broker unreachable")
 
-    def subscribe(self, topic, qos=0):
+    def subscribe(self, topic):
         pass
 
 

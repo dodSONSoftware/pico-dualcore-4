@@ -22,18 +22,9 @@ class MQTTException(Exception):
 
 
 class MQTTClient:
-    def __init__(
-        self,
-        client_id,
-        server,
-        port=0,
-        user=None,
-        password=None,
-        keepalive=0,
-        ssl=None,
-    ):
+    def __init__(self, client_id, server, port=0, keepalive=0):
         if port == 0:
-            port = 8883 if ssl else 1883
+            port = 1883
         self.client_id = client_id
         self.sock = None
         # Readiness poller for check_msg(), built once per socket and reused
@@ -42,16 +33,9 @@ class MQTTClient:
         self._poller_sock = None
         self.server = server
         self.port = port
-        self.ssl = ssl
         self.pid = 0
         self.cb = None
-        self.user = user
-        self.pswd = password
         self.keepalive = keepalive
-        self.lw_topic = None
-        self.lw_msg = None
-        self.lw_qos = 0
-        self.lw_retain = False
 
     def _send_str(self, s):
         self.sock.write(struct.pack("!H", len(s)))
@@ -105,18 +89,6 @@ class MQTTClient:
     def set_callback(self, f):
         self.cb = f
 
-    def set_last_will(self, topic, msg, retain=False, qos=0):
-        # Validation, not an assert: MicroPython omits assert statements at
-        # bytecode optimization >= 1, so protocol behavior must not depend on them.
-        if not (0 <= qos <= 1):
-            raise ValueError("Last-will qos must be 0 or 1 (QoS 2 is not supported)")
-        if not topic:
-            raise ValueError("Last-will topic is required")
-        self.lw_topic = topic
-        self.lw_msg = msg
-        self.lw_qos = qos
-        self.lw_retain = retain
-
     def connect(self, clean_session=True, timeout=None):
         self.sock = socket.socket()
         self.sock.settimeout(timeout)
@@ -127,25 +99,16 @@ class MQTTClient:
             self.server, self.port, socket.AF_INET, socket.SOCK_STREAM
         )[0][-1]
         self.sock.connect(addr)
-        if self.ssl:
-            self.sock = self.ssl.wrap_socket(self.sock, server_hostname=self.server)
         premsg = bytearray(b"\x10\0\0\0\0\0")
         msg = bytearray(b"\x04MQTT\x04\x02\0\0")
 
         sz = 10 + 2 + len(self.client_id)
         msg[6] = clean_session << 1
-        if self.user:
-            sz += 2 + len(self.user) + 2 + len(self.pswd)
-            msg[6] |= 0xC0
         if self.keepalive:
             if self.keepalive > 65535:
                 raise MQTTException("Keepalive exceeds the 65535-second MQTT maximum")
             msg[7] |= self.keepalive >> 8
             msg[8] |= self.keepalive & 0x00FF
-        if self.lw_topic:
-            sz += 2 + len(self.lw_topic) + 2 + len(self.lw_msg)
-            msg[6] |= 0x4 | (self.lw_qos & 0x1) << 3 | (self.lw_qos & 0x2) << 3
-            msg[6] |= self.lw_retain << 5
 
         i = 1
         while sz > 0x7F:
@@ -157,12 +120,6 @@ class MQTTClient:
         self.sock.write(premsg, i + 2)
         self.sock.write(msg)
         self._send_str(self.client_id)
-        if self.lw_topic:
-            self._send_str(self.lw_topic)
-            self._send_str(self.lw_msg)
-        if self.user:
-            self._send_str(self.user)
-            self._send_str(self.pswd)
         resp = self._read_required(4)
         if resp[0] != 0x20 or resp[1] != 0x02:
             # A malformed CONNACK means the stream is not what the handshake assumed.
@@ -170,10 +127,6 @@ class MQTTClient:
         if resp[3] != 0:
             raise MQTTException(resp[3])
         return resp[2] & 1
-
-    def disconnect(self):
-        self.sock.write(b"\xe0\0")
-        self.sock.close()
 
     def ping(self, timeout_sec=None):
         """Send PINGREQ and wait for the matching PINGRESP (optionally
@@ -194,27 +147,20 @@ class MQTTClient:
                 # done.
                 self.sock.settimeout(None)
 
-    def publish(self, topic, msg, retain=False, qos=0, packet_id=None, timeout_ms=None, splice_fragment=None):
-        """Publish an application message; optional packet_id (else auto-increment) and timeout_ms bound the QoS 1 exchange.
+    def publish(self, topic, msg, packet_id=None, timeout_ms=None, splice_fragment=None):
+        """Publish one QoS 1 application message; optional packet_id (else auto-increment) and timeout_ms bound the exchange.
 
         With ``splice_fragment``, the frame's final bytes are written
         segment by segment: ``msg`` without its closing brace, then a comma,
         the fragment, then the brace. The wire bytes are identical to a
         single pre-joined buffer, but no allocation is ever sized to the
         whole spliced frame (see the write below)."""
-        if qos == 2:
-            # Reject before a single frame byte goes out (an assert would
-            # vanish under MicroPython bytecode optimization >= 1).
-            raise MQTTException("QoS 2 is not supported")
-        pkt = bytearray(b"\x30\0\0\0")
-        pkt[0] |= qos << 1 | retain
-        sz = 2 + len(topic) + len(msg)
+        pkt = bytearray(b"\x32\0\0\0")
+        sz = 2 + len(topic) + len(msg) + 2
         if splice_fragment is not None:
             # The splice (comma + fragment + brace) replaces msg's closing
             # brace: the spliced frame body is len(msg) + len(fragment) + 1.
             sz += len(splice_fragment) + 1
-        if qos > 0:
-            sz += 2
         if sz > 2097151:
             # This encoder emits at most three remaining-length bytes (the
             # loop below); the protocol's four-byte maximum (268435455) is
@@ -229,27 +175,25 @@ class MQTTClient:
             sz >>= 7
             i += 1
         pkt[i] = sz
-        if qos > 0:
-            if packet_id is None:
-                pid = self.next_packet_id()
-            else:
-                pid = packet_id
+        if packet_id is None:
+            pid = self.next_packet_id()
+        else:
+            pid = packet_id
         # Bound the WHOLE QoS 1 exchange (frame writes included): a blackholed
         # link whose writes stop making progress then fails the publish
         # bounded, into Core 0's recovery, instead of wedging inside
         # sock.write(). Installed before byte 1; restored only after the
         # exchange.
-        timed = qos == 1 and timeout_ms is not None
+        timed = timeout_ms is not None
         if timed:
             self.sock.settimeout(timeout_ms / 1000.0)
         try:
             self.sock.write(pkt, i + 1)
             self._send_str(topic)
-            if qos > 0:
-                # Pack the packet id only now: it reuses the opcode/length
-                # bytes already written (wire order: header, topic, packet id).
-                struct.pack_into("!H", pkt, 0, pid)
-                self.sock.write(pkt, 2)
+            # Pack the packet id only now: it reuses the opcode/length
+            # bytes already written (wire order: header, topic, packet id).
+            struct.pack_into("!H", pkt, 0, pid)
+            self.sock.write(pkt, 2)
             if splice_fragment is None:
                 self.sock.write(msg)
             else:
@@ -265,20 +209,19 @@ class MQTTClient:
                 self.sock.write(b",")
                 self.sock.write(splice_fragment)
                 self.sock.write(b"}")
-            if qos == 1:
-                while 1:
-                    op = self.wait_msg()
-                    if op == 0x40:
-                        sz = self._read_required(1)
-                        if sz != b"\x02":
-                            # A PUBACK is exactly a 2-byte packet id.
-                            self._abort_corrupt_inbound(
-                                "PUBACK with unexpected remaining length"
-                            )
-                        rcv_pid = self._read_required(2)
-                        rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
-                        if pid == rcv_pid:
-                            return
+            while 1:
+                op = self.wait_msg()
+                if op == 0x40:
+                    sz = self._read_required(1)
+                    if sz != b"\x02":
+                        # A PUBACK is exactly a 2-byte packet id.
+                        self._abort_corrupt_inbound(
+                            "PUBACK with unexpected remaining length"
+                        )
+                    rcv_pid = self._read_required(2)
+                    rcv_pid = rcv_pid[0] << 8 | rcv_pid[1]
+                    if pid == rcv_pid:
+                        return
         finally:
             if timed:
                 # Not best-effort: the next operation assumes blocking mode,
@@ -286,7 +229,7 @@ class MQTTClient:
                 # it done.
                 self.sock.settimeout(None)
 
-    def subscribe(self, topic, qos=0):
+    def subscribe(self, topic):
         if self.cb is None:
             raise MQTTException("Subscribe callback is not set")
         # The remaining-length byte is single (valid through 127): the body
@@ -302,7 +245,7 @@ class MQTTClient:
         struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, pid)
         self.sock.write(pkt)
         self._send_str(topic)
-        self.sock.write(qos.to_bytes(1, "little"))
+        self.sock.write(b"\x01")
         while 1:
             op = self.wait_msg()
             if op == 0x90:

@@ -303,7 +303,7 @@ def test_publish_qos1_waits_for_matching_puback_and_restores_timeout():
     sock = MockSocket(incoming=b"\x40\x02\x00\x01")  # PUBACK for pid 1 (big-endian)
     client.sock = sock
 
-    client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+    client.publish(b"t", b"x", timeout_ms=4000)
 
     # PUBLISH frame with packet id 1, then no socket timeout left behind.
     assert bytes(sock.written) == b"\x32\x06\x00\x01t\x00\x01x"
@@ -336,7 +336,7 @@ def test_publish_spliced_writes_segments_byte_identical_to_a_join():
 
     sock.write = recording_write
 
-    client.publish(b"t", body, qos=1, timeout_ms=4000, splice_fragment=fragment)
+    client.publish(b"t", body, timeout_ms=4000, splice_fragment=fragment)
 
     # Header (remaining covers 2-byte topic length + topic + spliced body +
     # 2-byte packet id), topic, packet id 1, then body[:-1] + "," + fragment
@@ -371,7 +371,7 @@ def test_publish_without_splice_fragment_is_unchanged():
 
     sock.write = recording_write
 
-    client.publish(b"t", b'{"a":1}', qos=1, timeout_ms=4000)
+    client.publish(b"t", b'{"a":1}', timeout_ms=4000)
 
     # remaining = 2 (topic-length field) + 1 (topic) + 7 (payload) + 2 (pid)
     assert bytes(sock.written) == b"\x32\x0c\x00\x01t\x00\x01" + b'{"a":1}'
@@ -384,7 +384,7 @@ def test_publish_qos1_times_out_when_puback_never_arrives():
     client.sock = sock
 
     with pytest.raises(OSError):
-        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+        client.publish(b"t", b"x", timeout_ms=4000)
 
     # The PUBLISH frame went out, the bounded wait gave up, and the socket
     # is restored to the client's default (blocking) state.
@@ -401,7 +401,7 @@ def test_publish_qos1_timeout_active_before_first_publish_byte():
     sock.write_requires_timeout = True
     client.sock = sock
 
-    client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+    client.publish(b"t", b"x", timeout_ms=4000)
 
     assert bytes(sock.written) == b"\x32\x06\x00\x01t\x00\x01x"
     # The socket was restored to the client's default (blocking) state.
@@ -418,7 +418,7 @@ def test_publish_qos1_write_stall_surfaces_as_bounded_error():
     client.sock = sock
 
     with pytest.raises(OSError):
-        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+        client.publish(b"t", b"x", timeout_ms=4000)
 
     # The stalled write was bounded and the socket left in its default state.
     assert sock.written == b""
@@ -431,7 +431,7 @@ def test_publish_qos1_ignores_non_matching_puback_and_keeps_waiting():
     sock = MockSocket(incoming=b"\x40\x02\x00\x02" + b"\x40\x02\x00\x01")
     client.sock = sock
 
-    client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+    client.publish(b"t", b"x", timeout_ms=4000)
 
     assert sock.buffer == b""
     assert sock.timeout_value is None
@@ -446,7 +446,7 @@ def test_publish_qos1_delivers_interleaved_publish_before_puback():
     sock = MockSocket(incoming=b"\x30\x04\x00\x01t\x78" + b"\x40\x02\x00\x01")
     client.sock = sock
 
-    client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+    client.publish(b"t", b"x", timeout_ms=4000)
 
     assert seen == [(b"t", b"x")]
     assert sock.buffer == b""
@@ -471,7 +471,7 @@ def test_publish_qos1_times_out_when_puback_stalls_after_opcode():
     client.sock = sock
 
     with pytest.raises(OSError):
-        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+        client.publish(b"t", b"x", timeout_ms=4000)
 
     # The PUBLISH went out; the bounded wait gave up rather than blocking.
     assert bytes(sock.written) == b"\x32\x06\x00\x01t\x00\x01x"
@@ -485,7 +485,7 @@ def test_publish_qos1_times_out_when_puback_pid_stalls():
     client.sock = sock
 
     with pytest.raises(OSError):
-        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+        client.publish(b"t", b"x", timeout_ms=4000)
 
     assert bytes(sock.written) == b"\x32\x06\x00\x01t\x00\x01x"
     assert sock.timeout_value is None
@@ -513,7 +513,7 @@ def test_subscribe_waits_for_suback_without_clearing_timeout():
     client.sock = sock
     sock.settimeout(4.0)
 
-    client.subscribe(b"t", qos=1)
+    client.subscribe(b"t")
 
     assert sock.buffer == b""
     # The established finite timeout was NOT cleared by the SUBACK wait (the
@@ -645,7 +645,7 @@ def test_publish_qos1_fails_immediately_when_settimeout_raises():
     client.sock = sock
 
     with pytest.raises(OSError):
-        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+        client.publish(b"t", b"x", timeout_ms=4000)
 
     # The timeout is installed before any PUBLISH write, so a failed install
     # aborts before byte 1 of the frame: nothing was transmitted, the ready
@@ -695,7 +695,7 @@ def test_publish_qos1_fails_when_blocking_restore_raises():
     client.sock = sock
 
     with pytest.raises(OSError):
-        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+        client.publish(b"t", b"x", timeout_ms=4000)
 
 
 def test_connect_fails_when_settimeout_raises(monkeypatch):
@@ -726,7 +726,7 @@ def test_subscribe_times_out_when_suback_never_arrives():
     sock.settimeout(4.0)  # the finite timeout subscribe() relies on
 
     with pytest.raises(OSError):
-        client.subscribe(b"t", qos=1)
+        client.subscribe(b"t")
 
 
 # ---------------------------------------------------------------------------
@@ -1222,7 +1222,7 @@ def test_publish_qos1_uses_wrapped_packet_id():
     sock = MockSocket(incoming=b"\x40\x02\x00\x01")
     client.sock = sock
 
-    client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+    client.publish(b"t", b"x", timeout_ms=4000)
 
     # PUBLISH frame carries the wrapped packet id 1, not 65536 or 0.
     assert bytes(sock.written) == b"\x32\x06\x00\x01t\x00\x01x"
@@ -1238,7 +1238,7 @@ def test_subscribe_uses_wrapped_packet_id():
     sock = MockSocket(incoming=b"\x90\x03\x00\x01\x00")
     client.sock = sock
 
-    client.subscribe(b"t", qos=1)
+    client.subscribe(b"t")
 
     assert sock.buffer == b""
     assert client.pid == 1
@@ -1259,7 +1259,7 @@ def test_subscribe_rejects_suback_with_unexpected_remaining_length():
     client.sock = sock
 
     with pytest.raises(MQTTException):
-        client.subscribe(b"t", qos=1)
+        client.subscribe(b"t")
 
     # A corrupt frame, not a refused one: the socket is closed so Core 0's
     # recovery path reconnects instead of parsing the desynced stream.
@@ -1279,7 +1279,7 @@ def test_subscribe_suback_short_length_does_not_consume_next_packet():
     client.sock = sock
 
     with pytest.raises(MQTTException):
-        client.subscribe(b"t", qos=1)
+        client.subscribe(b"t")
 
     assert sock.closed
     # The PINGRESP must be intact in the stream, not half-consumed into the
@@ -1299,7 +1299,7 @@ def test_subscribe_rejects_reserved_suback_return_code():
     client.sock = sock
 
     with pytest.raises(MQTTException):
-        client.subscribe(b"t", qos=1)
+        client.subscribe(b"t")
 
     assert sock.closed
 
@@ -1371,7 +1371,9 @@ def test_publish_qos1_binds_puback_wait_to_broker_response_timeout(ticks):
     # A blackholed link must fail within the configured broker response
     # timeout so the Core 0 run loop's network recovery can fire.
     args, kwargs = client.publish_calls[0]
-    assert kwargs.get("qos") == 1
+    # QoS 1 is the client's fixed profile (no qos parameter); the PUBACK
+    # wait must still be bound to the configured broker response timeout.
+    assert "qos" not in kwargs
     assert kwargs.get("timeout_ms") == 4 * 1000
 
 
@@ -1519,7 +1521,7 @@ def test_subscribe_rejects_suback_with_wrong_packet_id():
     client.sock = sock
 
     with pytest.raises(MQTTException):
-        client.subscribe(b"t", qos=1)
+        client.subscribe(b"t")
 
 
 def test_subscribe_without_callback_raises():
@@ -1529,7 +1531,7 @@ def test_subscribe_without_callback_raises():
     client.sock = sock
 
     with pytest.raises(MQTTException, match="callback"):
-        client.subscribe(b"t", qos=1)
+        client.subscribe(b"t")
 
     assert sock.written == b""
 
@@ -1542,23 +1544,9 @@ def test_publish_qos1_rejects_puback_with_bad_length():
     client.sock = sock
 
     with pytest.raises(MQTTException):
-        client.publish(b"t", b"x", qos=1, timeout_ms=4000)
+        client.publish(b"t", b"x", timeout_ms=4000)
 
     assert sock.closed is True
-
-
-def test_publish_qos2_is_rejected_before_any_write():
-    """QoS 2 is not supported: the rejection must happen before a single byte
-    is transmitted, in every build (the old `assert 0` was unreachable under
-    bytecode optimization and the frame would simply go out unacked)."""
-    client = MQTTClient("pico_test", "broker", keepalive=30)
-    sock = MockSocket()
-    client.sock = sock
-
-    with pytest.raises(MQTTException, match="QoS 2"):
-        client.publish(b"t", b"x", qos=2)
-
-    assert sock.written == b""
 
 
 def test_ping_rejects_pingresp_with_payload():
@@ -1619,29 +1607,14 @@ def test_publish_size_above_remaining_length_maximum_is_rejected():
     client = MQTTClient("pico_test", "broker", keepalive=30)
     sock = MockSocket()
     client.sock = sock
-    # sz = 2 + len(topic) + len(msg); with an empty topic, 2097150 payload
-    # bytes puts sz exactly over the maximum.
-    msg = b"x" * 2097150
+    # sz = 2 + len(topic) + len(msg) + 2 (the QoS 1 packet id); with an
+    # empty topic, 2097148 payload bytes puts sz exactly over the maximum.
+    msg = b"x" * 2097148
 
     with pytest.raises(MQTTException):
-        client.publish(b"", msg, qos=0)
+        client.publish(b"", msg)
 
     assert sock.written == b""
-
-
-def test_set_last_will_validates_parameters():
-    """Last-will parameter validation is explicit: QoS 2 (unsupported by this
-    profile) and an empty topic are rejected; QoS 0/1 still configure."""
-    client = MQTTClient("pico_test", "broker", keepalive=30)
-
-    with pytest.raises(ValueError):
-        client.set_last_will(b"t", b"m", qos=2)
-    with pytest.raises(ValueError):
-        client.set_last_will(b"", b"m", qos=0)
-
-    client.set_last_will(b"lwt", b"offline", qos=1)
-    assert client.lw_topic == b"lwt"
-    assert client.lw_qos == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1688,7 +1661,7 @@ def test_subscribe_eof_during_suback_is_transport_error():
     client.sock = sock
 
     with pytest.raises(OSError):
-        client.subscribe(b"t", qos=1)
+        client.subscribe(b"t")
 
 
 def test_publish_qos1_eof_during_puback_pid_is_transport_error():
@@ -1700,7 +1673,7 @@ def test_publish_qos1_eof_during_puback_pid_is_transport_error():
     client.sock = sock
 
     with pytest.raises(OSError):
-        client.publish(b"t", b"x", qos=1)
+        client.publish(b"t", b"x")
 
 
 def test_wait_msg_eof_during_remaining_length_is_transport_error():

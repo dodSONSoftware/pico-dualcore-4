@@ -128,8 +128,8 @@ class Mqtt:
                 # Bound the handshake: the finite timeout installed here also
                 # carries across the two SUBACK waits below.
                 self._client.connect(timeout=self._ack_timeout_ms / 1000.0)
-                self._client.subscribe(self._command_topic, qos=1)
-                self._client.subscribe(self._info_response_topic, qos=1)
+                self._client.subscribe(self._command_topic)
+                self._client.subscribe(self._info_response_topic)
                 # Handshake complete: restore normal blocking mode. Not
                 # best-effort — the later bounded waits assume it, so a
                 # failed restoration fails this attempt instead of marking a
@@ -194,7 +194,6 @@ class Mqtt:
             self._client.publish(
                 topic,
                 message,
-                qos=1,
                 timeout_ms=self._ack_timeout_ms,
                 splice_fragment=splice_fragment,
             )
@@ -211,7 +210,7 @@ class Mqtt:
             raise OSError("MQTT is not connected")
 
         try:
-            self._client.publish(topic, message, qos=1, packet_id=packet_id, timeout_ms=timeout_ms)
+            self._client.publish(topic, message, packet_id=packet_id, timeout_ms=timeout_ms)
             self._touch()
             return True
         except MemoryError:
