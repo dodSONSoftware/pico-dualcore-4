@@ -43,13 +43,17 @@ def _validation_module(device_type):
     """The validation module for a supported device_type, imported on first
     use (an import cache hit afterwards); None for an unsupported type, which
     imports nothing. The dynamic import goes through the __import__ builtin,
-    not the importlib module: the board's MicroPython (the README pins
-    1.20+) ships no importlib, and __import__ with a non-empty fromlist
-    returns the named leaf module on both CPython and MicroPython."""
+    not the importlib module (the board's MicroPython, README floor 1.20,
+    ships no importlib), and the fromlist is the 4th POSITIONAL argument:
+    MicroPython builtins take no keyword arguments (a fromlist= keyword
+    TypeError'd on the Pico W, 0.4.102 hardware catch). The non-empty
+    fromlist makes the builtin return the named leaf module -- the shape the
+    compiler itself emits for a `from x import y` statement -- on both
+    CPython and MicroPython."""
     entry = _DEVICE_REGISTRY.get(device_type)
     if entry is None:
         return None
-    return __import__(entry[0], fromlist=["__name__"])
+    return __import__(entry[0], None, None, ["__name__"])
 
 
 def allowed_config_keys(device_type):

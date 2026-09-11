@@ -77,6 +77,19 @@ def test_registry_resolves_the_validation_modules_lazily():
     assert allowed_config_keys("bme280") is bme280_validation.ALLOWED_CONFIG_KEYS
 
 
+def test_dynamic_import_passes_fromlist_positionally():
+    """MicroPython builtins take no keyword arguments: a fromlist keyword on
+    the __import__ call TypeError'd the Pico W at config recovery (0.4.102
+    hardware catch). The fromlist must stay the 4th positional argument."""
+    tree = ast.parse((ROOT / "device_factory.py").read_text())
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "__import__"):
+            assert not node.keywords, "MicroPython __import__ takes no keywords"
+            assert len(node.args) == 4, "fromlist must be the 4th positional argument"
+
+
 def test_registry_imports_no_validation_package_at_module_top():
     """A module-top import of a validation package would make that type's
     validator resident from startup: only the registry strings may name the
