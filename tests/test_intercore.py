@@ -27,7 +27,6 @@ from intercore import (  # noqa: E402
     RETENTION_PRIORITY_HEALTH,
     RETENTION_PRIORITY_INFO,
     RETENTION_PRIORITY_TELEMETRY,
-    ConfigUpdateLane,
     InterCore,
     InterCoreEventQueue,
     KIND_COMMAND_RESPONSE,
@@ -1632,58 +1631,3 @@ def test_state_mailboxes_core_1_activity():
     boxes = StateMailboxes()
     boxes.set_core_1_activity_ms(12345)
     assert boxes.get_core_1_activity_ms() == 12345
-
-
-# --- config_update_lane: request/result for the HOT_RELOADED apply -----------
-
-
-def test_config_update_lane_default_empty():
-    lane = ConfigUpdateLane()
-    assert lane.take_request() is None
-    assert lane.take_result_for(1) is None
-
-
-def test_config_update_lane_request_set_take():
-    lane = ConfigUpdateLane()
-    request = {"generation": 1, "read_loop_sec": 40}
-    lane.post_request(request)
-    assert lane.take_request() is request
-    assert lane.take_request() is None  # cleared on read
-
-
-def test_config_update_lane_result_matched_by_generation():
-    lane = ConfigUpdateLane()
-    lane.post_result({"generation": 1, "success": True})
-    assert lane.take_result_for(1) == {"generation": 1, "success": True}
-    assert lane.take_result_for(1) is None  # consumed exactly once
-
-
-def test_config_update_lane_ignores_a_stale_generation():
-    lane = ConfigUpdateLane()
-    # A result from a different (superseded) transaction is not read as this
-    # one, and is left in place for its owner.
-    lane.post_result({"generation": 9, "success": True})
-    assert lane.take_result_for(1) is None
-    assert lane.take_result_for(9) == {"generation": 9, "success": True}
-
-
-def test_config_update_lane_replacement_semantics():
-    lane = ConfigUpdateLane()
-    first = {"generation": 1, "read_loop_sec": 10}
-    second = {"generation": 2, "health_interval_sec": 30}
-    lane.post_request(first)
-    lane.post_request(second)
-    assert lane.take_request() is second  # latest value wins
-
-
-def test_config_update_lane_type_validation():
-    lane = ConfigUpdateLane()
-    with pytest.raises(ValueError):
-        lane.post_request("not a dict")
-    with pytest.raises(ValueError):
-        lane.post_result("not a dict")
-
-
-def test_intercore_exposes_config_update_lane():
-    ic = InterCore(minimum_free_heap_bytes=RESERVE)
-    assert isinstance(ic.config_update_lane, ConfigUpdateLane)

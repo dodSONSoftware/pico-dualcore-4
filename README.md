@@ -16,7 +16,7 @@ This firmware implements a clean architecture where:
 
 - **Core 0** exclusively owns Wi-Fi, MQTT, sockets, UTC time synchronization, and system reboot
 - **Core 1** exclusively owns device drivers, sensor reads, device lifecycle management, and telemetry construction
-- Communication between cores uses four lanes with strict ownership rules (the two FIFO lanes are heap-governed: admitted against the board's two heap thresholds — the preferred reserve where memory-pressure handling begins and the hard minimum floor that must stay intact; the latest-value lanes carry state snapshots and the config-update request/result)
+- Communication between cores uses three lanes with strict ownership rules (the two FIFO lanes are heap-governed: admitted against the board's two heap thresholds — the preferred reserve where memory-pressure handling begins and the hard minimum floor that must stay intact; the latest-value lane carries the state snapshots)
 
 ### Architecture
 

@@ -13,9 +13,7 @@ lost. The command ran, the answer never arrived, and no retry can recover it.
 
 So a full response queue refuses the admission outright: the command is not
 executed, its command_id is not claimed, and no response is queued; the same
-command can be redelivered once capacity frees up. The single-flight pending
-HOT_RELOADED transaction holds one slot too, because its response is queued
-later (at Core 1's acknowledgement) and must not be overrun by a new admission.
+command can be redelivered once capacity frees up.
 """
 
 import pathlib
@@ -26,7 +24,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 sys.modules.setdefault("machine", MagicMock())
 
 from test_read_write_config_commands import (  # noqa: E402
-    _ack,
     _command,
     _committed,
     _full_config,
@@ -146,54 +143,4 @@ def test_one_free_slot_still_admits_command(make_core0):
     assert "adm-bound" in core0._recent_command_ids
     assert len(core0._pending_core0_responses) == _max_pending()
     assert any(r.get("command_id") == "adm-bound"
-               for r in core0._pending_core0_responses)
-
-
-# --- pending HOT_RELOADED transaction holds a slot ---------------------------
-
-
-def _open_pending_hot_update(core0):
-    candidate = _full_config()
-    candidate["read_loop_sec"] = 30  # Core 1-owned HOT change -> pending, deferred response
-    _send(core0, _command("write-config", "adm-hot", payload={"config": candidate}))
-    assert core0._pending_config_update is not None
-
-
-def test_pending_update_reserves_a_slot_for_a_new_command(make_core0):
-    """While a HOT_RELOADED transaction is pending (its response deferred to
-    Core 1's acknowledgement), a new command must be refused once the queue is
-    at the reserved boundary -- else it would overrun the deferred slot."""
-    core0 = make_core0()
-    _open_pending_hot_update(core0)
-    # Three responses pending while the deferred one still must fit.
-    for i in range(_max_pending() - 1):
-        core0._pending_core0_responses.append(_dummy_response(i))
-
-    _send(core0, _command("read-config", "adm-reserve"))
-
-    assert "adm-reserve" not in core0._recent_command_ids
-    assert len(core0._pending_core0_responses) == _max_pending() - 1
-    # The pending transaction is untouched by the refused admission.
-    assert core0._pending_config_update is not None
-
-
-def test_deferred_hot_acknowledgement_not_lost_at_resolution(make_core0):
-    """The whole point of the reservation: the deferred write-config
-    acknowledgement is guaranteed a slot at Core 1's acknowledgement, even when
-    the queue has filled up to the reserved boundary in the meantime."""
-    from test_read_write_config_commands import _ack
-
-    core0 = make_core0()
-    _open_pending_hot_update(core0)
-    for i in range(_max_pending() - 1):
-        core0._pending_core0_responses.append(_dummy_response(i))
-
-    # A 4th admission is refused...
-    _send(core0, _command("read-config", "adm-reserve2"))
-    assert "adm-reserve2" not in core0._recent_command_ids
-
-    # ...but the deferred acknowledgement still lands (queue -> full, not dropped).
-    _ack(core0, success=True)
-    assert len(core0._pending_core0_responses) == _max_pending()
-    assert any(r.get("command_id") == "adm-hot"
                for r in core0._pending_core0_responses)

@@ -438,76 +438,6 @@ def _regrid_next_boundary(anchor, now, interval_ms):
     return time.ticks_add(anchor, (elapsed // interval_ms + 1) * interval_ms)
 
 
-def _apply_config_update(config_update, config, schedulers):
-    """Apply a HOT_RELOADED Core 1 hot update (or its rollback): re-anchor
-    the read/health schedulers and refresh Core 1's own config copy.
-
-    A reload is a NEW scheduling boundary, re-anchored from the reload instant
-    rather than re-gridded to the boot anchor (next = now + interval); only
-    the keys present are touched, and no catch-up sample is emitted for a
-    shortened interval."""
-    now_ms = time.ticks_ms()
-    if "read_loop_sec" in config_update:
-        config["read_loop_sec"] = config_update["read_loop_sec"]
-        schedulers["read_loop_ms"] = config_update["read_loop_sec"] * 1000
-        schedulers["next_read_ms"] = time.ticks_add(
-            now_ms, schedulers["read_loop_ms"]
-        )
-    if "health_interval_sec" in config_update:
-        config["health_interval_sec"] = config_update["health_interval_sec"]
-        schedulers["health_interval_ms"] = config_update["health_interval_sec"] * 1000
-        schedulers["next_health_ms"] = time.ticks_add(
-            now_ms, schedulers["health_interval_ms"]
-        )
-
-
-def _process_config_update(intercore, config, schedulers):
-    """Apply one HOT_RELOADED config-update request from Core 0 and
-    acknowledge it. Internal runtime control on the dedicated lane, not an
-    external command: take the pending request, apply it, then post exactly
-    one result for the request's generation (no command response is owed).
-    On an apply failure the prior values are restored and a bounded failure
-    posted, so Core 1 is left unchanged. MemoryError propagates."""
-    request = intercore.config_update_lane.take_request()
-    if request is None:
-        return
-    generation = request.get("generation")
-
-    prior = (
-        config.get("read_loop_sec"),
-        config.get("health_interval_sec"),
-        schedulers["read_loop_ms"],
-        schedulers["health_interval_ms"],
-        schedulers["next_read_ms"],
-        schedulers["next_health_ms"],
-    )
-    try:
-        _apply_config_update(request, config, schedulers)
-    except MemoryError:
-        raise
-    except Exception:
-        # An apply failure must leave Core 1 unchanged: restore the prior
-        # values, then report a bounded failure so Core 0 rolls back.
-        (
-            config["read_loop_sec"],
-            config["health_interval_sec"],
-            schedulers["read_loop_ms"],
-            schedulers["health_interval_ms"],
-            schedulers["next_read_ms"],
-            schedulers["next_health_ms"],
-        ) = prior
-        intercore.config_update_lane.post_result({
-            "generation": generation,
-            "success": False,
-            "code": "core1_apply_failed",
-        })
-        return
-    intercore.config_update_lane.post_result({
-        "generation": generation,
-        "success": True,
-    })
-
-
 def _process_intercore_event(intercore, uptime_state, system_information=None):
     """Handle a Core 1-owned command event dispatched by Core 0 (currently
     get-details, with a validated {} payload). Core 0 owns the unknown-command
@@ -886,9 +816,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # The read/health schedulers share the normal-runtime anchor: fixed
         # boundaries every read_loop_sec / health_interval_sec from it,
         # independent of each other (they share the epoch, not an execution
-        # dependency). A HOT_RELOADED write re-anchors a changed interval
-        # from the reload instant via the config-update lane, without
-        # touching the anchor; the one immediate anchor pass runs below.
+        # dependency); the one immediate anchor pass runs below.
         schedulers = {
             "anchor_ms": normal_runtime_start_ticks_ms,
             "read_loop_ms": config["read_loop_sec"] * 1000,
@@ -920,11 +848,6 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         pending_command_response = None
 
         while True:
-            # Internal control first: a pending HOT_RELOADED config-update
-            # request from Core 0 re-anchors the schedulers and is acked on
-            # the config-update lane; independent of the user-command queue.
-            _process_config_update(intercore, config, schedulers)
-
             if pending_command_response is not None:
                 pending_command_response = _admit_or_substitute_command_response(
                     intercore, uptime_state, pending_command_response

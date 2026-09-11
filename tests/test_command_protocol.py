@@ -118,39 +118,11 @@ class RecordingEventQueue:
         return None
 
 
-class FakeConfigUpdateLane:
-    """Records posted config-update requests; the test posts a result to
-    drive Core 0's acknowledgement resolution."""
-
-    def __init__(self):
-        self.requests = []
-        self._result = None
-
-    def post_request(self, request):
-        self.requests.append(request)
-
-    def take_request(self):
-        if self.requests:
-            return self.requests.pop(0)
-        return None
-
-    def post_result(self, result):
-        self._result = result
-
-    def take_result_for(self, generation):
-        if self._result is not None and self._result.get("generation") == generation:
-            result = self._result
-            self._result = None
-            return result
-        return None
-
-
 class MockInterCore:
     def __init__(self):
         self.state_mailboxes = MagicMock()
         self.outbound_queue = MagicMock()
         self.event_queue = RecordingEventQueue()
-        self.config_update_lane = FakeConfigUpdateLane()
 
 
 @pytest.fixture
@@ -418,8 +390,9 @@ def test_write_config_broadcast_is_silently_ignored(make_core0):
 
 def test_write_config_targeted_is_executed(make_core0):
     """A targeted write-config carries exactly {"config": <complete candidate
-    configuration>} as its payload and is executed on Core 0: validated,
-    committed, applied -- the boundary no longer answers it not_implemented."""
+    configuration>} as its payload and is executed on Core 0: validated and
+    committed -- the boundary no longer answers it not_implemented. No live
+    apply: the change is pending a reboot."""
     core0 = make_core0()
     candidate = _full_config()
     candidate["read_loop_sec"] = 30
@@ -427,18 +400,7 @@ def test_write_config_targeted_is_executed(make_core0):
     _send(core0, _command(command_id="proto-write", command="write-config",
                           payload={"config": candidate}))
 
-    # read_loop_sec belongs to Core 1: the internal config-update request on
-    # the dedicated lane carries it (not a user-command event).
     assert core0._intercore.event_queue.events == []
-    assert core0._intercore.config_update_lane.requests == [
-        {"generation": 1, "read_loop_sec": 30}
-    ]
-    # Core 1 applies and acknowledges: the transaction commits and the response
-    # is released.
-    gen = core0._pending_config_update["generation"]
-    core0._intercore.config_update_lane.post_result(
-        {"generation": gen, "success": True})
-    core0._resolve_pending_config_update()
 
     response = _last_response(core0)
     assert response["command_id"] == "proto-write"
@@ -446,8 +408,9 @@ def test_write_config_targeted_is_executed(make_core0):
     assert response["targeted"] is True
     assert response["success"] is True
     assert response["data"]["configuration_changed"] is True
-    assert response["data"]["classification"] == "HOT_RELOADED"
-    assert response["data"]["reboot_required"] is False
+    assert response["data"]["classification"] == "REBOOT_REQUIRED"
+    assert response["data"]["reboot_required"] is True
+    assert core0._config_manager.reboot_required is True
 
 
 def test_read_config_targeted_returns_committed_config(make_core0):

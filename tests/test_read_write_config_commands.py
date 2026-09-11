@@ -8,15 +8,14 @@ command protocol contract, with the real configuration manager driving real
 temporary files.
 
 read-config: payload exactly {} (like reboot / get-details); the answer
-carries the committed (PERSISTED) configuration and the derived
-reboot_required state. write-config: the payload is exactly
+carries the committed (PERSISTED) configuration and the in-boot
+reboot_required flag. write-config: the payload is exactly
 {"config": <complete candidate configuration>} (unknown payload keys are
 named together; no patch/merge/partial-update shape); the answer carries
 configuration_changed, the classification, the resulting reboot state, and
-the deterministic change summary. HOT_RELOADED writes are applied on both
-cores (Core 0 live, Core 1 via the internal config-update event) before the
-transaction commits; a rejected Core 1 application rolls the file state back
-with the Core 0 values restored.
+the deterministic change summary. There is no live apply: every changed
+write commits and is pending a reboot, with the running firmware keeping
+its boot values until then.
 """
 
 import importlib
@@ -109,52 +108,11 @@ class RecordingEventQueue:
         return None
 
 
-class FakeConfigUpdateLane:
-    """The config-update request/result lane for Core 0 tests.
-
-    Records posted requests; the test posts a result (success or a bounded
-    failure) to drive Core 0's _resolve_pending_config_update, standing in for
-    Core 1's apply + acknowledgement."""
-
-    def __init__(self):
-        self.requests = []
-        self._result = None
-
-    def post_request(self, request):
-        self.requests.append(request)
-
-    def take_request(self):
-        if self.requests:
-            return self.requests.pop(0)
-        return None
-
-    def post_result(self, result):
-        self._result = result
-
-    def take_result_for(self, generation):
-        if self._result is not None and self._result.get("generation") == generation:
-            result = self._result
-            self._result = None
-            return result
-        return None
-
-
 class MockInterCore:
     def __init__(self):
         self.state_mailboxes = MagicMock()
         self.outbound_queue = MagicMock()
         self.event_queue = RecordingEventQueue()
-        self.config_update_lane = FakeConfigUpdateLane()
-
-
-def _ack(core0, success=True, code=None):
-    """Post Core 1's acknowledgement for the pending request and resolve it."""
-    gen = core0._pending_config_update["generation"]
-    result = {"generation": gen, "success": success}
-    if code is not None:
-        result["code"] = code
-    core0._intercore.config_update_lane.post_result(result)
-    core0._resolve_pending_config_update()
 
 
 @pytest.fixture
@@ -394,146 +352,50 @@ def test_write_config_unchanged_while_reboot_pending(make_core0, tmp_path, monke
                for line in lines)
 
 
-# --- write-config: HOT_RELOADED -------------------------------------------------
+# --- write-config: changed writes (all REBOOT_REQUIRED) --------------------------
 
 
-def test_write_config_hot_reload_applies_both_cores_and_commits(make_core0, tmp_path):
+def test_write_config_changed_scalar_keys_commit_pending_reboot(make_core0, tmp_path):
+    """Any changed key is REBOOT_REQUIRED: committed, no live apply, no
+    automatic reboot, the change summary naming each setting with old/new
+    values, sorted."""
     core0 = make_core0()
     candidate = _full_config()
     candidate["read_loop_sec"] = 40
     candidate["health_interval_sec"] = 120
 
-    _send(core0, _command("write-config", "cfg-wr-hot",
+    _send(core0, _command("write-config", "cfg-wr-changed",
                           payload={"config": candidate}))
-
-    # One logical transaction, held until Core 1 acks: no response yet, no
-    # user-command event, exactly one config-update request (both Core 1 keys,
-    # keyed by generation), and the file still pending (config.json.old kept).
-    assert core0._pending_config_update is not None
-    assert core0._intercore.event_queue.events == []
-    assert core0._intercore.config_update_lane.requests == [
-        {"generation": 1, "read_loop_sec": 40, "health_interval_sec": 120}
-    ]
-    assert core0._config_manager.transaction_active is True
-    assert (tmp_path / "config.json.old").exists()
-    assert core0._pending_core0_responses == []
-
-    # Core 1 applies and acknowledges: commit, steady state, transaction closed.
-    _ack(core0, success=True)
 
     response = _last_response(core0)
     assert response["success"] is True
     assert response["data"]["configuration_changed"] is True
-    assert response["data"]["classification"] == "HOT_RELOADED"
-    assert response["data"]["reboot_required"] is False
-    # Committed, steady state, transaction closed
+    assert response["data"]["classification"] == "REBOOT_REQUIRED"
+    assert response["data"]["reboot_required"] is True
+    # No automatic reboot: the explicit reboot command is still the only
+    # way the board resets.
+    assert core0._pending_reboot is None
+    # No live apply: Core 0's own configuration keeps its boot values.
+    assert core0._config["mqtt_command_poll_ms"] == 100
+    # Committed, steady state
+    assert core0._intercore.event_queue.events == []
     assert _committed(tmp_path) == candidate
     assert not (tmp_path / "config.json.old").exists()
     assert not (tmp_path / "config.json.tmp").exists()
-    assert core0._config_manager.transaction_active is False
-    assert core0._pending_config_update is None
+    assert core0._config_manager.reboot_required is True
     # The change summary names both settings with old/new values, sorted
     assert response["data"]["changes"] == [
         {
             "setting": "health_interval_sec",
-            "change_policy": "HOT_RELOADED",
             "original_value": 60,
             "new_value": 120,
         },
         {
             "setting": "read_loop_sec",
-            "change_policy": "HOT_RELOADED",
             "original_value": 20,
             "new_value": 40,
         },
     ]
-
-
-def test_write_config_hot_reload_applies_core0_keys_live(make_core0, tmp_path):
-    core0 = make_core0()
-    candidate = _full_config()
-    candidate["mqtt_command_poll_ms"] = 250
-    candidate["datetime_sync_interval_min"] = 30
-
-    _send(core0, _command("write-config", "cfg-wr-hot-c0",
-                          payload={"config": candidate}))
-
-    assert _last_response(core0)["success"] is True
-    # Core 0's live configuration carries the new values from now on
-    assert core0._config["mqtt_command_poll_ms"] == 250
-    assert core0._config["datetime_sync_interval_min"] == 30
-    # No Core 1 keys changed: no cross-core request at all and nothing pending
-    assert core0._intercore.event_queue.events == []
-    assert core0._intercore.config_update_lane.requests == []
-    assert core0._pending_config_update is None
-    # A Core 0-only hot write commits immediately (nothing is owed to Core 1)
-    assert _committed(tmp_path) == candidate
-    assert core0._config_manager.transaction_active is False
-
-
-def test_write_config_hot_reload_reanchors_poll_stamp(make_core0, tmp_path):
-    """A changed mqtt_command_poll_ms re-anchors the last-poll stamp at apply
-    time, so the new cadence starts cleanly (no stale-interval burst)."""
-    core0 = make_core0()
-    # Steady state: the clock has advanced and a poll already happened earlier.
-    _FAKE_TIME.now_ms = 5000
-    core0._last_command_poll_ms = 0
-    candidate = _full_config()
-    candidate["mqtt_command_poll_ms"] = 250
-
-    _send(core0, _command("write-config", "cfg-wr-poll",
-                          payload={"config": candidate}))
-
-    assert _last_response(core0)["success"] is True
-    assert core0._config["mqtt_command_poll_ms"] == 250
-    assert core0._last_command_poll_ms == 5000  # re-anchored to the reload instant
-
-
-def test_write_config_second_write_while_hot_pending_is_refused(make_core0, tmp_path):
-    """A HOT_RELOADED write is one-flight: while Core 1's acknowledgement is
-    outstanding, a second write-config is refused with a bounded error."""
-    core0 = make_core0()
-    candidate = _full_config()
-    candidate["read_loop_sec"] = 40
-    _send(core0, _command("write-config", "cfg-wr-first",
-                          payload={"config": candidate}))
-    assert core0._pending_config_update is not None
-
-    _send(core0, _command("write-config", "cfg-wr-second",
-                          payload={"config": candidate}))
-
-    response = _last_response(core0)
-    assert response["success"] is False
-    assert response["error"]["code"] == "config_update_in_progress"
-    # The first transaction is still pending and unaltered.
-    assert core0._pending_config_update is not None
-    assert core0._config_manager.transaction_active is True
-
-
-def test_write_config_hot_reload_rolls_back_when_core1_rejects(make_core0, tmp_path):
-    core0 = make_core0()
-    candidate = _full_config()
-    candidate["read_loop_sec"] = 40
-    candidate["mqtt_command_poll_ms"] = 250
-
-    _send(core0, _command("write-config", "cfg-wr-rollback",
-                          payload={"config": candidate}))
-
-    # Core 1 fails to apply the update and reports it back on the lane.
-    _ack(core0, success=False, code="core1_apply_failed")
-
-    response = _last_response(core0)
-    assert response["success"] is False
-    assert response["error"]["code"] == "core1_apply_failed"
-    # The committed configuration is back to the previous one, steady state
-    assert _committed(tmp_path) == _full_config()
-    assert not (tmp_path / "config.json.old").exists()
-    assert core0._config_manager.transaction_active is False
-    assert core0._config_manager.reboot_required is False
-    assert core0._pending_config_update is None
-    # Core 0's own value is restored (it was applied before the rejection);
-    # the Core 1 key was never in Core 0's split config.
-    assert core0._config["mqtt_command_poll_ms"] == 100
 
 
 def test_write_config_same_candidate_twice_is_unchanged(make_core0, tmp_path):
@@ -542,12 +404,8 @@ def test_write_config_same_candidate_twice_is_unchanged(make_core0, tmp_path):
     candidate["read_loop_sec"] = 40
     _send(core0, _command("write-config", "cfg-wr-first",
                           payload={"config": candidate}))
-    # Resolve the first (pending) transaction before the second write.
-    _ack(core0, success=True)
     assert _last_response(core0)["success"] is True
-    assert core0._pending_config_update is None
 
-    requests_after_first = len(core0._intercore.config_update_lane.requests)
     _send(core0, _command("write-config", "cfg-wr-second",
                           payload={"config": candidate}))
 
@@ -555,83 +413,8 @@ def test_write_config_same_candidate_twice_is_unchanged(make_core0, tmp_path):
     assert response["success"] is True
     assert response["data"]["classification"] == "UNCHANGED"
     assert response["data"]["changes"] == []
-    # UNCHANGED writes no cross-core request
-    assert len(core0._intercore.config_update_lane.requests) == requests_after_first
-
-
-def test_write_config_cancels_pending_reboot(make_core0, tmp_path):
-    core0 = make_core0()
-    reboot_candidate = _full_config()
-    reboot_candidate["source"] = "Other-Pico"
-    _send(core0, _command("write-config", "cfg-wr-reboot",
-                          payload={"config": reboot_candidate}))
-    assert core0._config_manager.reboot_required is True
-
-    # A candidate matching the ORIGINAL active config except one HOT key
-    # becomes the active configuration: the pending reboot is cancelled.
-    cancel = _full_config()
-    cancel["read_loop_sec"] = 40
-    _send(core0, _command("write-config", "cfg-wr-cancel",
-                          payload={"config": cancel}))
-
-    # Pending: the request crossed; Core 1 acks, and the commit cancels the
-    # pending reboot.
-    assert core0._intercore.config_update_lane.requests == [
-        {"generation": 1, "read_loop_sec": 40}
-    ]
-    _ack(core0, success=True)
-
-    response = _last_response(core0)
-    assert response["success"] is True
-    assert response["data"]["classification"] == "HOT_RELOADED"
-    assert response["data"]["reboot_required"] is False
-    assert core0._config_manager.reboot_required is False
-    assert _committed(tmp_path) == cancel
-
-    # A subsequent read-config reports the cancelled reboot: the persisted
-    # config and reboot_required false, not the stale pending state.
-    _send(core0, _command("read-config", "cfg-wr-cancel-read"))
-    read_response = _last_response(core0)
-    assert read_response["success"] is True
-    assert read_response["data"]["config"] == cancel
-    assert read_response["data"]["reboot_required"] is False
-
-
-def test_write_config_full_reset_to_active_cancels_pending(make_core0, tmp_path):
-    """Writing the ACTIVE configuration back verbatim while a different
-    reboot-required candidate is pending commits it and clears the pending
-    reboot: no pending difference remains and reboot_required is false."""
-    core0 = make_core0()
-    pending = _full_config()
-    pending["source"] = "Other-Pico"
-    _send(core0, _command("write-config", "cfg-wr-reset-1",
-                          payload={"config": pending}))
-    assert _last_response(core0)["data"]["classification"] == "REBOOT_REQUIRED"
-    assert core0._config_manager.reboot_required is True
-
-    # The reset candidate equals ACTIVE: changed versus PERSISTED (so it
-    # commits), but with an empty active-to-candidate difference (no hot
-    # keys to apply, no cross-core request).
-    _send(core0, _command("write-config", "cfg-wr-reset-2",
-                          payload={"config": _full_config()}))
-
-    response = _last_response(core0)
-    assert response["success"] is True
-    assert response["data"]["configuration_changed"] is True
-    assert response["data"]["classification"] == "HOT_RELOADED"
-    assert response["data"]["reboot_required"] is False
-    # The change summary reports what THIS write moved: the persisted
-    # candidate back to the active value.
-    assert response["data"]["changes"] == [{
-        "setting": "source",
-        "change_policy": "REBOOT_REQUIRED",
-        "original_value": "Other-Pico",
-        "new_value": "Test-Pico-2",
-    }]
-    assert core0._config_manager.reboot_required is False
-    assert core0._config_manager._active_snapshot is None
-    assert core0._config_manager.transaction_active is False
-    assert _committed(tmp_path) == _full_config()
+    assert response["data"]["reboot_required"] is True
+    assert core0._intercore.event_queue.events == []
 
 
 # --- write-config: REBOOT_REQUIRED ----------------------------------------------
@@ -641,7 +424,7 @@ def test_write_config_reboot_required_commits_without_applying(make_core0, tmp_p
     core0 = make_core0()
     candidate = _full_config()
     candidate["source"] = "Other-Pico"
-    candidate["read_loop_sec"] = 40  # a HOT key in the same write
+    candidate["read_loop_sec"] = 40  # a Core 1 scheduling key in the same write
 
     _send(core0, _command("write-config", "cfg-wr-reboot",
                           payload={"config": candidate}))
@@ -654,17 +437,16 @@ def test_write_config_reboot_required_commits_without_applying(make_core0, tmp_p
     # No automatic reboot: the explicit reboot command is still the only
     # way the board resets.
     assert core0._pending_reboot is None
-    # No runtime application at all: this is a MIXED candidate (a HOT key
-    # read_loop_sec plus a reboot key source), so no hot-update request
-    # crosses to Core 1 and Core 0's own live config is untouched.
+    # No live apply: Core 0's own running configuration keeps its boot
+    # values until the explicit reboot.
     assert core0._config["source"] == "Test-Pico-2"
-    assert core0._intercore.config_update_lane.requests == []
-    assert core0._pending_config_update is None
+    assert core0._config["mqtt_command_poll_ms"] == 100
+    assert core0._intercore.event_queue.events == []
     # The committed config is the candidate; steady state.
     assert _committed(tmp_path) == candidate
     assert not (tmp_path / "config.json.old").exists()
     assert core0._config_manager.reboot_required is True
-    # The change summary carries the mixed policies deterministically
+    # The change summary lists both settings deterministically
     settings = [c["setting"] for c in response["data"]["changes"]]
     assert settings == sorted(settings)
     assert settings == ["read_loop_sec", "source"]
@@ -691,9 +473,8 @@ def test_write_config_device_changes_are_compact_entries(make_core0, tmp_path):
     assert response["data"]["configuration_changed"] is True
     assert response["data"]["classification"] == "REBOOT_REQUIRED"
     assert response["data"]["reboot_required"] is True
-    # No runtime application of device changes, ever.
-    assert core0._intercore.config_update_lane.requests == []
-    assert core0._pending_config_update is None
+    # No live apply: no automatic reboot is armed by a device change.
+    assert core0._intercore.event_queue.events == []
     assert core0._pending_reboot is None
     devices_changes = [c for c in response["data"]["changes"] if c["setting"] == "devices"]
     assert [c["device_id"] for c in devices_changes] == [
@@ -701,7 +482,6 @@ def test_write_config_device_changes_are_compact_entries(make_core0, tmp_path):
     ]
     assert devices_changes[0] == {
         "setting": "devices",
-        "change_policy": "REBOOT_REQUIRED",
         "change_type": "ADDED",
         "device_id": "aaAddedDevice",
         "device_type": "bme280",
@@ -714,8 +494,8 @@ def test_write_config_device_changes_are_compact_entries(make_core0, tmp_path):
 
 
 def test_write_config_repeated_pending_reboot_writes(make_core0, tmp_path):
-    """A second reboot-required write while one is pending keeps the ORIGINAL
-    active snapshot and reports persisted-before -> candidate."""
+    """A second reboot-required write while one is pending reports
+    persisted-before -> candidate and keeps the reboot pending."""
     core0 = make_core0()
 
     first = _full_config()
@@ -738,8 +518,6 @@ def test_write_config_repeated_pending_reboot_writes(make_core0, tmp_path):
                      if c["setting"] == "source"][0]
     assert source_change["original_value"] == "Other-Pico"
     assert source_change["new_value"] == "Third-Pico"
-    # The active snapshot is still the pre-command-running configuration.
-    assert json.loads(core0._config_manager._active_snapshot)["source"] == "Test-Pico-2"
     assert _committed(tmp_path) == second
     assert core0._pending_reboot is None
 

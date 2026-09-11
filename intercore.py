@@ -542,56 +542,10 @@ class StateMailboxes:
             return self._utc_snapshot
 
 
-class ConfigUpdateLane:
-    """A narrow request/result lane for the HOT_RELOADED configuration apply
-    (internal runtime control, not an external command).
-
-    Core 0 posts a request carrying the Core 1-owned hot subset (changed
-    keys, plus a monotonic generation); Core 1 posts exactly one result for
-    that generation. Latest-value mailboxes under the same allocate_lock
-    discipline as StateMailboxes; one transaction in flight at a time (Core
-    0 enforces), and the generation keeps a stale result from being mistaken
-    for the current one."""
-
-    def __init__(self):
-        self._lock = _thread.allocate_lock()
-        self._request = None
-        self._result = None
-
-    def post_request(self, request):
-        if not isinstance(request, dict):
-            raise ValueError("config update request must be a dictionary")
-        with self._lock:
-            self._request = request
-
-    def take_request(self):
-        """The pending request (cleared on read), or None when none is pending."""
-        with self._lock:
-            request = self._request
-            self._request = None
-            return request
-
-    def post_result(self, result):
-        if not isinstance(result, dict):
-            raise ValueError("config update result must be a dictionary")
-        with self._lock:
-            self._result = result
-
-    def take_result_for(self, generation):
-        """The result posted for this generation (cleared on a match), else
-        None; a result for another generation is left in place for its owner."""
-        with self._lock:
-            result = self._result
-            if result is not None and result.get("generation") == generation:
-                self._result = None
-                return result
-            return None
-
-
 class InterCore:
     """Container exposing the explicit inter-core communication lanes.
 
-    The two FIFO lanes are heap-governed by the same board-specific free-heap thresholds -- the preferred reserve (start of pressure handling) and the minimum (hard survival floor) -- serialized on one shared heap-admission lock (the heap is global to both cores); the latest-value lanes (state snapshots, config-update request/result) are plain allocate_lock-guarded mailboxes."""
+    The two FIFO lanes are heap-governed by the same board-specific free-heap thresholds -- the preferred reserve (start of pressure handling) and the minimum (hard survival floor) -- serialized on one shared heap-admission lock (the heap is global to both cores); the latest-value state snapshots are plain allocate_lock-guarded mailboxes."""
 
     def __init__(self, minimum_free_heap_bytes, preferred_free_heap_bytes=None,
                  outbound_queue_max_messages=None):
@@ -622,4 +576,3 @@ class InterCore:
             minimum_free_heap_bytes, self._heap_admission_lock
         )
         self.state_mailboxes = StateMailboxes()
-        self.config_update_lane = ConfigUpdateLane()

@@ -78,28 +78,13 @@ _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS = 30000
 # ceilings under this constant.
 WDT_TIMEOUT_MS = 8000
 
-# HOT_RELOADED settings Core 0 applies to its live config at commit time;
-# Core 1's two HOT settings cross as an internal config-update event.
-_HOT_APPLY_CORE0_KEYS = (
-    "datetime_sync_interval_min",
-    "mqtt_command_poll_ms",
-    "mqtt_outbound_publish_delay_ms",
-    "network_snapshot_interval_sec",
-)
-_HOT_APPLY_CORE1_KEYS = ("read_loop_sec", "health_interval_sec")
-
-# Rollback key for the last-poll stamp: when mqtt_command_poll_ms changes the
-# stamp is re-anchored at apply time; the old value is kept for rollback.
-_POLL_STAMP_KEY = "_last_command_poll_ms"
-
-
 class Core0:
 
     def __init__(self, intercore, config, wifi_config, runtime_id, boot_ticks_ms, led_manager, config_manager):
         self._intercore = intercore
         self._config = config
         # Core 0 owns the configuration manager; it is never shared with
-        # Core 1, which only ever sees the internal config-update event.
+        # Core 1 (no live apply: a committed change takes effect at boot).
         self._config_manager = config_manager
         self._runtime_id = runtime_id
         self._uptime_state = create_uptime_state(boot_ticks_ms)
@@ -117,14 +102,6 @@ class Core0:
         # Recent command IDs (debounce cache, FIFO; see _RECENT_COMMAND_ID_CAPACITY).
         self._recent_command_ids = []
         self._pending_core0_responses = []
-        # A HOT_RELOADED write-config is one transaction across both cores:
-        # the response + commit are held until Core 1's ack (the run loop
-        # resolves it); _transaction_active stays True for the same window
-        # (single-flight).
-        self._pending_config_update = None
-        # Monotonic generation for config-update requests/results; a stale
-        # result can never be read as the current one.
-        self._config_update_generation = 0
         self._utc_request_counter = 0
         self._pending_utc_request_id = None
         self._utc_request_deadline_ms = None
@@ -245,14 +222,8 @@ class Core0:
         # Admit only if a response slot can be reserved first: otherwise the
         # command could execute and then lose its answer to a full queue,
         # with the sender's retry hitting the debounce cache above -- the
-        # command ran, the answer never arrived. The pending HOT transaction
-        # holds one slot too (reserved above) so its deferred acknowledgement
-        # cannot be overrun by a new admission.
-        reserved = 1 if self._pending_config_update is not None else 0
-        if (
-            len(self._pending_core0_responses) + reserved
-            >= _MAX_PENDING_CORE0_RESPONSES
-        ):
+        # command ran, the answer never arrived.
+        if len(self._pending_core0_responses) >= _MAX_PENDING_CORE0_RESPONSES:
             return
 
         # Claim the ID before deeper validation so a malformed duplicate
@@ -479,9 +450,9 @@ class Core0:
     def _handle_write_config_command(self, command_id, targeted, payload):
         """write-config: the payload is exactly {"config": <complete
         candidate>} -- no patch/merge/partial shape -- validated by the same
-        validate_config() as startup. UNCHANGED writes nothing; REBOOT_REQUIRED
-        commits; HOT_RELOADED is applied on both cores and committed once Core
-        1 acknowledges, rolled back with the file restored if it cannot be.
+        validate_config() as startup. UNCHANGED writes nothing; a changed
+        candidate commits and is pending a reboot -- no live apply, the
+        running firmware keeps its boot values until then.
         MemoryError propagates to the fail-fast boundary."""
         # Unknown payload keys are named together (sorted) regardless of the
         # rest of the payload.
@@ -515,18 +486,6 @@ class Core0:
             ))
             return
 
-        if self._config_manager.transaction_active:
-            # A hot transaction is pending Core 1's acknowledgement:
-            # single-flight, so a second write is refused with a bounded,
-            # non-executing answer.
-            self._queue_core0_response(self._command_error(
-                command_id, targeted, COMMAND_WRITE_CONFIG, {
-                    "code": "config_update_in_progress",
-                    "message": "A configuration update is already in progress",
-                },
-            ))
-            return
-
         try:
             result = self._config_manager.begin_write(candidate)
         except MemoryError:
@@ -547,48 +506,18 @@ class Core0:
             ))
             return
 
-        if not result["pending"]:
-            if result["classification"] == CLASSIFICATION_UNCHANGED:
-                message = ("[WARNING] write-config ignored: submitted "
-                           "configuration is identical to persisted "
-                           "configuration")
-                if self._config_manager.reboot_required:
-                    message += "; a reboot-required configuration remains pending"
-                print(message)
-            # UNCHANGED: no write, reboot state preserved. REBOOT_REQUIRED:
-            # committed, no runtime application owed.
-            self._queue_core0_response(
-                self._write_config_success(command_id, targeted, result)
-            )
-            return
-
-        # HOT_RELOADED: one transaction across both cores. No success
-        # response until Core 1's ack (run loop); a failed apply rolls Core 0
-        # and the file back so committed and running configuration agree.
-        old_values, core1_update = self._apply_hot_changes(result["changes"])
-        if not core1_update:
-            # Only Core 0-owned settings changed: nothing owed to Core 1,
-            # commit now.
-            self._config_manager.commit_hot_reload()
-            self._queue_core0_response(
-                self._write_config_success(command_id, targeted, result)
-            )
-            return
-
-        generation = self._next_config_update_generation()
-        request = {"generation": generation}
-        request.update(core1_update)
-        self._intercore.config_update_lane.post_request(request)
-        # Hold the response and rollback state until Core 1's ack (the run
-        # loop resolves it); _transaction_active stays True meanwhile
-        # (single-flight).
-        self._pending_config_update = {
-            "generation": generation,
-            "old_values": old_values,
-            "command_id": command_id,
-            "targeted": targeted,
-            "result": result,
-        }
+        if result["classification"] == CLASSIFICATION_UNCHANGED:
+            message = ("[WARNING] write-config ignored: submitted "
+                       "configuration is identical to persisted "
+                       "configuration")
+            if self._config_manager.reboot_required:
+                message += "; a reboot-required configuration remains pending"
+            print(message)
+        # UNCHANGED: no write, reboot state preserved. A changed candidate:
+        # committed, pending a reboot (no live apply).
+        self._queue_core0_response(
+            self._write_config_success(command_id, targeted, result)
+        )
 
     def _write_config_success(self, command_id, targeted, result):
         classification = result["classification"]
@@ -602,74 +531,12 @@ class Core0:
                 # of the reboot state it left behind.
                 "configuration_changed": classification != CLASSIFICATION_UNCHANGED,
                 "classification": classification,
-                # Derived at response time: True for REBOOT_REQUIRED, False
-                # for UNCHANGED without a pending reboot or after a hot
-                # commit cancels one.
+                # True once any committed change is pending a reboot,
+                # False at boot (and after that reboot).
                 "reboot_required": self._config_manager.reboot_required,
                 "changes": result["changes"],
             },
         }
-
-    def _apply_hot_changes(self, changes):
-        """Apply changed Core 0 HOT settings to the live config; return the
-        old values (for rollback, incl. the last-poll stamp) and the Core 1
-        update ({} when none)."""
-        old_values = {}
-        core1_update = {}
-        for change in changes:
-            setting = change["setting"]
-            if setting in _HOT_APPLY_CORE0_KEYS:
-                old_values[setting] = self._config[setting]
-                self._config[setting] = change["new_value"]
-                if setting == "mqtt_command_poll_ms":
-                    # Re-anchor the last-poll stamp to the reload instant so
-                    # the new cadence starts cleanly.
-                    old_values[_POLL_STAMP_KEY] = self._last_command_poll_ms
-                    self._last_command_poll_ms = time.ticks_ms()
-            elif setting in _HOT_APPLY_CORE1_KEYS:
-                core1_update[setting] = change["new_value"]
-        return old_values, core1_update
-
-    def _restore_hot_values(self, old_values):
-        for setting, value in old_values.items():
-            if setting == _POLL_STAMP_KEY:
-                self._last_command_poll_ms = value
-            else:
-                self._config[setting] = value
-
-    def _next_config_update_generation(self):
-        self._config_update_generation += 1
-        return self._config_update_generation
-
-    def _resolve_pending_config_update(self):
-        """Resolve a pending HOT apply once Core 1's ack is on the lane:
-        success commits (releasing the retained config.json.old) and releases
-        the held response; a failed apply rolls back and answers a bounded
-        error. A dead Core 1 never acks, but the liveness watchdog bounds
-        that (board reset; boot recovery restores config.json.old)."""
-        pending = self._pending_config_update
-        if pending is None:
-            return
-        result = self._intercore.config_update_lane.take_result_for(
-            pending["generation"]
-        )
-        if result is None:
-            return
-        self._pending_config_update = None
-        if result.get("success"):
-            self._config_manager.commit_hot_reload()
-            self._queue_core0_response(self._write_config_success(
-                pending["command_id"], pending["targeted"], pending["result"]
-            ))
-        else:
-            self._restore_hot_values(pending["old_values"])
-            self._config_manager.rollback_hot_reload()
-            self._queue_core0_response(self._command_error(
-                pending["command_id"], pending["targeted"], COMMAND_WRITE_CONFIG, {
-                    "code": result.get("code") or "core1_apply_failed",
-                    "message": "Core 1 could not apply the configuration update",
-                },
-            ))
 
     def _is_recent_command_id(self, command_id):
         """True if command_id is still claimed in the debounce cache (exact, case-sensitive)."""
@@ -1431,18 +1298,11 @@ class Core0:
             self._watch_core_1_heartbeat()
             self._feed_watchdog()
 
-            # Resolve a pending HOT apply now that the watchdog has run: if
-            # Core 1 is dead it has already reset, so no unbounded wait can
-            # accumulate here.
-            self._resolve_pending_config_update()
-
             if self._reboot_publish_due():
                 self._perform_reboot()
 
             self._recover_network_if_needed()
 
-            # Read per pass (not captured once): a HOT_RELOADED
-            # mqtt_command_poll_ms applies from the next pass.
             now_ms = time.ticks_ms()
             if time.ticks_diff(now_ms, self._last_command_poll_ms) >= self._config["mqtt_command_poll_ms"]:
                 try:

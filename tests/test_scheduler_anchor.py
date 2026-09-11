@@ -601,10 +601,9 @@ def test_core1_uses_one_shared_normal_runtime_anchor():
     time.ticks_ms() before the run loop, and both deadlines initialize
     from it and advance from their own previous deadline.
 
-    The deadlines live in the schedulers holder (schedulers["next_*_ms"]) so
-    a HOT_RELOADED write-config can re-anchor them in place (from the reload
-    instant, in _apply_config_update); this core1_main body only writes the
-    anchor-derived init and the in-loop advances.
+    The deadlines live in the schedulers holder (schedulers["next_*_ms"]);
+    this core1_main body only writes the anchor-derived init and the
+    in-loop advances.
     """
     tree = ast.parse((ROOT / "core1.py").read_text())
     func = next(n for n in ast.walk(tree)
