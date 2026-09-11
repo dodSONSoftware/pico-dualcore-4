@@ -236,8 +236,7 @@ def test_build_startup_log_structure(monkeypatch):
     # The message carries only Core 1's own fields: the envelope keys
     # (sequence, runtime_id, source, firmware_version, message_schema_version)
     # are Core 0's and are injected at publish time. The event log carries the
-    # startup summary only -- the system_information sections travel as their
-    # own best-effort section logs (diagnostics_parts pins how many follow).
+    # startup summary only.
     message = {
         "message_type": "log",
         "uptime_ms": 5000,
@@ -262,7 +261,6 @@ def test_build_startup_log_structure(monkeypatch):
                     "devices_configured": 1,
                     "devices_ready": 1,
                     "devices_failed": 0,
-                    "diagnostics_parts": 9,
                 },
             },
         },
@@ -531,7 +529,6 @@ _DETAIL_MESSAGE = {
                 "devices_configured": 1,
                 "devices_ready": 1,
                 "devices_failed": 0,
-                "diagnostics_parts": 9,
                 "ready_devices": [
                     {"device": "d", "name": "n" * 5000}
                 ],
@@ -609,9 +606,6 @@ def test_build_startup_log_bounded_omits_unbounded_sections(monkeypatch):
     assert startup["devices_failed"] == 1
     assert "ready_devices" not in startup
     assert "failed_devices" not in startup
-    # The part stream still follows the fallback: the count is pinned so
-    # a consumer can account for the best-effort parts.
-    assert startup["diagnostics_parts"] == len(core1._STARTUP_INFORMATION_PARTS)
     assert "system_information" not in data
     assert payload["message_type"] == "log"
     assert payload["payload"]["event"] == "system_startup_completed"
@@ -751,7 +745,7 @@ def test_admit_with_fallback_memory_error_on_fallback_propagates(monkeypatch):
 
 
 def test_build_startup_log_event_shape_has_no_system_information(monkeypatch):
-    """The real event log carries the startup summary only -- no system_information key, diagnostics_parts pinning the part stream, and failure_reason on (only) the failed devices."""
+    """The real event log carries the startup summary only -- no system_information key, and failure_reason on (only) the failed devices."""
     core1 = _core1_module(monkeypatch)
 
     class MockDeviceManager:
@@ -779,318 +773,7 @@ def test_build_startup_log_event_shape_has_no_system_information(monkeypatch):
     data = payload["payload"]["data"]
     assert set(data) == {"startup"}, "the event log must not embed the system_information snapshot"
     startup = data["startup"]
-    assert startup["diagnostics_parts"] == len(core1._STARTUP_INFORMATION_PARTS)
     assert startup["ready_devices"] == [{"device": "bme280", "name": "ok"}]
     assert startup["failed_devices"] == [
         {"device": "bme280", "name": "bad", "failure_reason": "I2C device not found"}
     ], "failed devices carry their failure_reason; ready devices do not"
-
-
-# ---------------------------------------------------------------------------
-# Best-effort system_information section stream
-# ---------------------------------------------------------------------------
-#
-# The startup event log no longer embeds the full system_information
-# snapshot: each section travels as its own small log (event
-# "system_information"), admitted best-effort after the event log. Each part
-# is built and serialized individually (one section graph + one buffer, never
-# the combined snapshot), so a memory-tight board that cannot hold the
-# combined object can still emit the parts it can. A permanent rejection or a
-# serialization MemoryError skips the section (with a warning) and the stream
-# continues: a diagnostic must never halt boot or reach the recovery
-# boundary, and the section's data stays retrievable via get-details.
-# part/parts make a skipped section detectable as a gap; the event log's
-# diagnostics_parts pins the total.
-
-
-class _SectionSource:
-    """Fake SystemInformation for the section stream: all nine getters, with
-    optional per-section faults (getter exception, getter MemoryError,
-    non-JSON-safe value) and a counter on get_device_sections()."""
-
-    def __init__(self, device_sections=None, getter_error=None,
-                 getter_memory_error=None, non_json_safe=None):
-        self.device_sections = device_sections or {
-            "devices": {"configured": 1, "active": 1},
-            "device_status": [{"id": "d0", "state": "ready"}],
-        }
-        self.getter_error = getter_error
-        self.getter_memory_error = getter_memory_error
-        self.non_json_safe = non_json_safe
-        self.device_section_calls = 0
-
-    def _maybe_fail(self, section):
-        """Raise for the faulted section, return the non-JSON-safe value for
-        the non-JSON-safe section, else None (the getter returns its normal
-        value)."""
-        if self.getter_memory_error == section:
-            raise MemoryError("no run for section")
-        if self.getter_error == section:
-            raise RuntimeError("getter blew up")
-        if self.non_json_safe == section:
-            return {123: "non-string key"}
-        return None
-
-    def get_device_sections(self):
-        self.device_section_calls += 1
-        failed = self._maybe_fail("devices")
-        if failed is not None:
-            return failed
-        return self.device_sections
-
-    def get_network(self):
-        failed = self._maybe_fail("network")
-        if failed is not None:
-            return failed
-        return {"ssid": "test-ssid"}
-
-    def get_memory(self):
-        failed = self._maybe_fail("memory")
-        if failed is not None:
-            return failed
-        return {"heap_alloc_bytes": 1, "heap_free_bytes": 2, "heap_total_bytes": 3}
-
-    def get_runtime(self):
-        failed = self._maybe_fail("runtime")
-        if failed is not None:
-            return failed
-        return {"read_loop_sec": 20}
-
-    def get_cpu(self):
-        failed = self._maybe_fail("cpu")
-        if failed is not None:
-            return failed
-        return {"frequency_hz": 125000000}
-
-    def get_machine(self):
-        failed = self._maybe_fail("machine")
-        if failed is not None:
-            return failed
-        return {"hardware_type": "pico_w", "machine": "Raspberry Pi Pico W"}
-
-    def get_communications(self):
-        failed = self._maybe_fail("communications")
-        if failed is not None:
-            return failed
-        return {"wifi_connected": True, "mqtt_connected": True}
-
-    def get_queues(self):
-        failed = self._maybe_fail("queues")
-        if failed is not None:
-            return failed
-        return {"outbound_pending": 0}
-
-
-class _RecordingSectionQueue:
-    """Admits everything; records (kind, decoded message, priority) per call."""
-
-    def __init__(self):
-        self.entries = []
-
-    def put_with_kind(self, kind, payload_bytes, retention_priority):
-        import json
-        self.entries.append((
-            kind,
-            json.loads(bytes(payload_bytes).decode("utf-8")),
-            retention_priority,
-        ))
-        return True
-
-
-class _RejectingSectionQueue:
-    """Permanently rejects one named section; admits and records the rest."""
-
-    def __init__(self, reject_section):
-        self.reject_section = reject_section
-        self.entries = []
-
-    def put_with_kind(self, kind, payload_bytes, retention_priority):
-        import json
-        message = json.loads(bytes(payload_bytes).decode("utf-8"))
-        if message["payload"]["data"]["section"] == self.reject_section:
-            raise ValueError("Message size 20000 exceeds maximum 16384")
-        self.entries.append((kind, message, retention_priority))
-        return True
-
-
-class _FlakySectionQueue:
-    """Every odd put_with_kind() call is a transient rejection."""
-
-    def __init__(self):
-        self.calls = 0
-        self.entries = []
-
-    def put_with_kind(self, kind, payload_bytes, retention_priority):
-        self.calls += 1
-        if self.calls % 2 == 1:
-            return False
-        import json
-        self.entries.append((
-            kind,
-            json.loads(bytes(payload_bytes).decode("utf-8")),
-            retention_priority,
-        ))
-        return True
-
-
-class _SectionBus:
-    """InterCore stand-in: the queue under test plus no UTC snapshot (the
-    section envelope leaves the timestamp null rather than failing)."""
-
-    def __init__(self, queue):
-        self.outbound_queue = queue
-        self.state_mailboxes = MagicMock()
-        self.state_mailboxes.get_utc_snapshot = lambda: None
-
-
-def _run_sections(monkeypatch, core1, queue, source, uptime_ms=1000):
-    """Drive the real section stream with a fixed uptime; return the admitted
-    messages in order."""
-    monkeypatch.setattr(core1, "current_uptime_ms", lambda state: uptime_ms)
-    core1._admit_startup_information_sections(_SectionBus(queue), {}, source)
-    return [message for _, message, _ in queue.entries]
-
-
-def test_section_stream_emits_one_log_per_part_in_order(monkeypatch):
-    """One system_information log per _STARTUP_INFORMATION_PARTS entry (7 parts, the cpu/machine and devices/device_status pairs combined), in order, with 1-based part/parts, under KIND_LOG at INFO retention. A combined part carries the comma-joined label and a value keyed by section name; the device snapshot is walked once, not twice."""
-    core1 = _core1_module(monkeypatch)
-    from intercore import KIND_LOG, RETENTION_PRIORITY_INFO
-
-    parts = core1._STARTUP_INFORMATION_PARTS
-    queue = _RecordingSectionQueue()
-    source = _SectionSource()
-    _run_sections(monkeypatch, core1, queue, source)
-
-    assert len(queue.entries) == len(parts)
-    for index, sections in enumerate(parts, start=1):
-        kind, message, priority = queue.entries[index - 1]
-        assert kind == KIND_LOG
-        assert priority == RETENTION_PRIORITY_INFO
-        assert message["message_type"] == "log"
-        assert message["payload"]["event"] == "system_information"
-        assert message["payload"]["module"] == "system"
-        assert message["uptime_ms"] == 1000
-        data = message["payload"]["data"]
-        assert data["section"] == ",".join(sections)
-        assert data["part"] == index
-        assert data["parts"] == len(parts)
-    # The device sections share one snapshot walk (the combined part takes it once).
-    assert source.device_section_calls == 1
-    by_part = {
-        message["payload"]["data"]["section"]: message["payload"]["data"]["value"]
-        for _, message, _ in queue.entries
-    }
-    assert by_part["network"] == {"ssid": "test-ssid"}
-    # Combined parts carry a value keyed by section name.
-    assert by_part["devices,device_status"] == source.device_sections
-    assert by_part["cpu,machine"] == {
-        "cpu": {"frequency_hz": 125000000},
-        "machine": {"hardware_type": "pico_w", "machine": "Raspberry Pi Pico W"},
-    }
-
-
-def test_section_stream_permanent_rejection_skips_part_and_continues(monkeypatch):
-    """A permanently rejected part is skipped with a warning; the parts behind it are still emitted (the gap is detectable via part)."""
-    core1 = _core1_module(monkeypatch)
-    labels = [",".join(sections) for sections in core1._STARTUP_INFORMATION_PARTS]
-
-    queue = _RejectingSectionQueue("network")
-    sections = [
-        m["payload"]["data"]["section"] for m in _run_sections(monkeypatch, core1, queue, _SectionSource())
-    ]
-    assert sections == [label for label in labels if label != "network"]
-
-
-def test_section_stream_transient_rejection_retried_once(monkeypatch):
-    """A transient rejection of a part keeps the single 100 ms retry: every part is admitted on its second attempt."""
-    core1 = _core1_module(monkeypatch)
-    parts = len(core1._STARTUP_INFORMATION_PARTS)
-
-    queue = _FlakySectionQueue()
-    fake_time = _RecordingTime()
-    monkeypatch.setattr(core1, "time", fake_time)
-    _run_sections(monkeypatch, core1, queue, _SectionSource())
-
-    assert len(queue.entries) == parts
-    assert queue.calls == 2 * parts, "exactly one retry per part"
-    assert fake_time.sleeps == [100] * parts
-
-
-def test_section_stream_serialization_memory_error_skips_part_without_propagation(monkeypatch):
-    """A serialization MemoryError on one part (the Pico W's fragmented pool) is answered with gc + one retry, then a skip -- never a propagation to the recovery boundary."""
-    core1 = _core1_module(monkeypatch)
-    import json as _json
-    labels = [",".join(sections) for sections in core1._STARTUP_INFORMATION_PARTS]
-
-    def _memory_error_for_communications(message):
-        if message["payload"].get("data", {}).get("section") == "communications":
-            raise MemoryError("no run for the serialized form")
-        return _json.dumps(message).encode("utf-8")
-
-    monkeypatch.setattr(core1, "serialize_and_validate_message", _memory_error_for_communications)
-    fake_gc = MagicMock()
-    monkeypatch.setattr(core1, "gc", fake_gc)
-
-    sections = [
-        m["payload"]["data"]["section"]
-        for m in _run_sections(monkeypatch, core1, _RecordingSectionQueue(), _SectionSource())
-    ]
-    assert sections == [label for label in labels if label != "communications"]
-    assert fake_gc.collect.called, "a reclaim is attempted before the skip"
-
-
-def test_section_stream_getter_error_yields_error_value(monkeypatch):
-    """A non-MemoryError getter failure still emits the part, with the bounded error value under that section's key (mirroring _collect_system_information_full's per-section contract)."""
-    core1 = _core1_module(monkeypatch)
-    queue = _RecordingSectionQueue()
-    _run_sections(monkeypatch, core1, queue, _SectionSource(getter_error="cpu"))
-    by_part = {
-        message["payload"]["data"]["section"]: message["payload"]["data"]["value"]
-        for _, message, _ in queue.entries
-    }
-    # cpu is combined with machine: the failed getter is the bounded error value
-    # under its own key, and machine still carries its real value.
-    assert by_part["cpu,machine"]["cpu"] == {"error": "getter blew up"}
-    assert by_part["cpu,machine"]["machine"] == {
-        "hardware_type": "pico_w",
-        "machine": "Raspberry Pi Pico W",
-    }
-
-
-def test_section_stream_getter_memory_error_skips_without_propagation(monkeypatch):
-    """A getter MemoryError skips the part and never propagates."""
-    core1 = _core1_module(monkeypatch)
-    labels = [",".join(sections) for sections in core1._STARTUP_INFORMATION_PARTS]
-    queue = _RecordingSectionQueue()
-    sections = [
-        m["payload"]["data"]["section"]
-        for m in _run_sections(monkeypatch, core1, queue, _SectionSource(getter_memory_error="queues"))
-    ]
-    assert sections == [label for label in labels if label != "queues"]
-
-
-def test_section_stream_non_json_safe_section_skips_its_part(monkeypatch):
-    """A section value that is not JSON-safe skips its whole part (a detectable gap): machine is combined with cpu, so a non-JSON-safe machine value drops the entire cpu,machine part."""
-    core1 = _core1_module(monkeypatch)
-    labels = [",".join(sections) for sections in core1._STARTUP_INFORMATION_PARTS]
-    queue = _RecordingSectionQueue()
-    sections = [
-        m["payload"]["data"]["section"]
-        for m in _run_sections(monkeypatch, core1, queue, _SectionSource(non_json_safe="machine"))
-    ]
-    assert sections == [label for label in labels if label != "cpu,machine"]
-
-
-def test_section_stream_getter_memory_error_skips_whole_combined_part(monkeypatch):
-    """A getter MemoryError on one section of a combined part skips the whole
-    part (both sections drop): the part's value is gathered together, so a
-    MemoryError while taking either section skips both."""
-    core1 = _core1_module(monkeypatch)
-    labels = [",".join(sections) for sections in core1._STARTUP_INFORMATION_PARTS]
-    queue = _RecordingSectionQueue()
-    sections = [
-        m["payload"]["data"]["section"]
-        for m in _run_sections(monkeypatch, core1, queue, _SectionSource(getter_memory_error="cpu"))
-    ]
-    # machine was healthy but rides with the failed cpu in the combined part.
-    assert sections == [label for label in labels if label != "cpu,machine"]

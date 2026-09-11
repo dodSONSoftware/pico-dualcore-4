@@ -213,7 +213,7 @@ Health messages are controlled by:
 - `mqtt_topic_health`: MQTT topic for health messages (default: `iot/v3/health`)
 - `health_interval_sec`: Interval between health messages (default: 60 seconds)
 
-The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` from a single runtime anchor captured once, after the startup log stream completes (the event log admitted, the best-effort part stream emitted). Telemetry shares the same anchor (`anchor + n × read_loop_sec`) but keeps its own independent scheduler. Boundaries missed during startup or an outage are skipped, never replayed, and deadlines advance from the previous deadline so processing delay cannot accumulate drift. See the scheduling sections in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` from a single runtime anchor captured once, after the startup event log is admitted. Telemetry shares the same anchor (`anchor + n × read_loop_sec`) but keeps its own independent scheduler. Boundaries missed during startup or an outage are skipped, never replayed, and deadlines advance from the previous deadline so processing delay cannot accumulate drift. See the scheduling sections in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Features
 

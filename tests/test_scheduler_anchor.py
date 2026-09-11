@@ -32,7 +32,6 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from config import split_config  # noqa: E402
-from devices.system_information.validation import STARTUP_INFORMATION_PARTS  # noqa: E402
 from intercore import (  # noqa: E402
     InterCore,
     KIND_COMMAND_RESPONSE,
@@ -273,16 +272,11 @@ def test_telemetry_and_health_share_the_same_anchor():
     _run_core1(fake_time, bus, _core1_config(), boot_ticks_ms)
 
     telemetry, health, others = _drain_outbound(bus)
-    # The startup event log is admitted first, then the best-effort
-    # system_information part stream (one log per part).
-    assert len(others) == 1 + len(STARTUP_INFORMATION_PARTS)
+    # The startup event log is the only log admitted at startup.
+    assert len(others) == 1
     startup_log = json.loads(others[0]["payload_bytes"].decode("utf-8"))
     assert others[0]["kind"] == KIND_LOG
     assert startup_log["payload"]["event"] == "system_startup_completed"
-    for index, entry in enumerate(others[1:], start=1):
-        part_log = json.loads(entry["payload_bytes"].decode("utf-8"))
-        assert part_log["payload"]["event"] == "system_information"
-        assert part_log["payload"]["data"]["part"] == index
     # Under the fake clock no time elapses between admission and the
     # anchor capture, so the startup log's uptime IS the anchor offset.
     anchor_uptime = startup_log["uptime_ms"]
