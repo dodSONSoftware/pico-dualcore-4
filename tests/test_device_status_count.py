@@ -4,9 +4,9 @@
 
 """Host-side tests for the status snapshot's active-count semantics.
 
-The documented contract: devices_configured = number of configured devices, devices_active = number of active/ready devices, device_failures = devices_configured - devices_active.
+The documented contract: devices_configured = number of configured devices, devices_active = number of active/ready devices.
 
-A device that has accumulated enough read failures is marked reinitialize_pending and intentionally remains in DeviceManager._active_devices (it must stay eligible for reinitialization). It is NOT currently ready, however, so the status snapshot must not count it as active: with one configured device that is reinit-pending, the snapshot must report active == 0 so the derived device_failures is 1 and the device_count_mismatch degradation reason can fire."""
+A device that has accumulated enough read failures is marked reinitialize_pending and intentionally remains in DeviceManager._active_devices (it must stay eligible for reinitialization). It is NOT currently ready, however, so the status snapshot must not count it as active: with one configured device that is reinit-pending, the snapshot must report active == 0 so the device_count_mismatch degradation reason can fire."""
 
 import pathlib
 import sys
@@ -84,7 +84,7 @@ def test_reinitialize_pending_device_does_not_count_as_active():
 
     assert devices["configured"] == 1
     assert devices["active"] == 0
-    # device_failures (configured - active, derived by consumers) is 1.
+    # configured - active is 1: the device_count_mismatch degradation input.
     assert devices["configured"] - devices["active"] == 1
     # The per-device state is still reported.
     assert snapshot["device_status"][0]["state"] == dm.DEVICE_STATE_REINITIALIZE_PENDING

@@ -283,12 +283,10 @@ def test_healthy_state_payload(health):
     assert p["network_stack_ready"] is True
     assert p["devices_configured"] == 1
     assert p["devices_active"] == 1
+    assert p["free_heap_bytes"] == 100000
+    assert p["minimum_free_heap_bytes"] == 65536
     assert p["outbound_queue_depth"] == 0
-    assert p["outbound_queued_bytes"] == 0
-    assert p["outbound_queue_high_watermark"] == 0
-    assert p["outbound_queue_high_watermark_bytes"] == 0
     assert p["outbound_evicted"] == 0
-    assert p["telemetry_evicted"] == 0
     assert p["outbound_rejected"] == 0
     assert p["utc_valid"] is True
     assert payload["uptime_ms"] == NOW_MS - BOOT_TICKS_MS  # 10000
@@ -345,16 +343,14 @@ def test_core_1_inactive_triggers_degraded(health):
     assert "core_1_inactive" in payload["payload"]["degraded_reasons"]
 
 
-def test_retained_queue_metrics_in_payload(health):
-    """Retained entries, depth, bytes, and high watermarks are reported."""
+def test_queue_depth_and_counters_in_payload(health):
+    """Queue depth and the eviction/rejection counters are reported (the
+    byte and high-watermark metrics are no longer in the health payload)."""
     health.set_healthy_baseline()
     health.set_utc(_valid_utc_snapshot())
-    entries = []
     for i in range(3):
-        entry = json.dumps({"id": i}).encode()
-        entries.append(entry)
         assert health.bus.outbound_queue.put_with_kind(
-            KIND_HEALTH, entry, RETENTION_PRIORITY_HEALTH
+            KIND_HEALTH, json.dumps({"id": i}).encode(), RETENTION_PRIORITY_HEALTH
         )
 
     payload = health.build()
@@ -362,11 +358,7 @@ def test_retained_queue_metrics_in_payload(health):
 
     assert p["status"] == "healthy"
     assert p["outbound_queue_depth"] == 3
-    assert p["outbound_queued_bytes"] == sum(len(e) for e in entries)
-    assert p["outbound_queue_high_watermark"] == 3
-    assert p["outbound_queue_high_watermark_bytes"] == sum(len(e) for e in entries)
     assert p["outbound_evicted"] == 0
-    assert p["telemetry_evicted"] == 0
     assert p["outbound_rejected"] == 0
 
 
@@ -464,7 +456,7 @@ def test_runtime_and_uptime_values(health):
 
 
 def test_payload_structure_matches_spec(health):
-    """The health payload carries every field the schema specifies."""
+    """The health payload carries exactly the operational-core field set."""
     health.set_healthy_baseline()
     health.set_utc(_valid_utc_snapshot())
 
@@ -479,19 +471,15 @@ def test_payload_structure_matches_spec(health):
                 "message_schema_version"):
         assert key not in payload
 
-    p = payload["payload"]
-    for field in (
-        "status", "degraded_reasons", "hardware_type", "machine", "cpu_temperature_c",
+    expected_fields = {
+        "status", "degraded_reasons", "cpu_temperature_c",
         "network_stack_ready", "wifi_connected", "wifi_rssi_dbm", "mqtt_connected",
-        "core_1_active", "core_1_activity_age_ms", "free_heap_bytes",
-        "minimum_free_heap_bytes", "heap_headroom_bytes", "devices_configured",
-        "devices_active", "device_failures", "outbound_queue_depth",
-        "outbound_queued_bytes", "outbound_queue_high_watermark",
-        "outbound_queue_high_watermark_bytes", "outbound_evicted",
-        "telemetry_evicted", "outbound_rejected",
+        "core_1_active", "free_heap_bytes", "minimum_free_heap_bytes",
+        "devices_configured", "devices_active", "outbound_queue_depth",
+        "outbound_evicted", "outbound_rejected",
         "utc_valid", "utc_sync_age_sec",
-    ):
-        assert field in p
+    }
+    assert set(payload["payload"]) == expected_fields
 
 
 def test_payload_is_json_safe(health):
@@ -543,7 +531,8 @@ def test_queue_depth_calculation():
 # Conditional / extended fields
 # ---------------------------------------------------------------------------
 
-def test_hardware_type_and_machine_fields(health):
+def test_minimum_free_heap_bytes_field(health):
+    """The board's hard floor flows from the hardware snapshot."""
     health.set_healthy_baseline()
     health.set_utc(_valid_utc_snapshot())
     health.set_hardware({
@@ -555,10 +544,7 @@ def test_hardware_type_and_machine_fields(health):
 
     payload = health.build()
 
-    p = payload["payload"]
-    assert p["hardware_type"] == "pico_2_w"
-    assert p["machine"] == "Raspberry Pi Pico 2 W with RP2350"
-    assert p["minimum_free_heap_bytes"] == 131072
+    assert payload["payload"]["minimum_free_heap_bytes"] == 131072
 
 
 def test_cpu_temperature_field(health):
@@ -622,46 +608,6 @@ def test_wifi_rssi_dbm_null_when_unavailable(health):
     assert payload["payload"]["wifi_rssi_dbm"] is None
 
 
-def test_heap_headroom_bytes_field(health):
-    """heap_headroom_bytes = free_heap - minimum_free_heap."""
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    health.set_free_heap(100000)
-    health.set_hardware({
-        "hardware_type": "pico_w", "machine": "Pico W", "minimum_free_heap_bytes": 65536,
-    })
-
-    payload = health.build()
-
-    assert payload["payload"]["free_heap_bytes"] == 100000
-    assert payload["payload"]["heap_headroom_bytes"] == 100000 - 65536  # 34464
-
-
-def test_heap_headroom_negative_when_low(health):
-    """heap_headroom_bytes is negative when free heap is below the reserve."""
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    health.set_free_heap(100000)
-    health.set_hardware({
-        "hardware_type": "pico_w", "machine": "Pico W", "minimum_free_heap_bytes": 120000,
-    })
-
-    payload = health.build()
-
-    assert payload["payload"]["heap_headroom_bytes"] == 100000 - 120000  # -20000
-
-
-def test_core_1_activity_age_ms_field(health):
-    health.set_healthy_baseline()
-    health.set_utc(_valid_utc_snapshot())
-    health.set_core_1_activity(NOW_MS - 43)  # 43ms ago
-
-    payload = health.build()
-
-    assert payload["payload"]["core_1_activity_age_ms"] == 43
-    assert payload["payload"]["core_1_active"] is True
-
-
 def test_utc_sync_age_sec_field(health):
     health.set_healthy_baseline()
     health.set_utc(_valid_utc_snapshot(age_ms=10000))  # 10s ago
@@ -682,8 +628,10 @@ def test_utc_sync_age_null_when_not_synchronized(health):
     assert payload["payload"]["utc_sync_age_sec"] is None
 
 
-def test_device_state_and_failures(health):
-    """device_failures = devices_configured - devices_active."""
+def test_device_state_and_mismatch(health):
+    """A configured-but-not-active device degrades health via
+    device_count_mismatch (the derived device_failures field is gone; the
+    counts are the source of truth)."""
     health.set_healthy_baseline()
     health.set_utc(_valid_utc_snapshot())
     health.set_devices(1, 0)  # 0 active of 1 configured
@@ -693,7 +641,6 @@ def test_device_state_and_failures(health):
     p = payload["payload"]
     assert p["devices_configured"] == 1
     assert p["devices_active"] == 0
-    assert p["device_failures"] == 1
     assert "device_count_mismatch" in p["degraded_reasons"]
 
 

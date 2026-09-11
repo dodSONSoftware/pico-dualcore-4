@@ -637,25 +637,12 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     try:
         hardware = intercore.state_mailboxes.get_hardware()
         minimum_free_heap = hardware.get("minimum_free_heap_bytes") if hardware else 65536
-        # The preferred reserve defaults to the hard floor for
-        # single-threshold hardware snapshots.
-        preferred_free_heap = (
-            hardware.get("preferred_free_heap_bytes", minimum_free_heap)
-            if hardware else 65536
-        )
-        hardware_type = hardware.get("hardware_type", "unknown")
-        machine = hardware.get("machine", "unknown")
     except MemoryError:
         raise
     except Exception:
         minimum_free_heap = 65536
-        preferred_free_heap = 65536
-        hardware_type = "unknown"
-        machine = "unknown"
 
     wifi_rssi_dbm = network_snapshot.get("rssi")
-
-    heap_headroom_bytes = free_heap - minimum_free_heap
 
     # UTC sync age: current_uptime - sync_uptime on the shared boot base
     # (correct for any duration, unlike a one-shot ticks_diff past half a
@@ -663,8 +650,6 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     utc_sync_age_sec = None
     if utc_snapshot is not None:
         utc_sync_age_sec = (uptime_ms - utc_snapshot["sync_uptime_ms"]) // 1000
-
-    device_failures = devices_configured - devices_active
 
     degraded_reasons = []
     network_stack_ready = bool(network_snapshot.get("network_stack_ready"))
@@ -701,28 +686,18 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
         "payload": {
             "status": status,
             "degraded_reasons": degraded_reasons,
-            "hardware_type": hardware_type,
-            "machine": machine,
             "cpu_temperature_c": cpu_temperature_c,
             "network_stack_ready": network_stack_ready,
             "wifi_connected": wifi_connected,
             "wifi_rssi_dbm": wifi_rssi_dbm,
             "mqtt_connected": mqtt_connected,
             "core_1_active": core_1_active,
-            "core_1_activity_age_ms": core_1_activity_age_ms,
             "free_heap_bytes": free_heap,
-            "preferred_free_heap_bytes": preferred_free_heap,
             "minimum_free_heap_bytes": minimum_free_heap,
-            "heap_headroom_bytes": heap_headroom_bytes,
             "devices_configured": devices_configured,
             "devices_active": devices_active,
-            "device_failures": device_failures,
             "outbound_queue_depth": outbound_status["depth"],
-            "outbound_queued_bytes": outbound_status["queued_bytes"],
-            "outbound_queue_high_watermark": outbound_status["high_watermark"],
-            "outbound_queue_high_watermark_bytes": outbound_status["high_watermark_bytes"],
             "outbound_evicted": outbound_status["messages_evicted"],
-            "telemetry_evicted": outbound_status["telemetry_evicted"],
             "outbound_rejected": outbound_status["messages_rejected"],
             "utc_valid": utc_valid,
             "utc_sync_age_sec": utc_sync_age_sec,

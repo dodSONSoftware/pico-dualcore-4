@@ -18,28 +18,18 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
   "payload": {
     "status": "healthy|degraded",
     "degraded_reasons": ["<reason1>", "<reason2>"],
-    "hardware_type": "pico_w|pico_2_w",
-    "machine": "Raspberry Pi Pico W with RP2040",
     "cpu_temperature_c": 42.3,
     "network_stack_ready": true,
     "wifi_connected": true,
     "wifi_rssi_dbm": -45,
     "mqtt_connected": true,
     "core_1_active": true,
-    "core_1_activity_age_ms": 42,
     "free_heap_bytes": 95728,
-    "preferred_free_heap_bytes": 65536,
     "minimum_free_heap_bytes": 49152,
-    "heap_headroom_bytes": 46576,
     "devices_configured": 1,
     "devices_active": 1,
-    "device_failures": 0,
     "outbound_queue_depth": 0,
-    "outbound_queued_bytes": 0,
-    "outbound_queue_high_watermark": 0,
-    "outbound_queue_high_watermark_bytes": 0,
     "outbound_evicted": 0,
-    "telemetry_evicted": 0,
     "outbound_rejected": 0,
     "utc_valid": true,
     "utc_sync_age_sec": 52
@@ -54,8 +44,6 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 
 ### Hardware Fields
 
-- `hardware_type`: Canonical hardware type from `detect_hardware()`
-- `machine`: Raw machine string from `os.uname().machine`
 - `cpu_temperature_c`: On-chip die temperature in °C (0.1 °C resolution) read from the ADC core-temp channel via `SystemInformation.get_cpu_temperature()` with the datasheet conversion (Vbe = 0.706 V at 27 °C, slope −1.721 mV/°C — the RP2040 and RP2350 datasheets state the same calibration, so one formula serves both boards); the conversion is VREF-sensitive (≈4 °C per 1 % VREF) and the sensor varies device-to-device, so the field is a trend indicator at roughly ±5 °C, not a calibrated absolute; `null` when the channel is unavailable (never a degradation trigger)
 
 ### Network Fields
@@ -68,31 +56,23 @@ Core 1 publishes health messages to `iot/v3/health` with the following payload s
 ### Memory Fields
 
 - `free_heap_bytes`: Current `gc.mem_free()` value
-- `preferred_free_heap_bytes`: Board-specific preferred reserve (64 KiB Pico W, 144 KiB Pico 2 W) — where memory-pressure handling (GC, then reclamation of low-retention entries) begins; never a rejection wall by itself
 - `minimum_free_heap_bytes`: Board-specific hard survival floor that admission must protect (48 KiB Pico W, 128 KiB Pico 2 W)
-- `heap_headroom_bytes`: free_heap - minimum_free_heap (negative when below the hard floor)
 
 ### Core Activity Fields
 
-- `core_1_active`: True if `core_1_activity_age_ms <= threshold`
-- `core_1_activity_age_ms`: Monotonic elapsed time since last activity report
+- `core_1_active`: True if the elapsed time since the last Core 1 activity report is within threshold (3 × `read_loop_sec`, minimum 60 s)
 
 ### Device Fields
 
 - `devices_configured`: From `DeviceManager.get_status_snapshot()`
 - `devices_active`: From `DeviceManager.get_status_snapshot()`
-- `device_failures`: devices_configured - devices_active
 
 ### Queue Fields
 
-The outbound queue is heap-governed **and** bounded by a deterministic entry-count ceiling (`outbound_queue_max_messages`, see the lane below), so these are observability metrics: the depth and high-water-mark are utilization against that count ceiling (the byte metrics have no count limit — the heap policy remains the byte/memory guard):
+The outbound queue is heap-governed **and** bounded by a deterministic entry-count ceiling (`outbound_queue_max_messages`, see the lane below), so these are observability metrics (the byte and high-watermark metrics remain reachable in the `get-details` `queues` section):
 
 - `outbound_queue_depth`: Queued + in-flight entries (current) — always `≤ outbound_queue_max_messages`
-- `outbound_queued_bytes`: Retained payload bytes (the queued FIFO plus the in-flight entry)
-- `outbound_queue_high_watermark`: Peak queue depth since boot — always `≤ outbound_queue_max_messages`
-- `outbound_queue_high_watermark_bytes`: Peak retained payload bytes since boot
 - `outbound_evicted`: Entries evicted under memory pressure (all kinds), including count-ceiling relief
-- `telemetry_evicted`: Evicted entries of the telemetry kind
 - `outbound_rejected`: Admissions rejected because the hard free-heap floor could not be restored or no eligible entry was available to relieve the count ceiling
 
 ### UTC Fields

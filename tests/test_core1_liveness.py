@@ -206,7 +206,6 @@ def test_core1_activity_stamp_survives_hostile_loop_phase():
     last_payload = health_payloads[-1]["payload"]
     assert last_payload["core_1_active"] is True
     assert "core_1_inactive" not in last_payload["degraded_reasons"]
-    assert last_payload["core_1_activity_age_ms"] <= ACTIVITY_INTERVAL_MS + LOOP_STEP_MS
 
     # The mailbox stamp itself is fresh within one interval plus one loop step.
     stamp = bus.state_mailboxes.get_core_1_activity_ms()

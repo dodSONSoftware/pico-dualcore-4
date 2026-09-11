@@ -155,8 +155,6 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 - `degraded_reasons`: Array of degradation reasons (e.g., "wifi_not_connected", "low_free_heap")
 
 ### Hardware
-- `hardware_type`: Canonical hardware type ("pico_w" or "pico_2_w")
-- `machine`: Human-readable machine identifier
 - `cpu_temperature_c`: On-chip die temperature (°C, 0.1 °C resolution) via the datasheet conversion (Vbe = 0.706 V at 27 °C, slope −1.721 mV/°C; VREF- and device-sensitive, roughly ±5 °C — a trend indicator, not a calibrated absolute); `null` when the ADC core-temp channel is unavailable
 
 ### Network
@@ -167,27 +165,19 @@ Core 1 periodically publishes health messages to `iot/v3/health` with the follow
 
 ### Memory
 - `free_heap_bytes`: Current free heap
-- `preferred_free_heap_bytes`: Preferred reserve — where memory-pressure handling begins (64KB Pico W, 144KB Pico 2 W); not a rejection wall
 - `minimum_free_heap_bytes`: Hard survival floor that admission must protect (48KB Pico W, 128KB Pico 2 W)
-- `heap_headroom_bytes`: free_heap - minimum_free_heap (may be negative)
 
 ### Core Activity
 - `core_1_active`: Boolean indicating Core 1 liveness
-- `core_1_activity_age_ms`: Milliseconds since last Core 1 activity report
 
 ### Devices
 - `devices_configured`: Number of configured devices
 - `devices_active`: Number of active/ready devices
-- `device_failures`: devices_configured - devices_active
 
 ### Queue
-The outbound queue is heap-governed **and** bounded by the `outbound_queue_max_messages` entry-count ceiling (evaluated after the heap policy, in-flight included), so these are observability metrics: the depth and high-water-mark are utilization against that ceiling (≤ `outbound_queue_max_messages`), while the byte metrics remain heap-governed only:
+The outbound queue is heap-governed **and** bounded by the `outbound_queue_max_messages` entry-count ceiling (evaluated after the heap policy, in-flight included), so these are observability metrics (the byte and high-watermark metrics remain reachable in the `get-details` `queues` section):
 - `outbound_queue_depth`: Current queued + in-flight entries (≤ `outbound_queue_max_messages`)
-- `outbound_queued_bytes`: Retained payload bytes (queued FIFO plus in-flight entry)
-- `outbound_queue_high_watermark`: Peak queue depth since boot (≤ `outbound_queue_max_messages`)
-- `outbound_queue_high_watermark_bytes`: Peak retained payload bytes since boot
 - `outbound_evicted`: Entries evicted under memory pressure or to relieve the count ceiling (all kinds)
-- `telemetry_evicted`: Evicted entries of the telemetry kind
 - `outbound_rejected`: Admissions rejected because the hard free-heap floor could not be restored or no eligible entry was available to relieve the count ceiling
 
 ### UTC
