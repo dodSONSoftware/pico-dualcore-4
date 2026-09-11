@@ -490,60 +490,6 @@ def test_run_loop_treats_check_msg_transport_failure_as_outage(make_core0):
     assert _MACHINE.reset_calls == 0
 
 
-def test_connection_log_then_queued_telemetry_paced(make_core0):
-    """Connection logs and queued telemetry share the one pacing interval."""
-    instance = make_core0(delay_ms=100)
-    _utc_synchronized(instance)
-    instance._queue_connection_log(
-        "mqtt_connection_established", "Connected to MQTT broker", "mqtt", {}
-    )
-    _queue_telemetry(instance, 7)
-
-    _run_to(instance, 220)
-
-    published = instance._mqtt.published
-    topics = [t for t, _m, _n in published]
-    times = [n for _t, _m, n in published]
-    # The existing run-loop priority is unchanged: the connection log first...
-    assert topics[0] == instance._config["mqtt_topic_log"]
-    assert topics[1] == instance._config["mqtt_topic_telemetry"]
-    # ...and the two PUBLISHes are separated by the configured interval.
-    assert times[0] == 0
-    assert times[1] >= 100
-
-
-def test_connection_log_held_while_outbound_entry_in_flight(make_core0):
-    """Symmetry with the command-response path: a pending connection log is
-    not published while an outbound entry is still in flight (a retry after a
-    transport failure), and publishes once that entry clears."""
-    instance = make_core0(delay_ms=100)
-    _utc_synchronized(instance)
-    instance._queue_connection_log(
-        "mqtt_connection_established", "Connected to MQTT broker", "mqtt", {}
-    )
-
-    # An in-flight outbound entry whose re-publish keeps losing its PUBACK
-    # (topic-selective, so the connection log's own publish would succeed if
-    # the gate were open): has_in_flight() stays True across passes, the
-    # state a transport failure leaves the head in.
-    instance._mqtt.fail_topics.add(instance._config["mqtt_topic_telemetry"])
-    _queue_telemetry(instance, 7)
-    entry = instance._intercore.outbound_queue.take()
-
-    # While the entry is in flight the connection log stays pending...
-    _run_to(instance, 200)
-    assert instance._pending_connection_logs
-    assert instance._intercore.outbound_queue.has_in_flight()
-
-    # ...and once it clears, the log publishes.
-    instance._mqtt.fail_topics.clear()
-    instance._intercore.outbound_queue.complete_in_flight(entry)
-    _run_to(instance, 300)
-
-    assert not instance._pending_connection_logs
-    assert instance._mqtt.published[0][0] == instance._config["mqtt_topic_log"]
-
-
 def test_core0_response_then_queued_telemetry_paced(make_core0):
     """A Core 0 command response and the next queued message are paced too."""
     instance = make_core0(delay_ms=100)
@@ -621,9 +567,8 @@ def test_reboot_holds_during_outage_then_acks_after_reconnect(make_core0):
     a down session is never attempted (it would fail fast, so the response
     would be rebuilt only to be thrown away), and the acknowledgement goes
     out on the first pass after the link returns. Recovery itself is
-    suppressed: with the fake's always-success connect() it would queue a
-    spurious connection log every pass, and the recovery path has its own
-    suite."""
+    suppressed: with the fake's always-success connect() it would clear the
+    outage on the first pass, and the recovery path has its own suite."""
     instance = make_core0(delay_ms=100)
     _utc_synchronized(instance)
     instance._pending_reboot = {
@@ -683,126 +628,6 @@ def test_startup_probe_waits_for_publish_slot(make_core0):
     assert instance._mqtt.published[0][2] >= 100
 
 
-def test_startup_connection_logs_are_paced(make_core0):
-    """Consecutive startup connection logs are paced by the interval.
-
-    The drain waits for the slot the preceding publish (probe #1) just closed."""
-    instance = make_core0(delay_ms=100)
-    instance._queue_connection_log("wifi_connection_established", "Connected to Wi-Fi", "wifi", {})
-    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
-
-    assert instance._drain_startup_mqtt_work() is True
-
-    published = instance._mqtt.published
-    assert len(published) == 2
-    times = [n for _t, _m, n in published]
-    assert times[0] == 0
-    assert times[1] >= 100
-
-
-def test_startup_drain_gives_each_log_its_own_window(make_core0):
-    """A slow-but-legal cycle on the first log must not consume the second log's window.
-
-    The first log's QoS 1 cycle (slot wait, frame write, PUBACK round trip) takes 3000 ms -- inside the 4 s mqtt_broker_response_timeout_sec the system allows, so it is legal. The old shared 2 s budget, measured from the drain's start, was exhausted by that one cycle and deferred the second log to the run loop with a drain-timeout warning. Each log is now measured against its own window starting when the previous log completed, so both logs are still drained here."""
-    instance = make_core0(delay_ms=100)
-    instance._queue_connection_log("wifi_connection_established", "Connected to Wi-Fi", "wifi", {})
-    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
-
-    # Slow down exactly the first log's publish cycle (a 3 s QoS 1 exchange).
-    original_publish = instance._mqtt.publish_qos1
-    calls = {"n": 0}
-
-    def slow_first_publish(topic, message, splice_fragment=None):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            _FAKE_TIME.sleep_ms(3000)
-        original_publish(topic, message, splice_fragment=splice_fragment)
-
-    instance._mqtt.publish_qos1 = slow_first_publish
-
-    assert instance._drain_startup_mqtt_work() is True
-
-    published = instance._mqtt.published
-    assert len(published) == 2
-    times = [n for _t, _m, n in published]
-    # First log's cycle consumed 3 s...
-    assert times[0] == 3000
-    # ...and the second log still got its own window: published after the
-    # pacing slot (100 ms) following the first log's completion.
-    assert times[1] >= 3100
-
-
-def test_startup_drain_dead_link_fails_the_pass_bounded(make_core0):
-    """A head log whose publish keeps failing must fail the pass, bounded.
-
-    The link is dead before the drain starts, so every attempt fails fast
-    with "MQTT is not connected". The old per-iteration deadline was re-armed
-    every ~100 ms and could never expire: the drain retried the same head
-    forever (a boot wedged inside start() for minutes, observed on hardware).
-    The head's window is now fixed for its lifetime, so the drain returns
-    False after the 2 s window and the contract re-establishes and retries."""
-    instance = make_core0(delay_ms=100)
-    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
-    instance._mqtt.connected = False
-
-    attempts = {"n": 0}
-
-    def dead_link_publish(topic, message, splice_fragment=None):
-        attempts["n"] += 1
-        # The pacing slice each retry waits in the real run.
-        _FAKE_TIME.sleep_ms(100)
-        raise OSError("MQTT is not connected")
-
-    instance._mqtt.publish_qos1 = dead_link_publish
-
-    assert instance._drain_startup_mqtt_work() is False
-
-    # Bounded by the head log's 2 s window (plus pacing slack)...
-    assert _FAKE_TIME.ticks_ms() <= 2200
-    assert attempts["n"] <= 21
-    # ...and the log is still pending for the re-established link.
-    assert len(instance._pending_connection_logs) == 1
-
-
-def test_startup_drain_etimedout_attempt_fails_the_pass_bounded(make_core0):
-    """A first attempt that burns the QoS 1 timeout on a blackholed link
-    also fails the pass once it returns, instead of re-arming a fresh window.
-
-    Models the observed hardware wedge: one 5 s ETIMEDOUT publish, the
-    session then down, every further attempt failing fast. The head's 2 s
-    window is checked after the slow attempt returns, so the drain exits
-    instead of entering the fast-fail retry storm with a fresh deadline
-    every ~100 ms."""
-    instance = make_core0(delay_ms=100)
-    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
-
-    original_publish = instance._mqtt.publish_qos1
-    attempts = {"n": 0}
-
-    def dead_link_publish(topic, message, splice_fragment=None):
-        attempts["n"] += 1
-        if not instance._mqtt.connected:
-            # Session down: the real client refuses fast.
-            _FAKE_TIME.sleep_ms(100)
-            raise OSError("MQTT is not connected")
-        # First attempt: the PUBLISH goes out on a blackholed link and the
-        # bounded wait loses the PUBACK (5 s), dropping the session.
-        _FAKE_TIME.sleep_ms(5000)
-        instance._mqtt.connected = False
-        original_publish(topic, message, splice_fragment=splice_fragment)
-
-    instance._mqtt.publish_qos1 = dead_link_publish
-    instance._mqtt.fail_publishes = 1  # only the first attempt loses its PUBACK
-
-    assert instance._drain_startup_mqtt_work() is False
-
-    # The slow attempt returned past the window's deadline; the fast-fail
-    # storm never starts (at most one pacing slice after the slow attempt).
-    assert _FAKE_TIME.ticks_ms() <= 5200
-    assert attempts["n"] <= 2
-    assert len(instance._pending_connection_logs) == 1
-
-
 def test_startup_utc_request_respects_preceding_publish(make_core0):
     """The startup UTC request does not start inside the interval either."""
     instance = make_core0(delay_ms=100)
@@ -822,21 +647,20 @@ def test_startup_utc_request_respects_preceding_publish(make_core0):
 def test_startup_contract_keeps_five_second_stabilization(make_core0):
     """The contract order and the 5 s stabilization step are unchanged.
 
-    Pacing only constrains WHEN a publish may begin: probe #1, the drained log, the 5 s stabilization, probe #2, then the UTC request."""
+    Pacing only constrains WHEN a publish may begin: probe #1, the 5 s
+    stabilization, probe #2, then the UTC request."""
     instance = make_core0(delay_ms=100)
-    instance._queue_connection_log("mqtt_connection_established", "Connected to MQTT broker", "mqtt", {})
     instance._mqtt._utc_deliver = True
 
     assert instance._verify_startup_contract() is True
 
     # The 5 s stabilization step is still there...
     assert 5000 in _FAKE_TIME.sleep_calls
-    # ...and the contract order holds, with the drain's log paced behind
-    # probe #1 (probe #1 completed at t=0, so the log goes out at +100).
+    # ...and the contract order holds: probe #1 completes at t=0, and
+    # probe #2 starts only after the stabilization.
     published = instance._mqtt.published
     types = [json.loads(m).get("message_type") for _t, m, _n in published]
-    assert types == ["network_probe", "log", "network_probe", "info_request"]
+    assert types == ["network_probe", "network_probe", "info_request"]
     times = [n for _t, _m, n in published]
     assert times[0] == 0
-    assert times[1] >= 100
-    assert times[2] >= times[1] + 5000
+    assert times[1] >= 5000

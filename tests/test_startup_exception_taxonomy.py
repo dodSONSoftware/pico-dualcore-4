@@ -6,13 +6,12 @@
 
 mqtt.py establishes the rule: MQTT_TRANSPORT_ERRORS (OSError, MQTTException) are transport/protocol failures -- link conditions. Startup, they fail the verification pass (the pass re-establishes the network and retries); on the reboot path, the reboot stays pending for a later pass. Anything else escaping the client (a bug in message handling, callback code, or state handling) is a programming failure and must reach main.py's controlled-reset boundary -- not be reclassified as a network/startup failure and retried into the same deterministic fault forever.
 
-Before the fix the startup helpers undid that rule with broad except-Exception wrappers: _utc_send_request() and _utc_wait_response() converted programming failures into failed UTC attempts, _perform_network_probe() into failed probes (the retry loop then reconnected into the same fault), _drain_startup_mqtt_work() swallowed them while the un-removed head log stayed queued -- an infinite retry of the same failing operation -- and _perform_reboot() converted them into "reboot remains pending".
+Before the fix the startup helpers undid that rule with broad except-Exception wrappers: _utc_send_request() and _utc_wait_response() converted programming failures into failed UTC attempts, _perform_network_probe() into failed probes (the retry loop then reconnected into the same fault), and _perform_reboot() converted them into "reboot remains pending".
 
 Covers:
 - core0.Core0._utc_send_request: a programming failure from publish escapes (a transport failure still rolls back the armed request ID)
 - core0.Core0._utc_wait_response: a programming failure from the response cycle (the callback path) escapes; a transport failure still fails the wait cleanly
 - core0.Core0._perform_network_probe: a programming failure escapes; a transport failure is a failed probe
-- core0.Core0._drain_startup_mqtt_work: a programming failure escapes with the head log still queued (the state a broad wrapper would have retried forever); a transport failure is still owned by _service_pending_connection_log, which holds the log for a later pass
 - core0.Core0._perform_reboot: a programming failure from the acknowledgement publish escapes (no reset); a transport failure still leaves the reboot pending"""
 
 import importlib
@@ -178,59 +177,6 @@ def test_startup_probe_transport_failure_is_a_failed_probe(make_core0):
     instance._mqtt.publish_qos1_with_packet_id.side_effect = OSError("MQTT is not connected")
 
     assert instance._perform_network_probe() is False
-
-
-# --- Startup drain -------------------------------------------------------------
-
-
-def _connection_log():
-    return {
-        "message_type": "log",
-        "payload": {
-            "level": "info",
-            "message": "Connected to Wi-Fi",
-            "event": "wifi_connection_established",
-            "module": "wifi",
-            "data": {"ssid": "test-ssid"},
-        },
-    }
-
-
-def test_startup_drain_programming_failure_propagates(make_core0, monkeypatch):
-    """A programming failure servicing the head log must escape.
-
-    The head stays queued: with the old broad wrapper the failure was
-    swallowed, the head remained, and the drain loop re-attempted the same
-    failing operation indefinitely with no forward progress."""
-    core0_mod, instance = make_core0()
-
-    def _fail(*args, **kwargs):
-        raise RuntimeError("message handling bug")
-
-    # Patch where the call resolves: core0's module-level import (the
-    # suite's convention, matching the core1 serializer patches).
-    monkeypatch.setattr(core0_mod, "serialize_and_validate_message", _fail)
-
-    instance._pending_connection_logs.append(_connection_log())
-
-    with pytest.raises(RuntimeError, match="message handling bug"):
-        instance._drain_startup_mqtt_work()
-
-    # The head was never removed: a broad wrapper would have retried it forever.
-    assert len(instance._pending_connection_logs) == 1
-
-
-def test_startup_drain_transport_failure_is_still_owned_by_the_service(make_core0):
-    """A transport failure is handled by _service_pending_connection_log()
-    itself (the log stays pending for a later pass): it never escapes, which
-    is what lets the drain keep no broad wrapper of its own."""
-    core0_mod, instance = make_core0()
-    instance._pending_connection_logs.append(_connection_log())
-    instance._mqtt.publish_qos1.side_effect = OSError("PUBACK timeout")
-
-    instance._service_pending_connection_log()  # must not raise
-
-    assert len(instance._pending_connection_logs) == 1  # held for a later pass
 
 
 # --- Reboot acknowledgement ----------------------------------------------------

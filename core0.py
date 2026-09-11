@@ -45,7 +45,6 @@ from message_serializer import (
 
 
 _MAX_PENDING_CORE0_RESPONSES = 4
-_MAX_PENDING_CONNECTION_LOGS = 4
 
 # Bounded substitutes for a command response that can never be published
 # as-is (holding it would stall the FIFO responses behind it).
@@ -118,7 +117,6 @@ class Core0:
         # Recent command IDs (debounce cache, FIFO; see _RECENT_COMMAND_ID_CAPACITY).
         self._recent_command_ids = []
         self._pending_core0_responses = []
-        self._pending_connection_logs = []
         # A HOT_RELOADED write-config is one transaction across both cores:
         # the response + commit are held until Core 1's ack (the run loop
         # resolves it); _transaction_active stays True for the same window
@@ -177,53 +175,6 @@ class Core0:
             return False
         self._pending_core0_responses.append(response)
         return True
-
-    def _queue_connection_log(self, event, message, module, data):
-        if len(self._pending_connection_logs) >= _MAX_PENDING_CONNECTION_LOGS:
-            print("[WARNING] Core 0 connection log queue full; log rejected")
-            return False
-        self._pending_connection_logs.append({
-            "message_type": "log",
-            "payload": {
-                "level": "info",
-                "message": message,
-                "event": event,
-                "module": module,
-                "data": data,
-            },
-        })
-        return True
-
-    def _service_pending_connection_log(self):
-        if not self._pending_connection_logs:
-            return
-
-        message = self._pending_connection_logs[0]
-        # The container is the persistent identity: stamped/serialized once,
-        # wire sequence claimed once (by _publish_entry) — a transport retry
-        # redelivers ONE (runtime_id, sequence) pair with the same document.
-        if "payload_bytes" not in message:
-            message["uptime_ms"] = self._uptime_ms()
-            message["timestamp"] = self._current_utc_timestamp()
-            message["payload_bytes"] = serialize_and_validate_message(message)
-            message["kind"] = KIND_LOG
-        try:
-            self._publish_entry(message)
-            self._pending_connection_logs.pop(0)
-        except MemoryError:
-            raise
-        except OutboundMessageTooLargeError as err:
-            # The spliced envelope pushed the log over the wire limit:
-            # permanent, and a log has no command to answer, so it is dropped
-            # (entries behind it keep moving) instead of retried.
-            print("[WARNING] Connection log dropped, envelope splice exceeded the per-message ceiling: {}".format(err))
-            self._pending_connection_logs.pop(0)
-        except (OSError, MQTTException) as err:
-            # Transport failure is a link condition: the log stays pending
-            # (bounded queue) for the pass after the link recovers. A
-            # programming failure is NOT caught here: it escapes to the
-            # top-level recovery boundary instead of being hidden.
-            print("[DEBUG] Connection log publish failed, retrying: {}".format(err))
 
     def _on_mqtt_message(self, topic, payload):
         try:
@@ -1288,40 +1239,6 @@ class Core0:
                 print("[DEBUG] Network probe failed: {}".format(err))
             return False
 
-    def _drain_startup_mqtt_work(self):
-        """Drain pending Core 0 MQTT work; True when none remains, False on timeout.
-
-        Each head log gets its own grace window, not re-armed by failed
-        attempts: a dead or blackholed link (whose publish fails and leaves
-        the same head pending) fails the pass -- which re-establishes the
-        network and retries the contract -- instead of retrying the same
-        head forever. A slow-but-legal QoS 1 cycle on one log completes it
-        and the next log starts its own fresh window."""
-        grace_ms = 2000  # per-head-log grace before the pass times out
-
-        while self._pending_connection_logs:
-            deadline_ms = time.ticks_add(time.ticks_ms(), grace_ms)
-            while self._pending_connection_logs:
-                head = self._pending_connection_logs[0]
-                self._wait_for_mqtt_publish_slot()
-                if time.ticks_diff(time.ticks_ms(), deadline_ms) >= 0:
-                    print("[WARNING] Startup MQTT work drain timeout")
-                    return False
-                # No wrapper of its own: _service_pending_connection_log()
-                # already owns MemoryError, the size rejection, and transport
-                # failures; a programming failure must escape to the top-level
-                # recovery boundary.
-                self._service_pending_connection_log()
-                if (
-                    self._pending_connection_logs
-                    and self._pending_connection_logs[0] is not head
-                ):
-                    # The head log completed (published or discarded): the
-                    # next head starts its own fresh window.
-                    break
-
-        return True
-
     def _synchronize_utc_required(self):
         """Run one bounded pass of startup UTC sync; True once a snapshot is
         acquired, False after _UTC_STARTUP_MAX_ATTEMPTS. A MemoryError or
@@ -1344,18 +1261,6 @@ class Core0:
 
         while not self._wifi.is_connected():
             if self._wifi.connect():
-                snapshot = self._wifi.snapshot(False)
-                self._queue_connection_log(
-                    "wifi_connection_established",
-                    "Connected to Wi-Fi",
-                    "wifi",
-                    {
-                        "ssid": snapshot["ssid"],
-                        "ip_address": snapshot["ip_address"],
-                        "rssi": snapshot["rssi"],
-                        "connect_count": snapshot["wifi_connect_count"],
-                    },
-                )
                 break
             delay_sec = self._config["wifi_reconnect_delays_sec"][-1]
             print("[WARNING] Wi-Fi connection sequence exhausted; retrying in {} sec".format(delay_sec))
@@ -1363,16 +1268,6 @@ class Core0:
 
         while not self._mqtt.is_connected():
             if self._mqtt.connect():
-                mqtt_status = self._mqtt.status()
-                self._queue_connection_log(
-                    "mqtt_connection_established",
-                    "Connected to MQTT broker",
-                    "mqtt",
-                    {
-                        "broker_address": self._config["mqtt_broker_ip_address"],
-                        "connect_count": mqtt_status["connect_count"],
-                    },
-                )
                 # LED remains flashing during network probe and UTC sync
                 break
             delay_sec = self._config["mqtt_reconnect_delays_sec"][-1]
@@ -1459,7 +1354,7 @@ class Core0:
 
     def start(self):
         """Establish Core 0 network services before Core 1 starts. Connect
-        steps are unbounded; verification (probes, drain, UTC) is
+        steps are unbounded; verification (probes, UTC) is
         self-healing -- a failed pass re-establishes and retries. Returns only
         on a clean pass; a MemoryError or programming failure propagates to
         the recovery boundary in main()."""
@@ -1500,17 +1395,13 @@ class Core0:
         print("[INFO] Core 0 startup complete - network stack verified and ready")
 
     def _verify_startup_contract(self):
-        """Run one full pass of the startup verification (probe, drain,
+        """Run one full pass of the startup verification (probe,
         stabilization, probe, UTC); True only when every step succeeds. A
         MemoryError or programming failure propagates to the recovery
         boundary in main()."""
         if not self._perform_network_probe():
             print("[WARNING] Startup verification: network probe #1 failed")
             return False
-
-        # Non-fatal: a drain timeout does not fail the pass.
-        if not self._drain_startup_mqtt_work():
-            print("[WARNING] Startup MQTT work drain did not complete")
 
         time.sleep_ms(5000)
 
@@ -1549,26 +1440,6 @@ class Core0:
                 self._perform_reboot()
 
             self._recover_network_if_needed()
-
-            # Like the command-response path below, hold a connection log
-            # while an outbound entry is still in flight (a retry after a
-            # transport failure): the two publish paths never interleave.
-            if (
-                self._mqtt.is_connected()
-                and self._pending_connection_logs
-                and not self._intercore.outbound_queue.has_in_flight()
-                and self._mqtt_publish_ready()
-            ):
-                try:
-                    self._service_pending_connection_log()
-                except MemoryError:
-                    raise
-                except (OSError, MQTTException) as err:
-                    # Transport failure only (recovered on the next pass); a
-                    # programming failure escapes run() to the top-level
-                    # recovery boundary.
-                    if DEBUG:
-                        print("[DEBUG] Connection log publish failed: {}".format(err))
 
             # Read per pass (not captured once): a HOT_RELOADED
             # mqtt_command_poll_ms applies from the next pass.

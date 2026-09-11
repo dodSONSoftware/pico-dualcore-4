@@ -4,7 +4,7 @@
 
 """Host-side tests for the wire-boundary size check on Core 0's envelope splice.
 
-The per-message ceiling is enforced at admission against the message body, but Core 0 later splices its five envelope members (sequence, runtime_id, source, firmware_version, message_schema_version) on top of that body before the PUBLISH. A body admitted at or under MAX_OUTBOUND_MESSAGE_BYTES can therefore exceed it once spliced. The splice must check the FINAL wire length against the ceiling before the joined frame is allocated, and treat an oversized splice as a PERMANENT failure of that entry: retrying the same bytes can never succeed. Command responses (the channel must keep moving) are answered with the bounded "response_too_large" substitute; telemetry/health/log and connection logs are discarded with a warning and the queue's oversized_discarded counter. Transient publish failures (a failed QoS 1 attempt, which raises a different error) still leave the entry in flight for retry, unchanged."""
+The per-message ceiling is enforced at admission against the message body, but Core 0 later splices its five envelope members (sequence, runtime_id, source, firmware_version, message_schema_version) on top of that body before the PUBLISH. A body admitted at or under MAX_OUTBOUND_MESSAGE_BYTES can therefore exceed it once spliced. The splice must check the FINAL wire length against the ceiling before the joined frame is allocated, and treat an oversized splice as a PERMANENT failure of that entry: retrying the same bytes can never succeed. Command responses (the channel must keep moving) are answered with the bounded "response_too_large" substitute; telemetry/health/log are discarded with a warning and the queue's oversized_discarded counter. Transient publish failures (a failed QoS 1 attempt, which raises a different error) still leave the entry in flight for retry, unchanged."""
 
 import json
 import pathlib
@@ -400,21 +400,3 @@ def test_full_response_queue_does_not_mark_the_reboot_answered(make_core0):
     assert instance._perform_reboot() is False
     assert len(instance._pending_core0_responses) == 4
     assert _MACHINE.reset_calls == 0
-
-
-def test_connection_log_oversized_by_the_envelope_is_dropped_not_raised(make_core0):
-    """A connection log is current-state data with no command to answer: a
-    splice overflow drops it (with the pending log removed) instead of
-    retrying it forever or escaping as an exception."""
-    import core0 as core0_module
-
-    instance = make_core0(delay_ms=0)
-
-    with patch.object(core0_module, "MAX_OUTBOUND_MESSAGE_BYTES", 64):
-        instance._queue_connection_log(
-            "mqtt_connection_established", "Connected to MQTT broker", "mqtt", {}
-        )
-        instance._service_pending_connection_log()
-
-    assert instance._pending_connection_logs == []
-    assert instance._mqtt.published == []
