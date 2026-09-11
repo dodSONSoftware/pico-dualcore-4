@@ -23,6 +23,15 @@ _MAX_PINGRESP_WAIT_SEC = 5
 # reset instead of being retried into the same fault.
 MQTT_TRANSPORT_ERRORS = (OSError, MQTTException)
 
+# Stable bounded reasons a session disconnect is recorded with (the
+# get-details communications section): a closed set, so the field never
+# grows and a root-cause analysis of a dropped link starts from a named
+# cause instead of a bare counter.
+DISCONNECT_WIFI_LOST = "wifi_lost"
+DISCONNECT_PING_TIMEOUT = "ping_timeout"
+DISCONNECT_PUBLISH_FAILURE = "publish_failure"
+DISCONNECT_CHECK_MSG_FAILURE = "check_msg_failure"
+
 
 class Mqtt:
     """Core 0's MQTT lifecycle: connect/subscribe, keepalive PINGREQ, QoS 1
@@ -50,6 +59,11 @@ class Mqtt:
         # attempt); cleared on success, used only to name the cause in Core
         # 0's exhaustion warning.
         self._last_connect_error = None
+        # The reason the most recent session disconnect was recorded
+        # (DISCONNECT_* above); None until the first disconnect this boot.
+        # Deliberately not cleared on reconnect: the field names the last
+        # drop, which is what a post-outage diagnosis wants.
+        self._last_disconnect_reason = None
         self._last_activity_ms = time.ticks_ms()
 
         try:
@@ -73,10 +87,15 @@ class Mqtt:
             self._wait_service()
 
     def _new_client(self):
+        # The client feeds Core 0's servicing hook (heartbeat check +
+        # hardware watchdog) before every blocking socket operation, so one
+        # transaction's chain of bounded waits cannot run the un-fed stretch
+        # past the Core 0 watchdog budget.
         client = MQTTClient(
             self._client_id,
             self._broker,
             keepalive=self._keepalive,
+            service=self._service_wait,
         )
         client.set_callback(self._message_callback)
         return client
@@ -154,10 +173,14 @@ class Mqtt:
                     sleep_sliced(delay_sec, self._service_wait)
         return False
 
-    def mark_disconnected(self):
+    def mark_disconnected(self, reason=None):
+        """Mark the session down, recording why (a DISCONNECT_* reason;
+        None leaves the field as-is for an unattributed call)."""
         if self._connected:
             self._disconnect_count += 1
         self._connected = False
+        if reason is not None:
+            self._last_disconnect_reason = reason
 
     def check_msg(self):
         """Poll for one pending inbound packet and deliver it to the callback;
@@ -172,7 +195,7 @@ class Mqtt:
         except MemoryError:
             raise
         except MQTT_TRANSPORT_ERRORS:
-            self.mark_disconnected()
+            self.mark_disconnected(DISCONNECT_CHECK_MSG_FAILURE)
             raise
 
     def publish_qos1(self, topic, message, splice_fragment=None):
@@ -193,7 +216,7 @@ class Mqtt:
         except MemoryError:
             raise
         except MQTT_TRANSPORT_ERRORS:
-            self.mark_disconnected()
+            self.mark_disconnected(DISCONNECT_PUBLISH_FAILURE)
             raise
         self._touch()
 
@@ -211,7 +234,7 @@ class Mqtt:
         except MQTT_TRANSPORT_ERRORS as err:
             if DEBUG:
                 print("[DEBUG] QoS 1 publish with packet_id {} failed: {}".format(packet_id, err))
-            self.mark_disconnected()
+            self.mark_disconnected(DISCONNECT_PUBLISH_FAILURE)
             return False
 
     def _ping_interval_sec(self):
@@ -238,7 +261,7 @@ class Mqtt:
         except MemoryError:
             raise
         except MQTT_TRANSPORT_ERRORS:
-            self.mark_disconnected()
+            self.mark_disconnected(DISCONNECT_PING_TIMEOUT)
             raise
         self._touch()
 
@@ -263,4 +286,5 @@ class Mqtt:
             "connected": self.is_connected(),
             "connect_count": self._connect_count,
             "disconnect_count": self._disconnect_count,
+            "last_disconnect_reason": self._last_disconnect_reason,
         }

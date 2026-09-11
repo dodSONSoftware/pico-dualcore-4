@@ -147,8 +147,9 @@ class FakeMqtt:
         self.connect_calls += 1
         return True
 
-    def mark_disconnected(self):
+    def mark_disconnected(self, reason=None):
         self.mark_disconnected_calls += 1
+        self.mark_disconnected_reason = reason
         self.connected = False
 
     def status(self):
@@ -156,6 +157,7 @@ class FakeMqtt:
             "connected": self.connected,
             "connect_count": self.connect_calls,
             "disconnect_count": 0,
+            "last_disconnect_reason": getattr(self, "mark_disconnected_reason", None),
         }
 
     def get_next_packet_id(self):
@@ -294,6 +296,10 @@ def test_recovery_after_wifi_drop_reconnects_stops_led_and_restores_ready(make_c
     assert wifi.connected is True
     assert mqtt.connected is True
     assert mqtt.mark_disconnected_calls == 1
+    # The drop is attributed: Wi-Fi loss is recorded under its stable reason
+    # and carried in the network snapshot (get-details communications).
+    from mqtt import DISCONNECT_WIFI_LOST
+    assert mqtt.mark_disconnected_reason == DISCONNECT_WIFI_LOST
     # LED flashed while re-establishing and stopped once recovery completed.
     assert led.states == [True, False]
     # Readiness is cleared for the outage and restored after recovery.
@@ -301,6 +307,9 @@ def test_recovery_after_wifi_drop_reconnects_stops_led_and_restores_ready(make_c
     snapshots = instance._intercore.state_mailboxes.network_snapshots
     assert snapshots[0]["network_stack_ready"] is False
     assert snapshots[-1]["network_stack_ready"] is True
+    # The drop is attributed: Wi-Fi loss is recorded under its stable reason
+    # and carried in the network snapshot (get-details communications).
+    assert snapshots[-1]["mqtt_last_disconnect_reason"] == DISCONNECT_WIFI_LOST
 
 
 def test_recovery_after_mqtt_drop_reconnects_stops_led_and_restores_ready(make_core0):

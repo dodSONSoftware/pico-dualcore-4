@@ -25,6 +25,17 @@ SYSTEM_INFORMATION_SECTIONS = (
     "device_status",
 )
 
+# machine.reset_cause() constant name -> stable short label. The mapping
+# reads the constants off the machine module (no hardcoded values), so a
+# build whose MicroPython names them differently degrades to "unknown"
+# instead of mislabeling a boot. The v1.28 rp2 port exposes exactly these
+# two causes — a watchdog reset, or nothing finer (every other reset,
+# including machine.reset(), reports PWRON_RESET).
+_RESET_CAUSE_LABELS = (
+    ("WDT_RESET", "wdt"),
+    ("PWRON_RESET", "poweron"),
+)
+
 
 
 class SystemInformation:
@@ -34,6 +45,32 @@ class SystemInformation:
         self._intercore = intercore
         self._config = config
         self._device_manager = None
+        # How this boot began (machine.reset_cause()); captured once, on
+        # first report — the value cannot change during a boot, so the
+        # later reports are a cache hit, not re-reads.
+        self._reset_cause = None
+
+    def get_reset_cause(self):
+        """Stable short label for how this boot began: "wdt" for a
+        hardware-watchdog reset, "poweron" for any other reset — the v1.28
+        rp2 port reports no finer cause (a machine.reset() reboot reports
+        "poweron") — so a WDT reset is diagnosable from the next boot's
+        startup log instead of only from the absence of a shutdown log."""
+        if self._reset_cause is None:
+            try:
+                cause = machine.reset_cause()
+            except MemoryError:
+                raise
+            except Exception:
+                cause = None
+            label = "unknown"
+            if cause is not None:
+                for name, value in _RESET_CAUSE_LABELS:
+                    if getattr(machine, name, None) == cause:
+                        label = value
+                        break
+            self._reset_cause = label
+        return self._reset_cause
 
     def set_device_manager(self, device_manager):
         self._device_manager = device_manager
@@ -142,6 +179,7 @@ class SystemInformation:
             "implementation": sys.implementation.name,
             "preferred_free_heap_bytes": classification["preferred_free_heap_bytes"],
             "minimum_free_heap_bytes": classification["minimum_free_heap_bytes"],
+            "reset_cause": self.get_reset_cause(),
         }
 
     def get_communications(self):
@@ -153,6 +191,7 @@ class SystemInformation:
             "wifi_disconnect_count": snapshot.get("wifi_disconnect_count", 0),
             "mqtt_connect_count": snapshot.get("mqtt_connect_count", 0),
             "mqtt_disconnect_count": snapshot.get("mqtt_disconnect_count", 0),
+            "mqtt_last_disconnect_reason": snapshot.get("mqtt_last_disconnect_reason"),
         }
 
     def get_queues(self):

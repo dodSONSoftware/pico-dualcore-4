@@ -15,6 +15,11 @@ import hardware
 # Mock the 'machine' module before importing system_information
 # since it's MicroPython-specific and not available on the host
 class MockMachine:
+    # machine.reset_cause() constants, as the v1.28.0 rp2 port defines
+    # them: a watchdog reset, or nothing finer (every other reset,
+    # including a soft machine.reset(), reports PWRON_RESET).
+    PWRON_RESET = 1
+    WDT_RESET = 3
     freq = staticmethod(lambda: 125000000)
 
     class ADC:
@@ -275,6 +280,91 @@ class TestGetMachineConsumesSharedClassifier:
 
         assert result["hardware_type"] == "unknown"
         assert result["minimum_free_heap_bytes"] is None
+
+
+class TestGetResetCause:
+    """get_reset_cause() maps machine.reset_cause() to a stable short label
+    (the next-boot breadcrumb that names a watchdog reset)."""
+
+    def _system_information(self):
+        return SystemInformation(MockInterCore(), MockConfig())
+
+    def _pin_machine(self, monkeypatch):
+        import system_information
+
+        monkeypatch.setattr(system_information, "machine", _MOCK_MACHINE)
+
+    def test_wdt_reset_maps_to_wdt(self, monkeypatch):
+        self._pin_machine(monkeypatch)
+        monkeypatch.setattr(
+            _MOCK_MACHINE, "reset_cause", lambda: _MOCK_MACHINE.WDT_RESET,
+            raising=False,
+        )
+
+        assert self._system_information().get_reset_cause() == "wdt"
+
+    def test_poweron_reset_maps_to_poweron(self, monkeypatch):
+        self._pin_machine(monkeypatch)
+        monkeypatch.setattr(
+            _MOCK_MACHINE, "reset_cause", lambda: _MOCK_MACHINE.PWRON_RESET,
+            raising=False,
+        )
+
+        assert self._system_information().get_reset_cause() == "poweron"
+
+    def test_unrecognized_cause_value_is_unknown(self, monkeypatch):
+        self._pin_machine(monkeypatch)
+        monkeypatch.setattr(
+            _MOCK_MACHINE, "reset_cause", lambda: 99, raising=False,
+        )
+
+        assert self._system_information().get_reset_cause() == "unknown"
+
+    def test_missing_reset_cause_binding_is_unknown(self, monkeypatch):
+        """A build without machine.reset_cause() degrades to 'unknown'
+        instead of failing the report."""
+        self._pin_machine(monkeypatch)
+
+        assert self._system_information().get_reset_cause() == "unknown"
+
+    def test_captured_once(self, monkeypatch):
+        """The cause is a boot-time fact: first report reads it, later
+        reports are a cache hit, not re-reads."""
+        self._pin_machine(monkeypatch)
+        calls = []
+        monkeypatch.setattr(
+            _MOCK_MACHINE,
+            "reset_cause",
+            lambda: calls.append(1) or _MOCK_MACHINE.WDT_RESET,
+            raising=False,
+        )
+        system_information = self._system_information()
+
+        assert system_information.get_reset_cause() == "wdt"
+        assert system_information.get_reset_cause() == "wdt"
+        assert calls == [1]
+
+    def test_get_machine_carries_reset_cause(self, monkeypatch):
+        import system_information
+
+        self._pin_machine(monkeypatch)
+        monkeypatch.setattr(
+            _MOCK_MACHINE, "reset_cause", lambda: _MOCK_MACHINE.WDT_RESET,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            system_information.os,
+            "uname",
+            lambda: type("Uname", (), {
+                "machine": "Raspberry Pi Pico W with RP2040",
+                "version": "v1.28.0",
+            })(),
+        )
+
+        result = self._system_information().get_machine()
+
+        assert result["hardware_type"] == "pico_w"
+        assert result["reset_cause"] == "wdt"
 
 
 class TestGetCpuTemperature:

@@ -88,13 +88,16 @@ def _collect_system_information_full(system_information):
 _GET_DETAILS_FALLBACK_DROP_ORDER = ("device_status", "devices")
 
 
-def _startup_summary(device_status, startup_duration_ms):
+def _startup_summary(device_status, startup_duration_ms, reset_cause):
     """Startup statuses and device counts, shared by the startup event log
     and its bounded fallback. Subscription readiness is reported without
     topic names (topic ownership belongs to Core 0); the duration is named
-    duration_ms, not uptime_ms, to keep it distinct from the envelope's."""
+    duration_ms, not uptime_ms, to keep it distinct from the envelope's.
+    reset_cause names how THIS boot began (machine.reset_cause()), so a
+    watchdog or panic reset is visible in the next boot's log."""
     startup_summary = {
         "duration_ms": startup_duration_ms,
+        "reset_cause": reset_cause,
         "hardware": {"status": "ready"},
         "wifi": {"status": "ready"},
         "mqtt": {"status": "ready"},
@@ -129,12 +132,12 @@ def _startup_log_message(intercore, startup_duration_ms, startup_summary):
     }
 
 
-def _build_startup_log(intercore, device_manager, startup_duration_ms):
+def _build_startup_log(intercore, device_manager, startup_duration_ms, reset_cause):
     """Build the system_startup_completed event log (Core 1's own fields
     only). Failed devices carry their failure_reason here: the one diagnosis
     that matters at boot."""
     device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
-    startup_summary = _startup_summary(device_status, startup_duration_ms)
+    startup_summary = _startup_summary(device_status, startup_duration_ms, reset_cause)
 
     ready_devices = []
     failed_devices = []
@@ -155,7 +158,7 @@ def _build_startup_log(intercore, device_manager, startup_duration_ms):
     return _startup_log_message(intercore, startup_duration_ms, startup_summary)
 
 
-def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms):
+def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms, reset_cause):
     """Build the bounded startup-log fallback: only the startup statuses and
     device counts -- no per-device lists, no failure reasons -- so it fits
     when the event log (which carries device lists and driver failure reasons
@@ -165,7 +168,7 @@ def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms):
     return _startup_log_message(
         intercore,
         startup_duration_ms,
-        _startup_summary(device_status, startup_duration_ms),
+        _startup_summary(device_status, startup_duration_ms, reset_cause),
     )
 
 
@@ -754,8 +757,11 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # the difference between the event log (or its bounded fallback)
         # fitting and a MemoryError.
         gc.collect()
+        # How this boot began, captured once: the startup record is the
+        # next-boot breadcrumb that names a watchdog/panic reset.
+        reset_cause = system_information.get_reset_cause()
         startup_log_message = _build_startup_log(
-            intercore, device_manager, startup_duration_ms
+            intercore, device_manager, startup_duration_ms, reset_cause
         )
 
         # The startup event log must be admitted before telemetry can begin.
@@ -767,7 +773,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 intercore,
                 startup_log_message,
                 lambda: _build_startup_log_bounded(
-                    intercore, device_manager, startup_duration_ms
+                    intercore, device_manager, startup_duration_ms, reset_cause
                 ),
             )
         except ValueError as err:

@@ -31,7 +31,7 @@ from intercore import (
     OutboundMessageTooLargeError,
 )
 from message_protocol import format_utc_epoch_ms
-from mqtt import Mqtt
+from mqtt import DISCONNECT_WIFI_LOST, Mqtt
 from mqtt_client import MQTTException
 from network_wait import sleep_sliced
 from uptime import create_uptime_state, current_uptime_ms
@@ -960,6 +960,7 @@ class Core0:
         snapshot = self._wifi.snapshot(mqtt_status["connected"])
         snapshot["mqtt_connect_count"] = mqtt_status["connect_count"]
         snapshot["mqtt_disconnect_count"] = mqtt_status["disconnect_count"]
+        snapshot["mqtt_last_disconnect_reason"] = mqtt_status["last_disconnect_reason"]
         snapshot["network_stack_ready"] = self._network_stack_ready
         self._intercore.state_mailboxes.set_network_snapshot(snapshot)
         self._last_network_snapshot_ms = now_ms
@@ -1154,7 +1155,7 @@ class Core0:
         self._network_stack_ready = False
         if not self._wifi.is_connected():
             # Wi-Fi loss implies MQTT loss; drop the stale session state.
-            self._mqtt.mark_disconnected()
+            self._mqtt.mark_disconnected(DISCONNECT_WIFI_LOST)
         self._publish_network_snapshot(force=True)
         self.establish_network()
         self._network_stack_ready = True
@@ -1286,7 +1287,10 @@ class Core0:
             # cannot report itself, so Core 0 resets the board before doing
             # any other work. Feeding the hardware watchdog here proves this
             # pass of the loop executed; the longest un-fed stretch after
-            # this point is one bounded MQTT wait (under WDT_TIMEOUT_MS).
+            # this point is a single MQTT socket operation under the broker
+            # response timeout (MQTTClient feeds the hook before each one,
+            # so a stalled handshake or ACK wait cannot chain past
+            # WDT_TIMEOUT_MS un-fed).
             self._watch_core_1_heartbeat()
             self._feed_watchdog()
 

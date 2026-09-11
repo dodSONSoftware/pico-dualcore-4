@@ -327,12 +327,14 @@ def test_startup_summary_uses_explicit_duration_ms(monkeypatch):
             MockInterCore(),
             MockDeviceManager(),
             12782,
+            "poweron",
         )
     finally:
         core1.time = saved_time
 
     startup = payload["payload"]["data"]["startup"]
     assert startup["duration_ms"] == 12782
+    assert startup["reset_cause"] == "poweron"
     assert "uptime" not in startup
     # The envelope still carries device uptime under its explicit key.
     assert payload["uptime_ms"] == 12782
@@ -594,13 +596,17 @@ def test_build_startup_log_bounded_omits_unbounded_sections(monkeypatch):
     saved_time = core1.time
     core1.time = MagicMock(ticks_ms=lambda: 1000)
     try:
-        payload = core1._build_startup_log_bounded(MockInterCore(), MockDeviceManager(), 4321)
+        payload = core1._build_startup_log_bounded(MockInterCore(), MockDeviceManager(), 4321, "wdt")
     finally:
         core1.time = saved_time
 
     data = payload["payload"]["data"]
     startup = data["startup"]
     assert startup["duration_ms"] == 4321
+    # The reset-cause breadcrumb survives the bounded fallback: it is the
+    # one field a post-watchdog-reset diagnosis needs and the summary loses
+    # nothing by keeping it.
+    assert startup["reset_cause"] == "wdt"
     assert startup["devices_configured"] == 3
     assert startup["devices_ready"] == 2
     assert startup["devices_failed"] == 1
@@ -766,13 +772,14 @@ def test_build_startup_log_event_shape_has_no_system_information(monkeypatch):
     saved_time = core1.time
     core1.time = MagicMock(ticks_ms=lambda: 6000)
     try:
-        payload = core1._build_startup_log(MockInterCore(), MockDeviceManager(), 12782)
+        payload = core1._build_startup_log(MockInterCore(), MockDeviceManager(), 12782, "poweron")
     finally:
         core1.time = saved_time
 
     data = payload["payload"]["data"]
     assert set(data) == {"startup"}, "the event log must not embed the system_information snapshot"
     startup = data["startup"]
+    assert startup["reset_cause"] == "poweron"
     assert startup["ready_devices"] == [{"device": "bme280", "name": "ok"}]
     assert startup["failed_devices"] == [
         {"device": "bme280", "name": "bad", "failure_reason": "I2C device not found"}

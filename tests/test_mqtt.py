@@ -24,7 +24,12 @@ from mqtt_client import (  # noqa: E402
     MQTTClient,
     MQTTException,
 )
-from mqtt import Mqtt  # noqa: E402
+from mqtt import (  # noqa: E402
+    DISCONNECT_CHECK_MSG_FAILURE,
+    DISCONNECT_PING_TIMEOUT,
+    DISCONNECT_PUBLISH_FAILURE,
+    Mqtt,
+)
 
 
 class FakeTicks:
@@ -1792,3 +1797,191 @@ def test_check_msg_eof_mid_packet_marks_disconnected(ticks, mock_select):
     assert mqtt.is_connected() is False
     assert mqtt._disconnect_count == 1
     assert seen == []  # the truncated frame was never delivered
+
+
+# ---------------------------------------------------------------------------
+# Core 0 servicing feed at MQTT socket-operation boundaries
+#
+# The socket timeout bounds ONE blocking operation; one MQTT transaction
+# chains many of them (the connect handshake, a SUBACK/PUBACK/PINGRESP wait
+# loop that may consume unrelated frames). MQTTClient therefore feeds Core
+# 0's servicing hook (Core 1 heartbeat check + hardware watchdog) before
+# every blocking socket operation, so no un-fed stretch can chain past the
+# Core 0 watchdog budget (core0.py WDT_TIMEOUT_MS) while the broker is
+# merely slow.
+# ---------------------------------------------------------------------------
+
+def _traced_socket(sock, log):
+    """Record every blocking socket operation (connect/read/write) so a test
+    can verify a service feed immediately precedes each one."""
+    for name in ("connect", "read", "write"):
+        original = getattr(sock, name)
+
+        def wrapper(*args, _original=original, **kwargs):
+            log.append("op")
+            return _original(*args, **kwargs)
+
+        setattr(sock, name, wrapper)
+    return sock
+
+
+def test_mqtt_wires_its_service_hook_into_clients(ticks):
+    """Mqtt must hand its servicing hook (the Core 0 heartbeat + WDT feed)
+    to every client it constructs."""
+    mqtt = _mqtt(ticks)
+    calls = []
+    mqtt._wait_service = lambda: calls.append(1)
+
+    client = mqtt._new_client()
+    client._service()
+
+    assert calls == [1]
+
+
+def test_mqtt_connect_feeds_service_before_every_blocking_socket_operation(ticks, monkeypatch):
+    """The connect handshake chains many bounded waits (TCP connect, CONNACK,
+    two SUBACKs and their writes); a feed must precede every one, or a slow
+    broker chains the un-fed stretch past the WDT budget into a board reset
+    instead of the designed reconnect backoff."""
+    import mqtt_client
+
+    incoming = (
+        b"\x20\x02\x00\x00"       # CONNACK
+        b"\x90\x03\x00\x01\x00"   # SUBACK pid 1 (command topic)
+        b"\x90\x03\x00\x02\x00"   # SUBACK pid 2 (info response topic)
+    )
+    sock = MockSocket(incoming=incoming)
+    monkeypatch.setattr(mqtt_client.socket, "socket", lambda *a, **k: sock)
+
+    log = []
+
+    def traced_getaddrinfo(*args, **kwargs):
+        # getaddrinfo is a blocking operation the handshake feeds before too
+        # (it sits outside the socket timeout), so trace it like one.
+        log.append("op")
+        return [(None, None, None, ("127.0.0.1", 1883))]
+
+    monkeypatch.setattr(mqtt_client.socket, "getaddrinfo", traced_getaddrinfo)
+    _traced_socket(sock, log)
+    mqtt = _mqtt(ticks)
+    mqtt._wait_service = lambda: log.append("feed")
+
+    assert mqtt.connect() is True
+    assert mqtt.is_connected() is True
+
+    # Strict alternation: the handshake opens with a feed, and no blocking
+    # operation runs without a feed immediately before it.
+    assert log[0] == "feed"
+    assert all(
+        (entry == "feed") if i % 2 == 0 else (entry == "op")
+        for i, entry in enumerate(log)
+    )
+    # The handshake performed real work: TCP connect, CONNACK read, two
+    # SUBACK exchanges -- far more than one bounded wait.
+    assert log.count("op") >= 12
+
+
+def test_ping_feeds_service_for_each_trickled_packet_before_pingresp():
+    """A broker that trickles unrelated PUBLISH frames while the PINGRESP
+    wait is pending keeps every individual read short, so only a feed per
+    wait_msg() iteration keeps the un-fed stretch under the watchdog budget."""
+    import struct
+
+    def publish_frame(topic, payload):
+        body = struct.pack("!H", len(topic)) + topic + payload
+        return b"\x30" + bytes([len(body)]) + body
+
+    # Three QoS 0 PUBLISHes, then the PINGRESP the wait actually wants.
+    sock = MockSocket(incoming=publish_frame(b"t", b"m") * 3 + b"\xd0\x00")
+    log = []
+    client = MQTTClient(
+        "pico_test", "broker", keepalive=30,
+        service=lambda: log.append("feed"),
+    )
+    seen = []
+    client.set_callback(lambda topic, msg: seen.append((topic, msg)))
+    client.sock = sock
+    _traced_socket(sock, log)
+
+    client.ping(timeout_sec=4)
+
+    assert seen == [(b"t", b"m")] * 3  # the trickled frames were consumed
+    # Strict feed/op alternation across the whole wait: the PINGREQ write,
+    # then every read of every consumed frame and the PINGRESP.
+    assert log[0] == "feed"
+    assert all(
+        (entry == "feed") if i % 2 == 0 else (entry == "op")
+        for i, entry in enumerate(log)
+    )
+    assert log.count("feed") >= 4  # at least one per consumed frame + PINGRESP
+
+
+# ---------------------------------------------------------------------------
+# Disconnect reason: a dropped session names why (get-details communications)
+# ---------------------------------------------------------------------------
+
+def test_disconnect_reason_initial_and_preserved(ticks):
+    """The reason starts unset; a named mark_disconnected records it; an
+    unattributed call preserves the last named reason instead of erasing it."""
+    mqtt = _mqtt(ticks)
+
+    assert mqtt.status()["last_disconnect_reason"] is None
+
+    mqtt.mark_disconnected(DISCONNECT_PING_TIMEOUT)
+    assert mqtt.status()["last_disconnect_reason"] == DISCONNECT_PING_TIMEOUT
+
+    mqtt.mark_disconnected()
+    assert mqtt.status()["last_disconnect_reason"] == DISCONNECT_PING_TIMEOUT
+
+
+def test_ping_failure_records_ping_timeout_reason(ticks):
+    mqtt = _mqtt(ticks)
+    client = FakeClient()
+    client.ping_error = OSError("PINGRESP timeout")
+    mqtt._client = client
+    mqtt._connected = True
+
+    with pytest.raises(OSError):
+        mqtt.ping()
+
+    assert mqtt.is_connected() is False
+    assert mqtt.status()["last_disconnect_reason"] == DISCONNECT_PING_TIMEOUT
+
+
+def test_publish_failure_records_publish_failure_reason(ticks):
+    mqtt = _mqtt(ticks)
+    client = FakeClient()
+    client.publish_error = OSError("PUBACK timeout")
+    mqtt._client = client
+    mqtt._connected = True
+
+    with pytest.raises(OSError):
+        mqtt.publish_qos1("iot/v3/telemetry", b"x")
+
+    assert mqtt.is_connected() is False
+    assert mqtt.status()["last_disconnect_reason"] == DISCONNECT_PUBLISH_FAILURE
+
+
+def test_publish_with_packet_id_failure_records_publish_failure_reason(ticks):
+    mqtt = _mqtt(ticks)
+    client = FakeClient()
+    client.publish_error = OSError("PUBACK timeout")
+    mqtt._client = client
+    mqtt._connected = True
+
+    assert mqtt.publish_qos1_with_packet_id("iot/v3/telemetry", b"x", 7) is False
+    assert mqtt.status()["last_disconnect_reason"] == DISCONNECT_PUBLISH_FAILURE
+
+
+def test_check_msg_failure_records_check_msg_failure_reason(ticks):
+    mqtt = _mqtt(ticks)
+    client = FakeClient()
+    client.check_msg_error = OSError("inbound stall")
+    mqtt._client = client
+    mqtt._connected = True
+
+    with pytest.raises(OSError):
+        mqtt.check_msg()
+
+    assert mqtt.is_connected() is False
+    assert mqtt.status()["last_disconnect_reason"] == DISCONNECT_CHECK_MSG_FAILURE

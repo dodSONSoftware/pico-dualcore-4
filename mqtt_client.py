@@ -22,7 +22,7 @@ class MQTTException(Exception):
 
 
 class MQTTClient:
-    def __init__(self, client_id, server, port=0, keepalive=0):
+    def __init__(self, client_id, server, port=0, keepalive=0, service=None):
         if port == 0:
             port = 1883
         self.client_id = client_id
@@ -36,9 +36,22 @@ class MQTTClient:
         self.pid = 0
         self.cb = None
         self.keepalive = keepalive
+        # Optional Core 0 servicing hook (Core 1 heartbeat check + hardware
+        # watchdog feed), invoked before every blocking socket operation:
+        # the socket timeout bounds one operation, but one MQTT transaction
+        # chains many of them, and without a feed between operations the
+        # un-fed stretch could chain past the Core 0 watchdog budget
+        # (core0.py WDT_TIMEOUT_MS) while the broker is merely slow.
+        self._service_hook = service
+
+    def _service(self):
+        if self._service_hook is not None:
+            self._service_hook()
 
     def _send_str(self, s):
+        self._service()
         self.sock.write(struct.pack("!H", len(s)))
+        self._service()
         self.sock.write(s)
 
     def _abort_corrupt_inbound(self, reason):
@@ -57,6 +70,7 @@ class MQTTClient:
         # return fewer bytes, and that must surface as OSError (Core 0
         # reconnects over it), not IndexError from the caller indexing short
         # bytes (escapes the recovery boundary, resets the MCU).
+        self._service()
         data = self.sock.read(size)
         if data is None or len(data) != size:
             raise OSError(-1)
@@ -95,9 +109,14 @@ class MQTTClient:
         # Filter the lookup to the profile the default socket constructs
         # (AF_INET/SOCK_STREAM): an unfiltered multi-record hostname can hand
         # connect() an unusable first record even when a usable one follows.
+        # The lookup itself is not under the socket timeout: a literal IP
+        # (the shipped configuration) parses without a query, and a hostname
+        # is bounded by lwIP's own DNS retry logic instead.
+        self._service()
         addr = socket.getaddrinfo(
             self.server, self.port, socket.AF_INET, socket.SOCK_STREAM
         )[0][-1]
+        self._service()
         self.sock.connect(addr)
         premsg = bytearray(b"\x10\0\0\0\0\0")
         msg = bytearray(b"\x04MQTT\x04\x02\0\0")
@@ -117,7 +136,9 @@ class MQTTClient:
             i += 1
         premsg[i] = sz
 
+        self._service()
         self.sock.write(premsg, i + 2)
+        self._service()
         self.sock.write(msg)
         self._send_str(self.client_id)
         resp = self._read_required(4)
@@ -135,6 +156,7 @@ class MQTTClient:
         if timeout_sec is not None:
             self.sock.settimeout(timeout_sec)
         try:
+            self._service()
             self.sock.write(b"\xc0\0")
             while 1:
                 # wait_msg() consumes PINGRESP internally and returns None.
@@ -187,13 +209,16 @@ class MQTTClient:
         if timed:
             self.sock.settimeout(timeout_ms / 1000.0)
         try:
+            self._service()
             self.sock.write(pkt, i + 1)
             self._send_str(topic)
             # Pack the packet id only now: it reuses the opcode/length
             # bytes already written (wire order: header, topic, packet id).
             struct.pack_into("!H", pkt, 0, pid)
+            self._service()
             self.sock.write(pkt, 2)
             if splice_fragment is None:
+                self._service()
                 self.sock.write(msg)
             else:
                 # Segment the spliced tail: a zero-copy view of msg minus its
@@ -204,9 +229,13 @@ class MQTTClient:
                 # tens of KiB total free (a pre-joined copy would MemoryError
                 # on a fragmented post-startup heap).
                 view = memoryview(msg)
+                self._service()
                 self.sock.write(view[: len(msg) - 1])
+                self._service()
                 self.sock.write(b",")
+                self._service()
                 self.sock.write(splice_fragment)
+                self._service()
                 self.sock.write(b"}")
             while 1:
                 op = self.wait_msg()
@@ -242,8 +271,10 @@ class MQTTClient:
         pkt = bytearray(b"\x82\0\0\0")
         pid = self.next_packet_id()
         struct.pack_into("!BH", pkt, 1, 2 + 2 + len(topic) + 1, pid)
+        self._service()
         self.sock.write(pkt)
         self._send_str(topic)
+        self._service()
         self.sock.write(b"\x01")
         while 1:
             op = self.wait_msg()
@@ -274,6 +305,11 @@ class MQTTClient:
         # Read in the caller's socket mode and never change it: every caller
         # runs in blocking-with-timeout mode, and setblocking(True) ==
         # settimeout(None) in MicroPython would clear the caller's timeout.
+        # The per-call feed also bounds the SUBACK/PUBACK/PINGRESP wait
+        # loops: a broker trickling unrelated frames keeps each read short,
+        # so only a feed per iteration keeps the un-fed stretch under the
+        # Core 0 watchdog budget.
+        self._service()
         res = self.sock.read(1)
         if res is None:
             return None
@@ -338,6 +374,7 @@ class MQTTClient:
         if op & 6 == 2:
             pkt = bytearray(b"\x40\x02\0\0")
             struct.pack_into("!H", pkt, 2, pid)
+            self._service()
             self.sock.write(pkt)
         return op
 

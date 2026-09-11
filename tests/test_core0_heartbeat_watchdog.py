@@ -172,11 +172,11 @@ class FakeMqtt:
     def connect(self):
         return True
 
-    def mark_disconnected(self):
+    def mark_disconnected(self, reason=None):
         self.connected = False
 
     def status(self):
-        return {"connected": self.connected, "connect_count": 1, "disconnect_count": 0}
+        return {"connected": self.connected, "connect_count": 1, "disconnect_count": 0, "last_disconnect_reason": None}
 
     def publish_qos1(self, topic, message, splice_fragment=None):
         pass
@@ -201,11 +201,11 @@ class FailingMqtt:
         self.connect_calls += 1
         return False
 
-    def mark_disconnected(self):
+    def mark_disconnected(self, reason=None):
         pass
 
     def status(self):
-        return {"connected": False, "connect_count": 0, "disconnect_count": 0}
+        return {"connected": False, "connect_count": 0, "disconnect_count": 0, "last_disconnect_reason": None}
 
 
 @pytest.fixture

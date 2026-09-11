@@ -173,11 +173,11 @@ class FakeMqtt:
         self.connected = True
         return True
 
-    def mark_disconnected(self):
+    def mark_disconnected(self, reason=None):
         self.connected = False
 
     def status(self):
-        return {"connected": self.connected, "connect_count": 1, "disconnect_count": 0}
+        return {"connected": self.connected, "connect_count": 1, "disconnect_count": 0, "last_disconnect_reason": None}
 
     def get_next_packet_id(self):
         return 1

@@ -87,7 +87,7 @@ class MockMqtt:
         self._connect_count += 1
         return True
 
-    def mark_disconnected(self):
+    def mark_disconnected(self, reason=None):
         self._connected = False
 
     def check_msg(self):
@@ -116,6 +116,7 @@ class MockMqtt:
             "connected": self._connected,
             "connect_count": self._connect_count,
             "disconnect_count": self._disconnect_count,
+            "last_disconnect_reason": None,
         }
 
 
