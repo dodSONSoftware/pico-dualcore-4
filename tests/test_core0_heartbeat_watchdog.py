@@ -215,9 +215,10 @@ def env():
     _FAKE_TIME.stop_after_ms = None
     machine = ResettingMachine()
     _install_mocks(machine)
-    # core0 binds time from sys.modules at import time (as does uptime);
+    # core0 binds time from sys.modules at import time (as do uptime and network_wait);
     # reload in dependency order so the fakes are authoritative.
     importlib.reload(importlib.import_module("uptime"))
+    importlib.reload(importlib.import_module("network_wait"))
     core0_mod = importlib.import_module("core0")
     importlib.reload(core0_mod)
 

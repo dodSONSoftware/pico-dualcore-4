@@ -7,7 +7,14 @@ import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-CORE0_FILES = ("core0.py", "wifi.py", "mqtt.py", "mqtt_client.py", "config_manager.py")
+CORE0_FILES = (
+    "core0.py",
+    "wifi.py",
+    "mqtt.py",
+    "mqtt_client.py",
+    "network_wait.py",
+    "config_manager.py",
+)
 CORE1_FILES = (
     "core1.py",
     "device_manager.py",
@@ -30,7 +37,16 @@ def _imports(path):
 
 
 def test_core1_has_no_network_stack_imports():
-    forbidden = {"network", "socket", "mqtt", "mqtt_client", "wifi", "core0", "led_manager"}
+    forbidden = {
+        "network",
+        "network_wait",
+        "socket",
+        "mqtt",
+        "mqtt_client",
+        "wifi",
+        "core0",
+        "led_manager",
+    }
     for path in CORE1_FILES:
         assert not (_imports(path) & forbidden), path
 

@@ -124,6 +124,7 @@ def make_core0(tmp_path):
         _FAKE_TIME.now_ms = 0
         _install_mocks()
         importlib.reload(importlib.import_module("uptime"))
+        importlib.reload(importlib.import_module("network_wait"))
         core0_mod = importlib.import_module("core0")
         importlib.reload(core0_mod)
 

@@ -257,6 +257,7 @@ def make_core0():
         _install_mocks()
         # core0 imports uptime; rebind its time to the fake before reloading core0.
         importlib.reload(importlib.import_module("uptime"))
+        importlib.reload(importlib.import_module("network_wait"))
         core0_mod = importlib.import_module("core0")
         importlib.reload(core0_mod)
 

@@ -7,6 +7,7 @@ import time
 
 from debug import DEBUG
 from mqtt_client import MQTTClient, MQTTException
+from network_wait import sleep_sliced
 
 # Bounded wait for PINGRESP so a dead link surfaces quickly instead of
 # blocking the Core 0 run loop for the full keepalive window. The bound sits
@@ -69,14 +70,6 @@ class Mqtt:
     def _service_wait(self):
         if self._wait_service is not None:
             self._wait_service()
-
-    def _sleep_interruptible(self, delay_sec):
-        if delay_sec <= 0:
-            return
-
-        for _ in range(int(delay_sec * 10)):
-            self._service_wait()
-            time.sleep_ms(100)
 
     def _new_client(self):
         client = MQTTClient(
@@ -157,7 +150,7 @@ class Mqtt:
                 if attempt_index < len(self._reconnect_delays) - 1:
                     if DEBUG:
                         print("[DEBUG] MQTT retry in {} sec".format(delay_sec))
-                    self._sleep_interruptible(delay_sec)
+                    sleep_sliced(delay_sec, self._service_wait)
         return False
 
     def mark_disconnected(self):

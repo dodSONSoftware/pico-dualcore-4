@@ -76,6 +76,7 @@ The queues are heap-governed; the outbound queue is additionally bounded by a de
 | `message_serializer.py` | JSON-safe message validation and serialization |
 | `mqtt.py` | Core 0 MQTT lifecycle (QoS 1, keepalive PINGREQ, subscriptions) |
 | `mqtt_client.py` | Low-level MQTT wire protocol client |
+| `network_wait.py` | Core 0's sliced-wait primitive: the long network waits (Wi-Fi/MQTT backoffs, Core 0 run-loop waits) sleep in 100 ms slices with the servicing hook invoked between slices |
 | `wifi.py` | Core 0 Wi-Fi connection management |
 | `led_manager.py` | Core 0 onboard LED state machine |
 | `release.py` | Builds the deployable release artifact (`releases/`) |

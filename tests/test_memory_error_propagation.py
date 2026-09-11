@@ -184,6 +184,7 @@ def _make_core0():
     sys.modules["wifi"] = MagicMock()
     sys.modules["mqtt"] = MagicMock()
     importlib.reload(importlib.import_module("uptime"))
+    importlib.reload(importlib.import_module("network_wait"))
     core0_mod = importlib.import_module("core0")
     importlib.reload(core0_mod)
 

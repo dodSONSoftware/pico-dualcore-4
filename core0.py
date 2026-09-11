@@ -33,6 +33,7 @@ from intercore import (
 from message_protocol import format_utc_epoch_ms
 from mqtt import Mqtt
 from mqtt_client import MQTTException
+from network_wait import sleep_sliced
 from uptime import create_uptime_state, current_uptime_ms
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
 from wifi import Wifi
@@ -1212,12 +1213,10 @@ class Core0:
         self._feed_watchdog()
 
     def _sleep_and_service(self, delay_sec):
-        if delay_sec <= 0:
-            return
-
-        for _ in range(int(delay_sec * 10)):
-            self._service_wait()
-            time.sleep_ms(100)
+        # The 100 ms slicing itself lives in network_wait.sleep_sliced
+        # (shared with the Wi-Fi/MQTT backoffs); Core 0's hook pairs the
+        # Core 1 heartbeat check with the hardware watchdog feed.
+        sleep_sliced(delay_sec, self._service_wait)
 
     def start(self):
         """Establish Core 0 network services before Core 1 starts. Connect

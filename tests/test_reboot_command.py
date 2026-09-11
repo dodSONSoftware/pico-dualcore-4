@@ -165,6 +165,7 @@ def make_core0():
         _MACHINE.events = []
         _install_mocks()
         importlib.reload(importlib.import_module("uptime"))
+        importlib.reload(importlib.import_module("network_wait"))
         core0_mod = importlib.import_module("core0")
         importlib.reload(core0_mod)
 

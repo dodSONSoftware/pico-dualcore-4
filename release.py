@@ -25,6 +25,7 @@ REQUIRED_FILES = {
     "wifi.py",
     "mqtt.py",
     "mqtt_client.py",
+    "network_wait.py",
     "system_information.py",
     "uptime.py",
     "device_manager.py",

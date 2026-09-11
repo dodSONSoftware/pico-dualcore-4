@@ -6,6 +6,7 @@ import time
 import network
 
 from debug import DEBUG
+from network_wait import sleep_sliced
 
 
 class Wifi:
@@ -26,14 +27,6 @@ class Wifi:
     def _service_wait(self):
         if self._wait_service is not None:
             self._wait_service()
-
-    def _sleep_interruptible(self, delay_sec):
-        if delay_sec <= 0:
-            return
-
-        for _ in range(int(delay_sec * 10)):
-            self._service_wait()
-            time.sleep_ms(100)
 
     def _current_status(self):
         """The current WLAN association state, or None if it cannot be read;
@@ -156,7 +149,7 @@ class Wifi:
             if attempt_index < len(self._reconnect_delays_sec) - 1:
                 if DEBUG:
                     print("[DEBUG] Wi-Fi retry in {} sec".format(delay_sec))
-                self._sleep_interruptible(delay_sec)
+                sleep_sliced(delay_sec, self._service_wait)
 
         return False
 

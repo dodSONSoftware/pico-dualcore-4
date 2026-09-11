@@ -157,6 +157,7 @@ sys.modules["debug"] = _DEBUG_MOCK
 
 import mqtt as mqtt_mod  # noqa: E402
 import wifi as wifi_mod  # noqa: E402
+import network_wait as network_wait_mod  # noqa: E402
 
 _RECONNECT_DELAYS_SEC = [5, 5, 5, 5, 10, 10, 20, 20, 40, 40]
 _TIMEOUT_MS = 30000
@@ -164,6 +165,11 @@ _TIMEOUT_MS = 30000
 
 @pytest.fixture
 def ticks(monkeypatch):
+    # network_wait is one shared module object: an earlier test file's
+    # fake-clock fixture may have reloaded it under its own fake time. Pin
+    # its time global to the real (monkeypatched below) module for these
+    # tests so sleep_sliced runs on this file's controllable clock.
+    monkeypatch.setattr(network_wait_mod, "time", real_time)
     fake = FakeTicks()
     for name in ("ticks_ms", "ticks_diff", "ticks_add", "sleep_ms", "sleep"):
         monkeypatch.setattr(real_time, name, getattr(fake, name), raising=False)
@@ -235,46 +241,34 @@ def test_mqtt_connect_services_wait_and_watchdog_fires_inside_wait(ticks, monkey
     assert len(service.calls) > 50
 
 
-# --- Zero-delay waits --------------------------------------------------------
+# --- Sliced-wait shape (network_wait.sleep_sliced) ---------------------------
 #
-# Configuration validation permits zero-valued reconnect delays. A zero delay
-# is a configured *immediate* retry: it must wait nothing. The previous
-# implementation's max(int(delay * 10), 1) floor made it wait 100 ms and
-# service the hook once anyway, disagreeing with the configuration.
+# The 100 ms slicing is shared by Core 0, the Wi-Fi backoff, and the MQTT
+# backoff: service() runs before every 100 ms slice. Configuration validation
+# permits zero-valued reconnect delays; a zero delay is a configured
+# *immediate* retry: it must wait nothing. The previous implementation's
+# max(int(delay * 10), 1) floor made it wait 100 ms and service the hook once
+# anyway, disagreeing with the configuration.
 
 
-def test_wifi_zero_delay_waits_nothing_and_services_nothing(ticks):
+def test_sleep_sliced_zero_delay_waits_nothing_and_services_nothing(ticks):
     """A zero-second delay sleeps no slice and drops no watchdog check."""
     service = _counting_service(ticks)
-    wifi = wifi_mod.Wifi("test-ssid", "test-password", [0, 0], service)
 
-    wifi._sleep_interruptible(0)
+    network_wait_mod.sleep_sliced(0, service)
 
     assert ticks.now_ms == 0
     assert service.calls == []
 
 
-def test_mqtt_zero_delay_waits_nothing_and_services_nothing(ticks, monkeypatch):
-    """A zero-second delay sleeps no slice and drops no watchdog check."""
-    monkeypatch.setattr(mqtt_mod, "MQTTClient", _FailingClient)
+def test_sleep_sliced_services_before_each_hundred_ms_slice(ticks):
+    """service() fires once per 100 ms slice, before that slice's sleep."""
     service = _counting_service(ticks)
-    mqtt = mqtt_mod.Mqtt(
-        {
-            "mqtt_broker_ip_address": "10.0.0.1",
-            "mqtt_topic_command": "iot/v3/command",
-            "mqtt_topic_info_response": "iot/v3/info-response",
-            "mqtt_keepalive_sec": 30,
-            "mqtt_broker_response_timeout_sec": 4,
-            "mqtt_reconnect_delays_sec": [0, 0],
-        },
-        lambda message: None,
-        service,
-    )
 
-    mqtt._sleep_interruptible(0)
+    network_wait_mod.sleep_sliced(0.5, service)
 
-    assert ticks.now_ms == 0
-    assert service.calls == []
+    assert ticks.now_ms == 500
+    assert service.calls == [0, 100, 200, 300, 400]
 
 
 # --- Wi-Fi terminal-failure early-exit -------------------------------------

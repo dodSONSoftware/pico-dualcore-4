@@ -311,6 +311,9 @@ def test_utc_aging_survives_elapsed_beyond_half_period():
         sys.modules["debug"] = debug_mock
         sys.modules["wifi"] = MagicMock()
         sys.modules["mqtt"] = MagicMock()
+        # network_wait binds time at import like uptime: reload it under the
+        # fakes so core0's sliced waits are deterministic.
+        importlib.reload(importlib.import_module("network_wait"))
         core0 = (
             importlib.import_module("core0")
             if "core0" not in sys.modules
