@@ -22,7 +22,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from device_factory import (  # noqa: E402
     allowed_config_keys,
     create_device,
-    is_supported_device_type,
 )
 from devices.bme280.validation import (  # noqa: E402
     ALLOWED_CONFIG_KEYS,
@@ -184,7 +183,6 @@ def _initialized_device(config=None, i2c=None):
 
 
 def test_registry_supports_bme280():
-    assert is_supported_device_type("bme280") is True
     assert allowed_config_keys("bme280") == ALLOWED_CONFIG_KEYS
 
 

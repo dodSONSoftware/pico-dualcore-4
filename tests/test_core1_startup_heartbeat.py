@@ -316,14 +316,13 @@ def test_device_manager_refreshes_between_attempts():
             _manager_config(attempts=3),
             activity_refresh=refresh,
         )
-        initialized, failed = manager.initialize_devices()
+        initialized = manager.initialize_devices()
     finally:
         dm.create_device = saved_create
 
     # Normal initialization behavior is preserved: the device came up after
     # exactly the attempts the FlakyDriver needed (3), none failed.
     assert initialized == 1
-    assert failed == []
     assert driver.calls == 3
 
     # Refresh at every progress boundary, strictly increasing per attempt.
@@ -444,14 +443,13 @@ def test_device_manager_retry_sleep_refreshes_in_steps():
             _manager_config(attempts=2, retry_delay_ms=delay_ms),
             activity_refresh=refresh,
         )
-        initialized, failed = manager.initialize_devices()
+        initialized = manager.initialize_devices()
     finally:
         dm.create_device = saved_create
         dm.time = _HostTimeShim()
 
     # Normal initialization behavior is preserved.
     assert initialized == 1
-    assert failed == []
 
     # The delay is split into steps of at most 100 ms summing to the delay.
     assert len(step_time.steps) == delay_ms // 100
@@ -478,12 +476,11 @@ def test_device_manager_without_refresh_callback_is_unchanged():
     try:
         manager = dm.DeviceManager(_manager_config(attempts=1))
         assert manager._activity_refresh is None
-        initialized, failed = manager.initialize_devices()
+        initialized = manager.initialize_devices()
     finally:
         dm.create_device = saved_create
 
     assert initialized == 1
-    assert failed == []
 
 
 def test_device_manager_normal_read_refreshes_per_device():
@@ -553,9 +550,8 @@ def test_device_manager_normal_read_refreshes_per_device():
             for i in range(device_count)
         ]
         manager = dm.DeviceManager(config, activity_refresh=refresh)
-        initialized, failed = manager.initialize_devices()
+        initialized = manager.initialize_devices()
         assert initialized == device_count
-        assert failed == []
 
         # One telemetry pass, the same loop core1's _run_telemetry_read_pass
         # runs (initial and periodic passes share it).

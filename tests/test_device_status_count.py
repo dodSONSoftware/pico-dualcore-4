@@ -122,13 +122,12 @@ def test_one_failing_device_does_not_stop_the_others():
                 {"id": "dev2", "device_type": "test", "config": {}},
             ],
         })
-        initialized, failed = manager.initialize_devices()
+        initialized = manager.initialize_devices()
     finally:
         dm.create_device = saved
 
     assert initialized == 1
-    assert len(failed) == 1
-    assert failed[0]["device_id"] == "dev1"
+    assert list(manager._failed_devices) == ["dev1"]
     assert [m.device_id for m in manager.get_active_devices()] == ["dev2"]
 
     snapshot = manager.get_status_snapshot()

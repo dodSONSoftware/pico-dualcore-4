@@ -44,11 +44,6 @@ MAX_DEVICE_ID_LENGTH = 64
 MAX_DEVICE_NAME_LENGTH = 64
 
 
-def is_supported_device_type(device_type):
-    """True if device_type has a registered validator and constructor."""
-    return device_type in _DEVICE_REGISTRY
-
-
 def allowed_config_keys(device_type):
     """The device-specific config keys a supported device_type accepts, or None."""
     entry = _DEVICE_REGISTRY.get(device_type)

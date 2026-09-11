@@ -1019,14 +1019,10 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         )
         system_information.set_device_manager(device_manager)
 
-        initialized, failed = device_manager.initialize_devices()
+        initialized = device_manager.initialize_devices()
         print("[INFO] Core 1 devices initialized: {}/{}".format(
             initialized, len(config["devices"])
         ))
-        # failed carries each failed device's attempts_used and last_error
-        # (one entry per device, no per-attempt history).
-        if failed and DEBUG:
-            print("[DEBUG] Core 1 failed devices: {}".format(failed))
 
         startup_duration_ms = current_uptime_ms(uptime_state)
 

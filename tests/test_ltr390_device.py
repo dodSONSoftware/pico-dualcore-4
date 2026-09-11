@@ -24,7 +24,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from device_factory import (  # noqa: E402
     allowed_config_keys,
     create_device,
-    is_supported_device_type,
 )
 from devices.ltr390.validation import (  # noqa: E402
     ALLOWED_CONFIG_KEYS,
@@ -163,7 +162,6 @@ def _initialized_device(config=None, i2c=None):
 
 
 def test_registry_supports_ltr390():
-    assert is_supported_device_type("ltr390") is True
     assert allowed_config_keys("ltr390") == ALLOWED_CONFIG_KEYS
 
 

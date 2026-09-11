@@ -214,12 +214,6 @@ class DeviceManager:
 
     def _record_driver_failure(self, device_id, device_type, error):
         last_error = str(error)
-        failed_details = [{
-            "device_id": device_id,
-            "device_type": device_type,
-            "initialization_attempts_used": 1,
-            "last_error": last_error,
-        }]
         self._failed_devices[device_id] = {
             "id": device_id,
             "device": device_type,
@@ -231,16 +225,9 @@ class DeviceManager:
             "success": False,
             "device_id": device_id,
             "device_type": device_type,
-            "failed_details": failed_details,
         }
 
     def _record_initialization_failure(self, device_id, device_type, attempts_used, last_error):
-        failed_details = [{
-            "device_id": device_id,
-            "device_type": device_type,
-            "initialization_attempts_used": attempts_used,
-            "last_error": last_error,
-        }]
         self._failed_devices[device_id] = {
             "id": device_id,
             "device": device_type,
@@ -252,7 +239,6 @@ class DeviceManager:
             "success": False,
             "device_id": device_id,
             "device_type": device_type,
-            "failed_details": failed_details,
         }
 
     def _record_success(self, device_id, device_type, driver, attempts_used, name=None):
@@ -270,25 +256,23 @@ class DeviceManager:
             "success": True,
             "device_id": device_id,
             "device_type": device_type,
-            "failed_details": [],
         }
 
     def initialize_devices(self):
         """Initialize all configured devices in configuration order, with the
         configured attempts and retry delay per device; on final failure record
-        the device and continue. Returns (initialized_count, failed_details)."""
+        the device (in the failure status the system-information section
+        reports) and continue. Returns the initialized count."""
         initialized_count = 0
-        all_failed_device_details = []
 
         for device_def in self._devices_config:
             # Progress boundary: covers driver construction.
             self._refresh_activity()
             result = self._initialize_single_device(device_def)
-            all_failed_device_details.extend(result["failed_details"])
             if result["success"]:
                 initialized_count += 1
 
-        return initialized_count, all_failed_device_details
+        return initialized_count
 
     def get_active_devices(self):
         """The active managed devices in configuration order. Returns the
