@@ -5,8 +5,6 @@
 from devices.device import DeviceValidationError
 from devices.bme280 import validation as bme280_validation
 from devices.ltr390 import validation as ltr390_validation
-from devices.system_information.system_information_device import SystemInformationDevice
-from devices.system_information.validation import ALLOWED_CONFIG_KEYS, validate_config
 
 # The supported device_type registry: device_type -> (pure config validator,
 # allowed config keys). The single source of truth for which types the
@@ -14,7 +12,6 @@ from devices.system_information.validation import ALLOWED_CONFIG_KEYS, validate_
 # by create_device() (construction) and the pure validation path in config.py.
 # Adding a device type is adding one entry here plus its pure validator.
 _DEVICE_REGISTRY = {
-    "system-information": (validate_config, ALLOWED_CONFIG_KEYS),
     "bme280": (
         bme280_validation.validate_config,
         bme280_validation.ALLOWED_CONFIG_KEYS,
@@ -125,13 +122,8 @@ def validate_device_definition(device_definition):
     validate_device_config(device_type, device_definition["config"])
 
 
-def create_device(device_definition, system_information=None, i2c_bus_factory=None):
+def create_device(device_definition, i2c_bus_factory=None):
     device_type = device_definition["device_type"]
-
-    if device_type == "system-information":
-        if system_information is None:
-            raise ValueError("system-information requires system_information")
-        return SystemInformationDevice(system_information)
 
     if device_type == "bme280":
         # The driver never owns the bus: Core 1 supplies a factory that builds

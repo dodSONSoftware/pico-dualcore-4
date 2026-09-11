@@ -3,10 +3,10 @@
 # SPDX-License-Identifier: MIT
 
 """Host-side tests for the whole-device pure validation path: the device_type
-registry, the pure per-device validator, the pure system-information config
-validator, the driver's reuse of it, and the config-level unknown-field
-aggregation. None of these construct or touch hardware -- the import chain
-reaches no ``machine`` module, so they run on plain CPython."""
+registry, the pure per-device validator dispatch, the protocol-scale length
+bounds, and the config-level unknown-field aggregation. None of these
+construct or touch hardware -- the import chain reaches no ``machine``
+module, so they run on plain CPython."""
 
 import json
 import pathlib
@@ -23,13 +23,11 @@ from device_factory import (
     allowed_config_keys,
     validate_device_definition,
 )
-from devices.device import DeviceValidationError
-from devices.system_information.system_information_device import SystemInformationDevice
-from devices.system_information.validation import (
-    ALLOWED_CONFIG_KEYS,
-    SYSTEM_INFORMATION_SECTIONS,
-    validate_config as validate_system_information_config,
+from devices.bme280.bme280_device import BME280Device
+from devices.bme280.validation import (
+    ALLOWED_CONFIG_KEYS as BME280_ALLOWED_CONFIG_KEYS,
 )
+from devices.device import DeviceValidationError
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -39,11 +37,14 @@ def _base_config():
     return json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
 
 
-def _definition(device_type="system-information", config=None, **overrides):
+def _definition(device_type="bme280", config=None, **overrides):
     definition = {
         "id": "dev",
         "device_type": device_type,
-        "config": {"include": ["memory"]} if config is None else config,
+        "config": (
+            {"i2c_bus": 0, "sea_level_pressure_pa": 101325}
+            if config is None else config
+        ),
     }
     definition.update(overrides)
     return definition
@@ -54,8 +55,9 @@ def _definition(device_type="system-information", config=None, **overrides):
 # ---------------------------------------------------------------------------
 
 
-def test_registry_exposes_the_system_information_type():
-    assert allowed_config_keys("system-information") == ALLOWED_CONFIG_KEYS
+def test_registry_exposes_the_supported_types():
+    assert allowed_config_keys("bme280") == BME280_ALLOWED_CONFIG_KEYS
+    assert allowed_config_keys("ltr390") is not None
     assert allowed_config_keys("acme-9000") is None
 
 
@@ -74,7 +76,7 @@ def test_pure_validator_never_constructs_the_driver(monkeypatch):
     def explode(self, *args, **kwargs):
         raise AssertionError("the pure validator must not construct a driver")
 
-    monkeypatch.setattr(SystemInformationDevice, "__init__", explode)
+    monkeypatch.setattr(BME280Device, "__init__", explode)
     validate_device_definition(_definition())
 
 
@@ -101,7 +103,11 @@ def test_pure_validator_rejects_unknown_definition_fields():
 
 def test_pure_validator_dispatches_to_the_device_validator():
     with pytest.raises(DeviceValidationError) as excinfo:
-        validate_device_definition(_definition(config={"include": ["nope"]}))
+        validate_device_definition(_definition(config={
+            "i2c_bus": 0,
+            "sea_level_pressure_pa": 101325,
+            "i2c_address_candidates": [120],
+        }))
     assert excinfo.value.code == "invalid_value"
 
 
@@ -174,91 +180,18 @@ def test_worst_case_bounded_device_sections_stay_under_the_message_ceiling():
     the per-device sections of a message (startup-log ready/failed lists,
     telemetry identity fields, the read-config device section) stay under half
     of MAX_OUTBOUND_MESSAGE_BYTES, leaving margin for the envelope, the fixed
-    top-level configuration, and the non-config growth (system_information,
-    driver failure reasons) that no config bound can pin."""
+    top-level configuration, and the non-config growth (driver failure
+    reasons) that no config bound can pin."""
     from config import MAX_DEVICES
     from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES
 
     entry = {
-        "device": "system-information",
+        "device": "bme280",
         "name": "n" * MAX_DEVICE_NAME_LENGTH,
     }
     worst_case_entry = len(json.dumps(entry).encode("utf-8"))
     device_sections = MAX_DEVICES * worst_case_entry
     assert device_sections < MAX_OUTBOUND_MESSAGE_BYTES // 2
-
-
-# ---------------------------------------------------------------------------
-# Pure system-information config validator
-# ---------------------------------------------------------------------------
-
-
-def test_si_validator_accepts_any_valid_section_set():
-    validate_system_information_config({"include": list(SYSTEM_INFORMATION_SECTIONS)})
-
-
-def test_si_validator_rejects_unknown_config_keys():
-    with pytest.raises(DeviceValidationError) as excinfo:
-        validate_system_information_config({"include": ["memory"], "bogus": 1})
-    assert excinfo.value.code == "unknown_config_fields"
-
-
-def test_si_validator_rejects_missing_include():
-    with pytest.raises(DeviceValidationError) as excinfo:
-        validate_system_information_config({})
-    assert excinfo.value.code == "missing_key"
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [
-        {"include": "memory"},
-        {"include": [1]},
-        {"include": ["nope"]},
-        {"include": ["memory", "memory"]},
-    ],
-)
-def test_si_validator_rejects_bad_include(bad):
-    with pytest.raises(DeviceValidationError) as excinfo:
-        validate_system_information_config(bad)
-    assert excinfo.value.code == "invalid_value"
-
-
-def test_si_validator_accepts_an_empty_include():
-    """An empty include list is the "all sections" shorthand."""
-    validate_system_information_config({"include": []})
-
-
-# ---------------------------------------------------------------------------
-# The driver reuses the same pure validator (startup == write-time rules)
-# ---------------------------------------------------------------------------
-
-
-def test_initialize_reuses_the_pure_validator_and_applies_it():
-    device = SystemInformationDevice(None)
-    device.initialize({"include": ["memory"]})
-    assert device._include == ("memory",)
-
-
-def test_initialize_expands_an_empty_include_to_all_sections():
-    device = SystemInformationDevice(None)
-    device.initialize({"include": []})
-    assert device._include == tuple(SYSTEM_INFORMATION_SECTIONS)
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [
-        {},
-        {"include": ["nope"]},
-        {"include": ["memory", "memory"]},
-        {"include": ["memory"], "bogus": 1},
-    ],
-)
-def test_initialize_rejects_the_same_invalid_configs(bad):
-    device = SystemInformationDevice(None)
-    with pytest.raises(DeviceValidationError):
-        device.initialize(bad)
 
 
 # ---------------------------------------------------------------------------
@@ -275,9 +208,9 @@ def test_config_rejects_an_unsupported_device_type():
     assert excinfo.value.code == "unsupported_device_type"
 
 
-def test_config_rejects_an_invalid_include():
+def test_config_rejects_an_invalid_device_config_value():
     candidate = _base_config()
-    candidate["devices"][0]["config"]["include"] = ["nope"]
+    candidate["devices"][0]["config"]["sea_level_pressure_pa"] = 1
     with pytest.raises(ConfigError) as excinfo:
         validate_config(candidate)
     assert excinfo.value.code == "invalid_value"
@@ -316,6 +249,6 @@ def test_config_accepts_a_valid_definition_with_absent_hardware():
     write-time validation checks the schema, and only boot-time initialization
     decides physical presence."""
     candidate = _base_config()
-    candidate["devices"][0]["config"]["include"] = ["cpu"]
-    # No SystemInformation source exists on the host; validation must still pass.
+    candidate["devices"][0]["config"]["i2c_address_candidates"] = [119]
+    # No BME280 exists on the host; validation must still pass.
     assert validate_config(candidate) is candidate

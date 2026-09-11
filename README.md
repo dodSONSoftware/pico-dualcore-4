@@ -226,7 +226,7 @@ The cadence is anchored: boundaries fall at `anchor + n × health_interval_sec` 
 - **UTC Synchronization**: Mandatory at startup; non-blocking steady-state re-sync with deadline and retry throttling
 - **Core 1 Liveness**: Deadline-based heartbeat drives the `core_1_active` health field; the Core 0 watchdog resets the board if Core 1 stops refreshing — including while Core 0 is stuck in network recovery
 - **Core 0 Hardware Watchdog**: `machine.WDT` (8 s, armed once the startup contract has passed) is fed only from Core 0's own execution, so a Core 0 that is alive but no longer making progress resets the board — complementing the exception boundary that covers Core 0 failures that raise
-- **Startup Log**: One-time startup log stream published before telemetry — the `system_startup_completed` event log (the gate that halts boot if it cannot be admitted) followed by best-effort per-section `system_information` diagnostics, each a small log that skips on failure instead of taking the whole log down
+- **Startup Log**: One-time `system_startup_completed` event log published before telemetry — the gate that halts boot if it cannot be admitted
 - **LED Status**: Flashing during connection, pulse on telemetry send
 - **Reboot Command**: JSON command triggers clean reboot with acknowledgment
 - **Device Lifecycle**: Auto-retry initialization and read failures
@@ -318,8 +318,7 @@ Send to `mqtt_topic_command`:
 
 A successful `command_response` returns the system-information object directly
 in `payload.data`. It always contains every section in the authoritative
-`SYSTEM_INFORMATION_SECTIONS` list, independent of the configured
-`system-information` device `include` list.
+`SYSTEM_INFORMATION_SECTIONS` list.
 
 ```json
 {
@@ -351,33 +350,32 @@ section cannot be collected, that section contains an `error` object and the
 remaining sections are still returned.
 
 
-## Built-in Device
+## Built-in Devices
 
-There is one built-in device, it has a device type of "system_information".
+Two device types are registered, both I2C sensors sharing Core 1's per-device bus configuration (bus, SDA/SCL pins; `bme280` also names its address candidates): `bme280` — temperature, pressure, humidity, and derived altitude (Bosch BME280) — and `ltr390` — ambient light and UV index (Lite-On LTR-390UV-01).
 
 Example:
 ```
 {
-  "id": "p5h3DLqmWjCkLcXUtaFRq8yBsucEuY4A",
-  "device_type": "system-information",
-  "name": "System Information Sensor",
+  "id": "iAdZlw7PSOE5s85MEs1lWrqUNRjR",
+  "device_type": "bme280",
+  "name": "BME280 Environmental Sensor",
   "config": {
-    "include": [
-      "communications",  
-      "cpu",  
-      "device_status",  
-      "devices",  
-      "machine",  
-      "memory",  
-      "network",  
-      "queues",  
-      "runtime"
-    ]
+    "i2c_bus": 0,
+    "i2c_sda_pin": 0,
+    "i2c_scl_pin": 1,
+    "i2c_address_candidates": [ 118, 119 ],
+    "sea_level_pressure_pa": 101325,
+    "offsets": {
+      "temperature_c": 0,
+      "humidity_percent": 0,
+      "pressure_pascal": 0
+    }
   }
 }
 ```
 
-An empty `"include": []` list means all sections.
+The system-information data the `get-details` command returns is organized into these sections:
 
 | Section          | Information returned                         |
 | ---------------- | -------------------------------------------- |
@@ -406,9 +404,8 @@ An empty `"include": []` list means all sections.
 ├── devices/           # Device driver packages
 │   ├── __init__.py
 │   ├── device.py      # Device interface (initialize, read)
-│   └── system_information/
-│       ├── __init__.py
-│       └── system_information_device.py
+│   ├── bme280/        # BME280 temperature/pressure/humidity (I2C)
+│   └── ltr390/        # LTR-390 ambient light/UV (I2C)
 ├── led_manager.py     # Core 0 LED state machine
 ├── wifi.py            # Core 0 Wi-Fi connection management
 ├── mqtt.py            # Core 0 MQTT lifecycle (QoS 1, keepalive PINGREQ)
@@ -432,7 +429,7 @@ An empty `"include": []` list means all sections.
 3. Add the package files to `REQUIRED_PACKAGES` in `release.py`
 4. Register in `config.json` devices array
 
-See [`devices/system_information/system_information_device.py`](devices/system_information/system_information_device.py) for reference.
+See [`devices/bme280/bme280_device.py`](devices/bme280/bme280_device.py) for reference.
 
 ### Testing
 

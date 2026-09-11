@@ -92,8 +92,6 @@ def _reload_core1_under_fakes():
         "device_manager",
         "device_factory",
         "devices",
-        "devices.system_information",
-        "devices.system_information.system_information_device",
         "uptime",
         "core1",
     )

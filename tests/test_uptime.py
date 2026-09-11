@@ -200,8 +200,6 @@ def _reload_core1_under_fakes(fake_time):
         "device_manager",
         "device_factory",
         "devices",
-        "devices.system_information",
-        "devices.system_information.system_information_device",
     )
     for name in names:
         if name in sys.modules:

@@ -8,9 +8,22 @@ import os
 import sys
 import time
 
-from devices.system_information.validation import SYSTEM_INFORMATION_SECTIONS
 from hardware import classify_machine
 from message_protocol import format_utc_epoch_ms
+
+# The reportable system-information sections (the get-details data source's
+# full section set). Pure data, owned here with the data source.
+SYSTEM_INFORMATION_SECTIONS = (
+    "network",
+    "memory",
+    "runtime",
+    "devices",
+    "cpu",
+    "machine",
+    "communications",
+    "queues",
+    "device_status",
+)
 
 
 

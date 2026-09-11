@@ -297,7 +297,7 @@ def test_oversized_telemetry_sample_is_discarded_not_retried():
     result = {
         "status": "telemetry",
         "device_id": "dev-1",
-        "device": "system-information",
+        "device": "bme280",
         "telemetry": {"blob": "x" * (MAX_OUTBOUND_MESSAGE_BYTES + 1)},
     }
 

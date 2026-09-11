@@ -97,7 +97,7 @@ class ManagedDevice:
 class DeviceManager:
     """Manages device lifecycle for Core 1."""
 
-    def __init__(self, config, system_information=None, activity_refresh=None, uptime_state=None, i2c_bus_factory=None):
+    def __init__(self, config, activity_refresh=None, uptime_state=None, i2c_bus_factory=None):
         self._active_devices = []
         self._failed_devices = {}
 
@@ -105,8 +105,6 @@ class DeviceManager:
         self._device_initialization_retry_delay_ms = config["device_initialization_retry_delay_ms"]
         self._device_read_failure_threshold = config["device_read_failure_threshold"]
         self._devices_config = config["devices"]
-
-        self._system_information = system_information
 
         # Core 1's I2C bus factory (builds/dedupes machine.I2C per bus config).
         # Injected so this module stays host-importable; None for configs with
@@ -176,12 +174,10 @@ class DeviceManager:
         try:
             if self._i2c_bus_factory is None:
                 # No I2C bus factory wired (no I2C device configured): the
-                # classic two-argument construction path.
-                driver = create_device(device_def, self._system_information)
+                # one-argument construction path.
+                driver = create_device(device_def)
             else:
-                driver = create_device(
-                    device_def, self._system_information, self._i2c_bus_factory
-                )
+                driver = create_device(device_def, self._i2c_bus_factory)
             return driver, None
         except MemoryError:
             raise
@@ -310,8 +306,6 @@ class DeviceManager:
             previous_failures = managed_device.consecutive_read_failures
             managed_device.record_read_success()
 
-            self._refresh_system_information_self_status(managed_device, telemetry)
-
             return {
                 "status": DEVICE_RESULT_TELEMETRY,
                 "device_id": managed_device.device_id,
@@ -339,26 +333,6 @@ class DeviceManager:
                 "device_read_failure_threshold": self._device_read_failure_threshold,
                 "reinitialize_pending": managed_device.reinitialize_pending,
             }
-
-    def _refresh_system_information_self_status(self, managed_device, telemetry):
-        """Refresh this system-information device's own status after read
-        success: the snapshot captured during the read predates its own
-        success, so replace only this device's entry (others keep exactly what
-        the read captured). No-op for other types or absent device_status."""
-        if managed_device.device_type != "system-information":
-            return
-
-        device_status = telemetry.get("device_status")
-        if not isinstance(device_status, list):
-            return
-
-        now_ms = self._now_ms()
-        fresh_status = managed_device.get_status_snapshot(now_ms=now_ms)
-
-        for index, status in enumerate(device_status):
-            if isinstance(status, dict) and status.get("id") == managed_device.device_id:
-                device_status[index] = fresh_status
-                return
 
     def _process_reinitialization(self, managed_device):
         """Reinitialize a device, reusing the configured retry policy. A

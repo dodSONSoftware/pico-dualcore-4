@@ -147,8 +147,6 @@ def _reload_core1_under_fakes():
         "hardware",
         "system_information",
         "devices",
-        "devices.system_information",
-        "devices.system_information.system_information_device",
         "device_factory",
         "device_manager",
         "uptime",

@@ -14,7 +14,6 @@ CORE1_FILES = (
     "device_factory.py",
     "system_information.py",
     "devices/device.py",
-    "devices/system_information/system_information_device.py",
 )
 
 

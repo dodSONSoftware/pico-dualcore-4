@@ -1,6 +1,6 @@
 {
   "source": "Test-Pico-2",
-  "config_schema_version": 9,
+  "config_schema_version": 10,
   "outbound_queue_max_messages": 64,
   "read_loop_sec": 20,
   "health_interval_sec": 60,
@@ -27,14 +27,20 @@
   "mqtt_reconnect_delays_sec": [ 3, 3, 3, 5, 5, 5, 10, 10, 20, 20, 40, 40 ],
   "devices": [
     {
-      "id": "p5h3DLqmWjCkLcXUtaFRq8yBsucEuY4A",
-      "device_type": "system-information",
-      "name": "System Information Sensor",
+      "id": "fixture-bme280-00000000000000000001",
+      "device_type": "bme280",
+      "name": "Fixture Environmental Sensor",
       "config": {
-        "include": [
-          "queues",
-          "device_status"
-        ]
+        "i2c_bus": 0,
+        "i2c_sda_pin": 0,
+        "i2c_scl_pin": 1,
+        "i2c_address_candidates": [ 118, 119 ],
+        "sea_level_pressure_pa": 101325,
+        "offsets": {
+          "temperature_c": 0,
+          "humidity_percent": 0,
+          "pressure_pascal": 0
+        }
       }
     }
   ]

@@ -255,9 +255,8 @@ owned by Core 1 because the authoritative `SystemInformation` instance and
 device-manager state live there: Core 0 validates the command at the protocol
 boundary and dispatches a validated bounded event, and Core 1 executes it and
 returns a current snapshot containing every entry in
-`SYSTEM_INFORMATION_SECTIONS` as `command_response.payload.data` — unrestricted
-by the configured scheduled `system-information` device `include` list. The
-command requires an empty payload (any key is an unknown field, named sorted,
+`SYSTEM_INFORMATION_SECTIONS` as `command_response.payload.data`. The command
+requires an empty payload (any key is an unknown field, named sorted,
 at the Core 0 boundary — the same contract as `reboot`).
 
 - FIFO and heap-governed: the same hard free-heap floor and shared heap-admission lock as the outbound queue, but with NO eviction — an admitted event is a discrete control operation and is never displaced by a newer one. Under memory pressure the new event is rejected and the caller reports the `intercore_event_queue_memory_pressure` failure.
@@ -349,7 +348,7 @@ The cache is a **short-lived debounce mechanism**, not durable idempotency or ex
 - **Target** — the configured `source` (case-insensitive), the device's current IP address (case-insensitive string comparison), or `*`, like every command except `write-config`. A `*` command is dispatched non-targeted; a named/IP target is dispatched targeted.
 - **Payload** — exactly `{}`, the shared empty-payload contract. Any key is unknown for this command, so a non-empty object is answered (on Core 0, before dispatch) with `error.code: "unknown_fields"` carrying the offending keys in a sorted `unknown_fields` array. No filtering/options (`include`, `sections`, `compact`) are supported — YAGNI. A missing payload, or one that is not an object, is the common contract and is answered with a bounded `error.code: "invalid_payload"`.
 - **Dispatch** — a `{}` payload dispatches `{command_id, command: "get-details", payload: {}, targeted}` to the event queue. If admission fails (heap pressure) Core 0 answers with `error.code: "intercore_event_queue_memory_pressure"`.
-- **Execution** — Core 1 executes the event and returns the full system-information snapshot (every `SYSTEM_INFORMATION_SECTIONS` entry) as `command_response.payload.data`, **unrestricted by the configured scheduled `system-information` device `include` list** (that list limits scheduled telemetry reads only). If Core 1 cannot provide the snapshot it reports the existing `error.code: "system_information_unavailable"`. The response-size handling (Core 1's `response_too_large` / `response_invalid` substitution) is preserved, and the command/ID length bounds guarantee the identifying fields themselves cannot make the substitute oversized. A persistent serializer `MemoryError` on the full snapshot (a memory-tight board's fragmented pool) is answered the same way the size case is — with the bounded get-details forms (device sections dropped in order, `omitted_sections` naming the gap) described in the admission section above — so the unrestricted snapshot never becomes a hard failure.
+- **Execution** — Core 1 executes the event and returns the full system-information snapshot (every `SYSTEM_INFORMATION_SECTIONS` entry) as `command_response.payload.data`. If Core 1 cannot provide the snapshot it reports the existing `error.code: "system_information_unavailable"`. The response-size handling (Core 1's `response_too_large` / `response_invalid` substitution) is preserved, and the command/ID length bounds guarantee the identifying fields themselves cannot make the substitute oversized. A persistent serializer `MemoryError` on the full snapshot (a memory-tight board's fragmented pool) is answered the same way the size case is — with the bounded get-details forms (device sections dropped in order, `omitted_sections` naming the gap) described in the admission section above — so the unrestricted snapshot never becomes a hard failure.
 
 ### 3. `state_mailboxes`
 
@@ -463,15 +462,14 @@ The current device framework is retained:
 
 - `DeviceManager`
 - `Device` interface
-- `SystemInformationDevice`
 - `BME280Device`
+- `LTR390Device`
 - initialization retry behavior
 - read-failure/reinitialization behavior
 - reinitialization failure logging: the first reinit failure for a device is warned once; repeats while the same device stays in pending-reinit are suppressed until a successful reinit clears the flag, so a stuck device warns once instead of every cycle (a later independent failure warns again)
 
-The supported `device_type` registry (`device_factory._DEVICE_REGISTRY`) maps each type to its pure config validator and allowed config keys. Three types are registered:
+The supported `device_type` registry (`device_factory._DEVICE_REGISTRY`) maps each type to its pure config validator and allowed config keys. Two types are registered:
 
-- `system-information` — the software-only baseline test device; no hardware.
 - `bme280` — the first hardware (I2C) device: a Bosch BME280 temperature/pressure/humidity sensor.
 - `ltr390` — the second hardware (I2C) device: a Lite-On LTR-390UV-01 ambient-light/UV sensor.
 
@@ -670,7 +668,7 @@ Core 0 is the only UTC acquirer. Requests are published to `mqtt_topic_info_requ
 A candidate device is one atomic configuration unit identified by `id`: completely valid and accepted for the next boot, or invalid and rejected. No field-level device patches. `write-config` and startup must reject an invalid device definition **before persistence**, without touching hardware.
 
 - **Registry + pure entry point** (`device_factory.py`): each supported `device_type` maps to a **pure config validator** and its **allowed config keys**. `validate_device_definition()` is the pure per-device validator — generic definition shape, unknown definition fields, supported `device_type`, then dispatch to the type's pure validator. It **never constructs or initializes a hardware resource**: a valid definition with no physical backing passes, leaving physical absence to the boot-time `initialization_failed` outcome (an operational device failure, not a schema failure).
-- **Pure device validator** (`devices/system_information/validation.py`, host-importable / no `machine`): the authoritative `system-information` rules — `include` is a list of unique strings drawn from `SYSTEM_INFORMATION_SECTIONS` (an empty list is the "all sections" shorthand, expanded in `SystemInformationDevice.initialize()`), and **unknown config keys are rejected**. `SYSTEM_INFORMATION_SECTIONS` now lives here; `system_information.py` and the driver read it from there. `SystemInformationDevice.initialize()` calls the same pure validator, so startup and write-time share one rule set.
+- **Pure device validators** (`devices/<type>/validation.py`, host-importable / no `machine`): each supported type's authoritative config rules, with **unknown config keys rejected**; the type's driver `initialize()` calls the same pure validator, so startup and write-time share one rule set.
 - **Exception** (`devices.device.DeviceValidationError`, a `ValueError` with a stable `code`): the pure-validation failure type; `config.py` maps it onto `ConfigError` (preserving `code`). Because it is a `ValueError`, the device manager's per-device retry path still records it as `initialization_failed` if it ever reaches runtime.
 - **Boot semantics unchanged**: each device initializes independently; one failure does not invalidate the others; tolerant startup and the existing retry/reinit behavior continue. Any `devices` change is `REBOOT_REQUIRED` (no live `DeviceManager` mutation from `write-config`).
 

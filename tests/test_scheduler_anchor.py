@@ -4,7 +4,7 @@
 
 """Host-side regression tests for the shared normal-runtime scheduling anchor.
 
-All periodic Core 1 work (telemetry and health) must derive its fixed boundaries from one anchor, normal_runtime_start_ticks_ms, captured exactly once, after the startup log stream completes (the system_startup_completed event log admitted, then the best-effort system_information section stream emitted):
+All periodic Core 1 work (telemetry and health) must derive its fixed boundaries from one anchor, normal_runtime_start_ticks_ms, captured exactly once, after the startup log completes (the system_startup_completed event log admitted):
 
 - a one-shot initial sample is emitted at the anchor moment (one telemetry read pass and one health report, after startup-log admission, before the run loop)
 - telemetry boundaries fall at anchor + n * read_loop_sec
@@ -165,8 +165,6 @@ def _reload_core1_under_fakes():
         "hardware",
         "system_information",
         "devices",
-        "devices.system_information",
-        "devices.system_information.system_information_device",
         "device_factory",
         "device_manager",
         "uptime",
@@ -183,10 +181,27 @@ def _reload_core1_under_fakes():
     return core1
 
 
+class ProbeDriver:
+    """Fake telemetry driver for the probe device; never touches hardware."""
+
+    def initialize(self, config):
+        pass
+
+    def read(self):
+        return {"probe": 1}
+
+
 def _core1_config():
-    """Core 1 config with the default telemetry-producing device kept."""
+    """Core 1 config with a single probe device as the telemetry source.
+
+    Scheduling is independent of the fixture's device set: _run_core1 binds
+    a fake create_device for the probe, so no I2C device (the fixture's real
+    devices need a hardware bus) is ever constructed here."""
     config = json.loads((ROOT / "tests" / "fixtures" / "config.json").read_text())
-    _core0, core1_config= split_config(config)
+    _core0, core1_config = split_config(config)
+    core1_config["devices"] = [
+        {"id": "probe", "device_type": "probe", "config": {}}
+    ]
     return core1_config
 
 
@@ -206,11 +221,17 @@ def _run_core1(fake_time, bus, core1_config, boot_ticks_ms, pre_run=None):
     try:
         _install_fakes(fake_time)
         core1 = _reload_core1_under_fakes()
+        dm_mod = sys.modules["device_manager"]
+        saved_create_device = dm_mod.create_device
+        dm_mod.create_device = lambda device_def, i2c_bus_factory=None: ProbeDriver()
         if pre_run is not None:
             pre_run()
 
-        with pytest.raises(LoopStop):
-            core1.core1_main(bus, core1_config, boot_ticks_ms, "test-runtime")
+        try:
+            with pytest.raises(LoopStop):
+                core1.core1_main(bus, core1_config, boot_ticks_ms, "test-runtime")
+        finally:
+            dm_mod.create_device = saved_create_device
     finally:
         _restore()
 
@@ -222,16 +243,16 @@ def _slow_periodic_read(fake_time, delay_ms):
     state = {"calls": 0}
 
     def _pre_run():
-        module = sys.modules["devices.system_information.system_information_device"]
-        original_read = module.SystemInformationDevice.read
+        dm_mod = sys.modules["device_manager"]
 
-        def _slow_read(self):
-            state["calls"] += 1
-            if state["calls"] == 2:
-                fake_time.sleep_ms(delay_ms)
-            return original_read(self)
+        class _SlowDriver(ProbeDriver):
+            def read(self):
+                state["calls"] += 1
+                if state["calls"] == 2:
+                    fake_time.sleep_ms(delay_ms)
+                return {"slow": 1}
 
-        module.SystemInformationDevice.read = _slow_read
+        dm_mod.create_device = lambda device_def, i2c_bus_factory=None: _SlowDriver()
 
     return _pre_run
 

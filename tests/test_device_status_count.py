@@ -109,7 +109,7 @@ def test_one_failing_device_does_not_stop_the_others():
     configured device still initializes, the failure is recorded for the
     failing device only, and the snapshot shows configured 2 / active 1."""
     saved = dm.create_device
-    dm.create_device = lambda device_def, system_information: (
+    dm.create_device = lambda device_def, i2c_bus_factory=None: (
         FailingInitDriver() if device_def["id"] == "dev1" else OkDriver()
     )
     try:

@@ -678,9 +678,9 @@ def test_write_config_device_changes_are_compact_entries(make_core0, tmp_path):
 
     candidate = _full_config()
     modified = json.loads(json.dumps(original))
-    modified["config"]["include"] = ["queues"]
-    added = {"id": "aaAddedDevice", "device_type": "system-information",
-             "config": {"include": ["memory"]}}
+    modified["config"]["sea_level_pressure_pa"] = 101000
+    added = {"id": "aaAddedDevice", "device_type": "bme280",
+             "config": {"i2c_bus": 0, "sea_level_pressure_pa": 101325}}
     candidate["devices"] = [added, modified]  # original id stays, one added
 
     _send(core0, _command("write-config", "cfg-wr-devices",
@@ -704,7 +704,7 @@ def test_write_config_device_changes_are_compact_entries(make_core0, tmp_path):
         "change_policy": "REBOOT_REQUIRED",
         "change_type": "ADDED",
         "device_id": "aaAddedDevice",
-        "device_type": "system-information",
+        "device_type": "bme280",
     }
     assert devices_changes[1]["change_type"] == "MODIFIED"
     assert devices_changes[1]["device_type"] == original["device_type"]

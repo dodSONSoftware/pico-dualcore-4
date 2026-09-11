@@ -836,14 +836,13 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # (which stops the refresh) is still caught.
         device_manager = DeviceManager(
             config,
-            system_information=system_information,
             activity_refresh=lambda: intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms()),
             # Shared boot-relative uptime base: the device read-age fields
             # stay correct across a tick wrap (past half a tick period, raw
             # ticks would report a wrong age).
             uptime_state=uptime_state,
             # Core 1 owns its I2C buses; create_device pulls a bus from this
-            # factory only for I2C devices (never for system-information).
+            # factory only for I2C devices.
             i2c_bus_factory=_build_i2c_bus_factory(),
         )
         system_information.set_device_manager(device_manager)

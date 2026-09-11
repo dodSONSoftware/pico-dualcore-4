@@ -4,7 +4,7 @@
 
 """Host-side tests for the get-details command under the strict command protocol contract.
 
-get-details is owned by Core 1 (the authoritative SystemInformation instance and device-manager state live there), but Core 0 owns the command protocol boundary. Core 0 validates the command against its supported-command registry (case-insensitive source/IP/* target), enforces the {} payload contract (any key is an unknown field, named sorted), suppresses a duplicate command_id before an event is queued, answers unknown commands itself (not Core 1), and reports the event-queue memory-pressure failure. Core 1 executes the dispatched get-details event and returns the full system-information snapshot, unrestricted by the configured scheduled include list.
+get-details is owned by Core 1 (the authoritative SystemInformation instance and device-manager state live there), but Core 0 owns the command protocol boundary. Core 0 validates the command against its supported-command registry (case-insensitive source/IP/* target), enforces the {} payload contract (any key is an unknown field, named sorted), suppresses a duplicate command_id before an event is queued, answers unknown commands itself (not Core 1), and reports the event-queue memory-pressure failure. Core 1 executes the dispatched get-details event and returns the full system-information snapshot.
 """
 
 import importlib
@@ -237,33 +237,6 @@ def test_get_details_returns_every_system_information_section():
     assert tuple(data) == SYSTEM_INFORMATION_SECTIONS
     for section in SYSTEM_INFORMATION_SECTIONS:
         assert data[section] == {"section": section}
-
-
-def test_configured_include_does_not_restrict_get_details():
-    """The system-information device include list limits scheduled telemetry
-    reads only; get-details must still return every configured section."""
-    from devices.system_information.system_information_device import (
-        SystemInformationDevice,
-    )
-
-    system_information = FullSystemInformation()
-    device = SystemInformationDevice(system_information)
-    device.initialize({"include": ["network", "memory", "runtime"]})
-
-    # The configured device read honors the include subset...
-    assert tuple(device.read()) == ("network", "memory", "runtime")
-
-    # ...but the command path must ignore it and return the full snapshot.
-    intercore = InterCore(_event())
-    with patch.object(core1, "_message_time", return_value=(1234, None)):
-        response = core1._process_intercore_event(
-            intercore,
-            object(),
-            system_information,
-        )
-
-    data = response["message"]["payload"]["data"]
-    assert tuple(data) == SYSTEM_INFORMATION_SECTIONS
 
 
 def test_system_information_unavailable_is_preserved():

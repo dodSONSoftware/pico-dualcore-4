@@ -131,8 +131,6 @@ def _reload_core1_under_fakes():
         "hardware",
         "system_information",
         "devices",
-        "devices.system_information",
-        "devices.system_information.system_information_device",
         "device_factory",
         "device_manager",
         "uptime",
@@ -295,7 +293,7 @@ def test_core1_slow_read_does_not_stale_the_heartbeat_stamp():
 
         driver = SlowReadDriver(fake_time, recorder)
         saved_create = dm.create_device
-        dm.create_device = lambda device_def, system_information, i2c_bus_factory=None: driver
+        dm.create_device = lambda device_def, i2c_bus_factory=None: driver
         try:
             with pytest.raises(LoopStop):
                 core1.core1_main(

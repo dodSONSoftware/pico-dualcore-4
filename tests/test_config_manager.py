@@ -645,11 +645,11 @@ def test_change_summary_reports_devices_compact_and_sorted(config_dir):
     original_device = candidate["devices"][0]
 
     modified = copy.deepcopy(original_device)
-    modified["config"]["include"] = ["queues", "device_status", "memory"]
+    modified["config"]["sea_level_pressure_pa"] = 101000
     added = {
         "id": "aaAddedDevice",
-        "device_type": "system-information",
-        "config": {"include": ["memory"]},
+        "device_type": "bme280",
+        "config": {"i2c_bus": 0, "sea_level_pressure_pa": 101325},
     }
     candidate["devices"] = [added, modified]  # original removed, both differ
 
@@ -658,7 +658,7 @@ def test_change_summary_reports_devices_compact_and_sorted(config_dir):
     devices_changes = [c for c in result["changes"] if c["setting"] == "devices"]
     assert [c["device_id"] for c in devices_changes] == ["aaAddedDevice", original_device["id"]]
     assert devices_changes[0]["change_type"] == "ADDED"
-    assert devices_changes[0]["device_type"] == "system-information"
+    assert devices_changes[0]["device_type"] == "bme280"
     assert devices_changes[0]["change_policy"] == CLASSIFICATION_REBOOT_REQUIRED
     assert devices_changes[1]["change_type"] == "MODIFIED"
     assert devices_changes[1]["device_type"] == original_device["device_type"]
@@ -672,8 +672,8 @@ def test_change_summary_reports_removed_device(config_dir):
     original_device = candidate["devices"][0]
     candidate["devices"] = [{
         "id": "replacementDevice",
-        "device_type": "system-information",
-        "config": {"include": ["memory"]},
+        "device_type": "bme280",
+        "config": {"i2c_bus": 0, "sea_level_pressure_pa": 101325},
     }]  # the original device is removed, a replacement added
 
     result = manager.begin_write(candidate)
@@ -697,8 +697,8 @@ def test_change_summary_order_only_device_change_is_one_bounded_entry(config_dir
     two_devices = _base_config()
     second = {
         "id": "secondDevice",
-        "device_type": "system-information",
-        "config": {"include": ["memory"]},
+        "device_type": "bme280",
+        "config": {"i2c_bus": 0, "sea_level_pressure_pa": 101325},
     }
     two_devices["devices"] = list(_base_config()["devices"]) + [second]
     manager.begin_write(two_devices)  # committed: two devices

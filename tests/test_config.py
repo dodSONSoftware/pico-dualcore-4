@@ -356,12 +356,23 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
     config["devices"] = [
         {
             "id": field_max[:15] + id_suffixes[index],
-            "device_type": "system-information",
+            "device_type": "bme280",
             "config": {
-                "include": [
-                    "network", "memory", "runtime", "devices", "cpu",
-                    "machine", "communications", "queues", "device_status",
-                ],
+                "i2c_bus": index % 2,
+                "i2c_sda_pin": 0,
+                "i2c_scl_pin": 1,
+                "i2c_freq_hz": 1000000,
+                "i2c_address_candidates": [118, 119],
+                "temperature_oversampling": 5,
+                "pressure_oversampling": 5,
+                "humidity_oversampling": 5,
+                "iir_filter": 4,
+                "sea_level_pressure_pa": 115000,
+                "offsets": {
+                    "temperature_c": 100,
+                    "humidity_percent": 100,
+                    "pressure_pascal": 200000,
+                },
             },
             "name": field_max,
         }
