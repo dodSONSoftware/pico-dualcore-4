@@ -89,17 +89,15 @@ def main():
     # such run survives the import sets plus the CYW43/lwIP buffers (a spawn
     # that late raised MemoryError into the silent reset boundary below and
     # reboot-looped the board). Spawning before the core1 import gives the
-    # stack the cleanest pool state of the startup -- the core1 chain's code
-    # objects are not yet interleaved into the pool, the state the Pico W
-    # validated in 0.4.87. The worker stays idle until Core 0's network
-    # snapshot reports the full startup contract verified, then runs
-    # core1_main -- Core 1 is still gated on the startup contract (its modules
-    # are already loaded by then, so the ready path is a sys.modules cache
-    # hit, not a parse).
+    # stack the cleanest pool state of the startup (the core1 chain's code
+    # objects are not yet interleaved into the pool). The worker stays idle
+    # until Core 0's network snapshot reports the full startup contract
+    # verified, then runs core1_main -- its modules are already loaded, so
+    # the ready path is a sys.modules cache hit, not a parse.
     # start_new_thread(func, args, kwargs): the third positional argument is
-    # the keyword-args dict forwarded to the thread function itself -- this
-    # MicroPython _thread has no stack-size parameter, so the thread always
-    # runs on the MicroPython-default stack.
+    # the keyword-args dict forwarded to the thread function -- this
+    # MicroPython _thread has no stack-size parameter, so the thread runs on
+    # the MicroPython-default stack.
     import _thread
 
     def _core1_thread_entry(bus, cfg, boot_ms, rid):
@@ -121,17 +119,15 @@ def main():
     print("[INFO] Core 1 worker spawned; starts when the network stack reports ready")
 
     # Core 1's modules are imported here, on the main thread, after the spawn
-    # and BEFORE the core0 import and the network bring-up. Importing core1
-    # parses its source, and that parse working buffer is a C-heap (non-GC)
-    # allocation; by the time the network snapshot reports ready the CYW43/
-    # lwIP buffers plus the worker's ~4 KiB stack have consumed the C heap, so
-    # a late parse MemoryErrors on a ~2 KiB buffer while gc.mem_free() still
-    # shows ~102 KiB (gc.collect() compacts only the GC heap and cannot
-    # recover the C heap). Importing now, while the C heap is still clear,
-    # keeps the worker's ready path to a sys.modules cache hit. core1_main
-    # still RUNS on the worker thread, so Core 1's device ownership is
-    # unchanged; the modules have no import-time side effects, so loading them
-    # here is safe.
+    # and BEFORE the core0 import and the network bring-up: importing core1
+    # parses its source into a C-heap (non-GC) working buffer, and by the time
+    # the network snapshot reports ready the CYW43/lwIP buffers plus the
+    # worker's ~4 KiB stack have consumed the C heap, so a late parse
+    # MemoryErrors while gc.mem_free() still shows plenty (gc.collect()
+    # compacts only the GC heap, not the C heap). Importing while the C heap
+    # is still clear keeps the worker's ready path to a sys.modules cache hit.
+    # core1_main still RUNS on the worker thread, so Core 1's device
+    # ownership is unchanged; the modules have no import-time side effects.
     from core1 import core1_main
     print("[INFO] Core 1 modules imported pre-network (free heap {} bytes)".format(gc.mem_free()))
 
@@ -141,15 +137,12 @@ def main():
     # configuration-recovery parse residue, both import sets' compile
     # temporaries, and the thread-spawn residue -- interleaved between the
     # live import objects. On the Pico W the 0.4.90 core0 import died exactly
-    # here: a 1336-byte allocation in the import machinery with 88,176 bytes
-    # of heap free (the pool fragmented into no contiguous run), and this
-    # import sits ABOVE the recovery boundary below, so the MemoryError
-    # escaped to the silent reset boundary and reboot-looped the board. The
-    # collect coalesces the freed runs before the import's code-object
-    # allocations; the boot line reports the post-collect free heap so a
-    # recurrence shows whether the pool is exhausted or merely interleaved.
-    # gc.collect() coalesces free runs but does not compact live objects (the
-    # documented 0.4.74 lesson) -- if the run still does not exist, the next
+    # here: a ~1.3 KiB allocation with ~88 KiB free in a pool fragmented into
+    # no contiguous run, and this import sits ABOVE the recovery boundary
+    # below, so that MemoryError escaped to the silent reset boundary and
+    # reboot-looped the board. The collect coalesces the freed runs before
+    # the import's code-object allocations. It coalesces free runs but does
+    # not compact live objects -- if the run still does not exist, the next
     # step is a smaller resident import set, not more collection.
     gc.collect()
     print("[INFO] Heap reclaimed before Core 0 import (free heap {} bytes)".format(gc.mem_free()))
@@ -172,15 +165,15 @@ def main():
     # deterministic startup validation that intentionally fails fast: a
     # misconfigured or unsupported board must stay down with a diagnosable
     # error, not reboot forever. From here on every layer has a supervisor:
-    # Core 0's heartbeat watchdog recovers a dead Core 1, and the hardware
-    # watchdog (armed at the end of core0.start()) recovers a Core 0 that is
-    # alive but no longer making progress — the exception boundary below
-    # covers what a reset cannot: an unrecoverable Core 0 exception, which is
-    # a controlled board reset, not application termination.
+    # Core 0's heartbeat watchdog recovers a dead Core 1, the hardware
+    # watchdog (armed at the end of core0.start()) a Core 0 that is alive but
+    # no longer making progress — and the exception boundary below covers
+    # what neither can: an unrecoverable Core 0 exception, which is a
+    # controlled board reset, not application termination.
     try:
-        # Core 0 establishes the network before Core 1's modules are imported:
-        # the worker spawned above imports core1 only after the network
-        # snapshot reports the startup contract verified.
+        # Core 0 establishes the network; the worker above starts running
+        # core1_main only once the network snapshot reports the startup
+        # contract verified.
         core0.start()
 
         core0.run()

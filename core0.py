@@ -64,19 +64,18 @@ _UTC_PROMPT_RETRY_DELAY_MS = 500
 _RECENT_COMMAND_ID_CAPACITY = 16
 
 # Core 1 heartbeat watchdog timeout: Core 1 refreshes the stamp on a 5 s
-# deadline, so a stamp this old means the Core 1 thread is dead or wedged.
-# Far above any live-loop gap, below the 60 s core_1_inactive diagnostic
-# threshold, so a dead Core 1 resets the board. Static constant; not a config key.
+# deadline, so a stamp this old means the thread is dead or wedged (far
+# above any live-loop gap, below the 60 s core_1_inactive diagnostic
+# threshold). Static constant, not a config key.
 _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS = 30000
 
 # Hardware watchdog (machine.WDT) timeout: the one supervision layer for
-# Core 0 itself. The budget is derived, not arbitrary: every single blocking
-# operation Core 0 performs must fail on its OWN timeout before this one can
-# fire (a watchdog reset means "Core 0 is wedged", never "the link was slow"),
-# and every longer wait is sliced at 100 ms with _service_wait() between
-# slices, which feeds the watchdog. See ARCHITECTURE.md, "Core 0 hardware
-# watchdog", for the full budget derivation; a test pins both 5 s wait
-# ceilings under this constant.
+# Core 0 itself. Derived, not arbitrary: every single blocking operation
+# must fail on its OWN timeout first (a watchdog reset means "Core 0 is
+# wedged", never "the link was slow"), and every longer wait is sliced at
+# 100 ms with _service_wait() between slices, which feeds the watchdog.
+# Derivation: ARCHITECTURE.md, "Core 0 hardware watchdog"; a test pins both
+# 5 s wait ceilings under this constant.
 WDT_TIMEOUT_MS = 8000
 
 class Core0:
@@ -116,9 +115,8 @@ class Core0:
         self._next_sequence = 0
         self._network_stack_ready = False
         # Hardware watchdog, armed by start() once the startup contract has
-        # passed (startup itself is unbounded and must not be supervised);
-        # None when the build lacks machine.WDT (degraded, see
-        # _enable_watchdog).
+        # passed (startup is unbounded and unsupervised); None when the build
+        # lacks machine.WDT (degraded, see _enable_watchdog).
         self._wdt = None
 
     def _uptime_ms(self):
@@ -158,10 +156,9 @@ class Core0:
         try:
             if isinstance(topic, bytes):
                 topic = topic.decode()
-            # The parser reads the frame bytes directly (MicroPython's
-            # json.loads takes any buffer): no decoded-string copy sits
-            # alongside the parsed object graph at the 20 KiB inbound
-            # ceiling.
+            # Read the frame bytes directly (MicroPython's json.loads takes
+            # any buffer): no decoded-string copy sits alongside the parsed
+            # graph at the 20 KiB inbound ceiling.
             doc = json.loads(payload)
         except MemoryError:
             raise
@@ -171,8 +168,8 @@ class Core0:
             return
 
         # Release the raw frame now that the parse succeeded: otherwise it
-        # stays alive across the whole command handler alongside the parsed
-        # graph, adding a full frame of heap to every response allocation.
+        # stays alive across the whole handler alongside the parsed graph, a
+        # full frame of heap on every response allocation.
         del payload
 
         if not isinstance(doc, dict):
@@ -200,9 +197,9 @@ class Core0:
             return
 
         # Staged validation: target and command_id drops are silent (no
-        # response is possible without a bounded command_id, and foreign
-        # traffic must not consume a cache entry); once the ID is claimed,
-        # every failure is answered.
+        # response is possible without a bounded command_id; foreign traffic
+        # must not consume a cache entry); once the ID is claimed, every
+        # failure is answered.
         target = doc.get("target")
         if not self._target_matches(target):
             return
@@ -221,9 +218,9 @@ class Core0:
             return
 
         # Admit only if a response slot can be reserved first: otherwise the
-        # command could execute and then lose its answer to a full queue,
-        # with the sender's retry hitting the debounce cache above -- the
-        # command ran, the answer never arrived.
+        # command could execute and lose its answer to a full queue, with the
+        # sender's retry hitting the debounce cache -- the command ran, the
+        # answer never arrived.
         if len(self._pending_core0_responses) >= _MAX_PENDING_CORE0_RESPONSES:
             return
 
@@ -264,8 +261,8 @@ class Core0:
             return
 
         # An over-long name is answered with a bounded error and never
-        # echoed: echoing it back would build the oversized response the
-        # bound exists to prevent.
+        # echoed: echoing it would build the oversized response the bound
+        # exists to prevent.
         if len(command) > MAX_COMMAND_LENGTH:
             self._queue_core0_response(self._command_error(
                 command_id, targeted, command, {
@@ -287,7 +284,7 @@ class Core0:
 
         # Ownership dispatch: only a supported name proceeds; an unregistered
         # bounded name is answered here (Core 1 is not the generic fallback),
-        # with the actual name in the standard command field.
+        # actual name in the standard command field.
         if not is_supported_command(command):
             self._queue_core0_response(self._command_error(
                 command_id, targeted, command, {
@@ -298,8 +295,8 @@ class Core0:
             return
 
         # write-config never applies fleet-wide: no validation, no file
-        # operation, no response (the ID stays claimed -- this is a
-        # message-debounce mechanism).
+        # operation, no response (the ID stays claimed; this is message
+        # debouncing).
         if command == COMMAND_WRITE_CONFIG and target == BROADCAST_TARGET:
             return
 
@@ -385,10 +382,10 @@ class Core0:
         }
 
     def _handle_get_details_command(self, command_id, targeted, payload):
-        """get-details dispatch: Core 1 owns execution (it holds the
-        SystemInformation instance and device state), so Core 0 only forwards
-        the validated event. Payload is exactly {} (shared with reboot); an
-        admission failure means the free-heap reserve could not be restored."""
+        """Forward get-details to Core 1, which owns execution (the
+        SystemInformation instance and device state). Payload is exactly {}
+        (shared with reboot); admission failure means the free-heap reserve
+        could not be restored."""
         if payload:
             self._queue_core0_response(
                 self._unknown_fields_error(COMMAND_GET_DETAILS, command_id, targeted, payload)
@@ -417,7 +414,7 @@ class Core0:
         """read-config: answer with the committed (PERSISTED) configuration
         and derived reboot state. Payload is exactly {}; Wi-Fi secrets never
         cross this path; a missing/invalid committed file is answered with
-        the actual cause (boot recovery normally guarantees a valid one)."""
+        the actual cause."""
         if payload:
             self._queue_core0_response(
                 self._unknown_fields_error(COMMAND_READ_CONFIG, command_id, targeted, payload)
@@ -452,8 +449,7 @@ class Core0:
         """write-config: the payload is exactly {"config": <complete
         candidate>} -- no patch/merge/partial shape -- validated by the same
         validate_config() as startup. UNCHANGED writes nothing; a changed
-        candidate commits and is pending a reboot -- no live apply, the
-        running firmware keeps its boot values until then.
+        candidate commits and is pending a reboot (no live apply).
         MemoryError propagates to the fail-fast boundary."""
         # Unknown payload keys are named together (sorted) regardless of the
         # rest of the payload.
@@ -717,8 +713,8 @@ class Core0:
 
     def _publish_entry(self, entry):
         """Publish one entry from its pre-serialized bytes, envelope spliced
-        in before the closing brace (never decoded/re-serialized here). The
-        final spliced length must stay within MAX_OUTBOUND_MESSAGE_BYTES or
+        in before the closing brace (never decoded/re-serialized). The final
+        spliced length must stay within MAX_OUTBOUND_MESSAGE_BYTES or
         OutboundMessageTooLargeError is raised -- permanent for the entry."""
         payload = entry["payload_bytes"]
         if not isinstance(payload, (bytes, bytearray)) or bytes(payload[-1:]) != b"}":
@@ -755,8 +751,8 @@ class Core0:
     def _answer_discarded_command_response(self, entry):
         """Queue the bounded substitute for a discarded oversized command
         response: the acknowledgement is owed, so answer with a small
-        response_too_large error, reading only bounded identifying fields back
-        (an unreadable body has no identity to answer with -- the discard stands)."""
+        response_too_large error reading only bounded identifying fields (an
+        unreadable body has no identity -- the discard stands)."""
         body = entry["payload_bytes"]
         if isinstance(body, bytearray):
             body = bytes(body)
@@ -793,8 +789,8 @@ class Core0:
     ):
         """Build and publish a Core 0 command response (pre-serialized); the
         container lets a retry keep the claimed identity and bytes. True on
-        publish, False on a permanent failure (cause recorded on the container
-        for the matching bounded substitute); MemoryError propagates."""
+        publish, False on a permanent failure (cause recorded for the matching
+        bounded substitute); MemoryError propagates."""
         payload_bytes = container.get("_payload_bytes") if container is not None else None
         if payload_bytes is None:
             payload = {
@@ -947,7 +943,7 @@ class Core0:
         # Sliced, like every other long run-loop wait: a monolithic sleep plus
         # the publish wait that preceded it could stretch past WDT_TIMEOUT_MS,
         # and the board would reset via the hardware watchdog instead of this
-        # explicit path (a watchdog trip that was really a planned reboot).
+        # explicit path.
         self._sleep_and_service(5)
         print("[INFO] machine.reset()")
         machine.reset()
@@ -1167,8 +1163,8 @@ class Core0:
 
     def _watch_core_1_heartbeat(self):
         """Watch Core 1's liveness heartbeat and reset the MCU when stale;
-        no-op before Core 1's first stamp so the unbounded startup connect
-        loops are unaffected."""
+        no-op before Core 1's first stamp (the unbounded startup connect
+        loops are unaffected)."""
         last_activity_ms = self._intercore.state_mailboxes.get_core_1_activity_ms()
         if last_activity_ms is None:
             return
@@ -1180,23 +1176,21 @@ class Core0:
     def _feed_watchdog(self):
         """Feed the hardware watchdog; a no-op before arming (or when the
         build lacks machine.WDT). Fed only from Core 0's own execution —
-        the run loop and the sliced waits it drives — never by an
-        independent timer or Core 1, so a subsystem that keeps running can
-        never mask a dead Core 0. A feed() failure is a real failure and
-        escapes to the top-level recovery boundary (no catch here)."""
+        never by an independent timer or Core 1, so a running subsystem can
+        never mask a dead Core 0. A feed() failure escapes to the top-level
+        recovery boundary (no catch here)."""
         if self._wdt is not None:
             self._wdt.feed()
 
     def _enable_watchdog(self):
         """Arm the hardware watchdog once the startup contract has passed:
-        from here on, a Core 0 that stops making progress resets the board
-        within WDT_TIMEOUT_MS instead of idling until a power cycle.
+        from here on, a Core 0 that stops making progress resets within
+        WDT_TIMEOUT_MS instead of idling until a power cycle.
 
         Arming is the one intentional capability probe (the Wi-Fi PM_NONE
-        precedent): a build without machine.WDT degrades to no hardware
-        supervision plus a warning instead of a deterministic reset loop —
-        making absence fatal would reboot into the same missing attribute
-        forever."""
+        precedent): a build without machine.WDT degrades to a warning
+        instead of a deterministic reset loop — making absence fatal would
+        reboot into the same missing attribute forever."""
         try:
             self._wdt = machine.WDT(timeout=WDT_TIMEOUT_MS)
         except MemoryError:
@@ -1207,8 +1201,7 @@ class Core0:
 
     def _service_wait(self):
         """Core 0 servicing hook for each 100 ms slice of long network waits:
-        keeps the Core 1 heartbeat check firing and the hardware watchdog
-        fed through backoffs and observation windows."""
+        the Core 1 heartbeat check plus the hardware watchdog feed."""
         self._watch_core_1_heartbeat()
         self._feed_watchdog()
 
@@ -1220,10 +1213,10 @@ class Core0:
 
     def start(self):
         """Establish Core 0 network services before Core 1 starts. Connect
-        steps are unbounded; verification (probes, UTC) is
-        self-healing -- a failed pass re-establishes and retries. Returns only
-        on a clean pass; a MemoryError or programming failure propagates to
-        the recovery boundary in main()."""
+        steps are unbounded; verification (probes, UTC) is self-healing -- a
+        failed pass re-establishes and retries. Returns only on a clean pass;
+        a MemoryError or programming failure propagates to the recovery
+        boundary in main()."""
         self._led_manager.set_connecting(True)
 
         # Connect (Wi-Fi, then MQTT + subscriptions), shared with the
@@ -1264,7 +1257,7 @@ class Core0:
         """Run one full pass of the startup verification (probe,
         stabilization, probe, UTC); True only when every step succeeds. A
         MemoryError or programming failure propagates to the recovery
-        boundary in main()."""
+        boundary."""
         if not self._perform_network_probe():
             print("[WARNING] Startup verification: network probe #1 failed")
             return False

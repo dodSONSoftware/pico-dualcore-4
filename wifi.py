@@ -10,7 +10,8 @@ from network_wait import sleep_sliced
 
 
 class Wifi:
-    """Original-style Wi-Fi lifecycle, owned exclusively by Core 0."""
+    """Core 0's Wi-Fi lifecycle: association, bounded observation windows,
+    reconnect backoffs, all waits sliced."""
 
     def __init__(self, ssid, password, reconnect_delays_sec, wait_service=None):
         self._ssid = ssid
@@ -32,7 +33,7 @@ class Wifi:
         """The current WLAN association state, or None if it cannot be read;
         callers treat None as "unknown" (the observation timeout governs),
         never as a failure. Only OSError reads as unknown; a programming
-        failure escapes, as at the MQTT boundary, not masked as "no state"."""
+        failure escapes, as at the MQTT boundary."""
         try:
             status = self._wlan.status()
         except MemoryError:
@@ -43,10 +44,9 @@ class Wifi:
 
     def _terminal_failure_statuses(self):
         """The WLAN association states that end a connect attempt, as ints.
-        WRONG_PASSWORD, NO_AP_FOUND, CONNECT_FAIL are final for the current
-        connect() call. The STAT_* constants live on the network module
-        (Pico W: -3, -2, -1) — read them from there; inventing literals is
-        how 3 (STAT_GOT_IP) almost became a "failure"."""
+        The STAT_* constants live on the network module (Pico W: -3, -2, -1)
+        — read them from there; inventing literals is how 3 (STAT_GOT_IP)
+        almost became a "failure"."""
         return (
             network.STAT_WRONG_PASSWORD,
             network.STAT_NO_AP_FOUND,
@@ -55,7 +55,7 @@ class Wifi:
 
     def is_connected(self):
         # Same taxonomy as connect(): OSError reads as "not connected"; a
-        # programming failure escapes instead of masking itself as False.
+        # programming failure escapes, not masked as False.
         try:
             return self._wlan is not None and self._wlan.isconnected()
         except MemoryError:
@@ -74,7 +74,8 @@ class Wifi:
             return None
 
     def connect(self):
-        """Connect using the critical sequence from the original firmware."""
+        """Connect with the configured reconnect backoffs; each attempt's
+        observation window is bounded (200 slices of 100 ms) and sliced."""
         for attempt_index, delay_sec in enumerate(self._reconnect_delays_sec):
             try:
                 self._wlan = network.WLAN(network.WLAN.IF_STA)
@@ -82,8 +83,8 @@ class Wifi:
 
                 # The PM_NONE probe keeps a deliberately broad catch: an
                 # optional power-management feature whose absence a driver
-                # reports with no single portable exception type. This is the
-                # one broad catch in this module — everything else follows the
+                # reports with no single portable exception type — the one
+                # broad catch in this module; everything else follows the
                 # transport-failure taxonomy.
                 try:
                     self._wlan.config(pm=self._wlan.PM_NONE)
@@ -108,10 +109,9 @@ class Wifi:
                     # slice of the up-to-20-second observation window.
                     self._service_wait()
                     # A terminal association state (wrong password, missing
-                    # AP, connect failure) means the driver will not recover
-                    # within this window: stop observing instead of waiting
-                    # out the full 20 s (a still-connecting state is not
-                    # terminal; the timeout remains the fallback).
+                    # AP, connect failure) will not recover within this
+                    # window: stop observing instead of waiting out the full
+                    # 20 s (a still-connecting state is not terminal).
                     status = self._current_status()
                     if status is not None and status in terminal_statuses:
                         terminal_status = status
@@ -134,11 +134,10 @@ class Wifi:
             except MemoryError:
                 raise
             except OSError as err:
-                # Same taxonomy the MQTT boundary follows: a transport
-                # failure (OSError) is a link condition to retry, but a
-                # programming failure must escape to main.py's controlled
-                # reset — a broad catch would hand establish_network()
-                # infinite retries into the same deterministic fault.
+                # Same taxonomy the MQTT boundary follows: an OSError is a
+                # link condition to retry; a programming failure must escape
+                # to main.py's controlled reset — a broad catch would hand
+                # establish_network() infinite retries into the same fault.
                 if DEBUG:
                     print("[DEBUG] Wi-Fi attempt failed: {}".format(err))
 

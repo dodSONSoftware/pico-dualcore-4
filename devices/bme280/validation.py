@@ -68,14 +68,13 @@ def _is_finite_number(value):
 
 
 def validate_config(config):
-    """Pure validation of a bme280 device config (no hardware): accepts the
-    keys in ``ALLOWED_CONFIG_KEYS`` with the documented bounds and the two
-    cross-field rules (a fresh pressure/humidity compensation requires
-    temperature; SDA and SCL must differ); raises ``DeviceValidationError``
-    (a ``ValueError``) with a stable ``code`` on the first violation. Touches
-    no hardware: a valid definition with no physical backing passes --
-    physical absence is an operational failure (``initialization_failed`` at
-    boot), not a schema failure. Defaults are applied by the driver, not here."""
+    """Pure validation of a bme280 device config (no hardware): the keys in
+    ``ALLOWED_CONFIG_KEYS`` with the documented bounds plus the cross-field
+    rules; raises ``DeviceValidationError`` (a ``ValueError``) with a stable
+    ``code`` on the first violation. A valid definition with no physical
+    backing passes -- physical absence is an operational failure
+    (``initialization_failed`` at boot), not a schema failure. Defaults are
+    applied by the driver, not here."""
     if not isinstance(config, dict):
         raise DeviceValidationError(
             "bme280 device config must be an object",

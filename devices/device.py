@@ -4,13 +4,11 @@
 
 
 class DeviceValidationError(ValueError):
-    """A pure device-definition or device-config validation failure, raised by
-    the pure validators (never by hardware), so ``config.py`` can map it onto
-    ``ConfigError`` and the write-config response can carry a stable cause.
-    ``code`` is one of ``invalid_value`` / ``missing_key`` /
+    """A pure validation failure (never raised by hardware), mapped by
+    ``config.py`` onto ``ConfigError`` so the write-config response can carry
+    a stable cause; ``code`` is one of ``invalid_value`` / ``missing_key`` /
     ``unknown_config_fields`` / ``unsupported_device_type``. A ``ValueError``
-    subclass so the device manager's per-device ``except Exception`` retry path
-    still catches it."""
+    subclass so the device manager's per-device retry path still catches it."""
 
     def __init__(self, message, code="invalid_value"):
         super().__init__(message)

@@ -95,15 +95,13 @@ class SystemInformation:
         return self.get_device_sections()["device_status"]
 
     def get_cpu_temperature(self):
-        # The rp2 port exposes the on-chip die sensor only as an ADC channel
-        # (no machine.temperature() binding); the constructor enables it.
-        # read_u16() returns the 12-bit reading scaled to 16 bits (raw << 4),
-        # so scale it back before converting. The RP2040 and RP2350 datasheets
-        # state the same calibration (Vbe = 0.706 V at 27 C, slope
-        # -1.721 mV/C on a 12-bit ADC, 3.3 V reference), so one formula serves
-        # both boards. The conversion is VREF-sensitive (~4 C per 1% VREF) and
-        # the sensor varies device-to-device: the value is a trend indicator at
-        # roughly +/-5 C, not a calibrated absolute.
+        # The rp2 port exposes the die sensor only as an ADC channel (no
+        # machine.temperature() binding); read_u16() returns the 12-bit
+        # reading scaled to 16 bits, so scale it back. The RP2040 and RP2350
+        # datasheets state the same calibration (Vbe = 0.706 V at 27 C, slope
+        # -1.721 mV/C), so one formula serves both boards. The conversion is
+        # VREF-sensitive (~4 C per 1% VREF): a trend indicator at roughly
+        # +/-5 C, not a calibrated absolute.
         try:
             adc = machine.ADC(machine.ADC.CORE_TEMP)
             raw = adc.read_u16() >> 4

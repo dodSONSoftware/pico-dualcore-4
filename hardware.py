@@ -10,11 +10,10 @@ HARDWARE_TYPE_UNKNOWN = "unknown"
 
 # Board-specific free-heap thresholds (bytes). Two distinct concepts: the
 # PREFERRED reserve marks the start of memory-pressure handling (GC,
-# increased willingness to reclaim low-retention queue entries — not a
-# rejection wall), and the MINIMUM is the hard survival floor admission must
-# protect (below it, expendable incoming traffic may be rejected). Real Pico
-# W operation transiently approaches or dips below 64 KiB while constructing
-# and serializing legitimate messages, so the two must not be one value.
+# increased willingness to reclaim — not a rejection wall), and the MINIMUM
+# is the hard survival floor admission must protect. Real Pico W operation
+# transiently approaches or dips below 64 KiB while constructing and
+# serializing legitimate messages, so the two must not be one value.
 PICO_W_PREFERRED_FREE_HEAP_BYTES = 64 * 1024   # 65,536 bytes
 PICO_W_MIN_FREE_HEAP_BYTES = 48 * 1024         # 49,152 bytes
 # Pico 2 W keeps its own policy: the same 16 KiB pressure band above its
@@ -35,7 +34,7 @@ _PICO_2_W_MACHINE_PATTERNS = (
 
 
 def classify_machine(machine_name):
-    """Classify a machine string into {hardware_type, preferred_free_heap_bytes, minimum_free_heap_bytes} -- the single source of truth for the mapping."""
+    """Classify a machine string into {hardware_type, preferred_free_heap_bytes, minimum_free_heap_bytes} — the single source of truth for the mapping."""
     if machine_name in _PICO_W_MACHINE_PATTERNS:
         return {
             "hardware_type": HARDWARE_TYPE_PICO_W,

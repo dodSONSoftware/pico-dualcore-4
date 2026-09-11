@@ -9,11 +9,11 @@ from binascii import hexlify
 
 # Maximum remaining length (bytes) for an inbound MQTT packet. Derived, not
 # arbitrary: the worst-case spec-valid inbound frame (a write-config command
-# carrying the worst-case valid configuration) is 16,865 bytes, pinned by the
-# serialized-size invariant test in tests/test_config.py — 20 KiB keeps every
-# valid command deliverable while bounding what json.loads() can amplify at
-# the parse peak. An oversized frame must fail the connection instead of
-# letting sock.read(sz) request an allocation that could exhaust Pico RAM.
+# carrying the worst-case valid configuration) is 16,865 bytes (pinned in
+# tests/test_config.py) — 20 KiB keeps every valid command deliverable while
+# bounding what json.loads() can amplify at the parse peak. An oversized
+# frame must fail the connection instead of letting sock.read(sz) request an
+# allocation that could exhaust Pico RAM.
 MAX_INBOUND_PACKET_BYTES = 20 * 1024
 
 
@@ -56,7 +56,7 @@ class MQTTClient:
         # A short or empty read is a transport failure: at EOF read(n) may
         # return fewer bytes, and that must surface as OSError (Core 0
         # reconnects over it), not IndexError from the caller indexing short
-        # bytes (which escapes the recovery boundary and resets the MCU).
+        # bytes (escapes the recovery boundary, resets the MCU).
         data = self.sock.read(size)
         if data is None or len(data) != size:
             raise OSError(-1)
@@ -151,10 +151,10 @@ class MQTTClient:
         """Publish one QoS 1 application message; optional packet_id (else auto-increment) and timeout_ms bound the exchange.
 
         With ``splice_fragment``, the frame's final bytes are written
-        segment by segment: ``msg`` without its closing brace, then a comma,
-        the fragment, then the brace. The wire bytes are identical to a
-        single pre-joined buffer, but no allocation is ever sized to the
-        whole spliced frame (see the write below)."""
+        segment by segment: ``msg`` without its closing brace, a comma, the
+        fragment, then the brace — wire-identical to a single pre-joined
+        buffer, but no allocation is ever sized to the whole spliced frame
+        (see the write below)."""
         pkt = bytearray(b"\x32\0\0\0")
         sz = 2 + len(topic) + len(msg) + 2
         if splice_fragment is not None:
@@ -165,7 +165,7 @@ class MQTTClient:
             # This encoder emits at most three remaining-length bytes (the
             # loop below); the protocol's four-byte maximum (268435455) is
             # never reachable — the application outbound ceiling is far below
-            # either limit.
+            # both.
             raise MQTTException(
                 "Publish size exceeds this client's remaining-length encoding limit"
             )
@@ -182,8 +182,7 @@ class MQTTClient:
         # Bound the WHOLE QoS 1 exchange (frame writes included): a blackholed
         # link whose writes stop making progress then fails the publish
         # bounded, into Core 0's recovery, instead of wedging inside
-        # sock.write(). Installed before byte 1; restored only after the
-        # exchange.
+        # sock.write(). Installed before byte 1, restored after the exchange.
         timed = timeout_ms is not None
         if timed:
             self.sock.settimeout(timeout_ms / 1000.0)
@@ -201,9 +200,9 @@ class MQTTClient:
                 # closing brace, then the splice itself. TCP is a byte
                 # stream, so the broker receives the pre-joined frame -- but
                 # no single allocation is sized to the whole frame: the
-                # largest free heap block can be smaller than the frame even
-                # with tens of KiB total free (a pre-joined copy would
-                # MemoryError on a fragmented post-startup heap).
+                # largest free block can be smaller than the frame even with
+                # tens of KiB total free (a pre-joined copy would MemoryError
+                # on a fragmented post-startup heap).
                 view = memoryview(msg)
                 self.sock.write(view[: len(msg) - 1])
                 self.sock.write(b",")
@@ -274,8 +273,7 @@ class MQTTClient:
     def wait_msg(self):
         # Read in the caller's socket mode and never change it: every caller
         # runs in blocking-with-timeout mode, and setblocking(True) ==
-        # settimeout(None) in MicroPython, which would clear the caller's
-        # timeout.
+        # settimeout(None) in MicroPython would clear the caller's timeout.
         res = self.sock.read(1)
         if res is None:
             return None
@@ -362,9 +360,8 @@ class MQTTClient:
             return any(ipoll(0))
         return bool(poller.poll(0))
 
-    # Checks whether a pending message from server is available. If not,
-    # returns immediately with None; otherwise does the same processing as
-    # wait_msg.
+    # Checks whether a pending message from server is available: None
+    # immediately if not, otherwise the same processing as wait_msg.
     def check_msg(self, timeout_sec):
         # Readiness is decided with a poll, not a non-blocking read: one
         # readable byte only means a packet has started, and MicroPython's

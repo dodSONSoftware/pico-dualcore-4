@@ -84,15 +84,15 @@ def _collect_system_information_full(system_information):
 # The get-details fallback's drop order when the full snapshot cannot be
 # serialized: the device sections are the only two that grow with the device
 # count, and device_status carries the unbounded failure_reason strings, so
-# dropping them first keeps every bounded form a fixed small size.
+# dropping them first keeps every bounded form a small fixed size.
 _GET_DETAILS_FALLBACK_DROP_ORDER = ("device_status", "devices")
 
 
 def _startup_summary(device_status, startup_duration_ms):
     """Startup statuses and device counts, shared by the startup event log
-    and its bounded fallback. Subscription readiness is reported without topic
-    names (topic ownership belongs to Core 0), and the startup duration is
-    named duration_ms so it is not confused with the envelope's uptime_ms."""
+    and its bounded fallback. Subscription readiness is reported without
+    topic names (topic ownership belongs to Core 0); the duration is named
+    duration_ms, not uptime_ms, to keep it distinct from the envelope's."""
     startup_summary = {
         "duration_ms": startup_duration_ms,
         "hardware": {"status": "ready"},
@@ -159,8 +159,8 @@ def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms):
     """Build the bounded startup-log fallback: only the startup statuses and
     device counts -- no per-device lists, no failure reasons -- so it fits
     when the event log (which carries device lists and driver failure reasons
-    no bound can pin) cannot. Losing the verbose diagnostics must not keep
-    the device from entering normal operation."""
+    no bound can pin) cannot; losing the verbose diagnostics must not keep
+    normal operation from starting."""
     device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
     return _startup_log_message(
         intercore,
@@ -170,12 +170,11 @@ def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms):
 
 
 def _try_queue_startup_log(intercore, message, retention_priority):
-    """Attempt to queue the startup log message.
-
-    True if admitted; False on transient heap pressure. ValueError on a
-    permanent rejection (retrying cannot succeed), except the oversized case,
-    which raises StartupLogTooLargeError so the caller can answer it with the
-    bounded fallback instead of failing startup."""
+    """Attempt to queue the startup log message. True if admitted; False on
+    transient heap pressure. ValueError on a permanent rejection (retrying
+    cannot succeed), except the oversized case, which raises
+    StartupLogTooLargeError so the caller can answer it with the bounded
+    fallback instead of failing startup."""
     try:
         payload_bytes = serialize_and_validate_message(message)
     except (UnsupportedValueError, NonStringKeyError, NonFiniteFloatError) as err:
@@ -214,26 +213,22 @@ def _admit_startup_log(intercore, message):
 
 
 def _admit_startup_log_with_fallback(intercore, message, fallback_builder):
-    """Admit the startup log; if the detailed message is rejected for
-    exceeding the outbound ceiling or fails serialization with MemoryError
-    (a memory-tight board's fragmented pool), admit the bounded fallback
-    summary instead. Every other permanent rejection escapes with its actual
-    reason so the caller fails fast (each admission keeps the single
-    transient retry)."""
+    """Admit the startup log; if the detailed message is rejected at the
+    outbound ceiling or fails serialization with MemoryError (a memory-tight
+    board's fragmented pool), admit the bounded fallback summary instead.
+    Every other permanent rejection escapes with its actual reason (each
+    admission keeps the single transient retry)."""
     try:
         return _admit_startup_log(intercore, message)
     except StartupLogTooLargeError:
         print("[WARN] Startup log exceeds the outbound ceiling; admitting the bounded summary instead")
         return _admit_startup_log(intercore, fallback_builder())
     except MemoryError:
-        # The detailed message's serialization buffers do not fit on a
-        # memory-tight board: a fragmented pool can hold tens of KiB in total
+        # The detailed message's serialization buffers do not fit: a
+        # memory-tight board's fragmented pool can hold tens of KiB in total
         # yet no run large enough for the serialized form, so the size check
-        # never sees the bytes. The bounded summary is the smaller object that
-        # answers it, so the verbose diagnostics cannot keep an otherwise
-        # valid configuration from entering normal operation. If the summary
-        # cannot be admitted either, the MemoryError propagates to the
-        # recovery boundary.
+        # never sees the bytes. If the bounded summary cannot be admitted
+        # either, the MemoryError propagates to the recovery boundary.
         print("[WARN] Startup log serialization exhausted the heap; admitting the bounded summary instead")
         return _admit_startup_log(intercore, fallback_builder())
 
@@ -242,7 +237,7 @@ def _current_utc_timestamp(intercore, uptime_ms):
     """Current UTC timestamp from the shared snapshot, or None if
     unsynchronized. Adding this sample's accumulated uptime to the pinned
     runtime start stays correct across the tick wrap, where a one-shot
-    ticks_diff against the sync tick would go stale past half a tick period."""
+    ticks_diff against the sync tick would go stale."""
     snapshot = intercore.state_mailboxes.get_utc_snapshot()
     if snapshot is None:
         return None
@@ -279,11 +274,11 @@ def _build_command_response(intercore, uptime_state, event, success, data=None, 
 
 
 def _try_queue_response(intercore, response):
-    """Queue a command response at CRITICAL retention priority.
-
-    True if admitted; False if transiently rejected (retry on a later pass);
-    ValueError on a permanent rejection (oversized: OutboundMessageTooLargeError);
-    MemoryError if the serializer's own gc + eviction recovery exhausts."""
+    """Queue a command response at CRITICAL retention priority. True if
+    admitted; False if transiently rejected (retry on a later pass);
+    ValueError on a permanent rejection (oversized:
+    OutboundMessageTooLargeError); MemoryError if the serializer's own gc +
+    eviction recovery exhausts."""
     return intercore.outbound_queue.put(
         response["kind"],
         response["message"],
@@ -334,20 +329,15 @@ def _build_get_details_response_without(intercore, uptime_state, response, secti
 def _admit_after_serialization_memory_error(intercore, uptime_state, response):
     """A persistent serialization MemoryError: the queue's own recovery
     (gc.collect() first, then one eligible eviction per failure) has already
-    exhausted, so the heap cannot form the contiguous run the serialized form
-    needs, now. A MemoryError escaping the admission used to kill Core 1's
-    worker thread -- the 0.4.91 Pico W died exactly here on a get-details
-    full snapshot (2,360 bytes with ~57 KiB free), and Core 0's heartbeat
-    watchdog reset the board 30 s later, the command unanswered. The full
-    get-details snapshot is the one response large enough to hit that wall:
-    answer it one section smaller at a time, dropping the device sections in
-    order (each attempt follows the queue's own gc.collect(), so the pool is
-    coalesced when the strictly smaller form is retried), until one is
-    admitted; the response stays a success and names what it omitted. Any
-    other response -- or a get-details whose device sections are already
-    gone -- takes the small error substitute. A MemoryError on a bounded
-    form's or the substitute's own admission propagates to the recovery
-    boundary (the 0.4.87 bounded-summary precedent: nothing loops)."""
+    exhausted. The full get-details snapshot is the one response large
+    enough to hit that wall, so answer it one section smaller at a time
+    (each retry follows the queue's own gc.collect(), so the pool is
+    coalesced for the strictly smaller form), until one is admitted; the
+    response stays a success and names what it omitted. Any other response
+    -- or a get-details whose device sections are already gone -- takes the
+    small error substitute. A MemoryError on a bounded form's or the
+    substitute's own admission propagates to the recovery boundary (nothing
+    loops)."""
     if response["message"]["payload"].get("command") == COMMAND_GET_DETAILS:
         candidate = response
         for section in _GET_DETAILS_FALLBACK_DROP_ORDER:
@@ -399,7 +389,7 @@ def _admit_after_serialization_memory_error(intercore, uptime_state, response):
 
 def _admit_or_substitute_command_response(intercore, uptime_state, response):
     """Admit a command response, or a bounded form of it / a small error
-    substitute for it (code "response_too_large" for oversized,
+    substitute (code "response_too_large" for oversized,
     "response_invalid" for a validation/serialization failure); either way
     the channel moves on. Returns the response still pending, or None if one
     was admitted."""
@@ -441,8 +431,8 @@ def _regrid_next_boundary(anchor, now, interval_ms):
 def _process_intercore_event(intercore, uptime_state, system_information=None):
     """Handle a Core 1-owned command event dispatched by Core 0 (currently
     get-details, with a validated {} payload). Core 0 owns the unknown-command
-    response, so Core 1 is not the generic fallback for arbitrary command
-    names. (Config-update traffic uses the dedicated lane, not this queue.)"""
+    response, so Core 1 is not the generic fallback. (Config-update traffic
+    uses the dedicated lane, not this queue.)"""
     event = intercore.event_queue.take()
     if event is None:
         return None
@@ -668,9 +658,9 @@ def _try_queue_health_message(intercore, message):
 
 
 def _try_queue_health_message_intercore(intercore, uptime_state, config, system_information):
-    """Build health payload and attempt to queue it.
-
-    Only when the network stack is ready and MQTT is connected, so health messages don't accumulate during outages."""
+    """Build the health payload and attempt to queue it, only when the network
+    stack is ready and MQTT is connected, so health messages don't accumulate
+    during outages."""
     network_snapshot = intercore.state_mailboxes.get_network_snapshot()
     if network_snapshot is None:
         return
@@ -691,14 +681,13 @@ def _try_queue_health_message_intercore(intercore, uptime_state, config, system_
 def _build_i2c_bus_factory():
     """Core 1 owns its I2C buses (ARCHITECTURE ownership invariant). Returns a
     factory that builds one machine.I2C per distinct (bus, sda, scl, freq) and
-    caches it, so two devices on the same bus share one object. sda/scl are
+    caches it, so two devices on the same bus share one object; sda/scl are
     None when a device config relies on the bus's default pins.
 
     The machine import is inside the closure (not here) so building the factory
     is side-effect-free: the bus -- and the machine import -- only happen when a
-    configured I2C device first requests one. Host tests that run core1_main
-    under a minimal fake machine never touch I2C/Pin, and pass a fake factory
-    directly for I2C device tests.
+    configured I2C device first requests one. Host tests pass a fake factory
+    directly.
     """
     cache = {}
 
@@ -731,13 +720,13 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # Accumulated uptime: every ticks_diff compares recent samples, so
         # uptime stays correct across a tick-counter wrap. boot_ticks_ms
         # anchors boot-lifetime uptime only; periodic scheduling anchors to
-        # normal_runtime_start_ticks_ms (captured below).
+        # normal_runtime_start_ticks_ms.
         uptime_state = create_uptime_state(boot_ticks_ms)
 
         system_information = SystemInformation(intercore, config)
         # activity_refresh keeps the liveness stamp current at initialization
-        # progress boundaries, so a legitimately long initialization does not
-        # age it past Core 0's 30 s watchdog bound while a wedged driver call
+        # progress boundaries: a legitimately long initialization does not age
+        # it past Core 0's 30 s watchdog bound, while a wedged driver call
         # (which stops the refresh) is still caught.
         device_manager = DeviceManager(
             config,
@@ -761,10 +750,9 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         # Reclaim the import/initialization residue before the startup log's
         # serialization buffers are needed: on a memory-tight board (Pico W)
-        # the pool is fragmented after the device init pass, and this
-        # allocation-light gc is the difference between the event log (or its
-        # bounded fallback) and the per-section diagnostics fitting and a
-        # MemoryError.
+        # the pool is fragmented after the device init pass, and this gc is
+        # the difference between the event log (or its bounded fallback)
+        # fitting and a MemoryError.
         gc.collect()
         startup_log_message = _build_startup_log(
             intercore, device_manager, startup_duration_ms
@@ -772,8 +760,8 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         # The startup event log must be admitted before telemetry can begin.
         # A permanent rejection fails fast with its actual reason; only heap
-        # pressure is retried. The oversized case is the one a different
-        # object can answer: the bounded fallback summary.
+        # pressure is retried. The oversized case is answered by a different
+        # object: the bounded fallback summary.
         try:
             startup_log_admitted = _admit_startup_log_with_fallback(
                 intercore,
@@ -794,10 +782,9 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         # The single normal-runtime scheduling anchor, captured exactly once,
         # after the startup event log is admitted. All periodic Core 1 work
-        # derives its fixed
-        # boundaries from this moment (not boot_ticks_ms). A reconnect, UTC
-        # resync, device reinit, or queue drain must never re-capture it; only
-        # a true reboot creates a new one.
+        # derives its fixed boundaries from this moment (not boot_ticks_ms);
+        # a reconnect, UTC resync, device reinit, or queue drain must never
+        # re-capture it -- only a true reboot creates a new one.
         normal_runtime_start_ticks_ms = time.ticks_ms()
 
         try:
@@ -816,7 +803,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # The read/health schedulers share the normal-runtime anchor: fixed
         # boundaries every read_loop_sec / health_interval_sec from it,
         # independent of each other (they share the epoch, not an execution
-        # dependency); the one immediate anchor pass runs below.
+        # dependency); the immediate anchor pass runs below.
         schedulers = {
             "anchor_ms": normal_runtime_start_ticks_ms,
             "read_loop_ms": config["read_loop_sec"] * 1000,
@@ -841,7 +828,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # report right after startup-log admission, so a subscriber connecting
         # at boot sees current data. Telemetry first, then health, so the
         # health report reflects queue state that already includes the fresh
-        # samples. The periodic schedulers are untouched (not a second grid).
+        # samples; the periodic schedulers are untouched.
         _run_telemetry_read_pass(device_manager, intercore, uptime_state)
         _try_queue_health_message_intercore(intercore, uptime_state, config, system_information)
 
@@ -869,9 +856,8 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 # replay them: telemetry is a current sample, not historical
                 # data (same policy as the health scheduler). Advance from the
                 # previous deadline (not execution time) so delay cannot
-                # accumulate into drift: boundaries stay at anchor + n *
-                # read_loop_ms. now_ms is stale by the read duration, so
-                # re-capture the clock for the skip comparison.
+                # accumulate into drift. now_ms is stale by the read duration,
+                # so re-capture the clock for the skip comparison.
                 skip_now_ms = time.ticks_ms()
                 while time.ticks_diff(skip_now_ms, schedulers["next_read_ms"]) >= 0:
                     schedulers["next_read_ms"] = time.ticks_add(
@@ -888,8 +874,8 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
             # Health boundary reached: emit at most one current report (skipped
             # during a network outage), then advance from the old deadline so
-            # the cadence stays anchored and missed boundaries are skipped,
-            # never replayed.
+            # the cadence stays anchored; missed boundaries are skipped, never
+            # replayed.
             if time.ticks_diff(now_ms, schedulers["next_health_ms"]) >= 0:
                 _try_queue_health_message_intercore(intercore, uptime_state, config, system_information)
                 while time.ticks_diff(now_ms, schedulers["next_health_ms"]) >= 0:

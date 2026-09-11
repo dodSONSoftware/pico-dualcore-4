@@ -7,9 +7,9 @@ and boot recovery.
 
 config.py remains the single source of truth for schema validation and
 per-core splitting. There is no live apply: every committed change is
-pending a reboot, the running firmware keeps its boot values until then,
+pending a reboot (the running firmware keeps its boot values until then),
 and ``reboot_required`` is a plain in-boot flag set by the first committed
-change of the boot (a fresh instance at boot starts False).
+change of the boot.
 """
 
 import errno
@@ -118,10 +118,9 @@ class ConfigManager:
             os.remove(path)
 
     def recover(self):
-        """Boot recovery: settle the committed config before anything else runs.
-
-        A valid .old is authoritative (a promotion interrupted before its
-        commit point), then a valid config.json, then a valid .tmp; an
+        """Boot recovery: settle the committed config before anything else
+        runs. A valid .old is authoritative (a promotion interrupted before
+        its commit point), then a valid config.json, then a valid .tmp; an
         invalid .old is released. On success the steady state is exactly one
         valid config.json; else startup fails clearly."""
         config_path = self._config_path
@@ -183,15 +182,13 @@ class ConfigManager:
 
     def begin_write(self, candidate):
         """Validate and (for a changed candidate) atomically promote a
-        write-config candidate.
-
-        Returns the classification and the change summary (PERSISTED-before
-        vs candidate). UNCHANGED writes perform no filesystem modification
-        and preserve the current reboot state; a changed candidate commits
-        and is pending a reboot -- no live apply on either core, the next
-        boot loads the persisted configuration. MemoryError propagates to
-        the fail-fast boundary; other failures restore pre-write state and
-        leave the artifacts for boot recovery."""
+        write-config candidate. Returns the classification and the change
+        summary (PERSISTED-before vs candidate). UNCHANGED writes perform no
+        filesystem modification and preserve the current reboot state; a
+        changed candidate commits and is pending a reboot -- no live apply on
+        either core. MemoryError propagates to the fail-fast boundary; other
+        failures restore pre-write state and leave the artifacts for boot
+        recovery."""
         validate_config(candidate)
         persisted = load_config(self._config_path)
         changes = _changes_summary(persisted, candidate)
@@ -251,14 +248,15 @@ class ConfigManager:
         os.sync()
 
     def _write_candidate_tmp(self, candidate):
-        """Fully write the candidate to .tmp (closed) -- a crash after this leaves a promotable artifact.
+        """Fully write the candidate to .tmp (closed) -- a crash after this
+        leaves a promotable artifact.
 
         json.dump() streams the serialization straight into the file object
         (MicroPython's dump writes through the stream, no pre-built string),
         so a configuration-sized allocation never coexists with the rest of
         the write-config peak (inbound frame + parsed graph + candidate +
-        active config). A mid-write failure leaves a partial .tmp, which is
-        already the tolerated artifact: the read-back re-validation before
-        promotion is what decides, never the write itself."""
+        active config). A mid-write failure leaves a partial .tmp -- the
+        tolerated artifact: the read-back re-validation before promotion is
+        what decides, never the write itself."""
         with open(self._tmp_path(), "w") as handle:
             json.dump(candidate, handle)

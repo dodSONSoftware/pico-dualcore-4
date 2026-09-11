@@ -117,9 +117,9 @@ class DeviceManager:
 
         # Optional liveness-stamp refresh callback, invoked at progress
         # boundaries (per device, per attempt, per retry-sleep step). Without
-        # it, a legitimately long initialization or a pass whose cumulative
-        # reads exceed the bound would age the stamp past Core 0's watchdog;
-        # a wedge inside a driver call still stops the refresh and is caught.
+        # it, a legitimately long initialization would age the stamp past
+        # Core 0's watchdog; a wedge inside a driver call still stops the
+        # refresh and is caught.
         self._activity_refresh = activity_refresh
 
     def _refresh_activity(self):
@@ -258,7 +258,7 @@ class DeviceManager:
         """Initialize all configured devices in configuration order, with the
         configured attempts and retry delay per device; on final failure record
         the device (in the failure status the system-information section
-        reports) and continue. Returns the initialized count."""
+        reports) and continue. Returns the count initialized."""
         initialized_count = 0
 
         for device_def in self._devices_config:

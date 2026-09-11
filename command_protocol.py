@@ -3,10 +3,8 @@
 # SPDX-License-Identifier: MIT
 
 """Command protocol constants and pure validation helpers (the Core 0
-command boundary). Only the protocol constants and the pure helpers that
-validate against them — no classes, no state, no schema framework. Firmware
-policy (debounce cache, response queues, dispatch) stays in the owning core
-modules."""
+command boundary): no classes, no state. Firmware policy (debounce cache,
+response queues, dispatch) stays in the owning core modules."""
 
 COMMAND_REBOOT = "reboot"
 COMMAND_GET_DETAILS = "get-details"
@@ -20,9 +18,8 @@ MAX_TARGET_LENGTH = 128
 # The configured source is spliced into every Core 0 outbound envelope, so it
 # is a protocol-scale identity (matched against a bounded target), not an
 # open-ended string: a huge identity would push even a tiny envelope past the
-# outbound wire ceiling. The invariant is about wire bytes (the outbound
-# ceiling is UTF-8 bytes), so the bound is measured in UTF-8 bytes, not
-# characters — a 64-character string of 4-byte code points is 256 bytes.
+# outbound wire ceiling. The bound is measured in UTF-8 bytes, not characters
+# (a 64-character string of 4-byte code points is 256 bytes).
 MAX_SOURCE_LENGTH = 64
 
 BROADCAST_TARGET = "*"
@@ -40,9 +37,7 @@ COMMAND_ENVELOPE_KEYS = frozenset((
 
 # Command ownership: Core 0 executes its own commands (reboot, read-config /
 # write-config); Core 1-owned commands are dispatched to Core 1 as validated
-# bounded events. Only get-details crosses. The configuration hot-reload
-# handshake (the config-update event) is internal control traffic, not an
-# external command.
+# bounded events. Only get-details crosses.
 CORE0_OWNED_COMMANDS = (
     COMMAND_REBOOT,
     COMMAND_READ_CONFIG,

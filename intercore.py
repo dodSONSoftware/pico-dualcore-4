@@ -48,14 +48,13 @@ class OutboundMessageTooLargeError(ValueError):
 
 
 class OutboundQueue:
-    """Core 1 -> Core 0 queue for MQTT-bound messages only.
-
-    Payload bytes are immutable once put() succeeds (pre-serialized UTF-8
-    JSON); the Core 0 envelope keys are injected at publish time. No fixed
-    capacity: the preferred reserve marks where memory-pressure handling
-    begins and is never a rejection wall; the hard floor is the survival
-    boundary admission must protect; CRITICAL is the non-evictable retention
-    floor. All decisions run under the shared heap-admission lock."""
+    """Core 1 -> Core 0 queue for MQTT-bound messages only. Payload bytes are
+    immutable once put() succeeds (pre-serialized UTF-8 JSON); the Core 0
+    envelope keys are injected at publish time. No fixed capacity: the
+    preferred reserve marks where pressure handling begins and is never a
+    rejection wall, the hard floor is the survival boundary admission must
+    protect, CRITICAL the non-evictable retention floor. All decisions run
+    under the shared heap-admission lock."""
 
     def __init__(self, minimum_free_heap_bytes, heap_admission_lock,
                  preferred_free_heap_bytes=None, max_messages=None):
@@ -92,9 +91,9 @@ class OutboundQueue:
         self._messages_rejected = 0
         self._serialization_rejected = 0
         self._oversized_rejected = 0
-        # Discarded at publish time: admitted at or under the ceiling, but
-        # the spliced envelope pushed the final wire length over it
-        # (permanent for the entry).
+        # Discarded at publish time: admitted at or under the ceiling, but the
+        # spliced envelope pushed the final wire length over it (permanent
+        # for the entry).
         self._oversized_discarded = 0
 
     def _reserve_restored(self):
@@ -106,8 +105,8 @@ class OutboundQueue:
     def _below_count_limit_locked(self):
         """True when one more append keeps the retained-entry depth (queued
         plus the in-flight entry, the same definition as depth/high_watermark)
-        at or under the configured count ceiling. Unbounded (no ceiling) is
-        always below. Caller holds self._lock."""
+        at or under the count ceiling; unbounded is always below. Caller
+        holds self._lock."""
         if self._max_messages is None:
             return True
         depth = len(self._queue) + (1 if self._in_flight is not None else 0)
@@ -154,11 +153,10 @@ class OutboundQueue:
         """Append one entry after making count room (caller holds the
         heap-admission lock, NOT the queue lock). The heap floor is checked by
         _append_locked; the count ceiling is enforced here, subordinate to it
-        (it is only reached where the heap floor already allowed the append):
-        at the ceiling, displace one eligible entry under the same retention
-        rule as the heap path, else the append is not made. Returns True if
-        appended, False if the append's own allocations crossed the hard floor
-        (the caller's displacement path decides) or the ceiling left nothing
+        (only reached where the heap floor already allowed the append): at the
+        ceiling, displace one eligible entry under the same retention rule,
+        else the append is not made. True if appended, False if the append's
+        own allocations crossed the hard floor or the ceiling left nothing
         eligible (the displacement path is the single rejection point, so a
         rejected message is counted exactly once)."""
         with self._lock:
@@ -178,11 +176,11 @@ class OutboundQueue:
 
     def _evict_one_eligible_locked(self, retention_priority):
         """Evict the oldest entry in the least-important class this priority
-        may displace (caller holds self._lock). Shared eligibility rule for
+        may displace (caller holds self._lock). Shared eligibility for
         admission and serialization recovery: no eviction on an empty queue,
         an incoming entry less important than everything queued, or CRITICAL
-        (non-evictable floor). Returns (True, worst_priority) on eviction
-        (counted by the regular eviction metrics), else (False, reason)."""
+        (non-evictable floor). Returns (True, worst_priority) on eviction,
+        else (False, reason)."""
         if not self._queue:
             return (False, "memory_pressure")
         # Explicit loop: no generator/list allocation in the
@@ -211,8 +209,8 @@ class OutboundQueue:
         eligible entry per persistent attempt (same eligibility as admission,
         CRITICAL never displaced), gc.collect() after each, until
         serialization succeeds or nothing eligible remains -- then the
-        MemoryError propagates to the firmware recovery boundary. No locks
-        are held across the serializer or gc.collect()."""
+        MemoryError propagates to the recovery boundary. No locks are held
+        across the serializer or gc.collect()."""
         gc_attempted = False
         while True:
             try:
@@ -248,19 +246,17 @@ class OutboundQueue:
                 raise ValueError("Message serialization failed: {}".format(err))
 
     def _admit_heap_governed(self, kind, payload_bytes, retention_priority):
-        """Apply the two-threshold heap admission decision (no locks held on entry).
-
-        The preferred reserve is not a rejection wall: pressure reclaims
-        (GC first, then at most one eligible entry) and still admits. The
-        hard floor is re-measured before every displacement, so no eviction
-        is decided on a pre-collection measurement. A configured count
-        ceiling (_max_messages) is a second, subordinate constraint: it is
-        enforced at each append via _try_append_with_count_gate(), only where
-        the heap floor already allows the append, so it can add a rejection or
-        a retention-aware eviction to make room but never admit what the heap
-        policy would reject. False is the only
-        rejection (nothing eligible remained) and is transient: the producer
-        retains and retries."""
+        """Apply the two-threshold heap admission decision (no locks held on
+        entry). The preferred reserve is not a rejection wall: pressure
+        reclaims (GC first, then at most one eligible entry) and still admits.
+        The hard floor is re-measured before every displacement, so no
+        eviction is decided on a pre-collection measurement. A configured
+        count ceiling is a second, subordinate constraint, enforced at each
+        append via _try_append_with_count_gate() only where the heap floor
+        already allows the append: it can add a rejection or a retention-aware
+        eviction to make room but never admit what the heap policy would
+        reject. False (nothing eligible remained) is the only rejection, and
+        is transient: the producer retains and retries."""
         with self._heap_admission_lock:
             if not self._preferred_restored():
                 # Pressure band crossed: give GC the first chance to reclaim
@@ -293,9 +289,9 @@ class OutboundQueue:
                 # path below decides.
 
             # HARD PRESSURE: measure the floor before displacing anything --
-            # the last rollback/collect may have restored it. Then displace
-            # the least-important eligible entry, reclaim, and repeat, until
-            # the entry is retained or nothing eligible remains.
+            # the last rollback/collect may have restored it. Displace the
+            # least-important eligible entry, reclaim, and repeat, until the
+            # entry is retained or nothing eligible remains.
             while True:
                 if self._reserve_restored():
                     if self._try_append_with_count_gate(
@@ -320,9 +316,9 @@ class OutboundQueue:
         """Admit one MQTT-bound message after validation, serialization, and
         size check. A serializer MemoryError is recovered per
         _serialize_with_recovery() before any queued data is discarded.
-        True if admitted, False on transient heap pressure (a later retry may
-        succeed); ValueError (or OutboundMessageTooLargeError for the size
-        case) on a permanent failure of the message itself."""
+        True if admitted, False on transient heap pressure; ValueError
+        (OutboundMessageTooLargeError for the size case) on a permanent
+        failure of the message itself."""
         if kind not in _KNOWN_KINDS:
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
         if not isinstance(message, dict):

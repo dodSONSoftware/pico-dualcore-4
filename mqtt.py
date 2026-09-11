@@ -12,20 +12,21 @@ from network_wait import sleep_sliced
 # Bounded wait for PINGRESP so a dead link surfaces quickly instead of
 # blocking the Core 0 run loop for the full keepalive window. The bound sits
 # under the Core 0 hardware watchdog budget (core0.py WDT_TIMEOUT_MS): every
-# single blocking wait Core 0 performs must fail on its own timeout before
-# the watchdog can fire.
+# single blocking wait must fail on its own timeout before the watchdog can
+# fire.
 _MAX_PINGRESP_WAIT_SEC = 5
 
 # Expected failure classes at the MQTT boundary: transport (OSError) and
 # wire-protocol (MQTTException) failures are link conditions — mark the
 # session down and let Core 0's recovery reconnect. Anything else escaping
 # the client is a programming failure: it must reach main.py's controlled
-# reset instead of being retried into the same fault and hidden.
+# reset instead of being retried into the same fault.
 MQTT_TRANSPORT_ERRORS = (OSError, MQTTException)
 
 
 class Mqtt:
-    """Small MQTT lifecycle based on the original working client."""
+    """Core 0's MQTT lifecycle: connect/subscribe, keepalive PINGREQ, QoS 1
+    publishes, all bounded waits."""
 
     def __init__(self, config, message_callback, wait_service=None):
         self._broker = config["mqtt_broker_ip_address"]
@@ -46,8 +47,8 @@ class Mqtt:
         self._disconnect_count = 0
         # The final expected transport/protocol error from the most recent
         # failed connect() attempt-sequence (None on success / before any
-        # attempt); cleared on success, used only to name the cause in
-        # Core 0's exhaustion warning.
+        # attempt); cleared on success, used only to name the cause in Core
+        # 0's exhaustion warning.
         self._last_connect_error = None
         self._last_activity_ms = time.ticks_ms()
 
@@ -86,8 +87,8 @@ class Mqtt:
         # and a graceful DISCONNECT frame is not warranted — a DISCONNECT
         # write on a blackholed link (the socket is back in infinite-blocking
         # mode after a failed bounded exchange) would wedge Core 0 inside
-        # sock.write() with no timeout, and the Core 1 watchdog could never
-        # run either. A direct close performs no write at all.
+        # sock.write() with no timeout. A direct close performs no write at
+        # all.
         client = self._client
         self._client = None
 
@@ -106,8 +107,8 @@ class Mqtt:
         """Connect and subscribe, handshake time-bounded: the CONNACK/SUBACK
         waits run under mqtt_broker_response_timeout_sec, so an unresponsive
         broker fails the attempt (retried with backoff) instead of wedging
-        Core 0. On success the socket returns to normal blocking mode. On a
-        fully failed sequence the last attempt's cause is retained on
+        Core 0; on success the socket returns to normal blocking mode. A
+        fully failed sequence retains the last attempt's cause on
         self.last_connect_error; a success clears it."""
         self._last_connect_error = None
         for attempt_index, delay_sec in enumerate(self._reconnect_delays):
@@ -124,9 +125,9 @@ class Mqtt:
                 self._client.subscribe(self._command_topic)
                 self._client.subscribe(self._info_response_topic)
                 # Handshake complete: restore normal blocking mode. Not
-                # best-effort — the later bounded waits assume it, so a
-                # failed restoration fails this attempt instead of marking a
-                # broken link healthy.
+                # best-effort — the later bounded waits assume it, so a failed
+                # restoration fails this attempt instead of marking a broken
+                # link healthy.
                 self._client.sock.settimeout(None)
                 self._connected = True
                 self._connect_count += 1
@@ -163,7 +164,7 @@ class Mqtt:
         the parse runs under the broker response timeout, so a stall after the
         first frame byte fails this poll instead of hanging. A callback bug is
         a programming failure (propagates without marking the session down);
-        a stalled/corrupt stream is a transport failure that fails the poll."""
+        a stalled/corrupt stream is a transport failure."""
         if not self.is_connected():
             return
         try:
@@ -179,8 +180,7 @@ class Mqtt:
         mqtt_broker_response_timeout_sec, so a blackholed link fails fast).
 
         With ``splice_fragment``, the frame's tail is spliced at the wire
-        (segment writes, no frame-sized allocation): see
-        ``MQTTClient.publish``."""
+        (segment writes, no frame-sized allocation): see ``MQTTClient.publish``."""
         if not self.is_connected():
             raise OSError("MQTT is not connected")
         try:
@@ -254,8 +254,8 @@ class Mqtt:
     def last_connect_error(self):
         """The final expected transport/protocol error from the most recent
         failed connect() attempt-sequence, or None (before any attempt, or
-        after a success) — exposed so Core 0's exhaustion warning can name
-        the cause instead of a generic 'sequence exhausted'."""
+        after a success) — exposed so Core 0's exhaustion warning can name the
+        cause instead of a generic 'sequence exhausted'."""
         return self._last_connect_error
 
     def status(self):

@@ -22,8 +22,8 @@ MAX_MQTT_KEEPALIVE_SEC = 65535
 # through 127); the body is topic + 5, so above 122 topic bytes the length
 # byte gains the continuation bit and the subscription never completes. Both
 # subscribed topics are the repair channel for a bad configuration, so the
-# bound sits at the config boundary (publish uses full variable-length
-# encoding; the bound applies to every topic for one simple policy).
+# bound sits at the config boundary and applies to every topic (publish uses
+# full variable-length encoding).
 MAX_MQTT_TOPIC_BYTES = 122
 
 # Feeds socket.connect(), which also resolves hostnames: the bound is DNS's
@@ -32,10 +32,10 @@ MAX_MQTT_BROKER_ADDRESS_BYTES = 253
 
 # The Wi-Fi secrets sit in config-secrets.json (boot provisioning, not
 # write-config) and feed network.WLAN.connect(). The SSID bound is IEEE
-# 802.11's 32-octet SSID limit; the password covers a 63-character WPA2-PSK
+# 802.11's 32-octet limit; the password covers a 63-character WPA2-PSK
 # passphrase and a 64-hex raw PSK. Measured in UTF-8 bytes like the other
 # protocol-scale strings: a misprovisioned file must fail fast here instead
-# of surfacing deep in the Wi-Fi retry machinery.
+# of deep in the Wi-Fi retry machinery.
 MAX_WIFI_SSID_BYTES = 32
 MAX_WIFI_PASSWORD_BYTES = 64
 
@@ -43,7 +43,7 @@ MAX_WIFI_PASSWORD_BYTES = 64
 # deltas below half the period (2^29 - 1 ms, ~6.21 days) and ticks_add raises
 # OverflowError at it. Any value that becomes a ticks_diff threshold or
 # ticks_add delta must stay under this ceiling, or the threshold can never be
-# reached (or the deadline/re-anchor raises).
+# reached (or the deadline/re-anchor raises) -- hence the bound.
 MAX_TICKS_SAFE_INTERVAL_MS = (1 << 29) - 1
 
 # Retries ride out a transient driver.initialize() failure; a device that
@@ -60,14 +60,14 @@ MAX_RECONNECT_ATTEMPTS = 32
 # Operational liveness bounds — in contrast to MAX_TICKS_SAFE_INTERVAL_MS
 # above, a representability bound: these stop a representable value from
 # defeating recovery. Shipped values (4 s / 5 s / 250 ms / 3) sit well below
-# every bound below.
+# every one of these.
 
 # Scales every bounded MQTT wait (the CONNACK/SUBACK handshake, the PUBACK,
 # check_msg completion, the UTC request deadline). Each single wait must stay
 # under the Core 0 hardware watchdog budget (core0.py WDT_TIMEOUT_MS, 8 s —
-# itself under the RP2 hardware maximum of 8388 ms), so a stalled link times
-# out on its own before the watchdog can fire: a watchdog reset means "Core 0
-# is not making progress", never "the broker was slow".
+# itself under the RP2 maximum of 8388 ms), so a stalled link times out on its
+# own before the watchdog can fire: a watchdog reset means "Core 0 is not
+# making progress", never "the broker was slow".
 MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC = 5
 
 # Startup-only (the network probe runs before the watchdog arms): bounds how
@@ -87,18 +87,18 @@ MAX_DEVICE_READ_FAILURE_THRESHOLD = 1000
 
 # Core 1 builds a per-device status structure before anything can be rejected
 # at the serialized-size ceiling (the bounded startup-log fallback and the
-# read-config response both carry it). The string fields are byte-bounded,
-# so at this device count a worst-case valid configuration stays under
-# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) serialized — pinned by the
-# serialized-size invariant test in tests/test_config.py.
+# read-config response both carry it). The string fields are byte-bounded, so
+# at this device count a worst-case valid configuration stays under
+# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) serialized — pinned by the invariant
+# test in tests/test_config.py.
 MAX_DEVICES = 16
 
 # Deterministic ceiling on the number of outbound-queue entries retained
-# (queued + in-flight). This is an observability/stability bound, NOT a memory
-# bound: the heap policy (preferred reserve / hard floor) remains the memory
-# guard and is evaluated first, so on a memory-constrained board the queue is
-# limited by heap pressure well before this count. The ceiling is the maximum
-# a config may set (1..256), not the maximum the queue can ever hold.
+# (queued + in-flight). An observability/stability bound, NOT a memory bound:
+# the heap policy (preferred reserve / hard floor) remains the memory guard
+# and is evaluated first, so a memory-constrained board is limited by heap
+# pressure well before this count. The ceiling is the maximum a config may set
+# (1..256), not the maximum the queue can ever hold.
 MAX_OUTBOUND_QUEUE_MAX_MESSAGES = 256
 
 
@@ -107,7 +107,7 @@ class ConfigError(Exception):
     code: ``code`` and ``unknown_fields`` let the command handler answer with
     a stable cause without parsing the message; ``details`` is a small flat
     key/value map merged as-is (e.g. expected/received schema versions).
-    ``code`` is None only for errors raised outside this module."""
+    ``code`` is None only outside this module."""
 
     def __init__(self, message, code=None, unknown_fields=None, details=None):
         super().__init__(message)
@@ -354,10 +354,10 @@ def _validate_devices(devices):
 
 def validate_config(config):
     """Pure validation of a complete configuration dict (no filesystem, no
-    hardware). Startup (``load_config``) and the write-config command both
-    run candidates through this single path, so a booted config and a
-    committed one are validated by exactly the same rules. Returns the
-    validated dict; raises ``ConfigError`` (stable ``code``) on violation."""
+    hardware). Startup (``load_config``) and the write-config command both run
+    candidates through this single path, so a booted config and a committed
+    one are validated by exactly the same rules. Returns the validated dict;
+    raises ``ConfigError`` (stable ``code``) on violation."""
     if not isinstance(config, dict):
         raise ConfigError("Config must be a JSON object", code="invalid_value")
 
@@ -552,7 +552,7 @@ def split_config(config):
     bus is not part of the per-core split: its heap-reserve bound is a board
     property owned by hardware.py and its outbound count ceiling is
     outbound_queue_max_messages, both read by main.py and passed to InterCore
-    directly at construction."""
+    at construction."""
     core0 = {
         "source": config["source"],
         "mqtt_broker_ip_address": config["mqtt_broker_ip_address"],

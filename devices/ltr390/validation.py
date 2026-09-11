@@ -85,14 +85,13 @@ def _is_finite_number(value):
 
 
 def validate_config(config):
-    """Pure validation of a ltr390 device config (no hardware): accepts the
-    keys in ``ALLOWED_CONFIG_KEYS`` with the documented bounds and the
-    timing cross-field rule (a measurement period cannot be shorter than the
-    ADC conversion of the selected resolution); raises ``DeviceValidationError``
-    (a ``ValueError``) with a stable ``code`` on the first violation. Touches
-    no hardware: a valid definition with no physical backing passes --
-    physical absence is an operational failure (``initialization_failed`` at
-    boot), not a schema failure. Defaults are applied by the driver, not here."""
+    """Pure validation of a ltr390 device config (no hardware): the keys in
+    ``ALLOWED_CONFIG_KEYS`` with the documented bounds plus the timing
+    cross-field rule; raises ``DeviceValidationError`` (a ``ValueError``)
+    with a stable ``code`` on the first violation. A valid definition with no
+    physical backing passes -- physical absence is an operational failure
+    (``initialization_failed`` at boot), not a schema failure. Defaults are
+    applied by the driver, not here."""
     if not isinstance(config, dict):
         raise DeviceValidationError(
             "ltr390 device config must be an object",
