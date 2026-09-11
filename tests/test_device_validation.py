@@ -8,6 +8,7 @@ bounds, and the config-level unknown-field aggregation. None of these
 construct or touch hardware -- the import chain reaches no ``machine``
 module, so they run on plain CPython."""
 
+import ast
 import json
 import pathlib
 import sys
@@ -16,6 +17,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+import device_factory
 from config import ConfigError, validate_config
 from device_factory import (
     MAX_DEVICE_ID_LENGTH,
@@ -59,6 +61,37 @@ def test_registry_exposes_the_supported_types():
     assert allowed_config_keys("bme280") == BME280_ALLOWED_CONFIG_KEYS
     assert allowed_config_keys("ltr390") is not None
     assert allowed_config_keys("acme-9000") is None
+
+
+def test_registry_resolves_the_validation_modules_lazily():
+    """The registry entries name the real modules: resolving a supported type
+    lands on the same module objects a direct import returns, an unsupported
+    type imports nothing, and the allowed-keys attribute is the module's own
+    key set (the validator and config.py's aggregation share one source)."""
+    from devices.bme280 import validation as bme280_validation
+    from devices.ltr390 import validation as ltr390_validation
+
+    assert device_factory._validation_module("bme280") is bme280_validation
+    assert device_factory._validation_module("ltr390") is ltr390_validation
+    assert device_factory._validation_module("acme-9000") is None
+    assert allowed_config_keys("bme280") is bme280_validation.ALLOWED_CONFIG_KEYS
+
+
+def test_registry_imports_no_validation_package_at_module_top():
+    """A module-top import of a validation package would make that type's
+    validator resident from startup: only the registry strings may name the
+    packages."""
+    tree = ast.parse((ROOT / "device_factory.py").read_text())
+    top_level_modules = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            top_level_modules.extend(item.name for item in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top_level_modules.append(node.module)
+    assert not any(
+        name.startswith("devices.bme280") or name.startswith("devices.ltr390")
+        for name in top_level_modules
+    )
 
 
 # ---------------------------------------------------------------------------

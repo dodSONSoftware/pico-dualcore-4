@@ -2,24 +2,24 @@
 # Copyright (c) 2026 dodson Software ( dodson labs )
 # SPDX-License-Identifier: MIT
 
-from devices.device import DeviceValidationError
-from devices.bme280 import validation as bme280_validation
-from devices.ltr390 import validation as ltr390_validation
+import importlib
 
-# The supported device_type registry: device_type -> (pure config validator,
-# allowed config keys). The single source of truth for which types the
-# firmware supports and how each validates its device-specific config, shared
-# by create_device() (construction) and the pure validation path in config.py.
-# Adding a device type is adding one entry here plus its pure validator.
+from devices.device import DeviceValidationError
+
+# The supported device_type registry: device_type -> (validation package,
+# validator attribute, allowed-config-keys attribute). Both attributes are
+# resolved by import at first use, never at module import: the validation
+# modules are pure (host-importable, no machine), but their source still
+# lands on the shared heap, and a type a board does not configure must not be
+# resident from startup -- Core 0 loads this module for config validation,
+# before Core 1 (which alone constructs and runs drivers) exists. The single
+# source of truth for which types the firmware supports and how each
+# validates its device-specific config, shared by create_device()
+# (construction) and the pure validation path in config.py. Adding a device
+# type is adding one entry here plus its pure validator.
 _DEVICE_REGISTRY = {
-    "bme280": (
-        bme280_validation.validate_config,
-        bme280_validation.ALLOWED_CONFIG_KEYS,
-    ),
-    "ltr390": (
-        ltr390_validation.validate_config,
-        ltr390_validation.ALLOWED_CONFIG_KEYS,
-    ),
+    "bme280": ("devices.bme280.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
+    "ltr390": ("devices.ltr390.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
 }
 
 # The complete set of keys a device definition may carry; anything beyond is
@@ -41,10 +41,22 @@ MAX_DEVICE_ID_LENGTH = 64
 MAX_DEVICE_NAME_LENGTH = 64
 
 
+def _validation_module(device_type):
+    """The validation module for a supported device_type, imported on first
+    use (an import cache hit afterwards); None for an unsupported type, which
+    imports nothing."""
+    entry = _DEVICE_REGISTRY.get(device_type)
+    if entry is None:
+        return None
+    return importlib.import_module(entry[0])
+
+
 def allowed_config_keys(device_type):
     """The device-specific config keys a supported device_type accepts, or None."""
     entry = _DEVICE_REGISTRY.get(device_type)
-    return entry[1] if entry is not None else None
+    if entry is None:
+        return None
+    return getattr(_validation_module(device_type), entry[2])
 
 
 def validate_device_config(device_type, config):
@@ -57,7 +69,7 @@ def validate_device_config(device_type, config):
             "Unsupported device type: {}".format(device_type),
             code="unsupported_device_type",
         )
-    entry[0](config)
+    getattr(_validation_module(device_type), entry[1])(config)
 
 
 def validate_device_definition(device_definition):
@@ -138,15 +150,16 @@ def create_device(device_definition, i2c_bus_factory=None):
             cfg["i2c_bus"],
             cfg.get("i2c_sda_pin"),
             cfg.get("i2c_scl_pin"),
-            cfg.get("i2c_freq_hz", bme280_validation.DEFAULT_I2C_FREQ_HZ),
+            cfg.get("i2c_freq_hz",
+                    _validation_module(device_type).DEFAULT_I2C_FREQ_HZ),
         )
         # Imported here, not at module top: Core 0 pulls in this module for the
         # validator during config validation, and a module-top driver import
         # would load the float-heavy driver resident on the shared heap from
         # startup -- before Core 1 (which alone constructs and runs it) exists.
         # Deferring it to this Core 1 construction point keeps that ~8 KB off
-        # the pre-spawn heap. The validator (line 6) stays module-level: config
-        # validation needs it on Core 0.
+        # the pre-spawn heap. (The validation module is no longer module-top
+        # either: the registry resolves it by import on first use.)
         from devices.bme280.bme280_device import BME280Device
         return BME280Device(i2c)
 
@@ -163,14 +176,15 @@ def create_device(device_definition, i2c_bus_factory=None):
             cfg["i2c_bus"],
             cfg.get("i2c_sda_pin"),
             cfg.get("i2c_scl_pin"),
-            cfg.get("i2c_freq_hz", ltr390_validation.DEFAULT_I2C_FREQ_HZ),
+            cfg.get("i2c_freq_hz",
+                    _validation_module(device_type).DEFAULT_I2C_FREQ_HZ),
         )
         # Same lazy-import rationale as the bme280 branch above: Core 0 pulls
         # in this module for the validator during config validation, and a
         # module-top driver import would load the float-heavy driver resident
         # on the shared heap from startup -- before Core 1 (which alone
-        # constructs and runs it) exists. The validator (line 7) stays
-        # module-level: config validation needs it on Core 0.
+        # constructs and runs it) exists. The validation module resolves
+        # through the registry, like the bme280 branch's does.
         from devices.ltr390.ltr390_device import LTR390Device
         return LTR390Device(i2c)
 

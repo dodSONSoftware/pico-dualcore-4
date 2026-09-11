@@ -63,7 +63,7 @@ The queues are heap-governed; the outbound queue is additionally bounded by a de
 | `core1.py` | Device lifecycle, sensor reads, telemetry, health messages, liveness heartbeat |
 | `intercore.py` | Three-lane message bus (two heap-governed FIFOs and the latest-value state snapshots) |
 | `device_manager.py` | Device lifecycle management (init retries, read failures, reinit) |
-| `device_factory.py` | Device construction from config; the supported `device_type` registry; the pure whole-device validation entry point (`validate_device_definition`) |
+| `device_factory.py` | Device construction from config; the supported `device_type` registry (validation packages resolved by import at first use, never module-top); the pure whole-device validation entry point (`validate_device_definition`) |
 | `devices/bme280/bme280_device.py` | `bme280` device (first hardware/I2C sensor): `BME280` register-protocol + Bosch compensation class and the `BME280Device` `Device` adapter (offsets, derived `altitude_m`); the I2C bus itself is Core 1's, built by the lazy per-device factory in `core1.py` |
 | `devices/bme280/validation.py` | Pure `bme280` config validation (host-importable, no `machine`): per-device I2C bus keys, `i2c_address_candidates`, oversampling/filter bounds, cross-field channel rules |
 | `devices/ltr390/ltr390_device.py` | `ltr390` device (second hardware/I2C sensor): `LTR390` register-protocol + lux/UVI conversion class (part-nibble ID, sequential ALS/UV sampling, bounded data-ready waits, standby at end) and the `LTR390Device` `Device` adapter (offsets on converted channels only); shares the Core 1 I2C bus with the `bme280` on the shipped config |
