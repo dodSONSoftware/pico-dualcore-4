@@ -33,6 +33,7 @@ If changes require push, branch switching, or other git operations, stop and req
 Run these before making any changes:
 - `git status --short` — inspect working tree for uncommitted changes
 - `grep "^FIRMWARE_VERSION = " version.py` — get current version from version.py
+- `grep "^FIRMWARE_NAME = " version.py` — get the current release codename for reference
 - Extract version value for reference
 
 Uncommitted changes should not cause an automatic abort. The workflow's purpose is to inspect, stage, and commit changes.
@@ -158,6 +159,40 @@ with open("version.py", "w") as f:
     f.write(content)
 ```
 
+**Update `FIRMWARE_NAME` in `version.py` (release codename):**
+
+The codename is a deterministic function of the version (see the Release Codename Scheme at the end of this file): look up the final version's `MAJOR` in the Animal table and `MINOR` in the Material table, and name it `<Material> <Animal>`. `PATCH` does not affect the codename — a patch bump on the same major.minor leaves `FIRMWARE_NAME` unchanged. This runs in **both** Case A and Case B: unlike a drifted version, which is ambiguous and stops the workflow, the codename can always be recomputed, so an authored version bump whose `FIRMWARE_NAME` was left stale is corrected here, not reported. If the existing `FIRMWARE_NAME` already equals the derived name, no edit is needed.
+
+Apply the same replace-and-verify discipline as the version bump (exactly one assignment):
+```python
+import re
+with open("version.py", "r") as f:
+    content = f.read()
+
+updated, count = re.subn(
+    r'^FIRMWARE_NAME\s*=\s*"[^"]*"\s*$',
+    'FIRMWARE_NAME = "{}"'.format(codename),
+    content,
+    count=1,
+    flags=re.MULTILINE
+)
+
+if count != 1:
+    raise RuntimeError(f"Expected exactly one FIRMWARE_NAME assignment, found {count}")
+
+with open("version.py", "r") as f:
+    content = f.read()
+    if f'FIRMWARE_NAME = "{codename}"' not in content:
+        raise RuntimeError("Codename verification failed")
+
+with open("version.py", "w") as f:
+    f.write(content)
+```
+
+**Keep the README release line in sync:** README.md carries a near-top display line of the form `**Release:** <Codename> — firmware <X.Y.Z> ...` (codename + version + the `version.py` source-of-truth pointer). After resolving the final version in **both** Case A and Case B, update that line: the firmware version to the final committed version on every bump, and the codename to the derived name whenever it changed (a patch-only bump leaves the name and the pointer intact). If the diff already updated the line, verify it in place instead of re-applying. If README.md is absent or no such line exists yet, add it per the shape above — only if README.md exists at all.
+
+If the codename changed, the CHANGELOG entry (step 3b) may note the new codename alongside the version, matching the shape of recent entries.
+
 ### 3b. UPDATE CHANGELOG.md
 
 This project maintains CHANGELOG.md, and every release-worthy commit gets an entry (in this project that is every commit, including docs and test-only changes). This step runs after step 3 because the entry names the resolved firmware version.
@@ -258,6 +293,7 @@ Run:
 - `git status` — confirm working tree is clean
 - `git log --oneline -3` — confirm commit landed correctly
 - `grep "^FIRMWARE_VERSION = " version.py` — verify version in committed commit
+- `grep "^FIRMWARE_NAME = " version.py` — verify the codename matches the committed version's major.minor
 
 ## Error Handling
 
@@ -313,3 +349,146 @@ Notable changes: Network configuration updated for new environment.
 - No submodules — all code in single repository
 - No npm/yarn dependencies to update
 - **Deployment**: Use the project's MicroPython upload tooling (mpremote, VS Code/vREPL, or the currently documented deployment path). BOOTSEL/UF2 mass-storage mode is for firmware image installation, not ordinary filesystem synchronization.
+
+## RELEASE CODENAME SCHEME
+
+The release codename stored in `FIRMWARE_NAME` in `version.py` is derived from `FIRMWARE_VERSION` (`MAJOR.MINOR.PATCH`). The mapping is deterministic:
+
+- **MAJOR** selects the **Animal**
+- **MINOR** selects the **Material**
+- **PATCH** does not affect the codename
+- Display the codename as:
+
+```text
+<Material> <Animal>
+```
+
+### Version Mapping
+
+```text
+MAJOR.MINOR.PATCH
+  │     │
+  │     └── Material
+  └──────── Animal
+```
+
+Example:
+
+```text
+2.3.14
+│ │
+│ └── 3 → Tin
+└──── 2 → Hawk
+
+Tin Hawk
+```
+
+### Major Version → Animal
+
+| Major | Animal |
+|---:|---|
+| `0` | Owl |
+| `1` | Fox |
+| `2` | Hawk |
+| `3` | Badger |
+| `4` | Falcon |
+| `5` | Wolf |
+| `6` | Eagle |
+| `7` | Jaguar |
+| `8` | Wolverine |
+| `9` | Tiger |
+| `10` | Grizzly |
+
+The animal identifies the major-version generation and remains unchanged for all minor and patch releases within that generation.
+
+### Minor Version → Material
+
+| Minor | Material |
+|---:|---|
+| `0` | Iron |
+| `1` | Zinc |
+| `2` | Aluminum |
+| `3` | Tin |
+| `4` | Bronze |
+| `5` | Brass |
+| `6` | Copper |
+| `7` | Nickel |
+| `8` | Steel |
+| `9` | Mercury |
+| `10` | Titanium |
+| `11` | Cobalt |
+| `12` | Carbon |
+| `13` | Graphite |
+| `14` | Silicon |
+| `15` | Ceramic |
+| `16` | Quartz |
+| `17` | Onyx |
+| `18` | Obsidian |
+| `19` | Garnet |
+| `20` | Amethyst |
+| `21` | Topaz |
+| `22` | Granite |
+| `23` | Opal |
+| `24` | Jade |
+| `25` | Turquoise |
+| `26` | Pearl |
+| `27` | Emerald |
+| `28` | Sapphire |
+| `29` | Ruby |
+| `30` | Silver |
+| `31` | Gold |
+| `32` | Platinum |
+| `33` | Amber |
+| `34` | Marble |
+| `35` | Diamond |
+
+### Rules
+
+1. Parse the version as `MAJOR.MINOR.PATCH`.
+2. Look up `MAJOR` in the Animal table.
+3. Look up `MINOR` in the Material table.
+4. Ignore `PATCH` when generating the codename.
+5. Return the name in exactly this order:
+
+   ```text
+   Material Animal
+   ```
+
+6. Do not invent or substitute names.
+7. Do not reorder the words.
+8. Do not alter capitalization.
+9. If `MAJOR` or `MINOR` is outside the defined tables, do not extrapolate.
+10. Use `Unknown` for any out-of-range component.
+
+Examples of out-of-range components:
+
+```text
+11.3.0  → Tin Unknown
+2.36.0  → Unknown Hawk
+11.36.0 → Unknown Unknown
+```
+
+### Examples
+
+```text
+0.0.0    → Iron Owl
+0.10.7   → Titanium Owl
+1.6.3    → Copper Fox
+2.3.14   → Tin Hawk
+3.16.2   → Quartz Badger
+4.11.0   → Cobalt Falcon
+5.18.9   → Obsidian Wolf
+6.28.1   → Sapphire Eagle
+7.29.4   → Ruby Jaguar
+8.30.0   → Silver Wolverine
+9.31.12  → Gold Tiger
+10.35.0  → Diamond Grizzly
+```
+
+Patch releases retain the same name:
+
+```text
+2.3.0  → Tin Hawk
+2.3.1  → Tin Hawk
+2.3.99 → Tin Hawk
+```
