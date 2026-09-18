@@ -95,7 +95,7 @@ class FakeSystemInformation:
         self._active = active
         self._cpu_temperature = cpu_temperature
 
-    def get_devices(self):
+    def get_device_counts(self):
         return {"configured": self._configured, "active": self._active}
 
     def get_cpu_temperature(self):

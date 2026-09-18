@@ -543,7 +543,11 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
     core_1_activity_threshold_ms = max(config["read_loop_sec"] * 3 * 1000, 60000)  # 60 seconds min
     core_1_active = core_1_activity_age_ms is not None and core_1_activity_age_ms <= core_1_activity_threshold_ms
 
-    devices = system_information.get_devices() if system_information else {"configured": 0, "active": 0}
+    # Counts only: the health message discards everything else the full
+    # per-device snapshot walk (get-details' job) would allocate here, on
+    # Core 1's tightest heap, in the same function that then serializes
+    # this message.
+    devices = system_information.get_device_counts() if system_information else {"configured": 0, "active": 0}
     devices_configured = devices["configured"]
     devices_active = devices["active"]
     cpu_temperature_c = system_information.get_cpu_temperature() if system_information else None

@@ -389,6 +389,25 @@ class DeviceManager:
             "log_failure_warning": log_failure_warning,
         }
 
+    def get_device_counts(self):
+        """Counts only (configured / active / initialization_failed) without
+        the per-device snapshot walk: the health message needs the two counts
+        and discards everything else the full walk allocates."""
+        # "active" means currently READY: a reinitialize_pending device stays
+        # in _active_devices (eligible for reinit) but is not counted.
+        return {
+            "configured": len(self._devices_config),
+            "active": sum(
+                1
+                for managed_device in self._active_devices
+                if managed_device.state == DEVICE_STATE_READY
+            ),
+            "initialization_failed": sum(
+                1 for d in self._failed_devices.values()
+                if d["state"] == DEVICE_STATE_INITIALIZATION_FAILED
+            ),
+        }
+
     def get_status_snapshot(self, now_ms=None):
         """JSON-safe status snapshot of all devices (active + failed), in
         configuration order. now_ms (optional) enables the age fields; the age
@@ -429,24 +448,7 @@ class DeviceManager:
             if device_id in device_snapshots:
                 device_status.append(device_snapshots[device_id])
 
-        # "active" means currently READY: a reinitialize_pending device stays
-        # in _active_devices (eligible for reinit) but is not counted.
-        active_count = sum(
-            1
-            for managed_device in self._active_devices
-            if managed_device.state == DEVICE_STATE_READY
-        )
-
-        initialization_failed = sum(
-            1 for d in self._failed_devices.values()
-            if d["state"] == DEVICE_STATE_INITIALIZATION_FAILED
-        )
-
         return {
-            "devices": {
-                "configured": len(self._devices_config),
-                "active": active_count,
-                "initialization_failed": initialization_failed,
-            },
+            "devices": self.get_device_counts(),
             "device_status": device_status,
         }

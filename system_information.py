@@ -129,8 +129,13 @@ class SystemInformation:
             return {"devices": {"configured": 0, "active": 0}, "device_status": []}
         return self._device_manager.get_status_snapshot(now_ms=time.ticks_ms())
 
-    def get_devices(self):
-        return self.get_device_sections()["devices"]
+    def get_device_counts(self):
+        """The device counts without the per-device snapshot walk: the health
+        message needs only the two counts, while get-device-sections' full
+        walk (per-device dicts, ages, failure reasons) exists for get-details."""
+        if self._device_manager is None:
+            return {"configured": 0, "active": 0, "initialization_failed": 0}
+        return self._device_manager.get_device_counts()
 
     def get_device_status(self):
         return self.get_device_sections()["device_status"]

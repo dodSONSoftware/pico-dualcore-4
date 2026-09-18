@@ -12,6 +12,8 @@ import pathlib
 import sys
 import types
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 # device_manager imports device_factory -> system_information, which imports
@@ -147,3 +149,44 @@ def test_recovered_device_counts_as_active_again():
     managed.clear_reinitialize_pending()
     assert managed.state == dm.DEVICE_STATE_READY
     assert manager.get_status_snapshot()["devices"]["active"] == 1
+
+
+def test_get_device_counts_matches_snapshot_devices_section():
+    """The health counts are the snapshot's devices section computed from
+    the same counting code, in the ready and reinit-pending states."""
+    manager = _make_manager(read_failure_threshold=3)
+    managed = _add_managed_device(manager)
+
+    # Ready: the counts agree with the full snapshot's devices section.
+    assert manager.get_device_counts() == manager.get_status_snapshot()["devices"]
+
+    # Reinit-pending: a device that left READY must be excluded by both,
+    # so the shared counting code cannot drift between the two paths.
+    for _ in range(3):
+        manager.process_device(managed)
+    assert managed.state == dm.DEVICE_STATE_REINITIALIZE_PENDING
+    assert manager.get_device_counts() == manager.get_status_snapshot()["devices"]
+    assert manager.get_device_counts()["active"] == 0
+
+
+def test_get_device_counts_does_not_build_per_device_snapshots():
+    """The counts path skips the per-device snapshot walk entirely: it must
+    not invoke the per-device builder the health message would otherwise
+    pay for and immediately discard."""
+    manager = _make_manager()
+    _add_managed_device(manager)
+
+    def _walk(self, now_ms=None):
+        raise AssertionError("get_device_counts() must not walk devices")
+
+    saved = dm.ManagedDevice.get_status_snapshot
+    dm.ManagedDevice.get_status_snapshot = _walk
+    try:
+        counts = manager.get_device_counts()
+        # The full snapshot still walks (and therefore trips the stub).
+        with pytest.raises(AssertionError):
+            manager.get_status_snapshot()
+    finally:
+        dm.ManagedDevice.get_status_snapshot = saved
+
+    assert counts == {"configured": 1, "active": 1, "initialization_failed": 0}

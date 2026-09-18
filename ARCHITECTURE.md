@@ -577,7 +577,7 @@ Core 1 generates health messages on a normal-runtime-anchored cadence: `health_i
    - RSSI: `StateMailboxes.get_network_snapshot().get("rssi")`
    - Core 1 activity: `StateMailboxes.get_core_1_activity_ms()`
    - Heap: `gc.mem_free()` (current measurement)
-   - Devices: `SystemInformation.get_devices()` (backed by `DeviceManager.get_status_snapshot()`)
+   - Devices: `SystemInformation.get_device_counts()` (backed by `DeviceManager.get_device_counts()` — the counts only, no per-device snapshot walk; the full walk stays with the get-details sections)
    - Queue: `OutboundQueue.status()` (depth, retained bytes, high watermarks, eviction/rejection counters)
    - UTC: `StateMailboxes.get_utc_snapshot()`
 
