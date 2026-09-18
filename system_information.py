@@ -49,6 +49,10 @@ class SystemInformation:
         # first report — the value cannot change during a boot, so the
         # later reports are a cache hit, not re-reads.
         self._reset_cause = None
+        # Lazily built ADC channel for the die temperature (the rp2 ADC is a
+        # shared peripheral; the channel is a pin selection), kept after
+        # construction instead of rebuilt per read.
+        self._adc = None
 
     def get_reset_cause(self):
         """Stable short label for how this boot began: "wdt" for a
@@ -139,8 +143,20 @@ class SystemInformation:
         # -1.721 mV/C), so one formula serves both boards. The conversion is
         # VREF-sensitive (~4 C per 1% VREF): a trend indicator at roughly
         # +/-5 C, not a calibrated absolute.
+        # The channel object is built once and kept: constructing an ADC per
+        # read puts a GC-managed allocation on every health message, on
+        # Core 1's most memory-sensitive path. A failed construction leaves
+        # the cache empty, so a broken channel is retried on each call as
+        # before (a failed RHS never assigns self._adc).
+        adc = self._adc
+        if adc is None:
+            try:
+                adc = self._adc = machine.ADC(machine.ADC.CORE_TEMP)
+            except MemoryError:
+                raise
+            except Exception:
+                return None
         try:
-            adc = machine.ADC(machine.ADC.CORE_TEMP)
             raw = adc.read_u16() >> 4
         except MemoryError:
             raise

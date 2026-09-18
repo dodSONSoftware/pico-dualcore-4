@@ -411,6 +411,70 @@ class TestGetCpuTemperature:
         with pytest.raises(MemoryError):
             self._system_information().get_cpu_temperature()
 
+    def test_adc_channel_constructed_once_per_instance(self, monkeypatch):
+        """The channel object is built once and kept (the rp2 ADC is a
+        shared peripheral; the channel is a pin selection) — one
+        construction per SystemInformation, not one per read, so the
+        routine health path adds no GC-managed ADC allocation."""
+        self._pin_machine(monkeypatch)
+        constructions = []
+        base_adc = _MOCK_MACHINE.ADC
+
+        class CountingADC(base_adc):
+            def __init__(self, channel):
+                constructions.append(1)
+                super().__init__(channel)
+
+        monkeypatch.setattr(_MOCK_MACHINE, "ADC", CountingADC)
+
+        system_information = self._system_information()
+        assert system_information.get_cpu_temperature() == 20.1
+        assert system_information.get_cpu_temperature() == 20.1
+        assert constructions == [1]
+
+    def test_adc_construction_failure_retries_each_call(self, monkeypatch):
+        """A failed construction leaves the cache empty, so a broken
+        channel is retried on every call (nulling each time) as before."""
+        self._pin_machine(monkeypatch)
+        attempts = []
+
+        class FailingADC:
+            CORE_TEMP = 4
+
+            def __init__(self, channel):
+                attempts.append(1)
+                raise OSError("channel unavailable")
+
+        monkeypatch.setattr(_MOCK_MACHINE, "ADC", FailingADC)
+
+        system_information = self._system_information()
+        assert system_information.get_cpu_temperature() is None
+        assert system_information.get_cpu_temperature() is None
+        assert attempts == [1, 1]
+
+    def test_adc_construction_memory_error_propagates_and_leaves_cache_empty(
+        self, monkeypatch
+    ):
+        """A MemoryError at construction escapes to the recovery boundary
+        instead of being reclassified as a null channel, and leaves the
+        cache empty, not a half-constructed object."""
+        self._pin_machine(monkeypatch)
+        attempts = []
+
+        class StarvingADC:
+            CORE_TEMP = 4
+
+            def __init__(self, channel):
+                attempts.append(1)
+                raise MemoryError()
+
+        monkeypatch.setattr(_MOCK_MACHINE, "ADC", StarvingADC)
+
+        system_information = self._system_information()
+        with pytest.raises(MemoryError):
+            system_information.get_cpu_temperature()
+        assert system_information._adc is None
+
     def test_get_cpu_without_adc_nulls_temperature_only(self, monkeypatch):
         # A machine without the ADC core-temp channel: temperature nulls,
         # frequency is unaffected.
