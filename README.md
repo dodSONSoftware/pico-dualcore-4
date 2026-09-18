@@ -2,7 +2,7 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.109. Codename derived from `FIRMWARE_VERSION` in [`version.py`](version.py) (major → animal, minor → material); `version.py` is the single source of truth.
+**Release:** Bronze Owl — firmware 0.4.110.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-1.20+-00897B?logo=micropython&logoColor=white)](https://micropython.org)

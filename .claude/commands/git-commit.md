@@ -189,7 +189,7 @@ with open("version.py", "w") as f:
     f.write(content)
 ```
 
-**Keep the README release line in sync:** README.md carries a near-top display line of the form `**Release:** <Codename> — firmware <X.Y.Z> ...` (codename + version + the `version.py` source-of-truth pointer). After resolving the final version in **both** Case A and Case B, update that line: the firmware version to the final committed version on every bump, and the codename to the derived name whenever it changed (a patch-only bump leaves the name and the pointer intact). If the diff already updated the line, verify it in place instead of re-applying. If README.md is absent or no such line exists yet, add it per the shape above — only if README.md exists at all.
+**Keep the README release line in sync:** README.md carries a near-top display line of the form `**Release:** <Codename> — firmware <X.Y.Z>.` (codename + version, nothing else). After resolving the final version in **both** Case A and Case B, update that line: the firmware version to the final committed version on every bump, and the codename to the derived name whenever it changed (a patch-only bump leaves the name intact). If the diff already updated the line, verify it in place instead of re-applying. If README.md is absent or no such line exists yet, add it per the shape above — only if README.md exists at all.
 
 If the codename changed, the CHANGELOG entry (step 3b) may note the new codename alongside the version, matching the shape of recent entries.
 
