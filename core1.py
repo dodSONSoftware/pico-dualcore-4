@@ -815,7 +815,6 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # independent of each other (they share the epoch, not an execution
         # dependency); the immediate anchor pass runs below.
         schedulers = {
-            "anchor_ms": normal_runtime_start_ticks_ms,
             "read_loop_ms": config["read_loop_sec"] * 1000,
             "health_interval_ms": config["health_interval_sec"] * 1000,
         }
