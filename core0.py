@@ -753,11 +753,12 @@ class Core0:
         response: the acknowledgement is owed, so answer with a small
         response_too_large error reading only bounded identifying fields (an
         unreadable body has no identity -- the discard stands)."""
+        # Read the entry's bytes directly (MicroPython's json.loads takes any
+        # buffer, bytes or bytearray): no decoded-string copy sits alongside
+        # the parsed graph on the memory-tightest path in the module.
         body = entry["payload_bytes"]
-        if isinstance(body, bytearray):
-            body = bytes(body)
         try:
-            doc = json.loads(body.decode("utf-8"))
+            doc = json.loads(body)
         except MemoryError:
             raise
         except Exception as err:

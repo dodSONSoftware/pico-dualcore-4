@@ -208,6 +208,91 @@ def test_discarded_response_with_unreadable_body_is_dropped_without_a_substitute
     assert queue.status()["oversized_discarded"] == 1
 
 
+class _RecordingJson:
+    """Delegates to the real json module and records loads() arguments
+    (optionally raising instead, to pin a handler's except clauses)."""
+
+    def __init__(self, real, loads_error=None):
+        self._real = real
+        self.loads_error = loads_error
+        self.loads_args = []
+
+    def loads(self, *args, **kwargs):
+        self.loads_args.append(args)
+        if self.loads_error is not None:
+            raise self.loads_error
+        return self._real.loads(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_discarded_command_response_body_reaches_the_parser_as_a_buffer(make_core0):
+    """The substitute path parses the entry's bytes directly: no decoded-string
+    copy sits alongside the parsed graph. The old handler's decode was the
+    largest single allocation in the handler on the memory-tightest path in
+    the module, and a MemoryError from it escaped to a controlled reset.
+    Verified red pre-fix: the old handler passed body.decode("utf-8")."""
+    instance = make_core0(delay_ms=0)
+    _utc_synchronized(instance)
+    import core0 as core0_mod
+    recorder = _RecordingJson(core0_mod.json)
+    queue = instance._intercore.outbound_queue
+    fragment = instance._envelope_fragment(instance._next_sequence)
+    body = bytearray(_command_response_body_of_length(
+        MAX_OUTBOUND_MESSAGE_BYTES - len(fragment)))
+    assert queue.put_with_kind(
+        KIND_COMMAND_RESPONSE, body, RETENTION_PRIORITY_CRITICAL
+    )
+    with patch.object(core0_mod, "json", recorder):
+        _run_to(instance, 40)
+
+    # The entry's own buffer (bytearray admitted as-is) went to the parser —
+    # never a decoded str, never a bytes() copy of it.
+    buffer_args = [
+        arg
+        for call in recorder.loads_args
+        for arg in call
+        if isinstance(arg, (bytes, bytearray))
+    ]
+    assert buffer_args, "json.loads was never called with a buffer"
+    assert buffer_args[0] is body
+    assert all(
+        not isinstance(arg, str)
+        for call in recorder.loads_args
+        for arg in call
+    )
+    # The substitute still answered with the command's identity preserved.
+    assert len(instance._mqtt.published) == 1
+    payload = json.loads(instance._mqtt.published[0][1])["payload"]
+    assert payload["error"]["code"] == "response_too_large"
+    assert payload["command_id"] == "drain-big-1"
+
+
+def test_discarded_command_response_parse_memory_error_propagates(make_core0):
+    """A MemoryError from reading the body back escapes to the recovery
+    boundary instead of being swallowed by the generic except (an unreadable
+    body only drops the substitute for a non-JSON/decode failure)."""
+    instance = make_core0(delay_ms=0)
+    _utc_synchronized(instance)
+    import core0 as core0_mod
+    queue = instance._intercore.outbound_queue
+    fragment = instance._envelope_fragment(instance._next_sequence)
+    body = _command_response_body_of_length(
+        MAX_OUTBOUND_MESSAGE_BYTES - len(fragment))
+    assert queue.put_with_kind(
+        KIND_COMMAND_RESPONSE, body, RETENTION_PRIORITY_CRITICAL
+    )
+    with patch.object(core0_mod, "json",
+                      _RecordingJson(core0_mod.json, loads_error=MemoryError)):
+        with pytest.raises(MemoryError):
+            _run_to(instance, 40)
+    assert instance._mqtt.published == []
+    # The discard stood before the parse failed: the entry is gone and the
+    # channel is not stalled behind it.
+    assert queue.get_depth() == 0
+
+
 # --- Core 0's own response and reboot paths --------------------------------
 
 
