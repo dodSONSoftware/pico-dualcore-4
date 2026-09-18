@@ -384,6 +384,37 @@ def test_post_admission_invariant_undoes_a_crossing_append(monkeypatch):
     assert gc.mem_free() >= RESERVE
 
 
+def test_post_admission_rollback_collect_runs_outside_the_queue_lock(monkeypatch):
+    """The stated invariant: gc.collect() is never run under the queue lock.
+    The rollback reclaim (the append's own allocations crossed the hard
+    floor) releases the lock before collecting, so a collect that probes the
+    queue (get_depth() takes the lock) cannot deadlock -- the first GC
+    callback or finalizer that ever touched the queue from an in-lock
+    collect would, on the non-recursive lock."""
+    ic, heap = _queue(monkeypatch, free_bytes=RESERVE + 512, alloc_per_entry=1024)
+    queue = ic.outbound_queue
+    probe = queue._lock
+    inner = heap.collect
+    seen = []
+
+    def collecting():
+        held = probe.locked()
+        seen.append(held)
+        if not held:
+            # The queue is usable from inside the collect (takes the
+            # queue lock): an in-lock collect would deadlock here.
+            queue.get_depth()
+        inner()
+
+    monkeypatch.setattr(gc, "collect", collecting)
+    assert (
+        queue.put_with_kind(KIND_TELEMETRY, b'{"a":1}', RETENTION_PRIORITY_TELEMETRY) is False
+    )
+    # The rollback path collects (each crossing attempt's undo), and every
+    # collect ran with the queue lock released.
+    assert seen == [False, False]
+
+
 def test_post_admission_invariant_admits_at_the_reserve(monkeypatch):
     """Boundary control: the append allocates, but the reserve holds with the
     entry retained (at, not above, the reserve) -- admitted."""
@@ -1548,6 +1579,37 @@ def test_event_post_admission_invariant_undoes_a_crossing_append(monkeypatch):
     assert status["rejected"] == 1
     assert heap.collects == 1
     assert gc.mem_free() >= RESERVE
+
+
+def test_event_post_admission_rollback_collect_runs_outside_the_queue_lock(monkeypatch):
+    """The event lane honors the same invariant: the crossing append's
+    rollback reclaim runs after the queue lock is released, so a collect
+    that probes the queue (status() takes the lock) cannot deadlock."""
+    ic, heap = _queue(monkeypatch)
+    eq = ic.event_queue
+    probe = eq._lock
+    inner = heap.collect
+    seen = []
+
+    def collecting():
+        held = probe.locked()
+        seen.append(held)
+        if not held:
+            # The queue is usable from inside the collect (takes the
+            # queue lock): an in-lock collect would deadlock here.
+            eq.status()
+        inner()
+
+    # 512 B of headroom, but retaining an event costs 1 KiB.
+    base = RESERVE + 512
+    alloc_per_event = 1024
+    monkeypatch.setattr(
+        gc, "mem_free", lambda: base - alloc_per_event * len(eq._queue), raising=False
+    )
+    monkeypatch.setattr(gc, "collect", collecting)
+    assert eq.put({"seq": 1}) is False
+    # The rollback collected, and it ran with the queue lock released.
+    assert seen == [False]
 
 
 def test_event_post_admission_invariant_admits_at_the_reserve(monkeypatch):

@@ -54,7 +54,10 @@ class OutboundQueue:
     preferred reserve marks where pressure handling begins and is never a
     rejection wall, the hard floor is the survival boundary admission must
     protect, CRITICAL the non-evictable retention floor. All decisions run
-    under the shared heap-admission lock."""
+    under the shared heap-admission lock; gc.collect() is never run under
+    the queue lock (every rollback and displacement reclaim releases it
+    first, since a collect under the non-recursive lock would deadlock the
+    first GC callback or finalizer that ever touches this queue)."""
 
     def __init__(self, minimum_free_heap_bytes, heap_admission_lock,
                  preferred_free_heap_bytes=None, max_messages=None):
@@ -126,7 +129,9 @@ class OutboundQueue:
     def _append_locked(self, kind, payload_bytes, retention_priority):
         """Append under the queue lock; return False (having undone the
         append) if the append's own allocations cross the hard floor (the
-        floor is re-measured after the append, since the append allocates)."""
+        floor is re-measured after the append, since the append allocates).
+        No reclaim here: the caller collects after releasing the queue lock
+        (gc is never run under the queue lock)."""
         entry = {
             "kind": kind,
             "retention_priority": retention_priority,
@@ -135,9 +140,9 @@ class OutboundQueue:
         self._queue.append(entry)
         if not self._reserve_restored():
             # The append crossed the reserve: undo it (the counters are
-            # untouched, so the admission is fully reversed) and reclaim.
+            # untouched, so the admission is fully reversed). The caller
+            # reclaims after releasing the queue lock.
             self._queue.pop()
-            gc.collect()
             return False
         self._queued_bytes += len(payload_bytes)
         # Same retained-entry definition as the current depth metric: queued
@@ -159,20 +164,32 @@ class OutboundQueue:
         own allocations crossed the hard floor or the ceiling left nothing
         eligible (the displacement path is the single rejection point, so a
         rejected message is counted exactly once)."""
+        appended = None
         with self._lock:
             if self._below_count_limit_locked():
                 # Room available: the append carries the post-admission floor
                 # check and watermark update in _append_locked.
-                return self._append_locked(kind, payload_bytes, retention_priority)
-            evicted, _ = self._evict_one_eligible_locked(retention_priority)
-            if not evicted:
-                return False
-        # Count relief reclaimed an entry: reclaim its garbage before the
-        # append re-measures the floor, as the heap path does after each
-        # displacement (gc is never run under the queue lock).
-        gc.collect()
-        with self._lock:
-            return self._append_locked(kind, payload_bytes, retention_priority)
+                appended = self._append_locked(kind, payload_bytes, retention_priority)
+            else:
+                evicted, _ = self._evict_one_eligible_locked(retention_priority)
+                if not evicted:
+                    # Nothing eligible at the ceiling: no append (nothing was
+                    # reclaimed, so there is nothing to collect either).
+                    return False
+        if appended is None:
+            # Count relief reclaimed an entry: reclaim its garbage before the
+            # append re-measures the floor, as the heap path does after each
+            # displacement (gc is never run under the queue lock).
+            gc.collect()
+            with self._lock:
+                appended = self._append_locked(kind, payload_bytes, retention_priority)
+        if not appended:
+            # The append's own allocations crossed the hard floor and were
+            # undone: reclaim after the queue lock is released, so the
+            # caller's next floor measurement is post-collection (the same
+            # ordering as every displacement path).
+            gc.collect()
+        return appended
 
     def _evict_one_eligible_locked(self, retention_priority):
         """Evict the oldest entry in the least-important class this priority
@@ -453,20 +470,28 @@ class InterCoreEventQueue:
             if gc.mem_free() < self._minimum_free_heap_bytes:
                 gc.collect()
             if gc.mem_free() >= self._minimum_free_heap_bytes:
+                rolled_back = False
                 with self._lock:
                     self._queue.append(event)
                     # Post-admission invariant: the append itself may
                     # allocate, so the reserve must hold with the event
                     # retained.
                     if gc.mem_free() < self._minimum_free_heap_bytes:
+                        # The append crossed the floor: undo it (the
+                        # watermark is untouched, so the admission is fully
+                        # reversed). The reclaim runs after the queue lock
+                        # is released (gc is never run under the queue lock).
                         self._queue.pop()
-                        gc.collect()
-                        self._rejected += 1
-                        return False
-                    depth = len(self._queue)
-                    if depth > self._high_watermark:
-                        self._high_watermark = depth
-                    return True
+                        rolled_back = True
+                    else:
+                        depth = len(self._queue)
+                        if depth > self._high_watermark:
+                            self._high_watermark = depth
+                if rolled_back:
+                    gc.collect()
+                    self._rejected += 1
+                    return False
+                return True
             # Admitted events are never evicted: reject the new event and let
             # the caller report the memory-pressure failure.
             self._rejected += 1
