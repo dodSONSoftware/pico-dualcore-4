@@ -87,6 +87,12 @@ def _collect_system_information_full(system_information):
 # dropping them first keeps every bounded form a small fixed size.
 _GET_DETAILS_FALLBACK_DROP_ORDER = ("device_status", "devices")
 
+# Diagnostic-only fallback for the (near-impossible) case where the hardware
+# mailbox was never populated — the Pico W preferred reserve, not any board's
+# survival floor (hardware.py is the source of truth for those): above the
+# Pico W floor (early alarm) but below the Pico 2 W floor (late alarm).
+_FALLBACK_MIN_FREE_HEAP_BYTES = 64 * 1024
+
 
 def _startup_summary(device_status, startup_duration_ms, reset_cause):
     """Startup statuses and device counts, shared by the startup event log
@@ -563,11 +569,11 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
 
     try:
         hardware = intercore.state_mailboxes.get_hardware()
-        minimum_free_heap = hardware.get("minimum_free_heap_bytes") if hardware else 65536
+        minimum_free_heap = hardware.get("minimum_free_heap_bytes") if hardware else _FALLBACK_MIN_FREE_HEAP_BYTES
     except MemoryError:
         raise
     except Exception:
-        minimum_free_heap = 65536
+        minimum_free_heap = _FALLBACK_MIN_FREE_HEAP_BYTES
 
     wifi_rssi_dbm = network_snapshot.get("rssi")
 
