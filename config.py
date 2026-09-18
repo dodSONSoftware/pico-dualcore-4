@@ -18,6 +18,15 @@ from version import CONFIG_SCHEMA_VERSION
 # brick the MQTT channel used to fix it.
 MAX_MQTT_KEEPALIVE_SEC = 65535
 
+# The ping interval floors to 1 s (max(keepalive // 2, 1)) and each
+# PINGREQ/PINGRESP exchange re-stamps activity AFTER the response, so the
+# broker-visible traffic gap is interval + RTT and must stay inside the
+# broker's 1.5 x keepalive tolerance. At keepalive 1-2 s any real RTT pushes
+# the gap past the tolerance (keepalive 1: 1 s + RTT vs 1.5 s) and the broker
+# disconnects a healthy client into a reconnect flap. 5 s is the smallest
+# value where interval (2 s) + realistic link RTT clears the 7.5 s tolerance.
+MIN_MQTT_KEEPALIVE_SEC = 5
+
 # subscribe() encodes the SUBSCRIBE Remaining Length in one byte (valid
 # through 127); the body is topic + 5, so above 122 topic bytes the length
 # byte gains the continuation bit and the subscription never completes. Both
@@ -59,8 +68,8 @@ MAX_RECONNECT_ATTEMPTS = 32
 
 # Operational liveness bounds — in contrast to MAX_TICKS_SAFE_INTERVAL_MS
 # above, a representability bound: these stop a representable value from
-# defeating recovery. Shipped values (4 s / 5 s / 250 ms / 3) sit well below
-# every one of these.
+# defeating recovery. Shipped values (4 s / 5 s / 100 ms / 250 ms / 3) sit
+# well below every one of these.
 
 # Scales every bounded MQTT wait (the CONNACK/SUBACK handshake, the PUBACK,
 # check_msg completion, the UTC request deadline). Each single wait must stay
@@ -74,6 +83,14 @@ MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC = 5
 # long one verification attempt can hold the device out of service. The worst
 # case per pass (two probes plus backoff) stays in minutes, not hours.
 MAX_NETWORK_PROBE_TIMEOUT_SEC = 30
+
+# Paces Core 0's startup publishes (the probes and the UTC attempts, two plus
+# three in one pass): _wait_for_mqtt_publish_slot blocks for up to the full
+# delay between them, in 10 ms slices, and startup is deliberately
+# unsupervised — no watchdog, no heartbeat — so only the config bound can
+# keep a multi-day value from holding startup in a paced stall. 60 s matches
+# the family's pacing bounds.
+MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS = 60 * 1000
 
 # Core 1's initialization retry pacing (a sliced sleep that refreshes the
 # liveness stamp, so no ticks or watchdog pressure): purely operational — a
@@ -428,6 +445,11 @@ def validate_config(config):
     ):
         _require_positive_integer(config, key)
 
+    if config["mqtt_keepalive_sec"] < MIN_MQTT_KEEPALIVE_SEC:
+        raise ConfigError(
+            "mqtt_keepalive_sec must be at least {}".format(MIN_MQTT_KEEPALIVE_SEC),
+            code="invalid_value",
+        )
     if config["mqtt_keepalive_sec"] > MAX_MQTT_KEEPALIVE_SEC:
         raise ConfigError(
             "mqtt_keepalive_sec must be at most {}".format(MAX_MQTT_KEEPALIVE_SEC),
@@ -456,6 +478,13 @@ def validate_config(config):
         raise ConfigError(
             "network_probe_timeout_sec must be at most {}".format(
                 MAX_NETWORK_PROBE_TIMEOUT_SEC
+            ),
+            code="invalid_value",
+        )
+    if config["mqtt_outbound_publish_delay_ms"] > MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS:
+        raise ConfigError(
+            "mqtt_outbound_publish_delay_ms must be at most {}".format(
+                MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS
             ),
             code="invalid_value",
         )

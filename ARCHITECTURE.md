@@ -387,7 +387,7 @@ Both probes must succeed with matching PUBACKs before Core 1 starts and before t
 
 ## MQTT keepalive
 
-The CONNPACK advertises `mqtt_keepalive_sec` (30 s default), so the broker disconnects the client if it sees no client packet within 1.5 x keepalive (45 s). Application traffic alone does not cover this gap — the health interval is 60 s — so Core 0 sends PINGREQ explicitly:
+The CONNPACK advertises `mqtt_keepalive_sec` (30 s default), so the broker disconnects the client if it sees no client packet within 1.5 x keepalive (45 s). The key is floored at 5 s in config validation: the ping interval floors to 1 s and each PINGRESP re-stamps activity after the response, so at keepalive 1–2 s the broker-visible traffic gap (interval + RTT) exceeds the 1.5× tolerance for any real RTT and the broker would disconnect a healthy client into a reconnect flap. Application traffic alone does not cover this gap — the health interval is 60 s — so Core 0 sends PINGREQ explicitly:
 
 - `Mqtt` tracks the last outbound MQTT activity (connect, PUBLISH, PINGREQ).
 - When idle for `keepalive / 2` (15 s default), `ping_due()` returns true and the Core 0 run loop sends a PINGREQ while no outbound entry is being published (a PUBLISH itself resets the broker's keepalive timer).

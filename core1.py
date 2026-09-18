@@ -6,6 +6,7 @@ import gc
 import time
 
 from command_protocol import COMMAND_GET_DETAILS
+from config import MAX_TICKS_SAFE_INTERVAL_MS
 from debug import DEBUG
 from device_manager import (
     DeviceManager,
@@ -546,7 +547,16 @@ def _build_health_payload(intercore, uptime_state, config, system_information):
 
     core_1_activity_ms = intercore.state_mailboxes.get_core_1_activity_ms()
     core_1_activity_age_ms = time.ticks_diff(now_ms, core_1_activity_ms) if core_1_activity_ms is not None else None
-    core_1_activity_threshold_ms = max(config["read_loop_sec"] * 3 * 1000, 60000)  # 60 seconds min
+    # read_loop_ms itself is ticks-safe by its config bound, but the 3x
+    # multiplier is not: read_loop_sec is schema-valid up to 536,870 s and
+    # 3 x read_loop_ms overflows the 30-bit ticks ceiling for any value above
+    # ~178,956 s, silently wrapping on the RP2. Clamp at the ceiling instead —
+    # the threshold's liveness diagnostic degrades gracefully there.
+    read_loop_ms = config["read_loop_sec"] * 1000
+    if read_loop_ms > MAX_TICKS_SAFE_INTERVAL_MS // 3:
+        core_1_activity_threshold_ms = MAX_TICKS_SAFE_INTERVAL_MS
+    else:
+        core_1_activity_threshold_ms = max(read_loop_ms * 3, 60000)  # 60 seconds min
     core_1_active = core_1_activity_age_ms is not None and core_1_activity_age_ms <= core_1_activity_threshold_ms
 
     # Counts only: the health message discards everything else the full

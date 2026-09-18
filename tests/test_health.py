@@ -343,6 +343,46 @@ def test_core_1_inactive_triggers_degraded(health):
     assert "core_1_inactive" in payload["payload"]["degraded_reasons"]
 
 
+def test_core_1_threshold_uses_3x_read_loop_when_it_fits(health):
+    """read_loop_sec = 178,956 s: 3 x 178,956,000 ms = 536,868,000 ms still
+    fits the 30-bit ticks ceiling (536,870,911), so the threshold is exactly
+    3 x read_loop — not clamped. An age equal to it is still active; one past
+    it degrades."""
+    health.set_healthy_baseline()
+    health.set_utc(_valid_utc_snapshot())
+    health.config["read_loop_sec"] = 178956
+
+    health.set_core_1_activity(NOW_MS - 536868000)  # age == threshold
+    payload = health.build()
+    assert payload["payload"]["core_1_active"] is True
+
+    health.set_core_1_activity(NOW_MS - 536868001)  # age one past
+    payload = health.build()
+    assert payload["payload"]["core_1_active"] is False
+    assert "core_1_inactive" in payload["payload"]["degraded_reasons"]
+
+
+def test_core_1_threshold_clamps_at_ticks_ceiling(health):
+    """read_loop_sec = 400,000 s is schema-valid (400,000,000 ms <= ceiling),
+    but 3 x 400,000,000 = 1,200,000,000 would not fit a 30-bit ticks value
+    (on the RP2 it wraps silently). The threshold clamps to the ceiling, so
+    an age above it (representable on the host, never on the device) degrades
+    instead of the diagnostic going dead (or, on-device, the wrapped value
+    misclassifying liveness)."""
+    health.set_healthy_baseline()
+    health.set_utc(_valid_utc_snapshot())
+    health.config["read_loop_sec"] = 400000
+
+    health.set_core_1_activity(NOW_MS - 536870911)  # age == clamped threshold
+    payload = health.build()
+    assert payload["payload"]["core_1_active"] is True
+
+    health.set_core_1_activity(NOW_MS - 1000000000)  # above the ceiling
+    payload = health.build()
+    assert payload["payload"]["core_1_active"] is False
+    assert "core_1_inactive" in payload["payload"]["degraded_reasons"]
+
+
 def test_queue_depth_and_counters_in_payload(health):
     """Queue depth and the eviction/rejection counters are reported (the
     byte and high-watermark metrics are no longer in the health payload)."""

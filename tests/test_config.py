@@ -20,7 +20,9 @@ from config import (
     MAX_MQTT_BROKER_ADDRESS_BYTES,
     MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC,
     MAX_MQTT_KEEPALIVE_SEC,
+    MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS,
     MAX_MQTT_TOPIC_BYTES,
+    MIN_MQTT_KEEPALIVE_SEC,
     MAX_NETWORK_PROBE_TIMEOUT_SEC,
     MAX_OUTBOUND_QUEUE_MAX_MESSAGES,
     MAX_RECONNECT_ATTEMPTS,
@@ -164,6 +166,7 @@ def test_validate_config_accepts_valid_config_without_any_file():
         (lambda config: config["devices"][0].__setitem__("id", "i" * (MAX_DEVICE_ID_LENGTH + 1)), "invalid_value"),
         (lambda config: config.update({"source": "S" * 16384}), "invalid_value"),
         (lambda config: config.update({"mqtt_keepalive_sec": MAX_MQTT_KEEPALIVE_SEC + 1}), "invalid_value"),
+        (lambda config: config.update({"mqtt_keepalive_sec": MIN_MQTT_KEEPALIVE_SEC - 1}), "invalid_value"),
         (lambda config: config.update({"device_initialization_attempts": MAX_DEVICE_INITIALIZATION_ATTEMPTS + 1}), "invalid_value"),
         (lambda config: config.update({"mqtt_topic_command": "t" * (MAX_MQTT_TOPIC_BYTES + 1)}), "invalid_value"),
         (lambda config: config.update({"mqtt_topic_command": "a\x00b"}), "invalid_value"),
@@ -450,6 +453,28 @@ def test_validate_config_keepalive_is_bounded_by_the_wire_limit():
     )
 
 
+def test_validate_config_keepalive_is_bounded_below_by_the_ping_interval():
+    """The ping interval floors to 1 s and each PINGRESP re-stamps activity
+    after the response, so at keepalive 1-2 s the broker-visible gap
+    (interval + RTT) exceeds the broker's 1.5 x tolerance for any real RTT:
+    the broker disconnects a healthy client into a reconnect flap. The floor
+    is an operational-liveness bound, like the other recovery-timing keys —
+    a representable value must not defeat keepalive. The inclusive minimum
+    connects while the next value down rejects."""
+    config = _base_config()
+    config["mqtt_keepalive_sec"] = MIN_MQTT_KEEPALIVE_SEC
+    assert validate_config(config) is config
+
+    config = _base_config()
+    config["mqtt_keepalive_sec"] = MIN_MQTT_KEEPALIVE_SEC - 1
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "mqtt_keepalive_sec must be at least {}".format(
+        MIN_MQTT_KEEPALIVE_SEC
+    )
+
+
 def test_validate_config_device_initialization_attempts_is_bounded():
     """Retries ride out a transient driver.initialize() failure; a device that
     fails them all is broken, so the count carries an inclusive upper bound
@@ -475,6 +500,7 @@ def test_validate_config_device_initialization_attempts_is_bounded():
     [
         ("mqtt_broker_response_timeout_sec", MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC),
         ("network_probe_timeout_sec", MAX_NETWORK_PROBE_TIMEOUT_SEC),
+        ("mqtt_outbound_publish_delay_ms", MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS),
         ("device_initialization_retry_delay_ms", MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS),
         ("device_read_failure_threshold", MAX_DEVICE_READ_FAILURE_THRESHOLD),
     ],
@@ -540,13 +566,13 @@ def test_validate_config_outbound_queue_max_messages_required_under_schema_8():
         ("read_loop_sec", 1000),
         ("health_interval_sec", 1000),
         ("network_snapshot_interval_sec", 1000),
-        # mqtt_broker_response_timeout_sec is NOT here: its operational
-        # liveness bound (MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC) is far tighter
-        # than the ticks ceiling and is pinned in
+        # mqtt_broker_response_timeout_sec and mqtt_outbound_publish_delay_ms
+        # are NOT here: their operational liveness bounds (MAX_MQTT_BROKER_
+        # RESPONSE_TIMEOUT_SEC, MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS) are far
+        # tighter than the ticks ceiling and are pinned in
         # test_validate_config_operational_liveness_bounds.
         ("datetime_sync_interval_min", 60 * 1000),
         ("mqtt_command_poll_ms", 1),
-        ("mqtt_outbound_publish_delay_ms", 1),
     ],
 )
 def test_validate_config_ticks_backed_intervals_are_bounded_by_the_ticks_limit(

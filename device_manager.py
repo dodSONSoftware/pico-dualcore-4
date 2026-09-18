@@ -214,7 +214,9 @@ class DeviceManager:
             "id": device_id,
             "device": device_type,
             "state": DEVICE_STATE_INITIALIZATION_FAILED,
-            "initialization_attempts_used": 1,
+            # The failure happened in create_device() before any initialize()
+            # ran: 0 is the honest count (1 would report a phantom attempt).
+            "initialization_attempts_used": 0,
             "failure_reason": last_error,
         }
         return {

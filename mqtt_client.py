@@ -5,7 +5,6 @@
 import select
 import socket
 import struct
-from binascii import hexlify
 
 # Maximum remaining length (bytes) for an inbound MQTT packet. Derived, not
 # arbitrary: the worst-case spec-valid inbound frame (a write-config command

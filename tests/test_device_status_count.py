@@ -137,6 +137,37 @@ def test_one_failing_device_does_not_stop_the_others():
     assert snapshot["devices"]["active"] == 1
 
 
+def test_driver_construction_failure_records_zero_attempts():
+    """A failure in create_device() happened before any initialize() attempt:
+    the failed-device record must report 0 attempts used, not the phantom 1
+    the record previously hardcoded (it flows verbatim into the snapshot's
+    device_status section and the startup log's failed_devices)."""
+    def _explode(device_def, i2c_bus_factory=None):
+        raise RuntimeError("simulated driver construction failure")
+
+    saved = dm.create_device
+    dm.create_device = _explode
+    try:
+        manager = dm.DeviceManager({
+            "device_initialization_attempts": 3,
+            "device_initialization_retry_delay_ms": 10,
+            "device_read_failure_threshold": 3,
+            "devices": [{"id": "dev1", "device_type": "test", "config": {}}],
+        })
+        initialized = manager.initialize_devices()
+    finally:
+        dm.create_device = saved
+
+    assert initialized == 0
+    entry = manager._failed_devices["dev1"]
+    assert entry["state"] == dm.DEVICE_STATE_INITIALIZATION_FAILED
+    assert entry["initialization_attempts_used"] == 0
+    assert entry["failure_reason"] == "simulated driver construction failure"
+    # The honest 0 propagates through the snapshot.
+    status = manager.get_status_snapshot()["device_status"][0]
+    assert status["initialization_attempts_used"] == 0
+
+
 def test_recovered_device_counts_as_active_again():
     manager = _make_manager(read_failure_threshold=1)
     managed = _add_managed_device(manager)

@@ -7,7 +7,7 @@ import machine
 import os
 import time
 
-from hardware import detect_hardware, HARDWARE_TYPE_PICO_W, HARDWARE_TYPE_PICO_2_W
+from hardware import detect_hardware
 from led_manager import LEDManager
 
 
