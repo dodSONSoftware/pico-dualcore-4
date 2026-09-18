@@ -833,6 +833,28 @@ def test_check_msg_oversized_packet_marks_disconnected(ticks, mock_select):
     assert sock.closed
 
 
+def test_check_msg_broker_disconnect_marks_disconnected(ticks, mock_select):
+    """A broker DISCONNECT in the run-loop poll is a transport failure: the
+    session is marked down and the drop raises for recovery — not parsed as
+    garbage (the old code returned the opcode and left the frame's 2-byte
+    reason code in the stream for the next read to misparse as opcodes)."""
+    mqtt = _mqtt(ticks)
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    sock = MockSocket(incoming=b"\xe0\x02\x86\x00")  # DISCONNECT, reason 0x86
+    client.sock = sock
+    mqtt._client = client
+    mqtt._connected = True
+
+    with pytest.raises(MQTTException):
+        mqtt.check_msg()
+
+    assert mqtt.is_connected() is False
+    assert mqtt._disconnect_count == 1
+    assert mqtt._last_disconnect_reason == DISCONNECT_CHECK_MSG_FAILURE
+    assert sock.closed
+
+
 # ---------------------------------------------------------------------------
 # Inbound packet internal consistency: a frame whose declared field lengths
 # exceed its own remaining length must be dropped, not read
@@ -1567,6 +1589,22 @@ def test_ping_rejects_pingresp_with_payload():
     assert sock.closed is True
 
 
+def test_ping_fails_on_broker_disconnect_before_pingresp():
+    """A broker DISCONNECT before the PINGRESP drops the connection instead of
+    desynchronizing the stream: the old code returned the opcode and looped,
+    parsing the frame's remaining length and reason code as spurious opcodes
+    — a PINGRESP that followed re-synced the stream and the ping silently
+    succeeded over a half-consumed frame."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    sock = MockSocket(incoming=b"\xe0\x02\x86\x00" + b"\xd0\x00")
+    client.sock = sock
+
+    with pytest.raises(MQTTException, match="Broker DISCONNECT"):
+        client.ping(timeout_sec=10)
+
+    assert sock.closed is True
+
+
 def test_wait_msg_rejects_inbound_qos2_before_callback():
     """An inbound QoS 2 PUBLISH is outside this client's protocol profile: it
     must be rejected at the wire layer, before the callback (which feeds the
@@ -1602,6 +1640,39 @@ def test_wait_msg_rejects_invalid_qos3_publish_before_callback():
         client.wait_msg()
 
     assert callback_calls == []
+    assert sock.closed is True
+
+
+def test_wait_msg_rejects_broker_disconnect():
+    """A broker-initiated DISCONNECT is a valid MQTT frame but no wait loop
+    here handles it: drop the connection, named as such, instead of returning
+    after the opcode byte and leaving the frame's 2-byte reason code in the
+    stream for the next read to misparse."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    sock = MockSocket(incoming=b"\xe0\x02\x86\x00")  # DISCONNECT, reason 0x86
+    client.sock = sock
+
+    with pytest.raises(MQTTException, match="Broker DISCONNECT"):
+        client.wait_msg()
+
+    assert sock.closed is True
+
+
+def test_wait_msg_rejects_unexpected_control_opcode():
+    """A control frame outside the set this client's wait loops consume —
+    UNSUBACK (nothing is ever unsubscribed), a reserved code, or a corrupt
+    opcode — aborts the connection instead of returning the opcode with the
+    body unconsumed."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+    # Reserved opcode 0x70 with a 2-byte body.
+    sock = MockSocket(incoming=b"\x70\x02\x01\x00")
+    client.sock = sock
+
+    with pytest.raises(MQTTException, match="Unexpected inbound opcode 0x70"):
+        client.wait_msg()
+
     assert sock.closed is True
 
 

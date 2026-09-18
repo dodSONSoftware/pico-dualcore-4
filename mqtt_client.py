@@ -325,7 +325,24 @@ class MQTTClient:
             return None
         op = res[0]
         if op & 0xF0 != 0x30:
-            return op
+            # PUBACK and SUBACK are returned body unconsumed: publish() and
+            # subscribe() consume them positionally in their own wait loops.
+            # Every other control frame is not consumed by any wait loop, and
+            # a conforming broker sends this client none of them (no UNSUBACK
+            # — nothing is ever unsubscribed — and a broker DISCONNECT is the
+            # broker ending the session). Returning after the opcode byte
+            # would leave the remaining length and body in the stream for the
+            # next read to misparse as a new packet — a leftover byte in
+            # 0x30-0x37 misparses as a PUBLISH and can swallow the following
+            # frame — so the unexpected frame drops the connection like every
+            # other nonconforming one.
+            if op in (0x40, 0x90):
+                return op
+            if op == 0xE0:
+                self._abort_corrupt_inbound("Broker DISCONNECT")
+            self._abort_corrupt_inbound(
+                "Unexpected inbound opcode 0x{:02x}".format(op)
+            )
         # Inbound QoS 2/3 is rejected from the opcode — before the payload is
         # read and before the callback (which feeds the command protocol)
         # runs: a nonconforming frame never reaches the command protocol.
