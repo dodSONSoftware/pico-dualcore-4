@@ -10,6 +10,7 @@ import time
 
 from hardware import classify_machine
 from message_protocol import format_utc_epoch_ms
+from version import FIRMWARE_NAME
 
 # The reportable system-information sections (the get-details data source's
 # full section set). Pure data, owned here with the data source.
@@ -196,6 +197,9 @@ class SystemInformation:
         return {
             "hardware_type": classification["hardware_type"],
             "machine": machine_name,
+            # The product codename — the firmware's own identity alongside
+            # the board's.
+            "firmware_name": FIRMWARE_NAME,
             "version": version,
             "implementation": sys.implementation.name,
             "preferred_free_heap_bytes": classification["preferred_free_heap_bytes"],

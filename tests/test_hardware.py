@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import hardware
+from version import FIRMWARE_NAME
 
 # Mock the 'machine' module before importing system_information
 # since it's MicroPython-specific and not available on the host
@@ -280,6 +281,24 @@ class TestGetMachineConsumesSharedClassifier:
 
         assert result["hardware_type"] == "unknown"
         assert result["minimum_free_heap_bytes"] is None
+
+    def test_get_machine_carries_firmware_name(self, monkeypatch):
+        """The machine section reports the product codename (the version.py
+        constant) — the firmware's own identity alongside the board's."""
+        import system_information
+
+        monkeypatch.setattr(
+            system_information.os,
+            "uname",
+            lambda: type("Uname", (), {
+                "machine": "Raspberry Pi Pico W with RP2040",
+                "version": "v1.28.0",
+            })(),
+        )
+
+        result = self._system_information().get_machine()
+
+        assert result["firmware_name"] == FIRMWARE_NAME
 
 
 class TestGetResetCause:

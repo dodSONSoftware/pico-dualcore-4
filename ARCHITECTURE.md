@@ -116,7 +116,7 @@ The hardware module provides:
 - `classify_machine()` — the single source of truth mapping a machine string to canonical type and both board heap thresholds. Both `detect_hardware()` (startup) and `SystemInformation.get_machine()` (telemetry/health) classify through it, so they can never disagree.
 - Detection function `detect_hardware()` returning an immutable result dict, failing fast on unknown hardware
 
-See `hardware.py` for implementation details.
+See `hardware.py` for implementation details. The get-details `machine` section (built by `SystemInformation.get_machine()`) also reports `firmware_name` — the product-codename constant `FIRMWARE_NAME` in `version.py` — the firmware's own identity alongside the board's.
 
 ## Ownership invariants
 
