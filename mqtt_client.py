@@ -8,7 +8,7 @@ import struct
 
 # Maximum remaining length (bytes) for an inbound MQTT packet. Derived, not
 # arbitrary: the worst-case spec-valid inbound frame (a write-config command
-# carrying the worst-case valid configuration) is 16,865 bytes (pinned in
+# carrying the worst-case valid configuration) is 16,329 bytes (pinned in
 # tests/test_config.py) — 20 KiB keeps every valid command deliverable while
 # bounding what json.loads() can amplify at the parse peak. An oversized
 # frame must fail the connection instead of letting sock.read(sz) request an
@@ -106,11 +106,12 @@ class MQTTClient:
         self.sock = socket.socket()
         self.sock.settimeout(timeout)
         # Filter the lookup to the profile the default socket constructs
-        # (AF_INET/SOCK_STREAM): an unfiltered multi-record hostname can hand
-        # connect() an unusable first record even when a usable one follows.
-        # The lookup itself is not under the socket timeout: a literal IP
-        # (the shipped configuration) parses without a query, and a hostname
-        # is bounded by lwIP's own DNS retry logic instead.
+        # (AF_INET/SOCK_STREAM). The config boundary validates the address
+        # as a numeric IPv4 literal, so the lookup performs no DNS query
+        # and stays immediate even though it sits outside the socket
+        # timeout (the servicing feed fires before and after it, not
+        # during — a hostname's query could stretch the un-fed stretch
+        # past the Core 0 watchdog).
         self._service()
         addr = socket.getaddrinfo(
             self.server, self.port, socket.AF_INET, socket.SOCK_STREAM

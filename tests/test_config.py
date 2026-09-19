@@ -17,7 +17,6 @@ from config import (
     MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS,
     MAX_DEVICE_READ_FAILURE_THRESHOLD,
     MAX_DEVICES,
-    MAX_MQTT_BROKER_ADDRESS_BYTES,
     MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC,
     MAX_MQTT_KEEPALIVE_SEC,
     MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS,
@@ -381,31 +380,49 @@ def test_validate_config_source_is_bounded_at_protocol_scale():
         validate_config(config)
 
 
-def test_validate_config_broker_address_is_byte_bounded():
-    """mqtt_broker_ip_address feeds socket.connect() (which also resolves
-    hostnames) and is spliced into the read-config response and connect logs;
-    it had no bound at all, so one ~15 KiB value made the read-config
-    response unsendable. DNS's hostname maximum is the inclusive bound, in
-    UTF-8 bytes."""
-    config = _base_config()
-    config["mqtt_broker_ip_address"] = "b" * MAX_MQTT_BROKER_ADDRESS_BYTES
-    assert validate_config(config) is config
+def test_validate_config_broker_address_is_numeric_ipv4():
+    """mqtt_broker_ip_address feeds the handshake's getaddrinfo() lookup,
+    which runs OUTSIDE the socket timeout \u2014 the servicing feed fires before
+    and after it, not during \u2014 so only a numeric literal (which parses
+    without a DNS query) keeps the attempt inside the bounded-failure model;
+    a hostname's query is bounded only by lwIP's retry logic, which can
+    stretch the un-fed stretch past the 8 s Core 0 watchdog."""
+    for address in ("10.0.0.1", "192.168.1.100", "0.0.0.0", "255.255.255.255"):
+        config = _base_config()
+        config["mqtt_broker_ip_address"] = address
+        assert validate_config(config) is config
 
-    config = _base_config()
-    config["mqtt_broker_ip_address"] = "b" * (MAX_MQTT_BROKER_ADDRESS_BYTES + 1)
-    with pytest.raises(ConfigError) as excinfo:
-        validate_config(config)
-    assert excinfo.value.code == "invalid_value"
-    assert str(excinfo.value) == (
-        "mqtt_broker_ip_address must be at most {} bytes".format(
-            MAX_MQTT_BROKER_ADDRESS_BYTES
-        )
+    rejections = (
+        "broker.example.com",  # hostname: a DNS query, outside the timeout
+        "b" * 253,             # the old 253-byte hostname maximum
+        "fe80::1",             # IPv6: outside the AF_INET/SOCK_STREAM profile
+        "256.0.0.1",           # octet over 255
+        "192.168.001.1",       # leading zero: an octal reading is ambiguous
+        "1.2.3",               # three parts
+        "1.2.3.4.5",           # five parts
+        "1..2.3",              # empty part
+        "192.168.1.a",         # non-digit
+        " 192.168.1.1",        # leading whitespace
+        "192.168.1.1 ",        # trailing whitespace
+        "192.168.1.1\n",       # embedded newline
+        "+1.2.3.4",            # a sign
+        "1.2.3.-4",            # a negative octet
+        "\u00e9.0.0.1",        # non-ASCII "digit"
     )
+    for address in rejections:
+        config = _base_config()
+        config["mqtt_broker_ip_address"] = address
+        with pytest.raises(ConfigError) as excinfo:
+            validate_config(config)
+        assert excinfo.value.code == "invalid_value"
+        assert str(excinfo.value) == (
+            "mqtt_broker_ip_address must be a numeric IPv4 address (dotted quad)"
+        )
 
-    # 253 characters of 2-byte code points is 506 bytes: rejected.
+    # The type check still belongs to the non-empty-string gate.
     config = _base_config()
-    config["mqtt_broker_ip_address"] = "\u00e9" * MAX_MQTT_BROKER_ADDRESS_BYTES
-    with pytest.raises(ConfigError, match="mqtt_broker_ip_address must be at most"):
+    config["mqtt_broker_ip_address"] = 123
+    with pytest.raises(ConfigError, match="must be a non-empty string"):
         validate_config(config)
 
 
@@ -428,7 +445,7 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
 
     config = _base_config()
     config["source"] = field_max
-    config["mqtt_broker_ip_address"] = "b" * MAX_MQTT_BROKER_ADDRESS_BYTES
+    config["mqtt_broker_ip_address"] = "255.255.255.255"
     for index, key in enumerate(_MQTT_TOPIC_KEYS):
         config[key] = "t" * (MAX_MQTT_TOPIC_BYTES - 1) + str(index)
     for key in ("wifi_reconnect_delays_sec", "mqtt_reconnect_delays_sec"):
@@ -501,7 +518,7 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
     command = {
         "message_type": "command",
         "message_schema_version": MESSAGE_SCHEMA_VERSION,
-        # An executable target matches the 253-byte broker address.
+        # An executable target matches the broker address.
         "target": config["mqtt_broker_ip_address"],
         # 128 4-byte code points: at the character bound, worst serialized form.
         "command_id": "\U0001F600" * MAX_COMMAND_ID_LENGTH,

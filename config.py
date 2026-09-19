@@ -36,10 +36,6 @@ MIN_MQTT_KEEPALIVE_SEC = 5
 # full variable-length encoding).
 MAX_MQTT_TOPIC_BYTES = 122
 
-# Feeds socket.connect(), which also resolves hostnames: the bound is DNS's
-# 253-byte hostname maximum rather than IPv6's 45 characters.
-MAX_MQTT_BROKER_ADDRESS_BYTES = 253
-
 # The Wi-Fi secrets sit in config-secrets.json (boot provisioning, not
 # write-config) and feed network.WLAN.connect(). The SSID bound is IEEE
 # 802.11's 32-octet limit; the password covers a 63-character WPA2-PSK
@@ -260,6 +256,32 @@ def _require_mqtt_topic(config, key):
         )
 
 
+def _require_ipv4_address(config, key):
+    """A numeric IPv4 dotted quad in canonical form (four dot-separated
+    parts, each 1-3 ASCII digits, no leading zero, value 0-255). The
+    handshake's getaddrinfo() lookup runs OUTSIDE the socket timeout —
+    the Core 0 servicing feed fires before and after it, not during —
+    and only a literal parses without a DNS query: a hostname's query
+    is bounded only by lwIP's own retry logic, which can stretch past
+    the 8 s Core 0 watchdog and reset the board instead of failing the
+    attempt into the bounded reconnect path. A leading zero is rejected
+    (an octal reading is ambiguous across resolvers) and IPv6 is
+    outside the AF_INET/SOCK_STREAM profile the lookup filters on."""
+    value = config[key]
+    parts = value.split(".")
+    if len(parts) != 4 or any(
+        not 1 <= len(part) <= 3
+        or any(ch < "0" or ch > "9" for ch in part)
+        or (len(part) > 1 and part[0] == "0")
+        or int(part) > 255
+        for part in parts
+    ):
+        raise ConfigError(
+            "{} must be a numeric IPv4 address (dotted quad)".format(key),
+            code="invalid_value",
+        )
+
+
 def _require_distinct_mqtt_topics(config):
     # Inbound dispatch matches by exact equality and the first matching
     # branch wins: a shared name silently disables one channel (equal
@@ -451,13 +473,7 @@ def validate_config(config):
             code="invalid_value",
         )
 
-    if len(config["mqtt_broker_ip_address"].encode("utf-8")) > MAX_MQTT_BROKER_ADDRESS_BYTES:
-        raise ConfigError(
-            "mqtt_broker_ip_address must be at most {} bytes".format(
-                MAX_MQTT_BROKER_ADDRESS_BYTES
-            ),
-            code="invalid_value",
-        )
+    _require_ipv4_address(config, "mqtt_broker_ip_address")
 
     for key in (
         "read_loop_sec",

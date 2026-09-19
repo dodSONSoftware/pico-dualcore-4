@@ -967,9 +967,11 @@ def _mock_broker_socket(monkeypatch, sock):
 
 def test_connect_filters_resolver_to_ipv4_stream(monkeypatch):
     """connect() must filter getaddrinfo to AF_INET/SOCK_STREAM and connect to
-    the filtered record: the config contract allows a broker hostname, and an
-    UNFILTERED lookup can return a first record (IPv6, datagram) that the
-    default stream socket cannot use even when a usable record exists."""
+    the filtered record: an UNFILTERED lookup can return a first record
+    (IPv6, datagram) that the default stream socket cannot use even when a
+    usable record exists. The config boundary requires a numeric IPv4
+    literal, so this is the profile-consistency guard for whatever reaches
+    the handshake."""
     import socket as real_socket
     import mqtt_client
 
