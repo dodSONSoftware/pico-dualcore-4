@@ -1612,6 +1612,40 @@ def test_event_post_admission_rollback_collect_runs_outside_the_queue_lock(monke
     assert seen == [False]
 
 
+def test_event_rejection_counter_updates_under_the_queue_lock(monkeypatch):
+    """Both rejection paths increment the counter under the queue lock:
+    status() reads _rejected under that lock, so the increments share the
+    discipline (a concurrent status() reader must never observe a torn
+    update)."""
+    ic, heap = _queue(monkeypatch)
+    eq = ic.event_queue
+    sets = []
+    orig_setattr = InterCoreEventQueue.__setattr__
+
+    def recording_setattr(self, name, value):
+        if name == "_rejected":
+            sets.append(self._lock.locked())
+        orig_setattr(self, name, value)
+
+    monkeypatch.setattr(InterCoreEventQueue, "__setattr__", recording_setattr)
+
+    # Path 1: the pre-admission pressure rejection.
+    heap.free_bytes = 0
+    assert eq.put({"seq": 1}) is False
+
+    # Path 2: the post-admission rollback (the crossing append is undone).
+    base = RESERVE + 512
+    alloc_per_event = 1024
+    monkeypatch.setattr(
+        gc, "mem_free", lambda: base - alloc_per_event * len(eq._queue), raising=False
+    )
+    assert eq.put({"seq": 2}) is False
+
+    # Both increments ran with the queue lock held, and the counter is sound.
+    assert sets == [True, True]
+    assert eq.status()["rejected"] == 2
+
+
 def test_event_post_admission_invariant_admits_at_the_reserve(monkeypatch):
     """Boundary control: the reserve holds with the event retained (at, not
     above) -- admitted."""

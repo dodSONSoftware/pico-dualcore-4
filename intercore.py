@@ -460,6 +460,14 @@ class InterCoreEventQueue:
         self._high_watermark = 0
         self._rejected = 0
 
+    def _count_rejection(self):
+        """The rejection metric, under the queue lock: status() reads
+        _rejected under the same lock, so the increment shares the
+        discipline. Called while the heap-admission lock is held -- the
+        same lock order put() already uses for queue access."""
+        with self._lock:
+            self._rejected += 1
+
     def put(self, event):
         """Admit one event, or reject it under memory pressure (never evicting an admitted event)."""
         if not isinstance(event, dict):
@@ -489,12 +497,12 @@ class InterCoreEventQueue:
                             self._high_watermark = depth
                 if rolled_back:
                     gc.collect()
-                    self._rejected += 1
+                    self._count_rejection()
                     return False
                 return True
             # Admitted events are never evicted: reject the new event and let
             # the caller report the memory-pressure failure.
-            self._rejected += 1
+            self._count_rejection()
             return False
 
     def take(self):
