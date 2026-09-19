@@ -101,6 +101,23 @@ def host_boot(monkeypatch):
     main_mod = importlib.import_module("main")
     importlib.reload(main_mod)
 
+    # The secrets boundary is a provisioning concern: config-secrets.json is
+    # gitignored and machine-local, so a fresh checkout has none and main()'s
+    # load_wifi_config("config-secrets.json") would fail the boot here. These
+    # tests target main()'s own recovery boundary, not filesystem config
+    # parsing, so stub the loader. The import is inside main() (from config
+    # import load_wifi_config), rebinding from the config module at call time
+    # -- patch the module attribute, not main_mod.
+    config_mod = importlib.import_module("config")
+    monkeypatch.setattr(
+        config_mod,
+        "load_wifi_config",
+        lambda path="config-secrets.json": {
+            "wifi_ssid": "test",
+            "wifi_password": "test-password",
+        },
+    )
+
     def _pico_w():
         return {
             "hardware_type": "pico_w",
