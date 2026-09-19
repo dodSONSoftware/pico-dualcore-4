@@ -30,8 +30,15 @@ SYSTEM_INFORMATION_SECTIONS = (
 # reads the constants off the machine module (no hardcoded values), so a
 # build whose MicroPython names them differently degrades to "unknown"
 # instead of mislabeling a boot. The v1.28 rp2 port exposes exactly these
-# two causes — a watchdog reset, or nothing finer (every other reset,
-# including machine.reset(), reports PWRON_RESET).
+# two causes. Field-verified on the flashed build (2026-09-18 capture,
+# 6/6 commanded reboots): a soft machine.reset() reports the WDT_RESET
+# value, not PWRON_RESET as 0.4.105 assumed — so "wdt" means "a reset via
+# machine.reset() or a hardware-watchdog expiry", and the two are
+# indistinguishable from this field alone. A commanded reboot is
+# recognized by the {"rebooting": true} acknowledgement Core 0 publishes
+# immediately before the reset; a "wdt" boot with no such preceding
+# acknowledgement is a genuine watchdog reset (the main.py recovery-
+# boundary reset publishes none, so it reads the same as one).
 _RESET_CAUSE_LABELS = (
     ("WDT_RESET", "wdt"),
     ("PWRON_RESET", "poweron"),
@@ -56,11 +63,16 @@ class SystemInformation:
         self._adc = None
 
     def get_reset_cause(self):
-        """Stable short label for how this boot began: "wdt" for a
-        hardware-watchdog reset, "poweron" for any other reset — the v1.28
-        rp2 port reports no finer cause (a machine.reset() reboot reports
-        "poweron") — so a WDT reset is diagnosable from the next boot's
-        startup log instead of only from the absence of a shutdown log."""
+        """Stable short label for how this boot began: "wdt" for the
+        WDT_RESET value, "poweron" for the PWRON_RESET value, else
+        "unknown" — the v1.28 rp2 port reports no finer cause. Field-
+        verified on the flashed build: a machine.reset() reboot reports
+        "wdt", not "poweron" — so "wdt" covers both a deliberate
+        machine.reset() and a hardware-watchdog expiry, and a "wdt" boot
+        is a genuine watchdog reset only when no {"rebooting": true}
+        acknowledgement (published immediately before a commanded reboot)
+        precedes it; the main.py recovery-boundary reset publishes none
+        and reads the same as a watchdog fire (a known, accepted limit)."""
         if self._reset_cause is None:
             try:
                 cause = machine.reset_cause()

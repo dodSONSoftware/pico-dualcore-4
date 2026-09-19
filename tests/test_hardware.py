@@ -17,8 +17,9 @@ from version import FIRMWARE_NAME
 # since it's MicroPython-specific and not available on the host
 class MockMachine:
     # machine.reset_cause() constants, as the v1.28.0 rp2 port defines
-    # them: a watchdog reset, or nothing finer (every other reset,
-    # including a soft machine.reset(), reports PWRON_RESET).
+    # them: a watchdog reset, or nothing finer. Field-verified on the
+    # flashed build: a soft machine.reset() reports the WDT_RESET value
+    # (not PWRON_RESET) — see system_information._RESET_CAUSE_LABELS.
     PWRON_RESET = 1
     WDT_RESET = 3
     freq = staticmethod(lambda: 125000000)
