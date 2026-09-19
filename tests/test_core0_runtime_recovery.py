@@ -67,15 +67,31 @@ def host_boot(monkeypatch):
 
     Installs the MicroPython stand-ins, reloads core0 and main under them, and fakes detect_hardware() to a supported Pico W so the validation phase passes. Deterministic-failure tests re-patch detect_hardware / load_config to raise.
 
-    The stand-ins are installed inside the fixture (not at collection time): later-collected modules import the real wifi/mqtt/time at collection, and mocked sys.modules entries would shadow them."""
+    The stand-ins are installed inside the fixture (not at collection time): later-collected modules import the real wifi/mqtt/time at collection, and mocked sys.modules entries would shadow them.
+
+    main() spawns Core 1's worker thread, which on a host process cannot be
+    killed: it idles until the network snapshot reports the startup contract
+    verified, which never happens here, and under the fake clock its 100 ms
+    idle sleep is instantaneous — a live worker would spin the GIL for the
+    rest of the suite and keep the pytest process alive at exit (CPython
+    waits for non-daemon threads). The spawn is a no-op here: every assertion
+    in this file targets main()'s own thread (the reset, the core1_main
+    gating), which holds either way."""
+    import _thread
+
+    monkeypatch.setattr(_thread, "start_new_thread", lambda func, args=(), kwargs=None: None)
+
+    # monkeypatch (not direct sys.modules assignment) so every stand-in is
+    # restored at teardown: a leaked fake time/machine/wifi/mqtt poisons the
+    # sys.modules entries of every later test in the process.
     machine = MagicMock(name="machine")
-    sys.modules["time"] = _FAKE_TIME
-    sys.modules["machine"] = machine
+    monkeypatch.setitem(sys.modules, "time", _FAKE_TIME)
+    monkeypatch.setitem(sys.modules, "machine", machine)
     debug_mock = MagicMock(name="debug")
     debug_mock.DEBUG = False
-    sys.modules["debug"] = debug_mock
-    sys.modules["wifi"] = MagicMock(name="wifi")
-    sys.modules["mqtt"] = MagicMock(name="mqtt")
+    monkeypatch.setitem(sys.modules, "debug", debug_mock)
+    monkeypatch.setitem(sys.modules, "wifi", MagicMock(name="wifi"))
+    monkeypatch.setitem(sys.modules, "mqtt", MagicMock(name="mqtt"))
 
     importlib.reload(importlib.import_module("uptime"))
     importlib.reload(importlib.import_module("network_wait"))

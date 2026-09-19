@@ -232,18 +232,22 @@ def _load_core0_config():
     return core0_config
 
 
-def _install_mocks(machine):
+def _install_mocks(machine, monkeypatch):
     """Fake machine/time; the REAL mqtt module (this file's invariant test
     needs its _MAX_PINGRESP_WAIT_SEC value, and an earlier test file may have
     leaked a MagicMock into sys.modules — pop it so the import is genuine);
-    a MagicMock wifi (its `import network` has no host equivalent)."""
+    a MagicMock wifi (its `import network` has no host equivalent).
+
+    Installed via monkeypatch so every entry is restored at teardown: a
+    leaked fake time/machine/wifi (or the popped mqtt) poisons the
+    sys.modules entries of every later test in the process."""
     from unittest.mock import MagicMock
 
-    sys.modules["time"] = _FAKE_TIME
-    sys.modules["machine"] = machine
-    sys.modules.pop("mqtt", None)
+    monkeypatch.setitem(sys.modules, "time", _FAKE_TIME)
+    monkeypatch.setitem(sys.modules, "machine", machine)
+    monkeypatch.delitem(sys.modules, "mqtt", raising=False)
     _mqtt_mod = importlib.import_module("mqtt")
-    sys.modules["wifi"] = MagicMock()
+    monkeypatch.setitem(sys.modules, "wifi", MagicMock())
     return _mqtt_mod
 
 
@@ -273,13 +277,13 @@ def _build_core0(machine):
 
 
 @pytest.fixture
-def env():
+def env(monkeypatch):
     """A fresh Core0 under a WDT-capable fake machine and a controllable
     clock, plus the real mqtt module for the budget invariant."""
     _FAKE_TIME.now_ms = 0
     _FAKE_TIME.stop_after_ms = None
     machine = WDTMachine()
-    mqtt_mod = _install_mocks(machine)
+    mqtt_mod = _install_mocks(machine, monkeypatch)
     instance, core0_mod = _build_core0(machine)
     return {
         "instance": instance,
@@ -350,13 +354,13 @@ def test_sliced_wait_feeds_watchdog(env):
     assert machine.reset_calls == 0
 
 
-def test_watchdog_degrades_when_machine_lacks_wdt():
+def test_watchdog_degrades_when_machine_lacks_wdt(monkeypatch):
     """A build without machine.WDT keeps the firmware running without
     hardware supervision (warning, not a reset loop)."""
     _FAKE_TIME.now_ms = 0
     _FAKE_TIME.stop_after_ms = None
     machine = BareMachine()
-    _install_mocks(machine)
+    _install_mocks(machine, monkeypatch)
     instance, _core0_mod = _build_core0(machine)
 
     instance.start()
