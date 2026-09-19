@@ -430,7 +430,14 @@ class BME280Device(Device):
             humidity_percent = humidity_percent + self._offset_h
 
         altitude_m = None
-        if pressure_pa is not None:
+        # The barometric formula's domain is positive pressure: a schema-legal
+        # pressure offset (bound +/-200000 Pa) can drive the adjusted pressure
+        # non-positive, where the fractional power is undefined (MicroPython
+        # raises ValueError; CPython yields a complex). Either outcome escapes
+        # the OSError-only operational domain into a reboot loop, so report
+        # the pressure as-is (the bad offset stays visible) and skip the
+        # derivation.
+        if pressure_pa is not None and pressure_pa > 0:
             altitude_m = 44330.0 * (
                 1.0 - (pressure_pa / self._sea_level_pa) ** 0.1903
             )

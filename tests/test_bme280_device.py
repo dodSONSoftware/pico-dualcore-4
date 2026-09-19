@@ -31,6 +31,7 @@ from devices.bme280.bme280_device import (  # noqa: E402
     BME280Device,
     _SENTINEL_20,
 )
+from message_protocol import is_json_safe  # noqa: E402
 
 
 # --- Calibration / sample fixtures -----------------------------------------
@@ -351,6 +352,26 @@ def test_altitude_is_none_when_pressure_is_skipped(fake_time):
     assert result["altitude_m"] is None
     assert isinstance(result["temperature_c"], float)
     assert isinstance(result["humidity_percent"], float)
+
+
+def test_altitude_is_none_when_the_offset_drives_pressure_nonpositive(fake_time):
+    """A schema-legal pressure offset (bound +/-200000 Pa) can drive the
+    offset-adjusted pressure non-positive, where the barometric formula's
+    fractional power is undefined (a domain error that escapes the operational
+    failure domain into a reboot loop). Altitude must then be None while the
+    pressure stays reported (the bad offset stays visible), and the sample
+    must remain a JSON-safe dict."""
+    device = _initialized_device(
+        {
+            "i2c_bus": 0,
+            "sea_level_pressure_pa": 101325,
+            "offsets": {"pressure_pascal": -200000},
+        }
+    )
+    result = device.read()
+    assert result["pressure_pa"] < 0.0
+    assert result["altitude_m"] is None
+    assert is_json_safe(result)
 
 
 # --- Reinitialization -------------------------------------------------------
