@@ -19,6 +19,9 @@ pinned here:
   every 100 ms slice of a long wait (via _service_wait), nothing else;
 * a build without machine.WDT degrades to no hardware supervision (a
   warning, not a reset loop), and the run loop keeps running;
+* a machine.WDT that EXISTS but fails to construct does NOT degrade: the
+  construction failure escapes start() to main.py's recovery boundary —
+  the probe is attribute presence only;
 * before start() the watchdog is neither armed nor fed.
 """
 
@@ -125,6 +128,29 @@ class BareMachine:
 
     def unique_id(self):
         return b"\x00\x01\x02\x03\x04\x05\x06\x07"
+
+
+class FailingWdtMachine:
+    """machine stand-in whose WDT exists but fails to construct: a
+    capability the RP2 port is expected to provide, present but unusable
+    (a regression, an invalid runtime, a hardware refusal). The failure
+    type is configurable per test; the contract is that it is a real
+    failure — no broad catch — and escapes start(), never a silent
+    degradation."""
+
+    def __init__(self, failure):
+        self.reset_calls = 0
+        self._failure = failure
+
+    def reset(self):
+        self.reset_calls += 1
+        raise _MachineReset()
+
+    def unique_id(self):
+        return b"\x00\x01\x02\x03\x04\x05\x06\x07"
+
+    def WDT(self, timeout=0):
+        raise self._failure
 
 
 class FakeLed:
@@ -370,6 +396,40 @@ def test_watchdog_degrades_when_machine_lacks_wdt(monkeypatch):
     with pytest.raises(LoopStop):
         instance.run()
     assert machine.reset_calls == 0
+
+
+def test_wdt_construction_failure_escapes(monkeypatch):
+    """A machine.WDT that exists but fails to construct is NOT degraded
+    away: the probe is attribute presence only, and a construction
+    failure (a runtime or regression on a target that is expected to
+    provide the capability) escapes start() to main.py's controlled-reset
+    boundary — the old broad catch would have swallowed it and left Core
+    0 running without its primary supervision while everything reported
+    healthy."""
+    _FAKE_TIME.now_ms = 0
+    _FAKE_TIME.stop_after_ms = None
+    machine = FailingWdtMachine(OSError("watchdog construction failed"))
+    _install_mocks(machine, monkeypatch)
+    instance, _core0_mod = _build_core0(machine)
+
+    with pytest.raises(OSError):
+        instance.start()
+    assert instance._wdt is None
+
+
+def test_wdt_construction_memory_error_escapes(monkeypatch):
+    """The MemoryError leg of the same contract: a heap failure arming
+    the watchdog re-raises through start() to the recovery boundary,
+    which performs no allocation — it is never a degraded boot."""
+    _FAKE_TIME.now_ms = 0
+    _FAKE_TIME.stop_after_ms = None
+    machine = FailingWdtMachine(MemoryError())
+    _install_mocks(machine, monkeypatch)
+    instance, _core0_mod = _build_core0(machine)
+
+    with pytest.raises(MemoryError):
+        instance.start()
+    assert instance._wdt is None
 
 
 def test_no_arming_or_feeding_before_start(env):

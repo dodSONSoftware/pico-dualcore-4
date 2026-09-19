@@ -1189,17 +1189,23 @@ class Core0:
         from here on, a Core 0 that stops making progress resets within
         WDT_TIMEOUT_MS instead of idling until a power cycle.
 
-        Arming is the one intentional capability probe (the Wi-Fi PM_NONE
-        precedent): a build without machine.WDT degrades to a warning
-        instead of a deterministic reset loop — making absence fatal would
-        reboot into the same missing attribute forever."""
-        try:
-            self._wdt = machine.WDT(timeout=WDT_TIMEOUT_MS)
-        except MemoryError:
-            raise
-        except Exception as err:
+        The getattr is the one intentional capability probe (the Wi-Fi
+        PM_NONE precedent): a build without machine.WDT degrades to a
+        warning instead of a deterministic reset loop — making absence
+        fatal would reboot into the same missing attribute forever. The
+        probe checks the attribute only; on the supported RP2 builds the
+        capability exists, so a construction failure is NOT a capability
+        condition — a runtime or regression that makes machine.WDT raise
+        is a real failure of a feature the board is expected to provide,
+        and escaping it (like a feed() failure) to main.py's recovery
+        boundary is preferred to silently dropping Core 0's primary
+        supervision while everything reports healthy."""
+        wdt_type = getattr(machine, "WDT", None)
+        if wdt_type is None:
             self._wdt = None
-            print("[WARNING] Hardware watchdog unavailable; Core 0 runs without hardware supervision: {}".format(err))
+            print("[WARNING] Hardware watchdog unavailable (this build has no machine.WDT); Core 0 runs without hardware supervision")
+            return
+        self._wdt = wdt_type(timeout=WDT_TIMEOUT_MS)
 
     def _service_wait(self):
         """Core 0 servicing hook for each 100 ms slice of long network waits:
