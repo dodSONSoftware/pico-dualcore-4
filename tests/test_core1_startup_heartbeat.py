@@ -294,7 +294,9 @@ def test_device_manager_refreshes_between_attempts():
             self.calls += 1
             self.observed.append(len(refresh_log))
             if self.calls < 3:
-                raise RuntimeError("simulated transient init failure")
+                # OSError: the operational failure domain the retry machinery
+                # treats as a sensor condition (a contract error would escape).
+                raise OSError("simulated transient init failure")
 
     dm = _host_time_device_manager()
     driver = FlakyDriver()
@@ -339,7 +341,9 @@ def test_device_manager_reinitialization_refreshes_between_attempts():
             self.calls += 1
             self.observed.append(len(refresh_log))
             if self.calls < 3:
-                raise RuntimeError("simulated transient init failure")
+                # OSError: the operational failure domain the retry machinery
+                # treats as a sensor condition (a contract error would escape).
+                raise OSError("simulated transient init failure")
 
     class RecordingTime(_HostTimeShim):
         """Records the refresh count at each retry sleep."""
@@ -407,7 +411,9 @@ def test_device_manager_retry_sleep_refreshes_in_steps():
         def initialize(self, config):
             self.calls += 1
             if self.calls < 2:
-                raise RuntimeError("simulated transient init failure")
+                # OSError: the operational failure domain the retry machinery
+                # treats as a sensor condition (a contract error would escape).
+                raise OSError("simulated transient init failure")
 
     class StepTime(_HostTimeShim):
         """Records each sleep step and the refresh count at that moment."""

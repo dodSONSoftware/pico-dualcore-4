@@ -59,7 +59,9 @@ class FlipDriver:
         if self.raise_memory_error:
             raise MemoryError("simulated heap exhaustion")
         if self.initialize_calls <= self.fail_times:
-            raise RuntimeError("simulated initialization failure")
+            # OSError: the operational failure domain the retry machinery
+            # treats as a sensor condition (a contract error would escape).
+            raise OSError("simulated initialization failure")
 
     def read(self):
         return {"value": 1}
@@ -162,7 +164,7 @@ def test_late_retry_construction_failure_keeps_attempt_count(unit):
     dm.initialize_devices()
 
     def _failing_create(device_def, i2c_bus_factory=None):
-        raise RuntimeError("simulated construction failure")
+        raise OSError("simulated construction failure")
 
     dm_mod.create_device = _failing_create
 
@@ -351,7 +353,9 @@ class FlakyDriver:
             self.healthy_after_call is None
             or len(self.initialize_ticks) < self.healthy_after_call
         ):
-            raise RuntimeError("simulated initialization failure")
+            # OSError: the operational failure domain the retry machinery
+            # treats as a sensor condition (a contract error would escape).
+            raise OSError("simulated initialization failure")
 
     def read(self):
         return {"probe": 1}

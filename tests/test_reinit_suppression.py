@@ -116,7 +116,9 @@ class FakeDriver:
     def initialize(self, config):
         self.initialize_calls += 1
         if self.initialize_should_fail:
-            raise RuntimeError("simulated initialization failure")
+            # OSError: the operational failure domain the reinit machinery
+            # retries (a contract error would escape the manager).
+            raise OSError("simulated initialization failure")
 
     def read(self):
         return {"value": 1}

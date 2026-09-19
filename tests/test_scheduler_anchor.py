@@ -541,8 +541,18 @@ def test_startup_log_admission_failure_blocks_normal_runtime():
     try:
         _install_fakes(fake_time)
         core1 = _reload_core1_under_fakes()
-        with pytest.raises(RuntimeError):
-            core1.core1_main(bus, _core1_config(), boot_ticks_ms, "test-runtime")
+        # Bind the probe driver explicitly, like _run_core1: an unsupported
+        # device type is a programming error that escapes initialize_devices
+        # (the manager's recovery domain is OSError only), so the harness
+        # must supply the fake it drives.
+        dm_mod = sys.modules["device_manager"]
+        saved_create_device = dm_mod.create_device
+        dm_mod.create_device = lambda device_def, i2c_bus_factory=None: ProbeDriver()
+        try:
+            with pytest.raises(RuntimeError):
+                core1.core1_main(bus, _core1_config(), boot_ticks_ms, "test-runtime")
+        finally:
+            dm_mod.create_device = saved_create_device
     finally:
         _restore()
         gc.mem_free = saved_mem_free

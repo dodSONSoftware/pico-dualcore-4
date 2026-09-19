@@ -97,7 +97,23 @@ class ManagedDevice:
 
 
 class DeviceManager:
-    """Manages device lifecycle for Core 1."""
+    """Manages device lifecycle for Core 1.
+
+    Operational failure domain: only ``OSError`` is a recoverable device
+    failure. Every driver normalizes its hardware/I2C failures to it (a bus
+    drop, a sensor timeout, a missing chip), so each recovery path -- driver
+    construction, boot initialization, the normal read, the runtime
+    reinitialization, and the boot-failure late-retry pass -- catches
+    ``OSError`` beside the ``MemoryError`` re-raise. Anything else is a
+    firmware defect that reinitializing cannot repair: a ``TypeError``
+    contract violation (including the manager's own check of a ``read()``
+    return), a ``ValueError`` from a driver that reached its validator
+    despite the config-boundary validation or from the I2C bus factory's
+    same-bus conflict, a ``RuntimeError``/``ArithmeticError`` state defect.
+    Those escape to Core 1's worker boundary, where the dead worker is
+    recovered by Core 0's heartbeat watchdog, instead of the fault being
+    reclassified as a failed sensor and retried indefinitely into itself.
+    """
 
     def __init__(self, config, activity_refresh=None, uptime_state=None, i2c_bus_factory=None):
         self._active_devices = []
@@ -183,7 +199,11 @@ class DeviceManager:
             return driver, None
         except MemoryError:
             raise
-        except Exception as err:
+        # Operational failure domain: OSError only. A factory ValueError
+        # (unsupported type, the I2C bus same-bus conflict) or TypeError is
+        # a configuration/programming error -- recording it as a failed
+        # device would hide it behind the retry machinery.
+        except OSError as err:
             return None, err
 
     def _initialize_driver_with_retries(self, driver, device_def):
@@ -203,7 +223,10 @@ class DeviceManager:
                 return attempts_used, True, None
             except MemoryError:
                 raise
-            except Exception as err:
+            # OSError (hardware/I2C) only: a validator ValueError or driver
+            # state defect is deterministic -- the retry budget must not be
+            # burned re-hitting the same fault.
+            except OSError as err:
                 last_error = str(err)
                 if attempt < self._device_initialization_attempts:
                     self._sleep_with_activity_refresh(self._device_initialization_retry_delay_ms)
@@ -321,7 +344,11 @@ class DeviceManager:
             }
         except MemoryError:
             raise
-        except Exception as err:
+        # OSError (hardware/I2C) only: a read failure is a sensor condition,
+        # so the driver's I2C errors are retried toward reinitialization.
+        # The manager's own contract TypeError above and any driver defect
+        # escape instead of counting as sensor failures.
+        except OSError as err:
             managed_device.record_read_failure()
 
             if managed_device.consecutive_read_failures >= self._device_read_failure_threshold:
@@ -370,7 +397,10 @@ class DeviceManager:
                 }
             except MemoryError:
                 raise
-            except Exception as err:
+            # OSError (hardware/I2C) only, the same domain as the boot path:
+            # a deterministic contract defect must not consume the reinit
+            # attempts.
+            except OSError as err:
                 last_error = str(err)
                 if attempt < self._device_initialization_attempts:
                     self._sleep_with_activity_refresh(self._device_initialization_retry_delay_ms)
@@ -438,7 +468,11 @@ class DeviceManager:
                 driver.initialize(device_def["config"])
             except MemoryError:
                 raise
-            except Exception as err:
+            # OSError (hardware/I2C) only: a deterministic contract defect
+            # escapes to the recovery boundary instead of being re-probed
+            # on every pass. Construction errors (e.g. the I2C bus same-bus
+            # conflict) escape from _create_driver above, never recorded.
+            except OSError as err:
                 failed_info["initialization_attempts_used"] += 1
                 failed_info["failure_reason"] = str(err)
                 results.append(

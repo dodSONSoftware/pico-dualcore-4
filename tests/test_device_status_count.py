@@ -10,6 +10,7 @@ A device that has accumulated enough read failures is marked reinitialize_pendin
 
 import pathlib
 import sys
+import time as _real_time
 import types
 
 import pytest
@@ -26,6 +27,45 @@ if "machine" not in sys.modules:
 import device_manager as dm  # noqa: E402
 
 
+class _HostTime:
+    """Host time shim for the read path: CPython's time has no
+    ticks_ms/sleep_ms, and the read path records timestamps through
+    device_manager.time. Bind explicitly (the suite's convention): the
+    manager's recovery domain is OSError only, so a host-side AttributeError
+    from the bare CPython time module must not be classifiable as a read
+    failure -- the failure the tests simulate must be the driver's own."""
+
+    def __init__(self):
+        self.now_ms = 0
+
+    def ticks_ms(self):
+        return self.now_ms
+
+    def ticks_diff(self, now, prev):
+        return now - prev
+
+    def ticks_add(self, base, delta):
+        return base + delta
+
+    def sleep_ms(self, ms):
+        self.now_ms += ms
+
+    def __getattr__(self, name):
+        return getattr(_real_time, name)
+
+
+@pytest.fixture(autouse=True)
+def _host_clock():
+    """Bind the host time shim for the test and restore the prior binding
+    on exit: earlier test modules leave different time bindings on the
+    shared (reloaded) module object, and the read-path tests need
+    ticks_ms regardless of which module ran last."""
+    saved = dm.time
+    dm.time = _HostTime()
+    yield
+    dm.time = saved
+
+
 class FailingDriver:
     """Driver whose read() always fails (initialize succeeds)."""
 
@@ -33,7 +73,8 @@ class FailingDriver:
         pass
 
     def read(self):
-        raise RuntimeError("simulated read failure")
+        # OSError: the operational (hardware) failure domain the manager retries.
+        raise OSError("simulated read failure")
 
 
 def _make_manager(read_failure_threshold=3):
@@ -96,7 +137,7 @@ class FailingInitDriver:
     """Driver whose initialize() always fails."""
 
     def initialize(self, config):
-        raise RuntimeError("simulated initialization failure")
+        raise OSError("simulated initialization failure")
 
 
 class OkDriver:
@@ -143,7 +184,7 @@ def test_driver_construction_failure_records_zero_attempts():
     the record previously hardcoded (it flows verbatim into the snapshot's
     device_status section and the startup log's failed_devices)."""
     def _explode(device_def, i2c_bus_factory=None):
-        raise RuntimeError("simulated driver construction failure")
+        raise OSError("simulated driver construction failure")
 
     saved = dm.create_device
     dm.create_device = _explode
