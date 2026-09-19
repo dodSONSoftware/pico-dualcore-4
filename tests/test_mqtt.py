@@ -1316,9 +1316,32 @@ def test_subscribe_suback_short_length_does_not_consume_next_packet():
     assert b"\xd0\x00" in bytes(sock.buffer)
 
 
+def test_subscribe_rejects_qos2_grant_above_requested_qos1():
+    """The subscription requests QoS 1, so MQTT 3.1.1 bounds the grant at
+    the request: a QoS 2 grant (0x02) is impossible for this client and a
+    protocol violation, not a grant — and the client's code does not support
+    QoS 2 delivery, so accepting it would move the failure farther from its
+    cause. Before the check this returned success."""
+    client = MQTTClient("pico_test", "broker", keepalive=30)
+    client.set_callback(lambda topic, msg: None)
+
+    # Correct length, correct pid, but return code 0x02: before the check
+    # this returned success.
+    sock = MockSocket(incoming=b"\x90\x03\x00\x01\x02")
+    client.sock = sock
+
+    with pytest.raises(MQTTException):
+        client.subscribe(b"t")
+
+    # A corrupt frame, not a granted one: the socket is closed so Core 0's
+    # recovery path reconnects instead of trusting the impossible grant.
+    assert sock.closed
+
+
 def test_subscribe_rejects_reserved_suback_return_code():
-    """Only 0x00-0x02 (granted QoS) and 0x80 (failure) are valid SUBACK
-    return codes; a reserved code is a protocol violation, not a grant."""
+    """Only 0x00/0x01 (grants at or below the requested QoS 1) and 0x80
+    (failure) are valid SUBACK return codes; any other code is a protocol
+    violation, not a grant."""
     client = MQTTClient("pico_test", "broker", keepalive=30)
     client.set_callback(lambda topic, msg: None)
 

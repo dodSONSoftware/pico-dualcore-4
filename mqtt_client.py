@@ -292,10 +292,14 @@ class MQTTClient:
                     raise MQTTException("Invalid SUBACK packet identifier")
                 if resp[2] == 0x80:
                     raise MQTTException(resp[2])
-                if resp[2] not in (0x00, 0x01, 0x02):
-                    # Only granted-QoS codes 0x00-0x02 and 0x80 (failure) are
-                    # valid; a reserved code is a protocol violation, not a
-                    # grant.
+                if resp[2] not in (0x00, 0x01):
+                    # This client's subscription requests QoS 1, so MQTT
+                    # 3.1.1 bounds the grant at the request: 0x00 or 0x01.
+                    # 0x02 exceeds the request (an impossible grant — and
+                    # this client's code does not support QoS 2 delivery),
+                    # and a reserved code is not a grant either; both are
+                    # protocol violations, not a grant. 0x80 (failure) is
+                    # handled above.
                     self._abort_corrupt_inbound("Invalid SUBACK return code")
                 return
 
