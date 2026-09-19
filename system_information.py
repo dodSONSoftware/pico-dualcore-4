@@ -35,10 +35,11 @@ SYSTEM_INFORMATION_SECTIONS = (
 # value, not PWRON_RESET as 0.4.105 assumed — so "wdt" means "a reset via
 # machine.reset() or a hardware-watchdog expiry", and the two are
 # indistinguishable from this field alone. A commanded reboot is
-# recognized by the {"rebooting": true} acknowledgement Core 0 publishes
-# immediately before the reset; a "wdt" boot with no such preceding
-# acknowledgement is a genuine watchdog reset (the main.py recovery-
-# boundary reset publishes none, so it reads the same as one).
+# positively identified by the {"rebooting": true} acknowledgement Core 0
+# publishes immediately before the reset; a "wdt" boot with no such
+# preceding acknowledgement is unclassified within that WDT/software-reset
+# family — a hardware-watchdog expiry or an unacknowledged commanded reset
+# (the main.py recovery boundary publishes none).
 _RESET_CAUSE_LABELS = (
     ("WDT_RESET", "wdt"),
     ("PWRON_RESET", "poweron"),
@@ -68,11 +69,13 @@ class SystemInformation:
         "unknown" — the v1.28 rp2 port reports no finer cause. Field-
         verified on the flashed build: a machine.reset() reboot reports
         "wdt", not "poweron" — so "wdt" covers both a deliberate
-        machine.reset() and a hardware-watchdog expiry, and a "wdt" boot
-        is a genuine watchdog reset only when no {"rebooting": true}
-        acknowledgement (published immediately before a commanded reboot)
-        precedes it; the main.py recovery-boundary reset publishes none
-        and reads the same as a watchdog fire (a known, accepted limit)."""
+        machine.reset() and a hardware-watchdog expiry. A commanded
+        reboot is positively identified by the {"rebooting": true}
+        acknowledgement Core 0 publishes immediately before it; a "wdt"
+        boot with no such preceding acknowledgement is unclassified
+        within that WDT/software-reset family — a hardware-watchdog
+        expiry or an unacknowledged commanded reset (the main.py
+        recovery boundary publishes none), not a confirmed watchdog fire."""
         if self._reset_cause is None:
             try:
                 cause = machine.reset_cause()

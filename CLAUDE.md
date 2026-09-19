@@ -157,7 +157,7 @@ Check for:
 
 ### Connection Problems
 
-- At boot, a one-time `system_startup_completed` startup event log is published to `mqtt_topic_log` (it carries `reset_cause`, how this boot began — field-verified on the flashed build, a commanded `machine.reset()` reboot reports `wdt`, so `wdt` covers a deliberate reset or a hardware-watchdog expiry; a `wdt` boot with no preceding `rebooting: true` acknowledgement is a genuine watchdog reset — the recovery-boundary reset publishes none, so it reads the same as one)
+- At boot, a one-time `system_startup_completed` startup event log is published to `mqtt_topic_log` (it carries `reset_cause`, how this boot began — field-verified on the flashed build, a commanded `machine.reset()` reboot reports `wdt`, so `wdt` covers a deliberate reset or a hardware-watchdog expiry; a `wdt` boot with a preceding `rebooting: true` acknowledgement was a commanded reboot, while a `wdt` boot with no such acknowledgement is unclassified within that WDT/software-reset family — a watchdog expiry or an unacknowledged commanded reset, the recovery-boundary reset publishing none)
 - LED flashes 50ms on/50ms off until the startup contract is verified
 - Check Wi-Fi retry delays in config
 - Core 0 sends PINGREQ when idle for `keepalive / 2`; a blackholed link (TCP up, no PINGRESP/PUBACK) surfaces as a failed ping or publish
