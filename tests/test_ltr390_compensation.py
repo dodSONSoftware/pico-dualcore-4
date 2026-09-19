@@ -177,20 +177,20 @@ def test_lux_is_zero_at_zero_raw():
 
 
 def test_uvi_at_the_reference_operating_point():
-    # x18 / 20-bit: 2300 counts per UVI directly.
-    assert _sensor(gain=18, resolution_bits=20)._calculate_uvi(2300) == pytest.approx(1.0)
+    # x18 / 20-bit: 1400 counts per UVI directly (current datasheet revision).
+    assert _sensor(gain=18, resolution_bits=20)._calculate_uvi(1400) == pytest.approx(1.0)
 
 
 def test_uvi_scales_at_lower_gain_and_resolution():
-    # Doc section 53: x18 / 18-bit (INT 1.0) -> 2300 * (18/18) * (1/4) = 575.
-    assert _sensor(gain=18, resolution_bits=18)._calculate_uvi(575) == pytest.approx(1.0)
-    # Doc section 54: x3 / 18-bit -> 2300 * (3/18) * (1/4) = 2300/24 counts/UVI,
-    # so 2300 raw counts is 24 UVI exactly.
-    assert _sensor(gain=3, resolution_bits=18)._calculate_uvi(2300) == pytest.approx(24.0)
+    # x18 / 18-bit (INT 1.0) -> 1400 * (18/18) * (1/4) = 350.
+    assert _sensor(gain=18, resolution_bits=18)._calculate_uvi(350) == pytest.approx(1.0)
+    # x3 / 18-bit -> 1400 * (3/18) * (1/4) = 1400/24 counts/UVI,
+    # so 1400 raw counts is 24 UVI exactly.
+    assert _sensor(gain=3, resolution_bits=18)._calculate_uvi(1400) == pytest.approx(24.0)
 
 
 def test_uvi_applies_the_window_factor():
-    assert _sensor(gain=18, resolution_bits=20, window_factor=2.0)._calculate_uvi(2300) == pytest.approx(2.0)
+    assert _sensor(gain=18, resolution_bits=20, window_factor=2.0)._calculate_uvi(1400) == pytest.approx(2.0)
 
 
 def test_uvi_is_zero_at_zero_raw():

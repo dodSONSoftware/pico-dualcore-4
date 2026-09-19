@@ -35,7 +35,7 @@ from devices.ltr390.ltr390_device import LTR390Device  # noqa: E402
 # --- Canned samples ---------------------------------------------------------
 
 ALS_RAW = 10000    # default x3 / 18-bit -> 2000.0 lux exactly
-UV_RAW = 2300      # default x3 / 18-bit -> 2300 / (2300/24) = 24.0 UVI
+UV_RAW = 1400      # default x3 / 18-bit -> 1400 / (1400/24) = 24.0 UVI
 
 
 def _pack_raw20(value):
@@ -347,8 +347,8 @@ def test_read_applies_the_window_factor_to_converted_channels_only(fake_time):
 
 def test_read_with_a_uv_sensitive_profile(fake_time):
     """End-to-end at x18 / 20-bit (the UVI reference operating point):
-    0.6 * raw / (18 * 4) lux and 2300 raw = 1.0 UVI exactly."""
-    i2c = FakeLTR390I2C(als_raw=12000, uv_raw=2300, conversion_delay_ms=400)
+    0.6 * raw / (18 * 4) lux and 1400 raw = 1.0 UVI exactly."""
+    i2c = FakeLTR390I2C(als_raw=12000, uv_raw=1400, conversion_delay_ms=400)
     device = _initialized_device(
         {
             "i2c_bus": 0,
@@ -362,7 +362,7 @@ def test_read_with_a_uv_sensitive_profile(fake_time):
     assert result["lux"] == pytest.approx(100.0)
     assert result["uv_index"] == pytest.approx(1.0)
     assert result["als_raw"] == 12000
-    assert result["uv_raw"] == 2300
+    assert result["uv_raw"] == 1400
 
 
 # --- Reinitialization -------------------------------------------------------

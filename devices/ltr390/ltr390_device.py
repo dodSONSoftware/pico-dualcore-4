@@ -84,7 +84,12 @@ _READY_GUARD_MS = const(50)
 _READY_POLL_MS = const(5)
 
 _LUX_SCALE = 0.6
-_UVI_REFERENCE_COUNTS = 2300.0   # counts per UVI at the reference operating point
+# The current datasheet revision (DS86-2015-0004, Rev B, effective 2023-03-24)
+# specifies UV sensitivity 1400 counts/UVI (typ.) at gain 18x / 20-bit, no
+# window; the 2016 original revision specified 2300 under the same conditions.
+# The current production characteristic governs modules shipping today, so the
+# reference follows the current revision (the scaling math below is unchanged).
+_UVI_REFERENCE_COUNTS = 1400.0   # counts per UVI at the reference operating point
 _UVI_REFERENCE_GAIN = 18.0       # gain x18 / 20-bit (integration 4.0)
 _UVI_REFERENCE_INTEGRATION = 4.0
 
@@ -239,9 +244,9 @@ class LTR390:
 
     def _calculate_uvi(self, raw):
         """UV counts to an *estimated* UV Index (not an official meteorological
-        one): the ~2300 counts/UVI reference holds at x18 / 20-bit; any other
-        operating point scales by its gain and integration ratios to that
-        reference."""
+        one): the ~1400 counts/UVI reference (current datasheet revision)
+        holds at x18 / 20-bit; any other operating point scales by its gain
+        and integration ratios to that reference."""
         counts_per_uvi = (
             _UVI_REFERENCE_COUNTS
             * (self._gain_factor / _UVI_REFERENCE_GAIN)
