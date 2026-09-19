@@ -521,7 +521,16 @@ class InterCoreEventQueue:
 
 
 class StateMailboxes:
-    """Latest-value immutable snapshots shared between cores; state replaces rather than queues."""
+    """Latest-value immutable snapshots shared between cores; state replaces rather than queues.
+
+    Zero-copy by design: the lock makes publication/retrieval atomic, but the
+    snapshot's immutability is a producer contract, not a mechanism -- each
+    producer builds a fresh snapshot object before every set_*() and never
+    mutates one once published (getters return the live reference, so a
+    post-publication mutation would be visible across the core boundary). A
+    defensive copy per transfer is deliberately avoided: on the Pico W it
+    would add exactly the allocation and heap fragmentation this
+    architecture exists to avoid."""
 
     def __init__(self):
         self._lock = _thread.allocate_lock()

@@ -1699,6 +1699,27 @@ def test_state_mailboxes_set_get_utc():
     assert boxes.get_utc_snapshot() is snapshot
 
 
+def test_state_mailboxes_publish_is_zero_copy():
+    """The mailbox pins its zero-copy contract: set_*() publishes the
+    producer's object as-is and get_*() returns that same reference -- no
+    defensive copy (a copy on every transfer would add exactly the
+    allocation and heap fragmentation the embedded design avoids, so a
+    future copy-on-write "safety improvement" must fail this test). The
+    snapshot's immutability is therefore a producer contract: each producer
+    builds a fresh snapshot per set_*() and never mutates one once
+    published; a post-publication mutation would be visible across the core
+    boundary through the live reference."""
+    boxes = StateMailboxes()
+    for setter, getter in (
+        (boxes.set_network_snapshot, boxes.get_network_snapshot),
+        (boxes.set_utc_snapshot, boxes.get_utc_snapshot),
+        (boxes.set_hardware, boxes.get_hardware),
+    ):
+        snapshot = {"v": 1}
+        setter(snapshot)
+        assert getter() is snapshot
+
+
 def test_state_mailboxes_replacement_semantics():
     boxes = StateMailboxes()
     first = {"v": 1}

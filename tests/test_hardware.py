@@ -301,6 +301,31 @@ class TestGetMachineConsumesSharedClassifier:
 
         assert result["firmware_name"] == FIRMWARE_NAME
 
+    def test_get_machine_builds_a_fresh_object_per_call(self, monkeypatch):
+        """Producer contract for the hardware mailbox: get_machine() returns
+        a fresh dict per call and never mutates a published one. The state
+        mailbox is zero-copy (getters return the live reference), so the
+        snapshot's immutability is the producer's contract, not a mailbox
+        mechanism."""
+        import system_information
+
+        monkeypatch.setattr(
+            system_information.os,
+            "uname",
+            lambda: type("Uname", (), {
+                "machine": "Raspberry Pi Pico W with RP2040",
+                "version": "v1.23.0",
+            })(),
+        )
+
+        system_information_instance = self._system_information()
+        first = system_information_instance.get_machine()
+        first["machine"] = "mutated"
+
+        second = system_information_instance.get_machine()
+        assert second is not first
+        assert second["machine"] == "Raspberry Pi Pico W with RP2040"
+
 
 class TestGetResetCause:
     """get_reset_cause() maps machine.reset_cause() to a stable short label

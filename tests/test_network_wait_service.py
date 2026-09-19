@@ -514,3 +514,19 @@ def test_wifi_snapshot_ifconfig_taxonomy(monkeypatch):
     wifi = _wifi_wlan(monkeypatch, associated=True, ifconfig_error=TypeError("bad ifconfig"))
     with pytest.raises(TypeError):
         wifi.snapshot(False)
+
+
+def test_wifi_snapshot_builds_a_fresh_object_per_call(monkeypatch):
+    """Producer contract for the network-snapshot mailbox: Wifi.snapshot()
+    builds a fresh dict per call and never mutates a published one. The
+    state mailbox is zero-copy (getters return the live reference), so the
+    snapshot's immutability is the producer's contract, not a mailbox
+    mechanism."""
+    wifi = _wifi_wlan(monkeypatch, associated=True)
+
+    first = wifi.snapshot(True)
+    first["ip_address"] = "mutated"
+
+    second = wifi.snapshot(True)
+    assert second is not first
+    assert second["ip_address"] == "192.168.1.100"
