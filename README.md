@@ -2,10 +2,10 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.131.
+**Release:** Bronze Owl — firmware 0.4.132.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
-[![MicroPython](https://img.shields.io/badge/MicroPython-1.20+-00897B?logo=micropython&logoColor=white)](https://micropython.org)
+[![MicroPython](https://img.shields.io/badge/MicroPython-v1.28.0-00897B?logo=micropython&logoColor=white)](https://micropython.org)
 [![Raspberry Pi Pico W](https://img.shields.io/badge/Hardware-Pico%20W-blue.svg)](https://www.raspberrypi.com/products/raspberry-pi-pico/)
 [![Raspberry Pi Pico 2 W](https://img.shields.io/badge/Hardware-Pico%202%20W-blue.svg)](https://www.raspberrypi.com/products/rp2040/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -52,7 +52,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for detailed architecture documentation
 ### Prerequisites
 
 - Raspberry Pi Pico W or Pico 2 W
-- MicroPython 1.20+ firmware
+- MicroPython v1.28.0 firmware (the exact build both deployment scripts flash — `RPI_PICO_W` / `RPI_PICO2_W` v1.28.0)
 - VS Code with Pico extension or `mpremote` for deployment
 
 ### Configuration
