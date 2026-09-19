@@ -40,6 +40,7 @@ REQUIRED_FILES = {
 REQUIRED_PACKAGES = {
     "devices/__init__.py",
     "devices/device.py",
+    "devices/rp2_i2c.py",
     "devices/bme280/__init__.py",
     "devices/bme280/validation.py",
     "devices/bme280/bme280_device.py",

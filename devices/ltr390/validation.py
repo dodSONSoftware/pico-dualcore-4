@@ -14,6 +14,7 @@ sensor is an operational failure at ``initialize()``, not a schema choice.
 """
 
 from devices.device import DeviceValidationError
+from devices.rp2_i2c import validate_rp2_i2c_pins
 
 # The complete set of keys a ltr390 device config may contain. Anything beyond
 # this is unknown and reported as a qualified path.
@@ -59,7 +60,6 @@ _CONVERSION_TIME_MS = {
 }
 
 _MAX_I2C_BUS = 1
-_MAX_GPIO = 29
 DEFAULT_I2C_FREQ_HZ = 400000   # I2C fast mode; shared with the bus factory
 _MIN_FREQ_HZ = 100000
 _MAX_FREQ_HZ = 1000000
@@ -120,22 +120,13 @@ def validate_config(config):
             code="invalid_value",
         )
 
-    # i2c_sda_pin / i2c_scl_pin: optional explicit pins; must be distinct GPIOs.
-    sda = config.get("i2c_sda_pin")
-    scl = config.get("i2c_scl_pin")
-    for key, value in (("i2c_sda_pin", sda), ("i2c_scl_pin", scl)):
-        if value is None:
-            continue
-        if not _is_int(value) or not 0 <= value <= _MAX_GPIO:
-            raise DeviceValidationError(
-                "{} must be an integer 0-{}".format(key, _MAX_GPIO),
-                code="invalid_value",
-            )
-    if sda is not None and sda == scl:
-        raise DeviceValidationError(
-            "i2c_sda_pin and i2c_scl_pin must be different pins",
-            code="invalid_value",
-        )
+    # i2c_sda_pin / i2c_scl_pin: optional explicit pins; the shared RP2 routing
+    # validator checks type, range, distinctness, and membership in the
+    # selected controller's SDA/SCL group (a pin the RP2 mux cannot route to
+    # this controller is a configuration error, not an operational one).
+    validate_rp2_i2c_pins(
+        bus, config.get("i2c_sda_pin"), config.get("i2c_scl_pin")
+    )
 
     # i2c_freq_hz: optional, a standard/fast/high-speed I2C clock.
     freq = config.get("i2c_freq_hz", DEFAULT_I2C_FREQ_HZ)

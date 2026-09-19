@@ -208,8 +208,8 @@ def test_validate_config_accepts_conflicting_settings_on_different_i2c_buses():
         _second_device(
             config,
             i2c_bus=1,
-            i2c_sda_pin=8,
-            i2c_scl_pin=9,
+            i2c_sda_pin=10,
+            i2c_scl_pin=11,
             i2c_freq_hz=100000,
         )
     )
@@ -441,9 +441,12 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
             "id": field_max[:15] + id_suffixes[index],
             "device_type": "bme280",
             "config": {
+                # Pins follow the bus: bus 0 -> GPIO 0/1, bus 1 -> GPIO 2/3.
+                # (A fixed 0/1 pair is only routable to I2C0, so the alternating
+                # buses need each controller's own SDA/SCL group.)
                 "i2c_bus": index % 2,
-                "i2c_sda_pin": 0,
-                "i2c_scl_pin": 1,
+                "i2c_sda_pin": (index % 2) * 2,
+                "i2c_scl_pin": (index % 2) * 2 + 1,
                 "i2c_freq_hz": 1000000,
                 "i2c_address_candidates": [118, 119],
                 "temperature_oversampling": 5,

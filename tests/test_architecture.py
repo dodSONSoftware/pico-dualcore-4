@@ -21,6 +21,7 @@ CORE1_FILES = (
     "device_factory.py",
     "system_information.py",
     "devices/device.py",
+    "devices/rp2_i2c.py",
 )
 
 

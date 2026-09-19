@@ -33,8 +33,8 @@ def _valid_config():
 def _full_config():
     return {
         "i2c_bus": 1,
-        "i2c_sda_pin": 4,
-        "i2c_scl_pin": 5,
+        "i2c_sda_pin": 6,
+        "i2c_scl_pin": 7,
         "i2c_freq_hz": 400000,
         "gain": 18,
         "resolution_bits": 20,
@@ -156,6 +156,17 @@ def test_accepts_distinct_i2c_pins():
     config["i2c_sda_pin"] = 4
     config["i2c_scl_pin"] = 5
     assert validate_config(config) is None
+
+
+def test_rejects_a_pin_that_cannot_route_to_the_selected_bus():
+    # 2 is I2C1's SDA pin, not I2C0's: routable and in-range, but the wrong
+    # controller -- a deterministic configuration error, not an operational
+    # device failure at machine.I2C(...) construction.
+    config = _valid_config()
+    config["i2c_sda_pin"] = 2
+    with pytest.raises(DeviceValidationError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
 
 
 # --- i2c_freq_hz -----------------------------------------------------------

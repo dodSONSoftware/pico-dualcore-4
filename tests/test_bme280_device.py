@@ -196,15 +196,15 @@ def test_create_device_returns_a_bme280_device_and_calls_the_factory():
     definition = _valid_definition(
         {
             "i2c_bus": 1,
-            "i2c_sda_pin": 4,
-            "i2c_scl_pin": 5,
+            "i2c_sda_pin": 6,
+            "i2c_scl_pin": 7,
             "i2c_freq_hz": 100000,
             "sea_level_pressure_pa": 101325,
         }
     )
     device = create_device(definition, i2c_bus_factory=factory)
     assert isinstance(device, BME280Device)
-    assert calls == [(1, 4, 5, 100000)]
+    assert calls == [(1, 6, 7, 100000)]
 
 
 def test_create_device_uses_bus_default_pins_and_freq_when_absent():
