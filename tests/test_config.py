@@ -35,6 +35,7 @@ from config import (
     validate_config,
 )
 from device_factory import MAX_DEVICE_ID_LENGTH, MAX_DEVICE_NAME_LENGTH
+from devices.bme280.validation import DEFAULT_I2C_FREQ_HZ
 from message_serializer import MAX_OUTBOUND_MESSAGE_BYTES, serialize_and_validate_message
 from mqtt_client import MAX_INBOUND_PACKET_BYTES
 from version import FIRMWARE_VERSION, MESSAGE_SCHEMA_VERSION
@@ -134,6 +135,85 @@ def test_duplicate_device_ids_fail_fast(tmp_path):
     config["devices"].append(copy.deepcopy(config["devices"][0]))
     with pytest.raises(ConfigError, match="Duplicate device id"):
         load_config(_write(tmp_path, config))
+
+
+# ---------------------------------------------------------------------------
+# Same-bus I2C conflict: on the RP2 port machine.I2C(bus) configures the
+# physical controller, so two devices on one bus must carry identical
+# effective (sda, scl, freq) settings; a conflict is a deterministic
+# configuration error rejected here, never a flaky-sensor runtime failure.
+# ---------------------------------------------------------------------------
+
+
+def _second_device(config, **config_changes):
+    device = copy.deepcopy(config["devices"][0])
+    device["id"] = "second-device"
+    for key, value in config_changes.items():
+        if value is None:
+            device["config"].pop(key, None)
+        else:
+            device["config"][key] = value
+    return device
+
+
+def test_validate_config_accepts_two_devices_sharing_one_i2c_bus_identically():
+    # The shipped configuration shape: two sensors on bus 0, same pins and
+    # (default) frequency, sharing one machine.I2C.
+    config = _base_config()
+    config["devices"].append(_second_device(config))
+    assert validate_config(config) is config
+
+
+def test_validate_config_rejects_conflicting_i2c_bus_pins_naming_both_devices():
+    config = _base_config()
+    config["devices"].append(_second_device(config, i2c_sda_pin=4))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    message = str(excinfo.value)
+    assert "Conflicting I2C configuration on i2c_bus 0" in message
+    assert "fixture-bme280-00000000000000000001" in message
+    assert "second-device" in message
+
+
+def test_validate_config_rejects_conflicting_i2c_bus_freq():
+    config = _base_config()
+    config["devices"].append(_second_device(config, i2c_freq_hz=100000))
+    with pytest.raises(ConfigError, match="Conflicting I2C configuration"):
+        validate_config(config)
+
+
+def test_validate_config_accepts_absent_and_explicit_default_i2c_freq_on_one_bus():
+    # The effective setting resolves the absent i2c_freq_hz to the type's
+    # default, so absent vs explicit-default is one setting, not a conflict.
+    config = _base_config()
+    config["devices"].append(
+        _second_device(config, i2c_freq_hz=DEFAULT_I2C_FREQ_HZ)
+    )
+    assert validate_config(config) is config
+
+
+def test_validate_config_rejects_absent_vs_nondefault_i2c_freq_on_one_bus():
+    config = _base_config()
+    config["devices"].append(_second_device(config, i2c_freq_hz=100000))
+    with pytest.raises(ConfigError, match="Conflicting I2C configuration"):
+        validate_config(config)
+
+
+def test_validate_config_accepts_conflicting_settings_on_different_i2c_buses():
+    # The rule is per physical controller: bus 1 may carry its own pins and
+    # clock even when they differ from bus 0's.
+    config = _base_config()
+    config["devices"].append(
+        _second_device(
+            config,
+            i2c_bus=1,
+            i2c_sda_pin=8,
+            i2c_scl_pin=9,
+            i2c_freq_hz=100000,
+        )
+    )
+    assert validate_config(config) is config
 
 
 # ---------------------------------------------------------------------------

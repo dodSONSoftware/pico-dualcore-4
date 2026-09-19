@@ -412,7 +412,15 @@ def test_change_summary_reports_devices_compact_and_sorted(config_dir):
     added = {
         "id": "aaAddedDevice",
         "device_type": "bme280",
-        "config": {"i2c_bus": 0, "sea_level_pressure_pa": 101325},
+        # Same explicit bus 0 pins as the fixture device: one bus is one
+        # physical controller, so a same-bus device must configure it
+        # identically (validate_config rejects a conflict).
+        "config": {
+            "i2c_bus": 0,
+            "i2c_sda_pin": 0,
+            "i2c_scl_pin": 1,
+            "sea_level_pressure_pa": 101325,
+        },
     }
     candidate["devices"] = [added, modified]  # original removed, both differ
 
@@ -459,7 +467,14 @@ def test_change_summary_order_only_device_change_is_one_bounded_entry(config_dir
     second = {
         "id": "secondDevice",
         "device_type": "bme280",
-        "config": {"i2c_bus": 0, "sea_level_pressure_pa": 101325},
+        # Same explicit bus 0 pins as the fixture device (see
+        # test_change_summary_reports_devices_compact_and_sorted).
+        "config": {
+            "i2c_bus": 0,
+            "i2c_sda_pin": 0,
+            "i2c_scl_pin": 1,
+            "sea_level_pressure_pa": 101325,
+        },
     }
     two_devices["devices"] = list(_base_config()["devices"]) + [second]
     manager.begin_write(two_devices)  # committed: two devices

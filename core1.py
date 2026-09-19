@@ -720,9 +720,19 @@ def _try_queue_health_message_intercore(intercore, uptime_state, config, system_
 
 def _build_i2c_bus_factory():
     """Core 1 owns its I2C buses (ARCHITECTURE ownership invariant). Returns a
-    factory that builds one machine.I2C per distinct (bus, sda, scl, freq) and
+    factory that builds one machine.I2C per physical controller (bus) and
     caches it, so two devices on the same bus share one object; sda/scl are
     None when a device config relies on the bus's default pins.
+
+    The cache is keyed on the bus, not (bus, sda, scl, freq): on the RP2 port
+    machine.I2C(bus) is the controller's own static object, and a second
+    construction reconfigures that controller's pins and clock. A same-bus
+    request with a different (sda, scl, freq) would silently reconfigure the
+    controller the first device already runs on (flaky reads that look like a
+    failing sensor rather than a configuration error) -- so it raises instead.
+    validate_config rejects such a conflict before any config reaches this
+    point; a raise here means that validation was bypassed, and the failure
+    stays a visible, deterministic device failure.
 
     The machine import is inside the closure (not here) so building the factory
     is side-effect-free: the bus -- and the machine import -- only happen when a
@@ -734,15 +744,25 @@ def _build_i2c_bus_factory():
     def create(bus, sda, scl, freq_hz):
         from machine import I2C, Pin
 
-        key = (bus, sda, scl, freq_hz)
-        if key not in cache:
-            kwargs = {"freq": freq_hz}
-            if sda is not None:
-                kwargs["sda"] = Pin(sda)
-            if scl is not None:
-                kwargs["scl"] = Pin(scl)
-            cache[key] = I2C(bus, **kwargs)
-        return cache[key]
+        cached = cache.get(bus)
+        if cached is not None:
+            cached_sda, cached_scl, cached_freq, i2c = cached
+            if (cached_sda, cached_scl, cached_freq) == (sda, scl, freq_hz):
+                return i2c
+            raise ValueError(
+                "I2C bus {} conflict: already configured as (sda, scl, freq) "
+                "({}, {}, {}), requested ({}, {}, {}); one bus is one physical "
+                "controller and cannot be reconfigured under a running device"
+                .format(bus, cached_sda, cached_scl, cached_freq, sda, scl, freq_hz)
+            )
+        kwargs = {"freq": freq_hz}
+        if sda is not None:
+            kwargs["sda"] = Pin(sda)
+        if scl is not None:
+            kwargs["scl"] = Pin(scl)
+        i2c = I2C(bus, **kwargs)
+        cache[bus] = (sda, scl, freq_hz, i2c)
+        return i2c
 
     return create
 

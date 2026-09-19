@@ -8,6 +8,7 @@ from command_protocol import MAX_SOURCE_LENGTH
 from device_factory import (
     DEVICE_DEFINITION_KEYS,
     allowed_config_keys,
+    i2c_bus_identity,
     validate_device_definition,
 )
 from devices.device import DeviceValidationError
@@ -367,6 +368,34 @@ def _validate_devices(devices):
             validate_device_definition(device)
         except DeviceValidationError as err:
             raise ConfigError(str(err), code=err.code) from err
+
+    # Same-bus conflicts span the whole list, like duplicate ids above: on the
+    # RP2 port machine.I2C(bus) configures the physical controller itself, so
+    # a second construction with a different pin or clock setting would
+    # silently reconfigure the controller the first device already runs on
+    # (flaky reads that look like a failing sensor rather than a configuration
+    # error). The effective settings must be identical within a bus; a
+    # conflicting write-config is rejected here instead of reaching hardware.
+    bus_owners = {}
+    for index, device in enumerate(devices):
+        identity = i2c_bus_identity(device)
+        if identity is None:
+            continue
+        bus, setting = identity[0], identity[1:]
+        device_id = device.get("id")
+        qualifier = device_id if isinstance(device_id, str) and device_id else str(index)
+        owner = bus_owners.get(bus)
+        if owner is None:
+            bus_owners[bus] = (qualifier, setting)
+        elif owner[1] != setting:
+            raise ConfigError(
+                "Conflicting I2C configuration on i2c_bus {}: devices '{}' "
+                "and '{}' must use identical i2c_sda_pin / i2c_scl_pin / "
+                "i2c_freq_hz (one bus is one physical controller, and a "
+                "second construction reconfigures it under the first device)"
+                .format(bus, owner[0], qualifier),
+                code="invalid_value",
+            )
 
 
 def validate_config(config):

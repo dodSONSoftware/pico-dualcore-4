@@ -136,13 +136,37 @@ def validate_device_definition(device_definition):
     validate_device_config(device_type, device_definition["config"])
 
 
+def i2c_bus_identity(device_definition):
+    """The effective (bus, sda, scl, freq) a device will hand Core 1's bus
+    factory, or None for a device without an I2C peripheral (no i2c_bus in
+    its config). sda/scl stay None when the config relies on the bus's
+    default pins (the port default is not config knowledge, so it is not
+    resolved here), and freq resolves to the type's DEFAULT_I2C_FREQ_HZ so
+    an absent key and an explicit default compare equal. Call only on a
+    definition that already passed validate_device_definition: a present
+    i2c_bus is then a valid bus, and the type's validation module (the
+    source of the default) already resolves."""
+    config = device_definition.get("config")
+    if not isinstance(config, dict) or "i2c_bus" not in config:
+        return None
+    return (
+        config["i2c_bus"],
+        config.get("i2c_sda_pin"),
+        config.get("i2c_scl_pin"),
+        config.get(
+            "i2c_freq_hz",
+            _validation_module(device_definition["device_type"]).DEFAULT_I2C_FREQ_HZ,
+        ),
+    )
+
+
 def create_device(device_definition, i2c_bus_factory=None):
     device_type = device_definition["device_type"]
 
     if device_type == "bme280":
         # The driver never owns the bus: Core 1 supplies a factory that builds
-        # (and dedupes) one machine.I2C per (bus, sda, scl, freq). sda/scl are
-        # None when the config relies on the bus's default pins. The bus is
+        # (and dedupes) one machine.I2C per physical controller (bus). sda/scl
+        # are None when the config relies on the bus's default pins. The bus is
         # created here (peripheral + pins only); the sensor protocol runs in
         # initialize(), wrapped by the retry/reinit machinery.
         if i2c_bus_factory is None:
@@ -167,9 +191,9 @@ def create_device(device_definition, i2c_bus_factory=None):
     if device_type == "ltr390":
         # Same bus ownership as bme280: the driver never creates the bus; Core 1
         # hands this point a factory that builds (and dedupes) one machine.I2C
-        # per (bus, sda, scl, freq), so two I2C devices on the same bus share
-        # one object. The sensor protocol runs in initialize(), wrapped by the
-        # retry/reinit machinery.
+        # per physical controller (bus), so two I2C devices on the same bus
+        # share one object. The sensor protocol runs in initialize(), wrapped by
+        # the retry/reinit machinery.
         if i2c_bus_factory is None:
             raise ValueError("ltr390 requires an i2c_bus_factory")
         cfg = device_definition["config"]
