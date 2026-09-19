@@ -62,7 +62,10 @@ _CONVERSION_TIME_MS = {
 _MAX_I2C_BUS = 1
 DEFAULT_I2C_FREQ_HZ = 400000   # I2C fast mode; shared with the bus factory
 _MIN_FREQ_HZ = 100000
-_MAX_FREQ_HZ = 1000000
+# The LTR390 specifies standard/fast-mode I2C (400 kbit/s maximum); 1 MHz is
+# outside its published interface spec, so the device cap is below the RP2
+# controller's own 1 MHz ceiling (the bme280 keeps that one).
+_MAX_FREQ_HZ = 400000
 _MIN_WINDOW_FACTOR = 1.0
 _MAX_WINDOW_FACTOR = 100.0
 DEFAULT_WINDOW_FACTOR = 1.0
@@ -128,7 +131,8 @@ def validate_config(config):
         bus, config.get("i2c_sda_pin"), config.get("i2c_scl_pin")
     )
 
-    # i2c_freq_hz: optional, a standard/fast/high-speed I2C clock.
+    # i2c_freq_hz: optional, a standard/fast-mode I2C clock (fast mode max --
+    # the LTR390 has no high-speed mode).
     freq = config.get("i2c_freq_hz", DEFAULT_I2C_FREQ_HZ)
     if not _is_int(freq) or not _MIN_FREQ_HZ <= freq <= _MAX_FREQ_HZ:
         raise DeviceValidationError(

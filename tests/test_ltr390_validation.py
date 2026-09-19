@@ -172,7 +172,7 @@ def test_rejects_a_pin_that_cannot_route_to_the_selected_bus():
 # --- i2c_freq_hz -----------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", [0, 99999, 1000001, "400000", True, 400000.0])
+@pytest.mark.parametrize("bad", [0, 99999, 400001, 1000000, 1000001, "400000", True, 400000.0])
 def test_rejects_an_out_of_range_i2c_freq(bad):
     config = _valid_config()
     config["i2c_freq_hz"] = bad
@@ -181,7 +181,9 @@ def test_rejects_an_out_of_range_i2c_freq(bad):
     assert excinfo.value.code == "invalid_value"
 
 
-@pytest.mark.parametrize("good", [100000, 400000, 1000000])
+# 400000 is the fast-mode cap the LTR390 specifies; 1 MHz is the RP2
+# controller ceiling the bme280 keeps, and out of spec for this sensor.
+@pytest.mark.parametrize("good", [100000, 400000])
 def test_accepts_a_standard_i2c_freq(good):
     config = _valid_config()
     config["i2c_freq_hz"] = good
