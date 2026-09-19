@@ -62,7 +62,7 @@ The queues are heap-governed; the outbound queue is additionally bounded by a de
 | `core0.py` | Network stack (Wi-Fi, MQTT, UTC, reboot, keepalive, recovery, Core 1 liveness watchdog, read-config/write-config command execution) |
 | `core1.py` | Device lifecycle, sensor reads, telemetry, health messages, liveness heartbeat |
 | `intercore.py` | Three-lane message bus (two heap-governed FIFOs and the latest-value state snapshots) |
-| `device_manager.py` | Device lifecycle management (init retries, read failures, reinit) |
+| `device_manager.py` | Device lifecycle management (init retries, read failures, reinit, boot-failure late recovery) |
 | `device_factory.py` | Device construction from config; the supported `device_type` registry (validation packages resolved by import at first use, never module-top); the pure whole-device validation entry point (`validate_device_definition`) |
 | `devices/bme280/bme280_device.py` | `bme280` device (first hardware/I2C sensor): `BME280` register-protocol + Bosch compensation class and the `BME280Device` `Device` adapter (offsets, derived `altitude_m`); the I2C bus itself is Core 1's, built by the lazy per-device factory in `core1.py` |
 | `devices/bme280/validation.py` | Pure `bme280` config validation (host-importable, no `machine`): per-device I2C bus keys, `i2c_address_candidates`, oversampling/filter bounds, cross-field channel rules |

@@ -17,6 +17,8 @@ DEVICE_RESULT_TELEMETRY = "telemetry"
 DEVICE_RESULT_READ_FAILED = "read_failed"
 DEVICE_RESULT_REINITIALIZED = "reinitialized"
 DEVICE_RESULT_REINITIALIZATION_FAILED = "reinitialization_failed"
+DEVICE_RESULT_BOOT_RECOVERED = "boot_recovered"
+DEVICE_RESULT_BOOT_RECOVERY_FAILED = "boot_recovery_failed"
 
 
 class ManagedDevice:
@@ -388,6 +390,100 @@ class DeviceManager:
             "consecutive_read_failures": managed_device.consecutive_read_failures,
             "total_read_failures": managed_device.total_read_failures,
             "reinitialization_attempts_used": attempts_used,
+            "log_failure_warning": log_failure_warning,
+        }
+
+    def has_failed_devices(self):
+        """Whether any boot-failed device remains: the steady-state retry
+        pass runs only while the set is non-empty, so the Core 1 loop's
+        gate is a single bool check once everything has recovered."""
+        return bool(self._failed_devices)
+
+    def retry_failed_devices(self):
+        """One steady-state retry pass over the boot-failed devices, in
+        configuration order: exactly one fresh initialize() attempt each.
+        The caller's slow interval is the retry policy, so the full
+        attempts x delay boot loop is deliberately NOT re-run here -- a
+        dead sensor must cost at most one bounded driver call, never hold
+        the read pass and every working sensor's telemetry. A recovered
+        device is promoted to a fresh READY ManagedDevice (cumulative
+        attempt count, zero read-failure state) and leaves the failure
+        record; a failed attempt updates the record (cumulative attempts,
+        last error) so the next pass retries it. Returns one result per
+        attempted device."""
+        results = []
+
+        for device_def in self._devices_config:
+            device_id = device_def["id"]
+            failed_info = self._failed_devices.get(device_id)
+            if failed_info is None:
+                continue
+
+            # Progress boundary: the same strategy as the boot path, so a
+            # legitimately slow probe cannot age the liveness stamp.
+            self._refresh_activity()
+
+            driver, driver_error = self._create_driver(device_def)
+            if driver is None:
+                # No initialize() ran: the attempt count stays honest
+                # (the boot path's 0 rule) and the constructor error is
+                # recorded for the next pass.
+                failed_info["failure_reason"] = str(driver_error)
+                results.append(
+                    self._late_retry_failure_result(failed_info, driver_error)
+                )
+                continue
+
+            try:
+                driver.initialize(device_def["config"])
+            except MemoryError:
+                raise
+            except Exception as err:
+                failed_info["initialization_attempts_used"] += 1
+                failed_info["failure_reason"] = str(err)
+                results.append(
+                    self._late_retry_failure_result(failed_info, err)
+                )
+                continue
+
+            managed_device = ManagedDevice(
+                device_id=device_id,
+                device_type=device_def["device_type"],
+                driver=driver,
+                name=device_def.get("name"),
+            )
+            managed_device.initialization_attempts_used = (
+                failed_info["initialization_attempts_used"] + 1
+            )
+            self._active_devices.append(managed_device)
+            del self._failed_devices[device_id]
+
+            results.append({
+                "status": DEVICE_RESULT_BOOT_RECOVERED,
+                "device_id": device_id,
+                "device": device_def["device_type"],
+                "initialization_attempts_used":
+                    managed_device.initialization_attempts_used,
+            })
+
+        return results
+
+    def _late_retry_failure_result(self, failed_info, error):
+        """Result for a failed steady-state retry; the first failure for a
+        device is flagged for a warning, repeats are suppressed until the
+        device recovers (the record is cleared on success, so a later
+        independent failure warns again) -- the reinit-suppression pattern."""
+        log_failure_warning = not failed_info.get("retry_failure_logged", False)
+        if log_failure_warning:
+            failed_info["retry_failure_logged"] = True
+
+        return {
+            "status": DEVICE_RESULT_BOOT_RECOVERY_FAILED,
+            "device_id": failed_info["id"],
+            "device": failed_info["device"],
+            "error": str(error),
+            "initialization_attempts_used":
+                failed_info["initialization_attempts_used"],
             "log_failure_warning": log_failure_warning,
         }
 

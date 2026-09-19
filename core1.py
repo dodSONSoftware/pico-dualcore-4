@@ -14,6 +14,8 @@ from device_manager import (
     DEVICE_RESULT_READ_FAILED,
     DEVICE_RESULT_REINITIALIZED,
     DEVICE_RESULT_REINITIALIZATION_FAILED,
+    DEVICE_RESULT_BOOT_RECOVERED,
+    DEVICE_RESULT_BOOT_RECOVERY_FAILED,
     DEVICE_STATE_READY,
     DEVICE_STATE_INITIALIZATION_FAILED,
 )
@@ -521,6 +523,21 @@ def _handle_device_result(intercore, uptime_state, result):
             print("[WARNING] Core 1 device reinitialization failed: {}: {}".format(
                 result["device_id"], result.get("error")
             ))
+        return
+
+    if status == DEVICE_RESULT_BOOT_RECOVERED:
+        print("[INFO] Core 1 device recovered from boot failure: {}".format(
+            result["device_id"]
+        ))
+        return
+
+    if status == DEVICE_RESULT_BOOT_RECOVERY_FAILED:
+        # Same suppression pattern as reinitialization failures: the manager
+        # flags the first failed steady-state retry, not the repeats.
+        if result.get("log_failure_warning", True):
+            print("[WARNING] Core 1 device boot initialization retry failed: {}: {}".format(
+                result["device_id"], result.get("error")
+            ))
 
 
 def _run_telemetry_read_pass(device_manager, intercore, uptime_state):
@@ -833,6 +850,13 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         schedulers = {
             "read_loop_ms": config["read_loop_sec"] * 1000,
             "health_interval_ms": config["health_interval_sec"] * 1000,
+            # Steady-state retry interval for boot-failed devices: the
+            # configured initialization retry delay with a 1 s floor -- the
+            # key is legal at 0, and 0 would probe the sensor on every
+            # 20 ms loop tick in steady state.
+            "failed_reinit_interval_ms": max(
+                config["device_initialization_retry_delay_ms"], 1000
+            ),
         }
         now_ms = time.ticks_ms()
 
@@ -843,6 +867,9 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         )
         schedulers["next_health_ms"] = _regrid_next_boundary(
             normal_runtime_start_ticks_ms, now_ms, schedulers["health_interval_ms"]
+        )
+        schedulers["next_failed_reinit_ms"] = _regrid_next_boundary(
+            normal_runtime_start_ticks_ms, now_ms, schedulers["failed_reinit_interval_ms"]
         )
 
         # Liveness heartbeat scheduler (deadline-based, independent of loop phase)
@@ -887,6 +914,33 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
                 while time.ticks_diff(skip_now_ms, schedulers["next_read_ms"]) >= 0:
                     schedulers["next_read_ms"] = time.ticks_add(
                         schedulers["next_read_ms"], schedulers["read_loop_ms"]
+                    )
+
+            # Boot-failed devices are retried at the slow steady-state
+            # interval: one bounded initialize() attempt per device per pass
+            # (the manager keeps the pass cheap so a dead sensor cannot hold
+            # the read pass). The gate is a single bool check while none
+            # remain failed.
+            if (
+                device_manager.has_failed_devices()
+                and time.ticks_diff(now_ms, schedulers["next_failed_reinit_ms"]) >= 0
+            ):
+                for result in device_manager.retry_failed_devices():
+                    _handle_device_result(intercore, uptime_state, result)
+
+                # The pass itself can consume real time (driver calls), so
+                # re-capture the clock for the advance; elapsed boundaries
+                # are skipped, never replayed, from the previous deadline.
+                retry_now_ms = time.ticks_ms()
+                while (
+                    time.ticks_diff(
+                        retry_now_ms, schedulers["next_failed_reinit_ms"]
+                    )
+                    >= 0
+                ):
+                    schedulers["next_failed_reinit_ms"] = time.ticks_add(
+                        schedulers["next_failed_reinit_ms"],
+                        schedulers["failed_reinit_interval_ms"],
                     )
 
             # Activity stamp every 5 s. now_ms is stale by the pass duration,
