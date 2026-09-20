@@ -100,13 +100,34 @@ def test_invalid_pin_is_rejected(bad_pin):
     assert excinfo.value.code == "invalid_value"
 
 
-@pytest.mark.parametrize("good_pin", [0, 16, 29])
-def test_board_gpio_range_is_accepted(good_pin):
-    # 1-Wire is software-timed: any of the board's 30 GPIOs is a legal data
-    # line (there is no mux routing constraint the way I2C's groups have).
+@pytest.mark.parametrize("good_pin", [0, 16, 22, 26, 27, 28])
+def test_exposed_gpio_is_accepted(good_pin):
+    # 1-Wire is software-timed: there is no mux routing constraint the way
+    # I2C's groups have, so every externally exposed Pico W / Pico 2 W GPIO
+    # is a legal data line (GP22 is the last of the 0-22 run, 26/28 the ends
+    # of the 26-28 run, past the reserved 23-25).
     config = _valid_config()
     config["pin"] = good_pin
     assert validate_config(config) is None
+
+
+@pytest.mark.parametrize("reserved", [23, 24, 25, 29])
+def test_wireless_reserved_pin_is_rejected(reserved):
+    # GP23/24/25/29 are the CYW43 allocation the boards do not expose: not
+    # wired for external use, and driven by the radio -- a data line on one
+    # of them is a "valid" config that loses network connectivity after a
+    # reboot, so it is a configuration error, not an operational one. The
+    # rejection names the reservation (a remote config writer needs to see
+    # why).
+    config = _valid_config()
+    config["pin"] = reserved
+    with pytest.raises(DeviceValidationError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    message = str(excinfo.value)
+    assert "pin" in message
+    assert str(reserved) in message
+    assert "wireless" in message
 
 
 # --- rom -------------------------------------------------------------------

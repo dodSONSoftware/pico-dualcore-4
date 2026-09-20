@@ -17,6 +17,7 @@ identity: the bus rescans after a fault, and only the ROM survives that.
 """
 
 from devices.device import DeviceValidationError
+from devices.rp2_pins import validate_user_gpio_pin
 
 # The complete set of keys a ds18b20 device config may contain. Anything beyond
 # this is unknown and reported as a qualified path.
@@ -34,10 +35,13 @@ _OFFSET_BOUNDS = {
     "temperature_c": 100.0,
 }
 
-# 1-Wire is software-timed on any regular RP2 GPIO: there is no mux routing
-# constraint the way I2C's SDA/SCL groups have, so any of the board's 30 GPIOs
-# is legal for the data line.
-_MAX_PIN = 29
+# 1-Wire is software-timed on any regular GPIO: there is no mux routing
+# constraint the way I2C's SDA/SCL groups have, so the data line is only
+# bounded by the board rule -- the externally exposed Pico W / Pico 2 W
+# GPIOs (``rp2_pins``). The four wireless-reserved pins are not exposed for
+# external use and are driven by the CYW43, so the shared validator rejects
+# them at the config boundary (a data line on one of them is a
+# "valid" configuration that loses network connectivity after a reboot).
 
 # ROM: exactly 8 bytes = 16 hex characters, family code 0x28 first. Case is
 # not a semantic difference, so both cases are accepted and the driver
@@ -103,19 +107,14 @@ def validate_config(config):
             code="unknown_config_fields",
         )
 
-    # pin: required, one of the board's GPIOs (any pin is a valid 1-Wire data
-    # line; the 1-Wire timing is software-driven, not fixed by a mux table).
+    # pin: required, an externally exposed GPIO (the 1-Wire timing is
+    # software-driven, not fixed by a mux table; the board rule bounds it).
     if "pin" not in config:
         raise DeviceValidationError(
             "ds18b20 device config missing required key: pin",
             code="missing_key",
         )
-    pin = config["pin"]
-    if not _is_int(pin) or not 0 <= pin <= _MAX_PIN:
-        raise DeviceValidationError(
-            "pin must be an integer 0-{}".format(_MAX_PIN),
-            code="invalid_value",
-        )
+    validate_user_gpio_pin("pin", config["pin"])
 
     # rom: required, 16 hex characters, family code 0x28 first -- a different
     # family decodes its temperature register differently and would read
