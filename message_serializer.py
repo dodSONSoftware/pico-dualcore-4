@@ -15,10 +15,8 @@ from message_protocol import is_json_safe
 # Maximum outbound MQTT payload bytes (16 KiB). The limit is enforced after
 # json.dumps() + utf-8 encode, so at peak the object graph, the str, and the
 # bytes are all resident: 16 KiB keeps that ~3x transient peak near 48 KiB on
-# a Pico W (256 KiB SRAM, 64 KiB reserved) and leaves ~6x headroom over the
-# largest legitimate message (the one-shot startup log). The aggregate
-# retained footprint is governed separately by the inter-core queues'
-# free-heap reserve (owned by hardware.py).
+# a Pico W. The aggregate retained footprint is governed separately by the
+# inter-core queues' free-heap reserve (owned by hardware.py).
 MAX_OUTBOUND_MESSAGE_BYTES = 16 * 1024
 
 
@@ -101,10 +99,6 @@ def serialize_and_validate_message(message):
     """Validate a message and serialize it to UTF-8 bytes for queue
     admission. is_json_safe() runs first as an allocation-light pass; the
     path-producing validator runs only on failure."""
-    # is_json_safe() enforces the same rules as _validate_value() without
-    # building per-node diagnostic paths, so the common valid case stays
-    # allocation-light; on failure the path-producing validator re-walks and
-    # raises the precise error (with the offending path).
     if not is_json_safe(message):
         _validate_value(message)
 

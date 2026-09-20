@@ -22,18 +22,16 @@ MAX_MQTT_KEEPALIVE_SEC = 65535
 # The ping interval floors to 1 s (max(keepalive // 2, 1)) and each
 # PINGREQ/PINGRESP exchange re-stamps activity AFTER the response, so the
 # broker-visible traffic gap is interval + RTT and must stay inside the
-# broker's 1.5 x keepalive tolerance. At keepalive 1-2 s any real RTT pushes
-# the gap past the tolerance (keepalive 1: 1 s + RTT vs 1.5 s) and the broker
-# disconnects a healthy client into a reconnect flap. 5 s is the smallest
-# value where interval (2 s) + realistic link RTT clears the 7.5 s tolerance.
+# broker's 1.5 x keepalive tolerance. 5 s is the smallest value where
+# interval + realistic link RTT clears that tolerance; below it the broker
+# disconnects a healthy client into a reconnect flap.
 MIN_MQTT_KEEPALIVE_SEC = 5
 
 # subscribe() encodes the SUBSCRIBE Remaining Length in one byte (valid
 # through 127); the body is topic + 5, so above 122 topic bytes the length
 # byte gains the continuation bit and the subscription never completes. Both
 # subscribed topics are the repair channel for a bad configuration, so the
-# bound sits at the config boundary and applies to every topic (publish uses
-# full variable-length encoding).
+# bound sits at the config boundary and applies to every topic.
 MAX_MQTT_TOPIC_BYTES = 122
 
 # The Wi-Fi secrets sit in config-secrets.json (boot provisioning, not
@@ -65,34 +63,26 @@ MAX_RECONNECT_ATTEMPTS = 32
 
 # Operational liveness bounds — in contrast to MAX_TICKS_SAFE_INTERVAL_MS
 # above, a representability bound: these stop a representable value from
-# defeating recovery. Shipped values (4 s / 5 s / 100 ms / 250 ms / 3) sit
-# well below every one of these.
+# defeating recovery. Shipped values sit well below every one of these.
 
 # Scales every bounded MQTT wait (the CONNACK/SUBACK handshake, the PUBACK,
 # check_msg completion, the UTC request deadline). Each single wait must stay
-# under the Core 0 hardware watchdog budget (core0.py WDT_TIMEOUT_MS, 8 s —
-# itself under the RP2 maximum of 8388 ms), so a stalled link times out on its
-# own before the watchdog can fire: a watchdog reset means "Core 0 is not
-# making progress", never "the broker was slow".
+# under the Core 0 hardware watchdog budget (core0.py WDT_TIMEOUT_MS, 8 s),
+# so a stalled link times out on its own before the watchdog can fire.
 MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC = 5
 
 # Startup-only (the network probe runs before the watchdog arms): bounds how
-# long one verification attempt can hold the device out of service. The worst
-# case per pass (two probes plus backoff) stays in minutes, not hours.
+# long one verification attempt can hold the device out of service.
 MAX_NETWORK_PROBE_TIMEOUT_SEC = 30
 
-# Paces Core 0's startup publishes (the probes and the UTC attempts, two plus
-# three in one pass): _wait_for_mqtt_publish_slot blocks for up to the full
-# delay between them, in 10 ms slices, and startup is deliberately
-# unsupervised — no watchdog, no heartbeat — so only the config bound can
-# keep a multi-day value from holding startup in a paced stall. 60 s matches
-# the family's pacing bounds.
+# Paces Core 0's startup publishes: _wait_for_mqtt_publish_slot blocks for up
+# to the full delay between them, in 10 ms slices, and startup is deliberately
+# unsupervised (no watchdog, no heartbeat) — so only the config bound can
+# keep a multi-day value from holding startup in a paced stall.
 MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS = 60 * 1000
 
 # Core 1's initialization retry pacing (a sliced sleep that refreshes the
-# liveness stamp, so no ticks or watchdog pressure): purely operational — a
-# 24-hour "delay" would leave the device declaring itself alive while making
-# no progress for a day.
+# liveness stamp, so no ticks or watchdog pressure): purely operational.
 MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS = 60 * 1000
 
 # Consecutive read failures before a device reinit: above this, automatic
@@ -103,16 +93,15 @@ MAX_DEVICE_READ_FAILURE_THRESHOLD = 1000
 # at the serialized-size ceiling (the bounded startup-log fallback and the
 # read-config response both carry it). The string fields are byte-bounded, so
 # at this device count a worst-case valid configuration stays under
-# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) serialized — pinned by the invariant
-# test in tests/test_config.py.
+# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB) serialized.
 MAX_DEVICES = 16
 
 # Deterministic ceiling on the number of outbound-queue entries retained
 # (queued + in-flight). An observability/stability bound, NOT a memory bound:
 # the heap policy (preferred reserve / hard floor) remains the memory guard
 # and is evaluated first, so a memory-constrained board is limited by heap
-# pressure well before this count. The ceiling is the maximum a config may set
-# (1..256), not the maximum the queue can ever hold.
+# pressure well before this count. The ceiling is the maximum a config may
+# set (1..256), not the maximum the queue can ever hold.
 MAX_OUTBOUND_QUEUE_MAX_MESSAGES = 256
 
 
@@ -259,14 +248,11 @@ def _require_mqtt_topic(config, key):
 def _require_ipv4_address(config, key):
     """A numeric IPv4 dotted quad in canonical form (four dot-separated
     parts, each 1-3 ASCII digits, no leading zero, value 0-255). The
-    handshake's getaddrinfo() lookup runs OUTSIDE the socket timeout —
-    the Core 0 servicing feed fires before and after it, not during —
-    and only a literal parses without a DNS query: a hostname's query
-    is bounded only by lwIP's own retry logic, which can stretch past
-    the 8 s Core 0 watchdog and reset the board instead of failing the
-    attempt into the bounded reconnect path. A leading zero is rejected
-    (an octal reading is ambiguous across resolvers) and IPv6 is
-    outside the AF_INET/SOCK_STREAM profile the lookup filters on."""
+    handshake's getaddrinfo() lookup runs OUTSIDE the socket timeout and
+    only a literal parses without a DNS query: a hostname's query could
+    stretch past the 8 s Core 0 watchdog instead of failing the attempt
+    into the bounded reconnect path. A leading zero is ambiguous across
+    resolvers; IPv6 is outside the AF_INET/SOCK_STREAM lookup profile."""
     value = config[key]
     parts = value.split(".")
     if len(parts) != 4 or any(
@@ -391,13 +377,12 @@ def _validate_devices(devices):
         except DeviceValidationError as err:
             raise ConfigError(str(err), code=err.code) from err
 
-    # Same-bus conflicts span the whole list, like duplicate ids above: on the
-    # RP2 port machine.I2C(bus) configures the physical controller itself, so
-    # a second construction with a different pin or clock setting would
-    # silently reconfigure the controller the first device already runs on
-    # (flaky reads that look like a failing sensor rather than a configuration
-    # error). The effective settings must be identical within a bus; a
-    # conflicting write-config is rejected here instead of reaching hardware.
+    # Same-bus conflicts span the whole list, like duplicate ids above: on
+    # the RP2 port machine.I2C(bus) configures the physical controller
+    # itself, so a second construction with a different pin or clock setting
+    # would silently reconfigure the controller under the first device
+    # (flaky reads that look like a failing sensor, not a configuration
+    # error). The effective settings must be identical within a bus.
     bus_owners = {}
     for index, device in enumerate(devices):
         identity = i2c_bus_identity(device)
@@ -416,6 +401,39 @@ def _validate_devices(devices):
                 "i2c_freq_hz (one bus is one physical controller, and a "
                 "second construction reconfigures it under the first device)"
                 .format(bus, owner[0], qualifier),
+                code="invalid_value",
+            )
+
+    # Cross-bus GPIO overlap spans the whole list, like the same-bus rule
+    # above: one GPIO cannot carry two bus protocols (a 1-Wire data pin on an
+    # I2C SDA/SCL pin would drive the same line in two protocols at once --
+    # flaky reads on both sensors). Only explicit I2C pins are compared: a
+    # device on the port's default pins resolves no config knowledge. Two
+    # ds18b20 devices on the same pin remain legal -- a 1-Wire multidrop bus.
+    onewire_owners = {}
+    for index, device in enumerate(devices):
+        if device.get("device_type") != "ds18b20":
+            continue
+        pin = device["config"]["pin"]
+        device_id = device.get("id")
+        qualifier = device_id if isinstance(device_id, str) and device_id else str(index)
+        onewire_owners.setdefault(pin, qualifier)
+
+    for index, device in enumerate(devices):
+        device_config = device.get("config")
+        if not isinstance(device_config, dict) or "i2c_bus" not in device_config:
+            continue
+        device_id = device.get("id")
+        qualifier = device_id if isinstance(device_id, str) and device_id else str(index)
+        for pin_key in ("i2c_sda_pin", "i2c_scl_pin"):
+            owner = onewire_owners.get(device_config.get(pin_key))
+            if owner is None:
+                continue
+            raise ConfigError(
+                "Conflicting GPIO pin {}: device '{}' (I2C {}) and device "
+                "'{}' (1-Wire DQ) share one pin; a GPIO cannot carry two bus "
+                "protocols"
+                .format(device_config.get(pin_key), qualifier, pin_key, owner),
                 code="invalid_value",
             )
 

@@ -5,18 +5,15 @@
 from devices.device import DeviceValidationError
 
 # The supported device_type registry: device_type -> (validation package,
-# validator attribute, allowed-config-keys attribute). Both attributes are
-# resolved by import at first use, never at module import: the validation
-# modules are pure (host-importable, no machine), but their source still
-# lands on the shared heap, and a type a board does not configure must not be
-# resident from startup -- Core 0 loads this module for config validation,
-# before Core 1 (which alone constructs and runs drivers) exists. Single
-# source of truth, shared by create_device() (construction) and config.py's
-# pure validation path: adding a device type is one entry here plus its pure
-# validator.
+# validator attribute, allowed-config-keys attribute), resolved by import at
+# first use, never at module import: a type a board does not configure must
+# not be resident from startup (Core 0 loads this module for config
+# validation, before Core 1 exists). Single source of truth for
+# create_device() and config.py's pure validation path.
 _DEVICE_REGISTRY = {
     "bme280": ("devices.bme280.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
     "ltr390": ("devices.ltr390.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
+    "ds18b20": ("devices.ds18b20.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
 }
 
 # The complete set of keys a device definition may carry; anything beyond is
@@ -27,12 +24,9 @@ DEVICE_DEFINITION_KEYS = frozenset(("id", "device_type", "config", "name"))
 # id and name are spliced into per-message payloads (telemetry identity
 # fields, startup-log device lists, the read-config response), so they carry
 # a length bound that keeps a worst-case valid message under
-# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB). 64 matches MAX_SOURCE_LENGTH. The
-# ceiling is a wire bound in UTF-8 bytes, not characters (64 characters of
-# 4-byte code points are 256 bytes, 192 serialized). The bound belongs at
-# this validation boundary: it must hold before Core 1 constructs per-device
-# structures (including the startup log's bounded fallback), not where the
-# message is serialized.
+# MAX_OUTBOUND_MESSAGE_BYTES (16 KiB). The bound is UTF-8 bytes, not
+# characters, and belongs at this validation boundary (before Core 1 builds
+# per-device structures), not where the message is serialized.
 MAX_DEVICE_ID_LENGTH = 64
 MAX_DEVICE_NAME_LENGTH = 64
 
@@ -40,13 +34,11 @@ MAX_DEVICE_NAME_LENGTH = 64
 def _validation_module(device_type):
     """The validation module for a supported device_type, imported on first
     use (an import cache hit afterwards); None for an unsupported type, which
-    imports nothing. The dynamic import goes through the __import__ builtin,
-    not importlib (the board's MicroPython ships no importlib), and the
-    fromlist is the 4th POSITIONAL argument: MicroPython builtins take no
-    keyword arguments (a fromlist= keyword TypeError'd on the Pico W, the
-    0.4.102 hardware catch). The non-empty fromlist makes the builtin return
-    the named leaf module -- the shape the compiler emits for a `from x
-    import y` statement -- on both CPython and MicroPython."""
+    imports nothing. The dynamic import goes through the __import__ builtin
+    (the board's MicroPython ships no importlib), and the fromlist is the
+    4th POSITIONAL argument: MicroPython builtins take no keyword arguments
+    (a fromlist= keyword TypeError'd on the Pico W). The non-empty fromlist
+    makes the builtin return the named leaf module, like `from x import y`."""
     entry = _DEVICE_REGISTRY.get(device_type)
     if entry is None:
         return None
@@ -138,14 +130,12 @@ def validate_device_definition(device_definition):
 
 def i2c_bus_identity(device_definition):
     """The effective (bus, sda, scl, freq) a device will hand Core 1's bus
-    factory, or None for a device without an I2C peripheral (no i2c_bus in
-    its config). sda/scl stay None when the config relies on the bus's
-    default pins (the port default is not config knowledge, so it is not
-    resolved here), and freq resolves to the type's DEFAULT_I2C_FREQ_HZ so
-    an absent key and an explicit default compare equal. Call only on a
-    definition that already passed validate_device_definition: a present
-    i2c_bus is then a valid bus, and the type's validation module (the
-    source of the default) already resolves."""
+    factory, or None for a device without an I2C peripheral. sda/scl stay
+    None when the config relies on the bus's default pins (the port default
+    is not config knowledge, so it is not resolved here), and freq resolves
+    to the type's DEFAULT_I2C_FREQ_HZ so an absent key and an explicit
+    default compare equal. Call only on a definition that already passed
+    validate_device_definition."""
     config = device_definition.get("config")
     if not isinstance(config, dict) or "i2c_bus" not in config:
         return None
@@ -160,15 +150,14 @@ def i2c_bus_identity(device_definition):
     )
 
 
-def create_device(device_definition, i2c_bus_factory=None):
+def create_device(device_definition, i2c_bus_factory=None, onewire_bus_factory=None):
     device_type = device_definition["device_type"]
 
     if device_type == "bme280":
-        # The driver never owns the bus: Core 1 supplies a factory that builds
-        # (and dedupes) one machine.I2C per physical controller (bus). sda/scl
-        # are None when the config relies on the bus's default pins. The bus is
-        # created here (peripheral + pins only); the sensor protocol runs in
-        # initialize(), wrapped by the retry/reinit machinery.
+        # The driver never owns the bus: Core 1's factory builds (and dedupes)
+        # one machine.I2C per physical controller (bus); sda/scl are None for
+        # the bus's default pins. The bus is created here (peripheral + pins
+        # only); the sensor protocol runs in initialize().
         if i2c_bus_factory is None:
             raise ValueError("bme280 requires an i2c_bus_factory")
         cfg = device_definition["config"]
@@ -181,19 +170,15 @@ def create_device(device_definition, i2c_bus_factory=None):
         )
         # Imported here, not at module top: Core 0 pulls in this module for the
         # validator during config validation, and a module-top driver import
-        # would load the float-heavy driver resident on the shared heap from
-        # startup -- before Core 1 (which alone constructs and runs it) exists.
-        # Deferring it to this Core 1 construction point keeps that ~8 KB off
-        # the pre-spawn heap. (The validation module resolves the same way.)
+        # would keep the driver resident on the shared heap from startup,
+        # before Core 1 (which alone constructs and runs it) exists.
         from devices.bme280.bme280_device import BME280Device
         return BME280Device(i2c)
 
     if device_type == "ltr390":
-        # Same bus ownership as bme280: the driver never creates the bus; Core 1
-        # hands this point a factory that builds (and dedupes) one machine.I2C
-        # per physical controller (bus), so two I2C devices on the same bus
-        # share one object. The sensor protocol runs in initialize(), wrapped by
-        # the retry/reinit machinery.
+        # Same bus ownership as bme280: Core 1's factory builds (and dedupes)
+        # one machine.I2C per physical controller (bus); the sensor protocol
+        # runs in initialize().
         if i2c_bus_factory is None:
             raise ValueError("ltr390 requires an i2c_bus_factory")
         cfg = device_definition["config"]
@@ -204,12 +189,21 @@ def create_device(device_definition, i2c_bus_factory=None):
             cfg.get("i2c_freq_hz",
                     _validation_module(device_type).DEFAULT_I2C_FREQ_HZ),
         )
-        # Same lazy-import rationale as the bme280 branch: a module-top driver
-        # import would keep the float-heavy driver resident on the shared heap
-        # from startup, before Core 1 (which alone constructs and runs it)
-        # exists. The validation module resolves through the registry, like
-        # bme280's.
+        # Same lazy-import rationale as the bme280 branch.
         from devices.ltr390.ltr390_device import LTR390Device
         return LTR390Device(i2c)
+
+    if device_type == "ds18b20":
+        # 1-Wire bus ownership mirrors the I2C case: Core 1's factory builds
+        # (and dedupes) one ds18x20.DS18X20 per data pin, so multidrop sensors
+        # on one pin share one bus object; the sensor protocol runs in
+        # initialize().
+        if onewire_bus_factory is None:
+            raise ValueError("ds18b20 requires an onewire_bus_factory")
+        cfg = device_definition["config"]
+        ds = onewire_bus_factory(cfg["pin"])
+        # Same lazy-import rationale as the bme280 branch.
+        from devices.ds18b20.ds18b20_device import DS18B20Device
+        return DS18B20Device(ds)
 
     raise ValueError("Unsupported device type: {}".format(device_type))

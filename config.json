@@ -56,6 +56,18 @@
           "uv_index": 0
         }
       }
+    },
+    {
+      "id": "mT4wJ9pXsRk2Hn6VcD8qZb3YgLu5W",
+      "device_type": "ds18b20",
+      "name": "DS18B20 Temperature Sensor",
+      "config": {
+        "pin": 2,
+        "rom": "28ff1ca26117048d",
+        "offsets": {
+          "temperature_c": 0
+        }
+      }
     }
   ]
 }

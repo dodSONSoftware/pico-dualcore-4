@@ -99,11 +99,9 @@ _FALLBACK_MIN_FREE_HEAP_BYTES = 64 * 1024
 
 def _startup_summary(device_status, startup_duration_ms, reset_cause):
     """Startup statuses and device counts, shared by the startup event log
-    and its bounded fallback. Subscription readiness is reported without
-    topic names (topic ownership belongs to Core 0); the duration is named
-    duration_ms, not uptime_ms, to keep it distinct from the envelope's.
-    reset_cause names how THIS boot began (machine.reset_cause()), so a
-    watchdog or panic reset is visible in the next boot's log."""
+    and its bounded fallback. Subscriptions are reported without topic names
+    (topic ownership belongs to Core 0); the duration is duration_ms, not
+    the envelope's uptime_ms; reset_cause names how this boot began."""
     startup_summary = {
         "duration_ms": startup_duration_ms,
         "reset_cause": reset_cause,
@@ -168,11 +166,9 @@ def _build_startup_log(intercore, device_manager, startup_duration_ms, reset_cau
 
 
 def _build_startup_log_bounded(intercore, device_manager, startup_duration_ms, reset_cause):
-    """Build the bounded startup-log fallback: only the startup statuses and
-    device counts -- no per-device lists, no failure reasons -- so it fits
-    when the event log (which carries device lists and driver failure reasons
-    no bound can pin) cannot; losing the verbose diagnostics must not keep
-    normal operation from starting."""
+    """The bounded startup-log fallback: startup statuses and device counts
+    only -- no per-device lists, no failure reasons -- so it fits when the
+    detailed event log cannot."""
     device_status = device_manager.get_status_snapshot(now_ms=time.ticks_ms())
     return _startup_log_message(
         intercore,
@@ -339,17 +335,13 @@ def _build_get_details_response_without(intercore, uptime_state, response, secti
 
 
 def _admit_after_serialization_memory_error(intercore, uptime_state, response):
-    """A persistent serialization MemoryError: the queue's own recovery
-    (gc.collect() first, then one eligible eviction per failure) has already
-    exhausted. The full get-details snapshot is the one response large
-    enough to hit that wall, so answer it one section smaller at a time
-    (each retry follows the queue's own gc.collect(), so the pool is
-    coalesced for the strictly smaller form), until one is admitted; the
-    response stays a success and names what it omitted. Any other response
-    -- or a get-details whose device sections are already gone -- takes the
-    small error substitute. A MemoryError on a bounded form's or the
-    substitute's own admission propagates to the recovery boundary (nothing
-    loops)."""
+    """A persistent serialization MemoryError: the queue's own recovery is
+    already exhausted. A full get-details snapshot is the one response large
+    enough to hit that wall, so answer it one section smaller at a time until
+    one is admitted; it stays a success and names what it omitted. Any other
+    response -- or a get-details whose device sections are already gone --
+    takes the small error substitute. A MemoryError on the substitute's own
+    admission propagates to the recovery boundary (nothing loops)."""
     if response["message"]["payload"].get("command") == COMMAND_GET_DETAILS:
         candidate = response
         for section in _GET_DETAILS_FALLBACK_DROP_ORDER:
@@ -719,25 +711,14 @@ def _try_queue_health_message_intercore(intercore, uptime_state, config, system_
 
 
 def _build_i2c_bus_factory():
-    """Core 1 owns its I2C buses (ARCHITECTURE ownership invariant). Returns a
-    factory that builds one machine.I2C per physical controller (bus) and
-    caches it, so two devices on the same bus share one object; sda/scl are
-    None when a device config relies on the bus's default pins.
-
-    The cache is keyed on the bus, not (bus, sda, scl, freq): on the RP2 port
-    machine.I2C(bus) is the controller's own static object, and a second
-    construction reconfigures that controller's pins and clock. A same-bus
-    request with a different (sda, scl, freq) would silently reconfigure the
-    controller the first device already runs on (flaky reads that look like a
-    failing sensor rather than a configuration error) -- so it raises instead.
-    validate_config rejects such a conflict before any config reaches this
-    point; a raise here means that validation was bypassed, and the failure
-    stays a visible, deterministic device failure.
-
-    The machine import is inside the closure (not here) so building the factory
-    is side-effect-free: the bus -- and the machine import -- only happen when a
-    configured I2C device first requests one. Host tests pass a fake factory
-    directly.
+    """Core 1 owns its I2C buses. One machine.I2C per physical controller
+    (bus), cached: on the RP2 port machine.I2C(bus) is the controller's own
+    static object, so a same-bus request with a different (sda, scl, freq)
+    would reconfigure the controller under the first device -- it raises
+    instead (validate_config rejects such a conflict; a raise here means
+    validation was bypassed). sda/scl are None for the bus's default pins.
+    The machine import is inside the closure, so building the factory is
+    side-effect-free until a configured I2C device first requests a bus.
     """
     cache = {}
 
@@ -767,6 +748,31 @@ def _build_i2c_bus_factory():
     return create
 
 
+def _build_onewire_bus_factory():
+    """Core 1 owns its 1-Wire buses. One ds18x20.DS18X20 per data pin,
+    cached: a second device on the same pin (multidrop) shares the bus --
+    no conflict raise, because a 1-Wire pin carries no reconfigurable
+    setting (no second signal, no clock). The machine/onewire/ds18x20
+    imports are inside the closure, so building the factory is
+    side-effect-free until a configured 1-Wire device first requests one.
+    """
+    cache = {}
+
+    def create(pin):
+        from machine import Pin
+        import onewire
+        import ds18x20
+
+        cached = cache.get(pin)
+        if cached is not None:
+            return cached
+        ds = ds18x20.DS18X20(onewire.OneWire(Pin(pin)))
+        cache[pin] = ds
+        return ds
+
+    return create
+
+
 def core1_main(intercore, config, boot_ticks_ms, runtime_id):
     """Core 1 entry point; this core never imports or touches network/MQTT."""
     try:
@@ -777,8 +783,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # startup wedge must age a stamp to be caught.
         intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
 
-        # Accumulated uptime: every ticks_diff compares recent samples, so
-        # uptime stays correct across a tick-counter wrap. boot_ticks_ms
+        # Accumulated uptime (correct across a tick wrap). boot_ticks_ms
         # anchors boot-lifetime uptime only; periodic scheduling anchors to
         # normal_runtime_start_ticks_ms.
         uptime_state = create_uptime_state(boot_ticks_ms)
@@ -786,18 +791,18 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         system_information = SystemInformation(intercore, config)
         # activity_refresh keeps the liveness stamp current at initialization
         # progress boundaries: a legitimately long initialization does not age
-        # it past Core 0's 30 s watchdog bound, while a wedged driver call
-        # (which stops the refresh) is still caught.
+        # it past Core 0's watchdog bound, while a wedged driver call (which
+        # stops the refresh) is still caught.
         device_manager = DeviceManager(
             config,
             activity_refresh=lambda: intercore.state_mailboxes.set_core_1_activity_ms(time.ticks_ms()),
             # Shared boot-relative uptime base: the device read-age fields
-            # stay correct across a tick wrap (past half a tick period, raw
-            # ticks would report a wrong age).
+            # stay correct across a tick wrap.
             uptime_state=uptime_state,
-            # Core 1 owns its I2C buses; create_device pulls a bus from this
-            # factory only for I2C devices.
+            # Core 1 owns its buses; create_device pulls one from these
+            # factories only for devices of that bus type.
             i2c_bus_factory=_build_i2c_bus_factory(),
+            onewire_bus_factory=_build_onewire_bus_factory(),
         )
         system_information.set_device_manager(device_manager)
 
@@ -808,11 +813,9 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
 
         startup_duration_ms = current_uptime_ms(uptime_state)
 
-        # Reclaim the import/initialization residue before the startup log's
-        # serialization buffers are needed: on a memory-tight board (Pico W)
-        # the pool is fragmented after the device init pass, and this gc is
-        # the difference between the event log (or its bounded fallback)
-        # fitting and a MemoryError.
+        # Coalesce the pool before the startup log's serialization buffers
+        # are needed: after the device init pass the Pico W pool is
+        # fragmented, and this gc is what lets the event log fit.
         gc.collect()
         # How this boot began, captured once: the startup record is the
         # next-boot breadcrumb that names a watchdog/panic reset.
@@ -846,8 +849,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
         # The single normal-runtime scheduling anchor, captured exactly once,
         # after the startup event log is admitted. All periodic Core 1 work
         # derives its fixed boundaries from this moment (not boot_ticks_ms);
-        # a reconnect, UTC resync, device reinit, or queue drain must never
-        # re-capture it -- only a true reboot creates a new one.
+        # only a true reboot creates a new one.
         normal_runtime_start_ticks_ms = time.ticks_ms()
 
         try:
@@ -871,9 +873,8 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             "read_loop_ms": config["read_loop_sec"] * 1000,
             "health_interval_ms": config["health_interval_sec"] * 1000,
             # Steady-state retry interval for boot-failed devices: the
-            # configured initialization retry delay with a 1 s floor -- the
-            # key is legal at 0, and 0 would probe the sensor on every
-            # 20 ms loop tick in steady state.
+            # configured initialization retry delay with a 1 s floor -- 0 is
+            # schema-legal but would probe the sensor every 20 ms loop tick.
             "failed_reinit_interval_ms": max(
                 config["device_initialization_retry_delay_ms"], 1000
             ),

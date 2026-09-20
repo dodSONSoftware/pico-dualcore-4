@@ -157,13 +157,11 @@ class OutboundQueue:
     def _try_append_with_count_gate(self, kind, payload_bytes, retention_priority):
         """Append one entry after making count room (caller holds the
         heap-admission lock, NOT the queue lock). The heap floor is checked by
-        _append_locked; the count ceiling is enforced here, subordinate to it
-        (only reached where the heap floor already allowed the append): at the
-        ceiling, displace one eligible entry under the same retention rule,
-        else the append is not made. True if appended, False if the append's
-        own allocations crossed the hard floor or the ceiling left nothing
-        eligible (the displacement path is the single rejection point, so a
-        rejected message is counted exactly once)."""
+        _append_locked; the count ceiling is enforced here, subordinate to it:
+        at the ceiling, displace one eligible entry under the same retention
+        rule, else the append is not made. False if the append's own
+        allocations crossed the hard floor or nothing was eligible (the
+        displacement path is the single rejection point)."""
         appended = None
         with self._lock:
             if self._below_count_limit_locked():
@@ -221,13 +219,12 @@ class OutboundQueue:
 
     def _serialize_with_recovery(self, message, retention_priority):
         """Serialize the message, recovering a MemoryError before discarding
-        queued data. Only a serializer MemoryError triggers recovery (other
-        failures raise immediately): gc.collect() and retry first, then one
-        eligible entry per persistent attempt (same eligibility as admission,
-        CRITICAL never displaced), gc.collect() after each, until
-        serialization succeeds or nothing eligible remains -- then the
-        MemoryError propagates to the recovery boundary. No locks are held
-        across the serializer or gc.collect()."""
+        queued data: gc.collect() and retry first, then one eligible entry
+        per persistent attempt (same eligibility as admission, CRITICAL never
+        displaced), gc.collect() after each, until serialization succeeds or
+        nothing eligible remains -- then the MemoryError propagates to the
+        recovery boundary. No locks are held across the serializer or
+        gc.collect()."""
         gc_attempted = False
         while True:
             try:

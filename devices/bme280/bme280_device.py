@@ -6,13 +6,11 @@
 
 The sensor protocol (chip identification, reset, calibration, Bosch
 compensation) lives in the low-level ``BME280`` class; ``BME280Device`` is the
-``Device`` adapter that applies the application-layer policy the spec keeps
-out of the fundamental compensation -- user offsets and the derived altitude.
-The I2C bus is injected (Core 1 owns it); this module imports no ``machine``
-API, so it stays host-importable for the pure unit tests.
-
-The reference is the Bosch BME280 data sheet (BST-BME280-DS001) and SensorAPI;
-where guidance disagrees with the datasheet, the datasheet wins.
+``Device`` adapter that applies the application-layer policy -- user offsets
+and the derived altitude. The I2C bus is injected (Core 1 owns it); this
+module imports no ``machine`` API, so it stays host-importable. The reference
+is the Bosch BME280 data sheet (BST-BME280-DS001); where guidance disagrees
+with the datasheet, the datasheet wins.
 """
 
 import time

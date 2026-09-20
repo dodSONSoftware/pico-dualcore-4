@@ -4,21 +4,18 @@
 
 """Shared pure validation of the RP2 I2C pin routing.
 
-The two I2C sensor validators (``bme280``, ``ltr390``) each carry the same
-``i2c_bus`` / ``i2c_sda_pin`` / ``i2c_scl_pin`` keys, and on the RP2 the I2C
-controllers' pins are fixed by the GPIO mux table: an arbitrary GPIO pair is
-not a valid SDA/SCL for an arbitrary controller. The RP2 port enforces exactly
-this mapping at ``machine.I2C(...)`` construction (its ``IS_VALID_SDA`` /
-``IS_VALID_SCL`` checks), so a config that passes the pure validator must also
-be routable there -- a deterministic pin-routing error is a configuration error
-rejected at the config boundary, never an operational device failure. Kept
-host-importable (no ``machine``) so ``config.py``'s pure path, the drivers'
-``initialize()``, and the host tests all share the one set of rules.
+The I2C sensor validators (``bme280``, ``ltr390``) each carry the same
+``i2c_bus`` / ``i2c_sda_pin`` / ``i2c_scl_pin`` keys, and on the RP2 the
+controllers' pins are fixed by the GPIO mux table. The port enforces exactly
+this mapping at ``machine.I2C(...)`` construction, so a config that passes the
+pure validator must also be routable there: a deterministic pin-routing error
+is a configuration error rejected at the config boundary, never an operational
+device failure. Host-importable (no ``machine``) so ``config.py``'s pure path,
+the drivers' ``initialize()``, and the host tests share one set of rules.
 
 Board-specific pin reservations (e.g. a GPIO the Pico W hands to the CYW43
-radio or its flash) are outside this validator: the routing is the board-
-agnostic part, identical on the Pico W and Pico 2 W, and the pure config path
-does not branch on the detected board.
+radio or its flash) are outside this validator: the routing is board-agnostic
+and the pure config path does not branch on the detected board.
 """
 
 from devices.device import DeviceValidationError
@@ -61,11 +58,10 @@ def validate_rp2_i2c_pins(bus, sda, scl):
     ``DeviceValidationError`` (``code`` ``invalid_value``) on the first
     violation; returns ``None`` when the routing is valid.
 
-    A ``None`` pin is accepted without a routing check because the port's
-    default pins are always routable to their own controller: the port's
-    fallbacks are hardcoded to routable pairs (I2C0 8/9, I2C1 6/7) and board
-    defaults (e.g. the Pico's GPIO 0/1) likewise, so ``machine.I2C(bus)`` with
-    no pin args can never fail the port's own ``IS_VALID_*`` check.
+    A ``None`` pin skips the routing check: the port's default pins (hardcoded
+    routable pairs, I2C0 8/9, I2C1 6/7) always route to their own controller,
+    so ``machine.I2C(bus)`` with no pin args can never fail the port's own
+    check.
     """
     for key, value in (("i2c_sda_pin", sda), ("i2c_scl_pin", scl)):
         if value is None:

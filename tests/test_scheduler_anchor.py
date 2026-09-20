@@ -223,7 +223,7 @@ def _run_core1(fake_time, bus, core1_config, boot_ticks_ms, pre_run=None):
         core1 = _reload_core1_under_fakes()
         dm_mod = sys.modules["device_manager"]
         saved_create_device = dm_mod.create_device
-        dm_mod.create_device = lambda device_def, i2c_bus_factory=None: ProbeDriver()
+        dm_mod.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: ProbeDriver()
         if pre_run is not None:
             pre_run()
 
@@ -252,7 +252,7 @@ def _slow_periodic_read(fake_time, delay_ms):
                     fake_time.sleep_ms(delay_ms)
                 return {"slow": 1}
 
-        dm_mod.create_device = lambda device_def, i2c_bus_factory=None: _SlowDriver()
+        dm_mod.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: _SlowDriver()
 
     return _pre_run
 
@@ -547,7 +547,7 @@ def test_startup_log_admission_failure_blocks_normal_runtime():
         # must supply the fake it drives.
         dm_mod = sys.modules["device_manager"]
         saved_create_device = dm_mod.create_device
-        dm_mod.create_device = lambda device_def, i2c_bus_factory=None: ProbeDriver()
+        dm_mod.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: ProbeDriver()
         try:
             with pytest.raises(RuntimeError):
                 core1.core1_main(bus, _core1_config(), boot_ticks_ms, "test-runtime")

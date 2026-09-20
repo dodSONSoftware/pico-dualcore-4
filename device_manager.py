@@ -100,22 +100,18 @@ class DeviceManager:
     """Manages device lifecycle for Core 1.
 
     Operational failure domain: only ``OSError`` is a recoverable device
-    failure. Every driver normalizes its hardware/I2C failures to it (a bus
-    drop, a sensor timeout, a missing chip), so each recovery path -- driver
-    construction, boot initialization, the normal read, the runtime
-    reinitialization, and the boot-failure late-retry pass -- catches
-    ``OSError`` beside the ``MemoryError`` re-raise. Anything else is a
-    firmware defect that reinitializing cannot repair: a ``TypeError``
-    contract violation (including the manager's own check of a ``read()``
-    return), a ``ValueError`` from a driver that reached its validator
-    despite the config-boundary validation or from the I2C bus factory's
-    same-bus conflict, a ``RuntimeError``/``ArithmeticError`` state defect.
-    Those escape to Core 1's worker boundary, where the dead worker is
-    recovered by Core 0's heartbeat watchdog, instead of the fault being
-    reclassified as a failed sensor and retried indefinitely into itself.
+    failure -- every driver normalizes its hardware/I2C failures to it, so
+    each recovery path (construction, boot init, read, reinit, late retry)
+    catches ``OSError`` beside the ``MemoryError`` re-raise. Anything else
+    is a firmware defect that reinitializing cannot repair (a ``TypeError``
+    contract violation, a driver ``ValueError``, a ``RuntimeError``/
+    ``ArithmeticError`` state defect); those escape to Core 1's worker
+    boundary (recovered by Core 0's heartbeat watchdog) instead of being
+    retried indefinitely into the same fault.
     """
 
-    def __init__(self, config, activity_refresh=None, uptime_state=None, i2c_bus_factory=None):
+    def __init__(self, config, activity_refresh=None, uptime_state=None, i2c_bus_factory=None,
+                 onewire_bus_factory=None):
         self._active_devices = []
         self._failed_devices = {}
 
@@ -124,19 +120,21 @@ class DeviceManager:
         self._device_read_failure_threshold = config["device_read_failure_threshold"]
         self._devices_config = config["devices"]
 
-        # Core 1's I2C bus factory (builds/dedupes machine.I2C per bus config).
-        # Injected so this module stays host-importable; None for configs with
-        # no I2C device, in which case create_device never asks for a bus.
+        # Core 1's bus factories (one machine.I2C per bus, one
+        # ds18x20.DS18X20 per 1-Wire data pin). Injected so this module
+        # stays host-importable; None for a config with no device of that
+        # bus type, in which case create_device never asks for a bus.
         self._i2c_bus_factory = i2c_bus_factory
+        self._onewire_bus_factory = onewire_bus_factory
 
         # Core 1's accumulated-uptime state, the source of truth for the
         # read-age fields; raw ticks when not wired (host tests).
         self._uptime_state = uptime_state
 
         # Optional liveness-stamp refresh callback, invoked at progress
-        # boundaries (per device, per attempt, per retry-sleep step). Without
-        # it, a legitimately long initialization would age the stamp past
-        # Core 0's watchdog; a wedge inside a driver call still stops the
+        # boundaries (per device, per attempt, per retry-sleep step): a
+        # legitimately long initialization must not age the stamp past
+        # Core 0's watchdog, while a wedged driver call still stops the
         # refresh and is caught.
         self._activity_refresh = activity_refresh
 
@@ -190,19 +188,20 @@ class DeviceManager:
 
     def _create_driver(self, device_def):
         try:
-            if self._i2c_bus_factory is None:
-                # No I2C bus factory wired (no I2C device configured): the
-                # one-argument construction path.
-                driver = create_device(device_def)
-            else:
-                driver = create_device(device_def, self._i2c_bus_factory)
+            # Both factories are always passed (each may be None for a config
+            # with no device of that bus type); the type-specific branch in
+            # create_device raises ValueError if the factory it needs is None.
+            driver = create_device(
+                device_def, self._i2c_bus_factory, self._onewire_bus_factory
+            )
             return driver, None
         except MemoryError:
             raise
         # Operational failure domain: OSError only. A factory ValueError
-        # (unsupported type, the I2C bus same-bus conflict) or TypeError is
-        # a configuration/programming error -- recording it as a failed
-        # device would hide it behind the retry machinery.
+        # (unsupported type, a missing required bus factory, the I2C bus
+        # same-bus conflict) or TypeError is a configuration/programming
+        # error -- recording it as a failed device would hide it behind the
+        # retry machinery.
         except OSError as err:
             return None, err
 
@@ -435,12 +434,9 @@ class DeviceManager:
         The caller's slow interval is the retry policy, so the full
         attempts x delay boot loop is deliberately NOT re-run here -- a
         dead sensor must cost at most one bounded driver call, never hold
-        the read pass and every working sensor's telemetry. A recovered
-        device is promoted to a fresh READY ManagedDevice (cumulative
-        attempt count, zero read-failure state) and leaves the failure
-        record; a failed attempt updates the record (cumulative attempts,
-        last error) so the next pass retries it. Returns one result per
-        attempted device."""
+        the read pass. A recovered device is promoted to a fresh READY
+        ManagedDevice and leaves the failure record; a failed attempt
+        updates the record so the next pass retries it."""
         results = []
 
         for device_def in self._devices_config:

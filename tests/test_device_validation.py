@@ -29,6 +29,9 @@ from devices.bme280.bme280_device import BME280Device
 from devices.bme280.validation import (
     ALLOWED_CONFIG_KEYS as BME280_ALLOWED_CONFIG_KEYS,
 )
+from devices.ds18b20.validation import (
+    ALLOWED_CONFIG_KEYS as DS18B20_ALLOWED_CONFIG_KEYS,
+)
 from devices.device import DeviceValidationError
 
 
@@ -60,6 +63,7 @@ def _definition(device_type="bme280", config=None, **overrides):
 def test_registry_exposes_the_supported_types():
     assert allowed_config_keys("bme280") == BME280_ALLOWED_CONFIG_KEYS
     assert allowed_config_keys("ltr390") is not None
+    assert allowed_config_keys("ds18b20") == DS18B20_ALLOWED_CONFIG_KEYS
     assert allowed_config_keys("acme-9000") is None
 
 
@@ -70,11 +74,14 @@ def test_registry_resolves_the_validation_modules_lazily():
     key set (the validator and config.py's aggregation share one source)."""
     from devices.bme280 import validation as bme280_validation
     from devices.ltr390 import validation as ltr390_validation
+    from devices.ds18b20 import validation as ds18b20_validation
 
     assert device_factory._validation_module("bme280") is bme280_validation
     assert device_factory._validation_module("ltr390") is ltr390_validation
+    assert device_factory._validation_module("ds18b20") is ds18b20_validation
     assert device_factory._validation_module("acme-9000") is None
     assert allowed_config_keys("bme280") is bme280_validation.ALLOWED_CONFIG_KEYS
+    assert allowed_config_keys("ds18b20") is ds18b20_validation.ALLOWED_CONFIG_KEYS
 
 
 def test_dynamic_import_passes_fromlist_positionally():
@@ -102,7 +109,9 @@ def test_registry_imports_no_validation_package_at_module_top():
         elif isinstance(node, ast.ImportFrom) and node.module:
             top_level_modules.append(node.module)
     assert not any(
-        name.startswith("devices.bme280") or name.startswith("devices.ltr390")
+        name.startswith("devices.bme280")
+        or name.startswith("devices.ltr390")
+        or name.startswith("devices.ds18b20")
         for name in top_level_modules
     )
     # The firmware may only module-top import modules the board's MicroPython

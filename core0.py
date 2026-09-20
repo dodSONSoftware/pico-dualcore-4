@@ -57,25 +57,20 @@ _UTC_STARTUP_MAX_ATTEMPTS = 3
 _UTC_RETRY_INTERVAL_MS = 30000
 _UTC_PROMPT_RETRY_DELAY_MS = 500
 
-# Command-ID debounce cache: stops repeated copies of one message (broker
-# redelivery, sender retry) from producing repeated responses and executions.
-# FIFO eviction, RAM-only, deliberately not heap-governed; a duplicate never
-# refreshes its position (not LRU). Not durable idempotency or exactly-once.
+# Command-ID debounce capacity: FIFO, RAM-only (not LRU, not durable
+# idempotency); stops repeated copies of one message from producing repeated
+# responses and executions.
 _RECENT_COMMAND_ID_CAPACITY = 16
 
-# Core 1 heartbeat watchdog timeout: Core 1 refreshes the stamp on a 5 s
-# deadline, so a stamp this old means the thread is dead or wedged (far
-# above any live-loop gap, below the 60 s core_1_inactive diagnostic
-# threshold). Static constant, not a config key.
+# A stamp this old means Core 1's thread is dead or wedged: far above any
+# live-loop gap, below the 60 s core_1_inactive diagnostic threshold.
+# Static constant, not a config key.
 _CORE_1_HEARTBEAT_STALE_TIMEOUT_MS = 30000
 
-# Hardware watchdog (machine.WDT) timeout: the one supervision layer for
-# Core 0 itself. Derived, not arbitrary: every single blocking operation
-# must fail on its OWN timeout first (a watchdog reset means "Core 0 is
-# wedged", never "the link was slow"), and every longer wait is sliced at
-# 100 ms with _service_wait() between slices, which feeds the watchdog.
-# Derivation: ARCHITECTURE.md, "Core 0 hardware watchdog"; a test pins both
-# 5 s wait ceilings under this constant.
+# Hardware watchdog timeout: derived, not arbitrary (every blocking operation
+# must fail on its own timeout first; a watchdog reset means "Core 0 is
+# wedged", never "the link was slow"). Derivation: ARCHITECTURE.md, "Core 0
+# hardware watchdog".
 WDT_TIMEOUT_MS = 8000
 
 class Core0:
@@ -109,14 +104,13 @@ class Core0:
         self._utc_snapshot = None
         self._last_network_snapshot_ms = None
         # Completion time of the last successful application PUBLISH (PUBACK
-        # received); drives the publish pacing gate for every publish path.
+        # received); drives the publish pacing gate.
         self._last_mqtt_publish_completed_ms = None
         self._last_command_poll_ms = time.ticks_ms()
         self._next_sequence = 0
         self._network_stack_ready = False
-        # Hardware watchdog, armed by start() once the startup contract has
-        # passed (startup is unbounded and unsupervised); None when the build
-        # lacks machine.WDT (degraded, see _enable_watchdog).
+        # Armed by start() once the startup contract has passed (startup is
+        # unbounded and unsupervised); None when the build lacks machine.WDT.
         self._wdt = None
 
     def _uptime_ms(self):
@@ -126,9 +120,8 @@ class Core0:
         snapshot = self._utc_snapshot
         if snapshot is None:
             return None
-        # current = runtime_start + current_uptime: both accumulate from the
-        # shared boot base, so this stays correct across the tick wrap, where
-        # a one-shot ticks_diff against the sync tick would not.
+        # Accumulated uptime, not a one-shot ticks_diff against the sync
+        # tick: the one-shot form is only valid within half a tick period.
         return format_utc_epoch_ms(
             snapshot["runtime_start_epoch_ms"] + self._uptime_ms()
         )
@@ -156,9 +149,8 @@ class Core0:
         try:
             if isinstance(topic, bytes):
                 topic = topic.decode()
-            # Read the frame bytes directly (MicroPython's json.loads takes
-            # any buffer): no decoded-string copy sits alongside the parsed
-            # graph at the 20 KiB inbound ceiling.
+            # Parse the frame buffer directly (no decoded-string copy
+            # alongside the parsed graph at the 20 KiB inbound ceiling).
             doc = json.loads(payload)
         except MemoryError:
             raise
@@ -167,9 +159,8 @@ class Core0:
                 print("[DEBUG] Ignoring invalid MQTT payload: {}".format(err))
             return
 
-        # Release the raw frame now that the parse succeeded: otherwise it
-        # stays alive across the whole handler alongside the parsed graph, a
-        # full frame of heap on every response allocation.
+        # Release the raw frame now that the parse succeeded, so it does not
+        # sit alongside the parsed graph across the whole handler.
         del payload
 
         if not isinstance(doc, dict):
@@ -178,8 +169,8 @@ class Core0:
             return
 
         # Global inbound schema gate: an unsupported message_schema_version
-        # is ignored for the whole message -- no response, no debounce
-        # entry, no state change -- including inbound info_response.
+        # is ignored for the whole message (no response, no debounce entry,
+        # no state change), including inbound info_response.
         version = doc.get("message_schema_version")
         if type(version) is not int or version != MESSAGE_SCHEMA_VERSION:
             if DEBUG:
@@ -382,10 +373,8 @@ class Core0:
         }
 
     def _handle_get_details_command(self, command_id, targeted, payload):
-        """Forward get-details to Core 1, which owns execution (the
-        SystemInformation instance and device state). Payload is exactly {}
-        (shared with reboot); admission failure means the free-heap reserve
-        could not be restored."""
+        """Forward get-details to Core 1, which owns execution. Payload is
+        exactly {} (shared contract with reboot)."""
         if payload:
             self._queue_core0_response(
                 self._unknown_fields_error(COMMAND_GET_DETAILS, command_id, targeted, payload)
@@ -411,10 +400,9 @@ class Core0:
             })
 
     def _handle_read_config_command(self, command_id, targeted, payload):
-        """read-config: answer with the committed (PERSISTED) configuration
-        and derived reboot state. Payload is exactly {}; Wi-Fi secrets never
-        cross this path; a missing/invalid committed file is answered with
-        the actual cause."""
+        """Answer with the committed (PERSISTED) configuration and derived
+        reboot state. Payload is exactly {}; Wi-Fi secrets never cross this
+        path."""
         if payload:
             self._queue_core0_response(
                 self._unknown_fields_error(COMMAND_READ_CONFIG, command_id, targeted, payload)
@@ -446,11 +434,9 @@ class Core0:
         })
 
     def _handle_write_config_command(self, command_id, targeted, payload):
-        """write-config: the payload is exactly {"config": <complete
-        candidate>} -- no patch/merge/partial shape -- validated by the same
-        validate_config() as startup. UNCHANGED writes nothing; a changed
-        candidate commits and is pending a reboot (no live apply).
-        MemoryError propagates to the fail-fast boundary."""
+        """The payload is exactly {"config": <complete candidate>} -- no
+        patch/merge/partial shape -- validated as at startup. A changed
+        candidate commits and is pending a reboot (no live apply)."""
         # Unknown payload keys are named together (sorted) regardless of the
         # rest of the payload.
         unknown = sorted(key for key in payload if key != "config")
@@ -685,12 +671,6 @@ class Core0:
         return sequence
 
     # --- Outbound publish pacing (mqtt_outbound_publish_delay_ms) --------
-    #
-    # A minimum quiet period between consecutive outbound application
-    # PUBLISHes, measured from the previous publish's COMPLETION (PUBACK),
-    # not its start. It is state, not a sleep: while the gate is closed Core
-    # 0 keeps running its normal loop and simply does not begin another
-    # application PUBLISH. Protocol-control traffic (PINGREQ) is never paced.
 
     def _mqtt_publish_ready(self):
         delay_ms = self._config["mqtt_outbound_publish_delay_ms"]
@@ -749,12 +729,10 @@ class Core0:
             print("[DEBUG] QoS 1 published: seq={}".format(sequence))
 
     def _answer_discarded_command_response(self, entry):
-        """Queue the bounded substitute for a discarded oversized command
-        response: the acknowledgement is owed, so answer with a small
-        response_too_large error reading only bounded identifying fields (an
-        unreadable body has no identity -- the discard stands)."""
-        # Read the entry's bytes directly (MicroPython's json.loads takes any
-        # buffer, bytes or bytearray): no decoded-string copy sits alongside
+        """Queue the bounded response_too_large substitute for a discarded
+        oversized command response: the acknowledgement is owed, so answer
+        with a small error reading only bounded identifying fields."""
+        # Parse the entry's buffer directly: no decoded-string copy alongside
         # the parsed graph on the memory-tightest path in the module.
         body = entry["payload_bytes"]
         try:
@@ -980,8 +958,8 @@ class Core0:
 
     def _utc_send_request(self):
         """Send a UTC time request without blocking; deadline tracked for the run loop.
-
-        The pending request ID is armed before publishing: a fast response can arrive inside the PUBACK wait."""
+        The request ID is armed before publishing (a fast response can arrive
+        inside the PUBACK wait)."""
         self._utc_request_counter += 1
         request_id = "{}_{}".format(self._runtime_id, self._utc_request_counter)
         request = {
@@ -1176,30 +1154,21 @@ class Core0:
             machine.reset()
 
     def _feed_watchdog(self):
-        """Feed the hardware watchdog; a no-op before arming (or when the
-        build lacks machine.WDT). Fed only from Core 0's own execution —
-        never by an independent timer or Core 1, so a running subsystem can
-        never mask a dead Core 0. A feed() failure escapes to the top-level
-        recovery boundary (no catch here)."""
+        """Feed the hardware watchdog (no-op until armed). Fed only from
+        Core 0's own execution, so a running subsystem can never mask a
+        dead Core 0; a feed() failure escapes to the recovery boundary."""
         if self._wdt is not None:
             self._wdt.feed()
 
     def _enable_watchdog(self):
-        """Arm the hardware watchdog once the startup contract has passed:
-        from here on, a Core 0 that stops making progress resets within
-        WDT_TIMEOUT_MS instead of idling until a power cycle.
+        """Arm the hardware watchdog once the startup contract has passed.
 
-        The getattr is the one intentional capability probe (the Wi-Fi
-        PM_NONE precedent): a build without machine.WDT degrades to a
-        warning instead of a deterministic reset loop — making absence
-        fatal would reboot into the same missing attribute forever. The
-        probe checks the attribute only; on the supported RP2 builds the
-        capability exists, so a construction failure is NOT a capability
-        condition — a runtime or regression that makes machine.WDT raise
-        is a real failure of a feature the board is expected to provide,
-        and escaping it (like a feed() failure) to main.py's recovery
-        boundary is preferred to silently dropping Core 0's primary
-        supervision while everything reports healthy."""
+        The getattr is the one intentional capability probe: a build without
+        machine.WDT degrades to a warning (making absence fatal would
+        reboot-loop). A construction failure is NOT a capability condition —
+        on the supported RP2 builds the capability exists, so a WDT that
+        raises is a real failure and escapes to the recovery boundary like a
+        feed() failure."""
         wdt_type = getattr(machine, "WDT", None)
         if wdt_type is None:
             self._wdt = None
@@ -1214,9 +1183,6 @@ class Core0:
         self._feed_watchdog()
 
     def _sleep_and_service(self, delay_sec):
-        # The 100 ms slicing itself lives in network_wait.sleep_sliced
-        # (shared with the Wi-Fi/MQTT backoffs); Core 0's hook pairs the
-        # Core 1 heartbeat check with the hardware watchdog feed.
         sleep_sliced(delay_sec, self._service_wait)
 
     def start(self):
@@ -1227,15 +1193,12 @@ class Core0:
         boundary in main()."""
         self._led_manager.set_connecting(True)
 
-        # Connect (Wi-Fi, then MQTT + subscriptions), shared with the
-        # run-loop recovery path so backoff, logging, and LED behavior stay
-        # in one place.
+        # Shared with the run-loop recovery path (backoff, logging, LED).
         self.establish_network()
 
-        # Verify the QoS 1 path (two probes) and acquire UTC; self-healing
-        # like the connect loops (the failed session is dropped and
-        # re-established). Core 1 stays gated until start() returns; only
-        # transport failures are retried.
+        # Verify the QoS 1 path (two probes) and acquire UTC; a failed pass
+        # drops the session, re-establishes, and retries. Core 1 stays
+        # gated until start() returns.
         while True:
             if self._verify_startup_contract():
                 break
@@ -1253,10 +1216,8 @@ class Core0:
 
         self._led_manager.set_connecting(False)
 
-        # Arm hardware supervision only now: the connect/verification loops
-        # above are deliberately unbounded, and a watchdog would reset them
-        # into the same waits. From here on every long wait is sliced and
-        # fed, and the bounded waits fail under the watchdog budget.
+        # Arm hardware supervision only now: the loops above are deliberately
+        # unbounded, and a watchdog would reset them into the same waits.
         self._enable_watchdog()
 
         print("[INFO] Core 0 startup complete - network stack verified and ready")
@@ -1292,12 +1253,9 @@ class Core0:
         while True:
             # First each pass: a dead Core 1 wedges the whole sensor and
             # cannot report itself, so Core 0 resets the board before doing
-            # any other work. Feeding the hardware watchdog here proves this
-            # pass of the loop executed; the longest un-fed stretch after
-            # this point is a single MQTT socket operation under the broker
-            # response timeout (MQTTClient feeds the hook before each one,
-            # so a stalled handshake or ACK wait cannot chain past
-            # WDT_TIMEOUT_MS un-fed).
+            # any other work. The feed here proves this pass executed; the
+            # longest un-fed stretch after it is one MQTT socket operation
+            # under its own timeout (MQTTClient feeds the hook before each).
             self._watch_core_1_heartbeat()
             self._feed_watchdog()
 

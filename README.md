@@ -2,7 +2,7 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.137.
+**Release:** Bronze Owl — firmware 0.4.138.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-v1.28.0-00897B?logo=micropython&logoColor=white)](https://micropython.org)
@@ -150,54 +150,9 @@ Latest-value snapshots:
 
 ## Health Messages
 
-Core 1 periodically publishes health messages to `iot/v3/health` with the following fields:
+Core 1 periodically publishes health messages to `iot/v3/health`. Each message reports the device's `status` ("healthy" or "degraded") and `degraded_reasons` (the active degradation reasons), along with hardware, network, memory, Core 1 activity, device, queue, and UTC fields. The full payload structure, every field definition, and the degradation-reason list are documented in the "Health Message Protocol" section of [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-### Status
-- `status`: "healthy" or "degraded"
-- `degraded_reasons`: Array of degradation reasons (e.g., "wifi_not_connected", "low_free_heap")
-
-### Hardware
-- `cpu_temperature_c`: On-chip die temperature (°C, 0.1 °C resolution) via the datasheet conversion (Vbe = 0.706 V at 27 °C, slope −1.721 mV/°C; VREF- and device-sensitive, roughly ±5 °C — a trend indicator, not a calibrated absolute); `null` when the ADC core-temp channel is unavailable
-
-### Network
-- `wifi_rssi_dbm`: Current Wi-Fi signal strength (dBm)
-- `network_stack_ready`: Core 0 network stack initialization status
-- `wifi_connected`: Wi-Fi connection status
-- `mqtt_connected`: MQTT broker connection status
-
-### Memory
-- `free_heap_bytes`: Current free heap
-- `minimum_free_heap_bytes`: Hard survival floor that admission must protect (48KB Pico W, 128KB Pico 2 W)
-
-### Core Activity
-- `core_1_active`: Boolean indicating Core 1 liveness
-
-### Devices
-- `devices_configured`: Number of configured devices
-- `devices_active`: Number of active/ready devices
-
-### Queue
-The outbound queue is heap-governed **and** bounded by the `outbound_queue_max_messages` entry-count ceiling (evaluated after the heap policy, in-flight included), so these are observability metrics (the byte and high-watermark metrics remain reachable in the `get-details` `queues` section):
-- `outbound_queue_depth`: Current queued + in-flight entries (≤ `outbound_queue_max_messages`)
-- `outbound_evicted`: Entries evicted under memory pressure or to relieve the count ceiling (all kinds)
-- `outbound_rejected`: Admissions rejected because the hard free-heap floor could not be restored or no eligible entry was available to relieve the count ceiling
-
-### UTC
-- `utc_valid`: Boolean indicating UTC time is valid
-- `utc_sync_age_sec`: Seconds since last successful UTC sync
-
-### Degradation Triggers
-
-The health status is "degraded" when any of these conditions are true:
-- `network_stack_not_ready`: Core 0 network not fully initialized
-- `wifi_not_connected`: Wi-Fi disconnected
-- `mqtt_not_connected`: MQTT broker connection lost
-- `core_1_inactive`: Core 1 activity exceeds threshold (3x read_loop_sec, min 60s)
-- `low_free_heap`: free_heap < minimum_free_heap (below the hard floor)
-- `device_count_mismatch`: devices_active != devices_configured
-- `utc_not_valid`: UTC snapshot unavailable
-
-Health messages are only generated when MQTT is connected to prevent stale messages during outages.
+Health messages are only generated when the network stack is ready and MQTT is connected, to prevent stale messages during outages.
 
 ### Configuration
 

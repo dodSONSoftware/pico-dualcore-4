@@ -29,17 +29,13 @@ SYSTEM_INFORMATION_SECTIONS = (
 # machine.reset_cause() constant name -> stable short label. The mapping
 # reads the constants off the machine module (no hardcoded values), so a
 # build whose MicroPython names them differently degrades to "unknown"
-# instead of mislabeling a boot. The v1.28 rp2 port exposes exactly these
-# two causes. Field-verified on the flashed build (2026-09-18 capture,
-# 6/6 commanded reboots): a soft machine.reset() reports the WDT_RESET
-# value, not PWRON_RESET as 0.4.105 assumed — so "wdt" means "a reset via
-# machine.reset() or a hardware-watchdog expiry", and the two are
-# indistinguishable from this field alone. A commanded reboot is
+# instead of mislabeling a boot. Field-verified on the flashed build: a soft
+# machine.reset() reports the WDT_RESET value, not PWRON_RESET — so "wdt"
+# covers both a software reset and a hardware-watchdog expiry, and the two
+# are indistinguishable from this field alone. A commanded reboot is
 # positively identified by the {"rebooting": true} acknowledgement Core 0
 # publishes immediately before the reset; a "wdt" boot with no such
-# preceding acknowledgement is unclassified within that WDT/software-reset
-# family — a hardware-watchdog expiry or an unacknowledged commanded reset
-# (the main.py recovery boundary publishes none).
+# preceding acknowledgement is unclassified within that family.
 _RESET_CAUSE_LABELS = (
     ("WDT_RESET", "wdt"),
     ("PWRON_RESET", "poweron"),
@@ -64,18 +60,9 @@ class SystemInformation:
         self._adc = None
 
     def get_reset_cause(self):
-        """Stable short label for how this boot began: "wdt" for the
-        WDT_RESET value, "poweron" for the PWRON_RESET value, else
-        "unknown" — the v1.28 rp2 port reports no finer cause. Field-
-        verified on the flashed build: a machine.reset() reboot reports
-        "wdt", not "poweron" — so "wdt" covers both a deliberate
-        machine.reset() and a hardware-watchdog expiry. A commanded
-        reboot is positively identified by the {"rebooting": true}
-        acknowledgement Core 0 publishes immediately before it; a "wdt"
-        boot with no such preceding acknowledgement is unclassified
-        within that WDT/software-reset family — a hardware-watchdog
-        expiry or an unacknowledged commanded reset (the main.py
-        recovery boundary publishes none), not a confirmed watchdog fire."""
+        """Stable short label for how this boot began: "wdt" (the WDT_RESET
+        value -- software reset or watchdog expiry; see _RESET_CAUSE_LABELS),
+        "poweron", else "unknown"."""
         if self._reset_cause is None:
             try:
                 cause = machine.reset_cause()
@@ -159,16 +146,14 @@ class SystemInformation:
     def get_cpu_temperature(self):
         # The rp2 port exposes the die sensor only as an ADC channel (no
         # machine.temperature() binding); read_u16() returns the 12-bit
-        # reading scaled to 16 bits, so scale it back. The RP2040 and RP2350
-        # datasheets state the same calibration (Vbe = 0.706 V at 27 C, slope
-        # -1.721 mV/C), so one formula serves both boards. The conversion is
-        # VREF-sensitive (~4 C per 1% VREF): a trend indicator at roughly
-        # +/-5 C, not a calibrated absolute.
+        # reading scaled to 16 bits. The RP2040 and RP2350 datasheets state
+        # the same calibration (Vbe = 0.706 V at 27 C, slope -1.721 mV/C);
+        # the conversion is VREF-sensitive (~4 C per 1% VREF), so this is a
+        # trend indicator at roughly +/-5 C, not a calibrated absolute.
         # The channel object is built once and kept: constructing an ADC per
-        # read puts a GC-managed allocation on every health message, on
-        # Core 1's most memory-sensitive path. A failed construction leaves
-        # the cache empty, so a broken channel is retried on each call as
-        # before (a failed RHS never assigns self._adc).
+        # read puts a GC-managed allocation on every health message. A
+        # failed construction leaves the cache empty, so a broken channel is
+        # retried on each call (a failed RHS never assigns self._adc).
         adc = self._adc
         if adc is None:
             try:

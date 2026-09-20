@@ -92,7 +92,7 @@ def unit():
 
     driver = FlipDriver(fail_times=99)
     saved_create_device = dm_mod.create_device
-    dm_mod.create_device = lambda device_def, i2c_bus_factory=None: driver
+    dm_mod.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: driver
 
     yield dm_mod, dm, driver
 
@@ -163,7 +163,7 @@ def test_late_retry_construction_failure_keeps_attempt_count(unit):
     dm_mod, dm, _driver = unit
     dm.initialize_devices()
 
-    def _failing_create(device_def, i2c_bus_factory=None):
+    def _failing_create(device_def, i2c_bus_factory=None, onewire_bus_factory=None):
         raise OSError("simulated construction failure")
 
     dm_mod.create_device = _failing_create
@@ -203,7 +203,7 @@ def test_late_retry_skips_active_devices_and_keeps_config_order():
     driver_a = FlipDriver(fail_times=0)   # healthy at boot
     driver_b = FlipDriver(fail_times=3)   # boot: 1, pass 3: 4 (success)
     saved_create_device = dm_mod.create_device
-    dm_mod.create_device = lambda device_def, i2c_bus_factory=None: (
+    dm_mod.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: (
         driver_a if device_def["id"] == "dev_a" else driver_b
     )
 
@@ -393,7 +393,7 @@ def _run_core1(fake_time, bus, core1_config, boot_ticks_ms, driver):
         core1 = _reload_core1_under_fakes()
         dm_mod = sys.modules["device_manager"]
         saved_create_device = dm_mod.create_device
-        dm_mod.create_device = lambda device_def, i2c_bus_factory=None: driver
+        dm_mod.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: driver
 
         try:
             with pytest.raises(LoopStop):

@@ -7,16 +7,14 @@
 The sensor protocol (part identification, standby/mode control, data-ready
 synchronization, raw reads, lux/UVI conversion) lives in the low-level
 ``LTR390`` class; ``LTR390Device`` is the ``Device`` adapter that applies the
-application-layer policy the conversion keeps out -- the user offsets. The
-I2C bus is injected (Core 1 owns it); this module imports no ``machine``
-API, so it stays host-importable for the pure unit tests.
+application-layer policy -- the user offsets. The I2C bus is injected (Core 1
+owns it); this module imports no ``machine`` API, so it stays host-importable.
 
-The most important architectural fact: ALS and UV are **sequential**.
-``MAIN_CTRL`` selects which channel is actively converting, so a combined
-sample is mode-switch, wait for a fresh conversion, read -- per channel --
-and never a bare read of both data registers. The reference is the Lite-On
-LTR-390UV-01 data sheet (DS86-2015-0004); where guidance disagrees with the
-data sheet, the data sheet wins.
+ALS and UV are **sequential**: ``MAIN_CTRL`` selects which channel is actively
+converting, so a combined sample is mode-switch, wait for a fresh conversion,
+read -- per channel -- never a bare read of both data registers. The reference
+is the Lite-On LTR-390UV-01 data sheet (DS86-2015-0004); where guidance
+disagrees with the data sheet, the data sheet wins.
 """
 
 import time

@@ -47,6 +47,9 @@ REQUIRED_PACKAGES = {
     "devices/ltr390/__init__.py",
     "devices/ltr390/validation.py",
     "devices/ltr390/ltr390_device.py",
+    "devices/ds18b20/__init__.py",
+    "devices/ds18b20/validation.py",
+    "devices/ds18b20/ds18b20_device.py",
 }
 
 FILES = REQUIRED_FILES | REQUIRED_PACKAGES

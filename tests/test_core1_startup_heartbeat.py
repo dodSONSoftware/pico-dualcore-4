@@ -211,7 +211,7 @@ def test_core1_registers_activity_stamp_before_device_initialization():
         probe = ProbeDriver(bus)
         stamp_at_construction, real_si = _capturing_system_information(core1, bus)
         saved_create = dm.create_device
-        dm.create_device = lambda device_def, i2c_bus_factory=None: probe
+        dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: probe
         try:
             # Before Core 1 runs, the stamp must not exist (fresh mailbox).
             assert bus.state_mailboxes.get_core_1_activity_ms() is None
@@ -301,7 +301,7 @@ def test_device_manager_refreshes_between_attempts():
     dm = _host_time_device_manager()
     driver = FlakyDriver()
     saved_create = dm.create_device
-    dm.create_device = lambda device_def, i2c_bus_factory=None: driver
+    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: driver
     try:
         manager = dm.DeviceManager(
             _manager_config(attempts=3),
@@ -431,7 +431,7 @@ def test_device_manager_retry_sleep_refreshes_in_steps():
     dm = _host_time_device_manager()
     driver = FlakyDriver()
     saved_create = dm.create_device
-    dm.create_device = lambda device_def, i2c_bus_factory=None: driver
+    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: driver
     dm.time = step_time
     try:
         manager = dm.DeviceManager(
@@ -467,7 +467,7 @@ def test_device_manager_without_refresh_callback_is_unchanged():
     dm = _host_time_device_manager()
     driver = OkDriver()
     saved_create = dm.create_device
-    dm.create_device = lambda device_def, i2c_bus_factory=None: driver
+    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: driver
     try:
         manager = dm.DeviceManager(_manager_config(attempts=1))
         assert manager._activity_refresh is None
@@ -535,7 +535,7 @@ def test_device_manager_normal_read_refreshes_per_device():
     saved_create = dm.create_device
     saved_time = dm.time
     dm.create_device = (
-        lambda device_def, i2c_bus_factory=None: SlowDriver(observed)
+        lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: SlowDriver(observed)
     )
     dm.time = pass_time
     try:

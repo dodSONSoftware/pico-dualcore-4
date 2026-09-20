@@ -6,13 +6,10 @@ import select
 import socket
 import struct
 
-# Maximum remaining length (bytes) for an inbound MQTT packet. Derived, not
-# arbitrary: the worst-case spec-valid inbound frame (a write-config command
-# carrying the worst-case valid configuration) is 16,329 bytes (pinned in
-# tests/test_config.py) — 20 KiB keeps every valid command deliverable while
-# bounding what json.loads() can amplify at the parse peak. An oversized
-# frame must fail the connection instead of letting sock.read(sz) request an
-# allocation that could exhaust Pico RAM.
+# Inbound remaining-length bound: 20 KiB keeps every spec-valid command
+# deliverable (the worst case is a write-config with the worst-case valid
+# configuration) while bounding what json.loads() can amplify at the parse
+# peak. Derivation: ARCHITECTURE.md, "Inbound packet size limit".
 MAX_INBOUND_PACKET_BYTES = 20 * 1024
 
 
@@ -35,12 +32,11 @@ class MQTTClient:
         self.pid = 0
         self.cb = None
         self.keepalive = keepalive
-        # Optional Core 0 servicing hook (Core 1 heartbeat check + hardware
-        # watchdog feed), invoked before every blocking socket operation:
-        # the socket timeout bounds one operation, but one MQTT transaction
-        # chains many of them, and without a feed between operations the
-        # un-fed stretch could chain past the Core 0 watchdog budget
-        # (core0.py WDT_TIMEOUT_MS) while the broker is merely slow.
+        # Optional Core 0 servicing hook (Core 1 heartbeat check + watchdog
+        # feed), invoked before every blocking socket operation: the socket
+        # timeout bounds one operation, but a transaction chains many, and
+        # without a feed between them the un-fed stretch could chain past the
+        # Core 0 watchdog budget while the broker is merely slow.
         self._service_hook = service
 
     def _service(self):

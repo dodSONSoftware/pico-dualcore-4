@@ -251,12 +251,11 @@ class ConfigManager:
         """Fully write the candidate to .tmp (closed) -- a crash after this
         leaves a promotable artifact.
 
-        json.dump() streams the serialization straight into the file object
+        json.dump() streams the serialization into the file object
         (MicroPython's dump writes through the stream, no pre-built string),
         so a configuration-sized allocation never coexists with the rest of
-        the write-config peak (inbound frame + parsed graph + candidate +
-        active config). A mid-write failure leaves a partial .tmp -- the
-        tolerated artifact: the read-back re-validation before promotion is
-        what decides, never the write itself."""
+        the write-config peak. A mid-write failure leaves a partial .tmp --
+        tolerated: the read-back re-validation before promotion decides,
+        never the write itself."""
         with open(self._tmp_path(), "w") as handle:
             json.dump(candidate, handle)

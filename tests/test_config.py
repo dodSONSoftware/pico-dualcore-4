@@ -216,6 +216,77 @@ def test_validate_config_accepts_conflicting_settings_on_different_i2c_buses():
 
 
 # ---------------------------------------------------------------------------
+# Cross-bus GPIO overlap: one GPIO cannot carry two bus protocols -- a
+# 1-Wire data pin on an I2C SDA/SCL pin would drive the same line in two
+# protocols at once (flaky reads on both sensors), so it is a deterministic
+# configuration error rejected here, never a flaky-sensor runtime failure.
+# ---------------------------------------------------------------------------
+
+
+def _ds18b20_device(device_id, pin=16, rom="28ff1ca26117048d"):
+    return {
+        "id": device_id,
+        "device_type": "ds18b20",
+        "config": {"pin": pin, "rom": rom},
+    }
+
+
+def test_validate_config_accepts_a_ds18b20_device():
+    config = _base_config()
+    config["devices"].append(_ds18b20_device("ds18b20-device"))
+    assert validate_config(config) is config
+
+
+def test_validate_config_rejects_a_ds18b20_pin_on_an_i2c_sda_pin():
+    # The fixture's bme280 is explicit on i2c_sda_pin 0 / i2c_scl_pin 1.
+    config = _base_config()
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=0))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 0" in message
+    assert "i2c_sda_pin" in message
+    assert "fixture-bme280-00000000000000000001" in message
+    assert "ds18b20-device" in message
+
+
+def test_validate_config_rejects_a_ds18b20_pin_on_an_i2c_scl_pin():
+    config = _base_config()
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=1))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 1" in message
+    assert "i2c_scl_pin" in message
+
+
+def test_validate_config_accepts_two_ds18b20_devices_sharing_one_pin():
+    # Multidrop: one 1-Wire line, two ROMs. A shared pin is one physical bus
+    # here (unlike the I2C same-bus rule, which is about reconfiguring a
+    # shared controller), so it is legal.
+    config = _base_config()
+    config["devices"].append(
+        _ds18b20_device("ds18b20-a", rom="28ff1ca26117048d")
+    )
+    config["devices"].append(
+        _ds18b20_device("ds18b20-b", rom="28ff8b236117032a")
+    )
+    assert validate_config(config) is config
+
+
+def test_validate_config_does_not_compare_port_default_i2c_pins():
+    # Only explicit I2C pins are config knowledge: a device that relies on the
+    # port default is not compared (the same reason the same-bus rule leaves
+    # absent pins distinct from explicit ones).
+    config = _base_config()
+    del config["devices"][0]["config"]["i2c_sda_pin"]
+    del config["devices"][0]["config"]["i2c_scl_pin"]
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=0))
+    assert validate_config(config) is config
+
+
+# ---------------------------------------------------------------------------
 # validate_config(): the pure validation path shared by startup and write-config
 # ---------------------------------------------------------------------------
 

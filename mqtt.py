@@ -54,15 +54,13 @@ class Mqtt:
         self._connected = False
         self._connect_count = 0
         self._disconnect_count = 0
-        # The final expected transport/protocol error from the most recent
-        # failed connect() attempt-sequence (None on success / before any
-        # attempt); cleared on success, used only to name the cause in Core
-        # 0's exhaustion warning.
+        # Last failed connect() attempt-sequence's transport/protocol error
+        # (None on success / before any attempt); names the cause in Core 0's
+        # exhaustion warning.
         self._last_connect_error = None
-        # The reason the most recent session disconnect was recorded
-        # (DISCONNECT_* above); None until the first disconnect this boot.
-        # Deliberately not cleared on reconnect: the field names the last
-        # drop, which is what a post-outage diagnosis wants.
+        # Last recorded disconnect reason (DISCONNECT_*); deliberately not
+        # cleared on reconnect -- the field names the last drop, which is
+        # what a post-outage diagnosis wants.
         self._last_disconnect_reason = None
         self._last_activity_ms = time.ticks_ms()
 
@@ -275,10 +273,8 @@ class Mqtt:
 
     @property
     def last_connect_error(self):
-        """The final expected transport/protocol error from the most recent
-        failed connect() attempt-sequence, or None (before any attempt, or
-        after a success) — exposed so Core 0's exhaustion warning can name the
-        cause instead of a generic 'sequence exhausted'."""
+        """Last failed connect() sequence's transport/protocol error, or None;
+        names the cause in Core 0's exhaustion warning."""
         return self._last_connect_error
 
     def status(self):

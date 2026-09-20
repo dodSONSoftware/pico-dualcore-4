@@ -35,8 +35,8 @@ def main():
     boot_ticks_ms = time.ticks_ms()
     gc.collect()
 
-    # Detect hardware early to validate the board and select the heap
-    # thresholds (preferred reserve and hard survival floor).
+    # Detect hardware first: fail fast on an unsupported board and select the
+    # board heap thresholds (preferred reserve and hard survival floor).
     hardware = detect_hardware()
     print("[INFO] Hardware detected: {} (heap reserve: {} preferred / {} minimum bytes)".format(
         hardware["hardware_type"],
@@ -44,7 +44,6 @@ def main():
         hardware["minimum_free_heap_bytes"],
     ))
 
-    # Start the boot/connection indication before loading the rest of the firmware.
     led_manager = LEDManager()
     led_manager.set_connecting(True)
 
@@ -55,24 +54,17 @@ def main():
 
     print("[INFO] Rebuilt dual-core firmware {}".format(FIRMWARE_VERSION))
 
-    # The configuration manager (Core 0-owned) settles the committed
-    # configuration -- recovering it from transaction artifacts if a write
-    # was interrupted -- before anything else runs.
+    # Settle the committed configuration (recovering it from transaction
+    # artifacts if a write was interrupted) before anything else runs.
     config_manager = ConfigManager("config.json")
     config = config_manager.recover()
     wifi_config = load_wifi_config("config-secrets.json")
-    # A bus property (like the board heap thresholds), read before the per-core
-    # split discards the full config: the outbound queue's deterministic count
-    # ceiling, subordinate to the heap policy.
+    # Read before split_config discards the full config: the outbound queue's
+    # count ceiling, subordinate to the heap policy.
     outbound_queue_max_messages = config["outbound_queue_max_messages"]
     core0_config, core1_config = split_config(config)
     config = None
 
-    # The bus is heap-governed: its admission thresholds are the board-specific
-    # preferred free-heap reserve (start of pressure handling) and the hard
-    # survival floor (hardware.py is the single source of truth), shared by
-    # both queues through one heap-admission lock, plus a configured count
-    # ceiling on the outbound queue.
     intercore = InterCore(
         minimum_free_heap_bytes=hardware["minimum_free_heap_bytes"],
         preferred_free_heap_bytes=hardware["preferred_free_heap_bytes"],
@@ -83,27 +75,15 @@ def main():
     # One runtime ID for this boot; both cores must agree on it.
     runtime_id = _runtime_id()
 
-    # Core 1's worker thread is spawned here, first -- before the core1 and
-    # core0 imports and the network bring-up: the thread's default ~4 KiB
-    # stack needs one contiguous GC-pool run, and on the Pico W (256 KB) no
-    # such run survives the import sets plus the CYW43/lwIP buffers (a spawn
-    # that late raised MemoryError into the silent reset boundary below and
-    # reboot-looped the board). Spawning before the core1 import gives the
-    # stack the cleanest pool state of the startup (the core1 chain's code
-    # objects are not yet interleaved into the pool). The worker stays idle
-    # until Core 0's network snapshot reports the full startup contract
-    # verified, then runs core1_main -- its modules are already loaded, so
-    # the ready path is a sys.modules cache hit, not a parse.
-    # start_new_thread(func, args, kwargs): the third positional argument is
-    # the keyword-args dict forwarded to the thread function -- this
-    # MicroPython _thread has no stack-size parameter, so the thread runs on
-    # the MicroPython-default stack.
+    # Spawn Core 1 first -- before the core1/core0 imports and the network
+    # bring-up -- so its ~4 KiB stack gets a contiguous GC-pool allocation
+    # before the Pico W heap fragments (late spawns MemoryErrored into the
+    # silent reset boundary and reboot-looped; see ARCHITECTURE.md).
     import _thread
 
     def _core1_thread_entry(bus, cfg, boot_ms, rid):
-        # Stamp liveness at spawn so a thread death in the wait is bounded by
-        # Core 0's stale-heartbeat watchdog (armed at the end of core0.start())
-        # instead of leaving Core 0 running with no Core 1.
+        # Stamp liveness at spawn so a worker death in the wait is bounded by
+        # Core 0's stale-heartbeat watchdog instead of going unnoticed.
         bus.state_mailboxes.set_core_1_activity_ms(time.ticks_ms())
         while True:
             snapshot = bus.state_mailboxes.get_network_snapshot()
@@ -118,32 +98,16 @@ def main():
     core1_config = None
     print("[INFO] Core 1 worker spawned; starts when the network stack reports ready")
 
-    # Core 1's modules are imported here, on the main thread, after the spawn
-    # and BEFORE the core0 import and the network bring-up: importing core1
-    # parses its source into a C-heap (non-GC) working buffer, and by the time
-    # the network snapshot reports ready the CYW43/lwIP buffers plus the
-    # worker's ~4 KiB stack have consumed the C heap, so a late parse
-    # MemoryErrors while gc.mem_free() still shows plenty (gc.collect()
-    # compacts only the GC heap, not the C heap). Importing while the C heap
-    # is still clear keeps the worker's ready path to a sys.modules cache hit.
-    # core1_main still RUNS on the worker thread, so Core 1's device
-    # ownership is unchanged; the modules have no import-time side effects.
+    # Import the Core 1 chain here, on the main thread, before the core0
+    # import: the parse buffer is a C-heap (non-GC) allocation the network
+    # bring-up exhausts, and a late import MemoryErrors where a late spawn
+    # cannot (see ARCHITECTURE.md). core1_main still runs on the worker.
     from core1 import core1_main
     print("[INFO] Core 1 modules imported pre-network (free heap {} bytes)".format(gc.mem_free()))
 
-    # Reclaim before the heaviest import of the startup. Since the collect at
-    # the top of main() the pool has accumulated collectable garbage -- the
-    # full configuration graph (nulled after the per-core split), the
-    # configuration-recovery parse residue, both import sets' compile
-    # temporaries, and the thread-spawn residue -- interleaved between the
-    # live import objects. On the Pico W the 0.4.90 core0 import died exactly
-    # here: a ~1.3 KiB allocation with ~88 KiB free in a pool fragmented into
-    # no contiguous run, and this import sits ABOVE the recovery boundary
-    # below, so that MemoryError escaped to the silent reset boundary and
-    # reboot-looped the board. The collect coalesces the freed runs before
-    # the import's code-object allocations. It coalesces free runs but does
-    # not compact live objects -- if the run still does not exist, the next
-    # step is a smaller resident import set, not more collection.
+    # Coalesce the pool before the heaviest import: it sits above the
+    # recovery boundary below, so a fragmentation MemoryError there (no
+    # contiguous run despite tens of KiB free) would reboot-loop the board.
     gc.collect()
     print("[INFO] Heap reclaimed before Core 0 import (free heap {} bytes)".format(gc.mem_free()))
 
@@ -161,26 +125,17 @@ def main():
     core0_config = None
     wifi_config = None
 
-    # Recovery boundary for the operational phase. Everything above is
-    # deterministic startup validation that intentionally fails fast: a
-    # misconfigured or unsupported board must stay down with a diagnosable
-    # error, not reboot forever. From here on every layer has a supervisor:
-    # Core 0's heartbeat watchdog recovers a dead Core 1, the hardware
-    # watchdog (armed at the end of core0.start()) a Core 0 that is alive but
-    # no longer making progress — and the exception boundary below covers
-    # what neither can: an unrecoverable Core 0 exception, which is a
-    # controlled board reset, not application termination.
+    # Recovery boundary for the operational phase: everything above is
+    # deterministic startup validation that fails fast (a misconfigured board
+    # must stay down, not reboot forever); from here an unrecoverable Core 0
+    # exception is a controlled board reset, not application termination.
     try:
-        # Core 0 establishes the network; the worker above starts running
-        # core1_main only once the network snapshot reports the startup
-        # contract verified.
         core0.start()
 
         core0.run()
     except MemoryError:
         # The heap is exhausted: this handler must not allocate, or the
-        # reset — the whole point of the boundary — could never run.
-        # machine.reset() is allocation-free and never returns on hardware.
+        # reset could never run (machine.reset() is allocation-free).
         machine.reset()
     except Exception as err:
         # Not a MemoryError, so the heap is serviceable and one diagnostic
