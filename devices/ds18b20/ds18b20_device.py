@@ -59,6 +59,12 @@ except ImportError:
 _MIN_TEMPERATURE_C = const(-55.0)
 _MAX_TEMPERATURE_C = const(125.0)
 
+# One conversion-wait sleep slice (ms): the wait is slept in bounded slices
+# while the data pin is released (see _wait_conversion); 10 ms bounds one
+# sleep without measurable overhead at the validator's 1000 ms ceiling
+# (100 slices).
+_WAIT_SLICE_MS = const(10)
+
 
 class DS18B20:
     """Low-level DS18B20 protocol over the injected 1-Wire bus.
@@ -106,13 +112,42 @@ class DS18B20:
 
     # --- Measurement --------------------------------------------------------
 
+    def _wait_conversion(self):
+        """The conversion-completion wait. The sensor needs no bus traffic
+        while it converts, so the data pin is released for the whole window
+        and re-acquired immediately before the caller's read_temp: on a
+        multi-drop pin the bus is the only communication path to any other
+        sensor sharing it, and the master must not hold it while the
+        conversion runs. The window is slept in slices of at most
+        _WAIT_SLICE_MS."""
+        try:
+            self._ds.release()
+        except MemoryError:
+            raise
+        except Exception as err:
+            # Same operational boundary as the read_temp call in read()
+            # (whose comment carries the rationale).
+            raise OSError("DS18B20 release failed: {}".format(err))
+        remaining = self._conversion_ms
+        while remaining > _WAIT_SLICE_MS:
+            time.sleep_ms(_WAIT_SLICE_MS)
+            remaining -= _WAIT_SLICE_MS
+        time.sleep_ms(remaining)
+        try:
+            self._ds.acquire()
+        except MemoryError:
+            raise
+        except Exception as err:
+            raise OSError("DS18B20 acquire failed: {}".format(err))
+
     def read(self):
         """One sample in Celsius: start the conversion, wait the configured
-        conversion window (750 ms at the power-on 12-bit default), then read
-        the scratchpad. The wait must cover the 12-bit maximum conversion
-        time -- the driver never configures the sensor's resolution, so a
-        shorter wait would read the previous scratchpad value (85 °C after a
-        power cycle), which is indistinguishable from a real 85 °C."""
+        conversion window (750 ms at the power-on 12-bit default) with the
+        data pin released for the whole window, then read the scratchpad.
+        The wait must cover the 12-bit maximum conversion time -- the driver
+        never configures the sensor's resolution, so a shorter wait would
+        read the previous scratchpad value (85 °C after a power cycle),
+        which is indistinguishable from a real 85 °C."""
         try:
             self._ds.convert_temp()
         except MemoryError:
@@ -121,7 +156,7 @@ class DS18B20:
             # Same operational boundary as the read_temp call below (whose
             # comment carries the rationale).
             raise OSError("DS18B20 convert failed: {}".format(err))
-        time.sleep_ms(self._conversion_ms)
+        self._wait_conversion()
 
         try:
             value = self._ds.read_temp(self._matched_rom)
