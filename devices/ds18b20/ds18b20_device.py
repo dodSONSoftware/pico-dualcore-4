@@ -102,7 +102,9 @@ class DS18B20:
             self._ds.convert_temp()
         except MemoryError:
             raise
-        except OSError as err:
+        except Exception as err:
+            # Same operational boundary as the read_temp call below (whose
+            # comment carries the rationale).
             raise OSError("DS18B20 convert failed: {}".format(err))
         time.sleep_ms(self._conversion_ms)
 
@@ -110,7 +112,14 @@ class DS18B20:
             value = self._ds.read_temp(self._matched_rom)
         except MemoryError:
             raise
-        except OSError as err:
+        except Exception as err:
+            # The injected bus's failure domain is operational: MicroPython's
+            # ds18x20 module raises a bare Exception on a scratchpad CRC
+            # failure (bit corruption in transit -- a stale scratchpad is
+            # still CRC-valid, so a CRC failure is not a stale read), and a
+            # hardware failure must normalize to OSError like every other
+            # driver's, or it escapes to Core 1's worker boundary and resets
+            # the device over one flaky read.
             raise OSError(
                 "DS18B20 ROM {} read failed: {}".format(self._rom_label, err)
             )

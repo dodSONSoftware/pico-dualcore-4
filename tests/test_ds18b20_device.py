@@ -41,15 +41,23 @@ ROM_B = "28ff8b236117032a"
 
 class FakeDS18X20:
     """A canned 1-Wire bus: a fixed ROM inventory, a recorded convert/read
-    protocol, and a per-read result (a float, None, or an exception to
-    raise). The ROMs are the bytearrays scan() yields, in scan order."""
+    protocol, a per-read result (a float, None, or an exception to raise),
+    and an optional exception to raise from convert_temp(). The ROMs are the
+    bytearrays scan() yields, in scan order."""
 
-    def __init__(self, roms=None, temperature=22.4375, read_error=None):
+    def __init__(
+        self,
+        roms=None,
+        temperature=22.4375,
+        read_error=None,
+        convert_error=None,
+    ):
         if roms is None:
             roms = (ROM_A,)
         self._roms = [bytearray(bytes.fromhex(rom)) for rom in roms]
         self.temperature = temperature
         self.read_error = read_error
+        self.convert_error = convert_error
         self.events = []  # ordered protocol events: "scan", "convert", "read"
         self.read_roms = []  # the ROMs passed to read_temp
 
@@ -59,6 +67,8 @@ class FakeDS18X20:
 
     def convert_temp(self):
         self.events.append("convert")
+        if self.convert_error is not None:
+            raise self.convert_error
 
     def read_temp(self, rom):
         self.events.append("read")
@@ -287,3 +297,26 @@ def test_read_wraps_a_bus_failure_as_an_operational_error(fake_time):
         device.read()
     assert ROM_A in str(excinfo.value)
     assert "reset failed" in str(excinfo.value)
+
+
+def test_read_wraps_the_bus_modules_bare_exception_as_an_operational_error(
+    fake_time,
+):
+    """MicroPython's ds18x20 module raises a bare Exception on a scratchpad
+    CRC failure (bit corruption in transit -- a stale scratchpad is still
+    CRC-valid). It must normalize to OSError like every other bus failure,
+    or it escapes the driver's boundary to Core 1's worker boundary and
+    resets the device over one flaky read."""
+    device = _initialized_device(ds=FakeDS18X20(read_error=Exception("CRC error")))
+    with pytest.raises(OSError) as excinfo:
+        device.read()
+    assert ROM_A in str(excinfo.value)
+    assert "CRC error" in str(excinfo.value)
+
+
+def test_convert_wraps_the_bus_bare_exception_as_an_operational_error(fake_time):
+    """The convert call is the same injected-bus boundary as the read call:
+    a non-MemoryError raise from it normalizes to OSError too."""
+    device = _initialized_device(ds=FakeDS18X20(convert_error=Exception("CRC error")))
+    with pytest.raises(OSError, match="convert failed"):
+        device.read()
