@@ -2,7 +2,7 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.144.
+**Release:** Bronze Owl — firmware 0.4.145.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-v1.28.0-00897B?logo=micropython&logoColor=white)](https://micropython.org)
@@ -340,7 +340,7 @@ Example:
   "name": "DS18B20 Temperature Sensor",
   "config": {
     "pin": 2,
-    "rom": "28ff1ca26117048d",
+    "rom": "28115246d4927c03",
     "offsets": {
       "temperature_c": 0
     }

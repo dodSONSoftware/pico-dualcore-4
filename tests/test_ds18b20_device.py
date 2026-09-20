@@ -51,8 +51,6 @@ class FakeDS18X20:
         temperature=22.4375,
         read_error=None,
         convert_error=None,
-        release_error=None,
-        acquire_error=None,
     ):
         if roms is None:
             roms = (ROM_A,)
@@ -60,11 +58,8 @@ class FakeDS18X20:
         self.temperature = temperature
         self.read_error = read_error
         self.convert_error = convert_error
-        self.release_error = release_error
-        self.acquire_error = acquire_error
-        self.events = []  # ordered protocol events: "scan", "convert", "release", "acquire", "read"
+        self.events = []  # ordered protocol events: "scan", "convert", "read"
         self.read_roms = []  # the ROMs passed to read_temp
-        self.released = False  # the pin state release()/acquire() toggles
 
     def scan(self):
         self.events.append("scan")
@@ -74,18 +69,6 @@ class FakeDS18X20:
         self.events.append("convert")
         if self.convert_error is not None:
             raise self.convert_error
-
-    def release(self):
-        self.events.append("release")
-        if self.release_error is not None:
-            raise self.release_error
-        self.released = True
-
-    def acquire(self):
-        self.events.append("acquire")
-        if self.acquire_error is not None:
-            raise self.acquire_error
-        self.released = False
 
     def read_temp(self, rom):
         self.events.append("read")
@@ -223,53 +206,33 @@ def test_read_before_initialize_raises():
 def test_read_runs_convert_wait_read_in_order(fake_time):
     """The protocol is two-stage: convert, wait, read -- never a bare read of
     the previous scratchpad value. The wait is the configured conversion
-    window (750 ms at the 12-bit default), and the data pin is released for
-    the whole window (multi-drop etiquette) and re-acquired before the
-    read."""
+    window (750 ms at the 12-bit default)."""
     ds = FakeDS18X20()
     device = _initialized_device(ds=ds)
     ds.events.clear()
     device.read()
-    assert ds.events == ["convert", "release", "acquire", "read"]
+    assert ds.events == ["convert", "read"]
     assert fake_time.now_ms == 750  # the default conversion window
 
 
-def test_wait_sleeps_in_bounded_slices_with_the_pin_released(fake_time, monkeypatch):
-    """Every sleep of the conversion wait is no longer than the slice bound
-    and observes the pin released: the sensor needs no bus traffic while it
-    converts, and a multi-drop pin must be free for the whole window (the
-    bus is the only communication path to any other sensor sharing it)."""
+def test_wait_is_one_sleep_of_the_full_conversion_window(fake_time, monkeypatch):
+    """The conversion wait is one uninterrupted sleep of the configured
+    window: the pin stays configured but undriven for the whole wait (the
+    DQ line is open-drain, so an idle pin is high-Z and a shared multi-drop
+    line stays free for any other master; the documented MicroPython
+    ds18x20 API exposes no pin release, and the sensor converts on its VDD
+    supply, not from the line). The validator's 1000 ms ceiling on the
+    window is what keeps this one sleep inside the Core 1 liveness budget."""
     ds = FakeDS18X20()
     device = _initialized_device(ds=ds)
-    observations = []  # (slice_ms, pin_released) per sleep
-    original_sleep = time_module.sleep_ms  # the fixture's FakeTime sleep_ms
+    observations = []  # every sleep_ms duration during read()
 
     def observing_sleep(ms):
-        observations.append((ms, ds.released))
-        original_sleep(ms)
+        observations.append(int(ms))
 
     monkeypatch.setattr(time_module, "sleep_ms", observing_sleep)
     device.read()
-    assert observations, "the conversion wait slept"
-    assert all(released for _, released in observations)
-    assert all(ms <= 10 for ms, _ in observations)
-    assert sum(ms for ms, _ in observations) == 750
-
-
-@pytest.mark.parametrize(
-    "error_attr, message",
-    [("release_error", "release failed"), ("acquire_error", "acquire failed")],
-)
-def test_wait_pin_transitions_wrap_bus_errors_as_operational_errors(
-    fake_time, error_attr, message
-):
-    """release()/acquire() are calls on the same injected bus as convert and
-    read: a non-MemoryError raise from them normalizes to OSError (the
-    OSError-only operational domain), not an escape to Core 1's worker
-    boundary."""
-    device = _initialized_device(ds=FakeDS18X20(**{error_attr: Exception("CRC error")}))
-    with pytest.raises(OSError, match=message):
-        device.read()
+    assert observations == [750]  # the full default window, in one sleep
 
 
 def test_read_uses_the_configured_conversion_wait(fake_time):
