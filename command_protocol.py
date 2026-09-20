@@ -52,7 +52,6 @@ BROADCAST_EXCLUDED_COMMANDS = frozenset((COMMAND_WRITE_CONFIG,))
 
 
 def is_supported_command(command):
-    """True when command is one of the supported command names."""
     return command in SUPPORTED_COMMANDS
 
 

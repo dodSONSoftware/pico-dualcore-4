@@ -9,7 +9,6 @@ import time
 
 
 def create_uptime_state(boot_ticks_ms):
-    """Create the state used to accumulate uptime from boot_ticks_ms."""
     return {
         "last_ticks_ms": boot_ticks_ms,
         "accumulated_ms": 0,
