@@ -98,6 +98,14 @@ def main():
     core1_config = None
     print("[INFO] Core 1 worker spawned; starts when the network stack reports ready")
 
+    # Reclaim the startup garbage (the nulled config graph, the recovery parse
+    # residue, the thread-spawn residue) and coalesce the free runs before the
+    # first heavy import: on the Pico W a fragmented pool can no longer yield
+    # the contiguous run the import's code objects need -- 0.4.90 hit this at
+    # the core0 import, and the grown core chain now exhausts it at the core1
+    # import. Mirrors the reclaim before the core0 import below.
+    gc.collect()
+
     # Import the Core 1 chain here, on the main thread, before the core0
     # import: the parse buffer is a C-heap (non-GC) allocation the network
     # bring-up exhausts, and a late import MemoryErrors where a late spawn

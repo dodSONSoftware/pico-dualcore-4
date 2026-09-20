@@ -54,6 +54,37 @@ def test_worker_spawns_before_both_imports():
     assert spawn < core1 < core0
 
 
+def test_heap_reclaimed_before_the_core1_import():
+    # The 0.4.139 Pico W failure: the core1 import -- the first heavy import,
+    # which runs before the collect that guards the core0 import -- MemoryError'd
+    # on a 640-byte allocation at the device_manager import. The core chain has
+    # grown since 0.4.90 (more modules resident before the network stack loads)
+    # to the point where the pre-core0 collect no longer protects the core1
+    # import: the startup garbage (the nulled config graph, the recovery parse
+    # residue, the thread-spawn residue) fragments the pool before the core1
+    # import's code-object allocations. A gc.collect() between the spawn and the
+    # core1 import reclaims it, mirroring the reclaim that guards the core0
+    # import.
+    main = _main_function()
+    spawn = _line_of(
+        lambda n: isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "start_new_thread",
+        main,
+    )
+    core1 = _import_line(main, "core1")
+    collects = [
+        n.lineno
+        for n in ast.walk(main)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "collect"
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "gc"
+    ]
+    assert any(spawn < line < core1 for line in collects)
+
+
 def test_heap_reclaimed_before_the_core0_import():
     # The 0.4.90 Pico W failure: a 1336-byte import-machinery allocation with
     # 88,176 bytes free (a fragmented pool, no contiguous run). A gc.collect()

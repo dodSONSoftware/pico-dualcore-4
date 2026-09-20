@@ -2,7 +2,7 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.139.
+**Release:** Bronze Owl — firmware 0.4.140.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-v1.28.0-00897B?logo=micropython&logoColor=white)](https://micropython.org)
@@ -299,7 +299,7 @@ remaining sections are still returned.
 
 ## Built-in Devices
 
-Two device types are registered, both I2C sensors sharing Core 1's per-device bus configuration (bus, SDA/SCL pins; `bme280` also names its address candidates): `bme280` — temperature, pressure, humidity, and derived altitude (Bosch BME280) — and `ltr390` — ambient light and UV index (Lite-On LTR-390UV-01).
+Three device types are registered. Two are I2C sensors sharing Core 1's per-device bus configuration (bus, SDA/SCL pins; `bme280` also names its address candidates): `bme280` — temperature, pressure, humidity, and derived altitude (Bosch BME280) — and `ltr390` — ambient light and UV index (Lite-On LTR-390UV-01). The third is the first 1-Wire device, `ds18b20` — a digital thermometer read by its factory-programmed ROM (temperature only).
 
 Example:
 ```
@@ -317,6 +317,32 @@ Example:
       "temperature_c": 0,
       "humidity_percent": 0,
       "pressure_pascal": 0
+    }
+  }
+},
+{
+  "id": "qX8vK2mWdNt5Rj3ZpA7yLc4BhFs6E",
+  "device_type": "ltr390",
+  "name": "LTR390 Light/UV Sensor",
+  "config": {
+    "i2c_bus": 0,
+    "i2c_sda_pin": 0,
+    "i2c_scl_pin": 1,
+    "offsets": {
+      "lux": 0,
+      "uv_index": 0
+    }
+  }
+},
+{
+  "id": "mT4wJ9pXsRk2Hn6VcD8qZb3YgLu5W",
+  "device_type": "ds18b20",
+  "name": "DS18B20 Temperature Sensor",
+  "config": {
+    "pin": 2,
+    "rom": "28ff1ca26117048d",
+    "offsets": {
+      "temperature_c": 0
     }
   }
 }
