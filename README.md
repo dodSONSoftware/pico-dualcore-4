@@ -2,7 +2,7 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.141.
+**Release:** Bronze Owl — firmware 0.4.142.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-v1.28.0-00897B?logo=micropython&logoColor=white)](https://micropython.org)
@@ -347,6 +347,17 @@ Example:
   }
 }
 ```
+
+**Finding the `ds18b20` `rom` value** — the ROM is a 64-bit factory-programmed ID, unique per sensor. It cannot be predicted from the wiring, so read it from the 1-Wire bus in the MicroPython REPL before starting the firmware (`main.main()`), on the pin the sensor's data line is connected to:
+
+```python
+from machine import Pin
+import onewire, ds18x20
+for rom in ds18x20.DS18X20(onewire.OneWire(Pin(2))).scan():
+    print(rom.hex())
+```
+
+One line is printed per sensor present on the pin. Copy the 16-character hex value (it starts with the family code `28`) into the device's `rom` config field. The scan order is not a stable identity — with several sensors sharing a pin, identify the target physically (e.g. disconnect the others one at a time until the desired ROM is the one remaining).
 
 The system-information data the `get-details` command returns is organized into these sections:
 

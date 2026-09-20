@@ -184,11 +184,17 @@ def test_default_conversion_wait_is_the_twelve_bit_window():
     assert validate_config(_valid_config()) is None
 
 
-@pytest.mark.parametrize("bad_wait", [True, "750", 750.0, None, 94, 188, 375, 749, 60001])
+@pytest.mark.parametrize("bad_wait", [True, "750", 750.0, None, 94, 188, 375, 749, 1001, 60000])
 def test_invalid_conversion_wait_is_rejected(bad_wait):
     # 94/188/375 are the documented 9/10/11-bit conversion times: they race
     # the scratchpad unless the driver has configured and verified a lower
-    # resolution, which this driver never does.
+    # resolution, which this driver never does. 1001 is one past the ceiling:
+    # no resolution's conversion window needs it (the 12-bit maximum is
+    # 750 ms; the ceiling is clone/timing margin, not protocol headroom),
+    # and the wait is one uninterrupted sleep that does not refresh Core 1's
+    # liveness stamp, so the ceiling stays far below Core 0's 30 s Core 1
+    # staleness timeout. 60000 was the former ceiling: schema-legal, yet a
+    # guaranteed heartbeat-stale reset after every read.
     config = _valid_config()
     config["conversion_ms"] = bad_wait
     with pytest.raises(DeviceValidationError) as excinfo:
@@ -196,7 +202,7 @@ def test_invalid_conversion_wait_is_rejected(bad_wait):
     assert excinfo.value.code == "invalid_value"
 
 
-@pytest.mark.parametrize("good_wait", [750, 760, 1000, 60000])
+@pytest.mark.parametrize("good_wait", [750, 760, 1000])
 def test_conversion_wait_bounds_are_accepted(good_wait):
     config = _valid_config()
     config["conversion_ms"] = good_wait

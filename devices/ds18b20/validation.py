@@ -51,11 +51,17 @@ _HEX_CHARS = frozenset("0123456789abcdefABCDEF")
 # sensor's resolution -- so the wait must cover the 12-bit window: a shorter
 # wait races the scratchpad and can return the previous value (85 °C after a
 # power cycle, which is also a valid real temperature and indistinguishable
-# from a stale read). The ceiling keeps one device's wait from holding the
-# whole read pass.
+# from a stale read). The ceiling is tight because no resolution's conversion
+# window comes close to it (the 12-bit maximum is 750 ms; the slack is
+# clone/timing margin, not protocol headroom) -- and the wait is one
+# uninterrupted sleep inside read() that does not refresh Core 1's liveness
+# stamp, so a value anywhere near Core 0's 30 s Core 1 staleness timeout
+# would be schema-legal yet reset the device after every read (the former
+# 60000 ceiling permitted exactly that, including after a remotely written
+# config).
 _MIN_CONVERSION_MS = 750
 DEFAULT_CONVERSION_MS = 750
-_MAX_CONVERSION_MS = 60000
+_MAX_CONVERSION_MS = 1000
 
 
 def _is_int(value):

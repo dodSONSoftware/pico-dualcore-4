@@ -18,6 +18,21 @@ value (85 °C after a power cycle) until the conversion completes, so the wait
 is part of the protocol -- and 85.0 °C is a valid real temperature, never an
 error code. The reference is the DS18B20 data sheet (Rev. 6); where guidance
 disagrees with the data sheet, the data sheet wins.
+
+The config's ``rom`` field is the sensor's 64-bit factory-programmed ID: it
+is unique per sensor, not derivable from the wiring, and must be read from
+the bus. In the MicroPython REPL (before the firmware starts, on the pin the
+sensor's data line is connected to, e.g. 2):
+
+    from machine import Pin
+    import onewire, ds18x20
+    for rom in ds18x20.DS18X20(onewire.OneWire(Pin(2))).scan():
+        print(rom.hex())
+
+One line is printed per sensor on the bus; copy the 16-character hex (it
+starts with the family code ``28``) into ``rom``. The scan order is not a
+stable identity -- with more than one sensor on the pin, identify the target
+physically (e.g. by disconnecting the others one at a time).
 """
 
 import time
