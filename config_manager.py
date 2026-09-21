@@ -117,23 +117,36 @@ class ConfigManager:
         if self._path_exists(path):
             os.remove(path)
 
+    def _try_load(self, path, invalid):
+        """Load and validate one recovery artifact: the config, or None with
+        the ConfigError recorded under ``path`` so the failure message can
+        name the reason a present artifact was invalid. MemoryError
+        propagates to the fail-fast boundary."""
+        try:
+            return load_config(path)
+        except MemoryError:
+            raise
+        except ConfigError as err:
+            invalid[path] = err
+            return None
+
     def recover(self):
         """Boot recovery: settle the committed config before anything else
         runs. A valid .old is authoritative (a promotion interrupted before
         its commit point), then a valid config.json, then a valid .tmp; an
         invalid .old is released. On success the steady state is exactly one
-        valid config.json; else startup fails clearly."""
+        valid config.json; else startup fails clearly, naming the reason: a
+        present artifact that fails to load or validate is reported as
+        invalid with its own error (the steady-state config.json first, then
+        the transaction artifacts), and only when nothing is present at all
+        are the artifacts reported as all missing."""
         config_path = self._config_path
         old_path = self._old_path()
         tmp_path = self._tmp_path()
+        invalid = {}
 
         if self._path_exists(old_path):
-            try:
-                config = load_config(old_path)
-            except MemoryError:
-                raise
-            except ConfigError:
-                config = None
+            config = self._try_load(old_path, invalid)
             if config is not None:
                 if self._path_exists(config_path):
                     os.remove(config_path)
@@ -143,12 +156,7 @@ class ConfigManager:
                 return config
 
         if self._path_exists(config_path):
-            try:
-                config = load_config(config_path)
-            except MemoryError:
-                raise
-            except ConfigError:
-                config = None
+            config = self._try_load(config_path, invalid)
             if config is not None:
                 self._remove_if_exists(old_path)
                 self._remove_if_exists(tmp_path)
@@ -156,12 +164,7 @@ class ConfigManager:
                 return config
 
         if self._path_exists(tmp_path):
-            try:
-                config = load_config(tmp_path)
-            except MemoryError:
-                raise
-            except ConfigError:
-                config = None
+            config = self._try_load(tmp_path, invalid)
             if config is not None:
                 os.rename(tmp_path, config_path)
                 # The .old that reached this branch is invalid by
@@ -170,9 +173,20 @@ class ConfigManager:
                 os.sync()
                 return config
 
+        # Every present artifact failed to load or validate: name the one
+        # closest to the steady state with its own reason -- a provisioned
+        # config.json that fails validation must not masquerade as a
+        # missing file.
+        for path in (config_path, old_path, tmp_path):
+            if path in invalid:
+                raise ConfigError(
+                    "No valid configuration found: {} is invalid: {}".format(
+                        path, invalid[path]),
+                    code="unreadable_file",
+                )
         raise ConfigError(
             "No valid configuration found: {} and its .old/.tmp recovery "
-            "artifacts are all missing or invalid".format(config_path),
+            "artifacts are all missing".format(config_path),
             code="unreadable_file",
         )
 

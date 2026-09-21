@@ -1,5 +1,5 @@
 {
-  "source": "Water-1",
+  "source": "Air-2",
   "config_schema_version": 10,
   "outbound_queue_max_messages": 32,
   "read_loop_sec": 20,
@@ -27,14 +27,19 @@
   "mqtt_reconnect_delays_sec": [ 2, 2, 2, 2, 2, 3, 3, 3, 5, 5, 5, 10, 10, 10, 20, 20, 20 ],
   "devices": [
     {
-      "id": "mT4wJ9pXsRk2Hn6VcD8qZb3YgLu5W",
-      "device_type": "ds18b20",
-      "name": "DS18B20 Temperature Sensor",
+      "id": "819caa3d3fa10bc4a0832cc02d961c3a",
+      "device_type": "bme280",
+      "name": "BME280 Environmental Sensor",
       "config": {
-        "pin": 2,
-        "rom": "28115246d4927c03",
+        "i2c_bus": 1,
+        "i2c_sda_pin": 2,
+        "i2c_scl_pin": 3,
+        "i2c_address_candidates": [ 118, 119 ],
+        "sea_level_pressure_pa": 101325,
         "offsets": {
-          "temperature_c": 0
+          "temperature_c": 0,
+          "humidity_percent": 0,
+          "pressure_pascal": 0
         }
       }
     }

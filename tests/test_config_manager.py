@@ -167,7 +167,52 @@ def test_recovery_fails_clearly_when_nothing_valid_exists(config_dir):
 
 def test_recovery_fails_when_all_files_are_absent(tmp_path):
     manager = ConfigManager(str(tmp_path / "config.json"))
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError, match="are all missing"):
+        manager.recover()
+
+
+def test_recovery_reports_all_missing_without_claiming_invalid(tmp_path):
+    """The all-missing message must not lump in the invalid case: a present
+    artifact that fails validation is named with its own reason below."""
+    manager = ConfigManager(str(tmp_path / "config.json"))
+    with pytest.raises(ConfigError) as excinfo:
+        manager.recover()
+    assert "invalid" not in str(excinfo.value)
+
+
+def test_recovery_names_the_validation_error_of_an_invalid_config(config_dir):
+    """A present config.json that fails validation is reported as invalid
+    with its own reason, not as a missing file."""
+    invalid = _base_config()
+    invalid["source"] = ""
+    (config_dir / "config.json").write_text(json.dumps(invalid))
+
+    manager = ConfigManager(str(config_dir / "config.json"))
+    with pytest.raises(
+        ConfigError,
+        match=r"config\.json is invalid: source must be a non-empty string",
+    ):
+        manager.recover()
+
+
+def test_recovery_names_config_json_when_several_artifacts_are_invalid(config_dir):
+    """When several artifacts are invalid, the steady-state file is the one
+    named: its reason is the actionable one."""
+    (config_dir / "config.json").write_text("corrupted")
+    (config_dir / "config.json.old").write_text("{ broken")
+    (config_dir / "config.json.tmp").write_text("also broken")
+
+    manager = ConfigManager(str(config_dir / "config.json"))
+    with pytest.raises(ConfigError, match=r"config\.json is invalid"):
+        manager.recover()
+
+
+def test_recovery_names_an_invalid_old_artifact_when_config_is_absent(config_dir):
+    (config_dir / "config.json").unlink()
+    (config_dir / "config.json.old").write_text("{ broken")
+
+    manager = ConfigManager(str(config_dir / "config.json"))
+    with pytest.raises(ConfigError, match=r"config\.json\.old is invalid"):
         manager.recover()
 
 
