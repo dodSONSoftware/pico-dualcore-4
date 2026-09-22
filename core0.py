@@ -951,6 +951,8 @@ class Core0:
     def _utc_note_reachable_failure(self):
         """Clear a malformed-payload pending request; re-key the throttle for a prompt retry."""
         self._utc_clear_pending()
+        # Backdate the last-attempt stamp so the 30 s throttle expires
+        # after the 500 ms prompt-retry delay, not after the full interval.
         self._utc_last_attempt_ms = time.ticks_add(
             time.ticks_ms(),
             _UTC_PROMPT_RETRY_DELAY_MS - _UTC_RETRY_INTERVAL_MS,
