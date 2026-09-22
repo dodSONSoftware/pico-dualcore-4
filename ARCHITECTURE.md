@@ -421,7 +421,7 @@ Each Core 0 iteration (10 ms period) services, in order:
 
 1. A pending reboot (publish the response, wait, `machine.reset()`).
 2. Network recovery via `_recover_network_if_needed` — this runs even before any publishing, so a lost link is detected and repaired at the top of the loop.
-3. The MQTT receive pump (`check_msg`) at the configured `mqtt_command_poll_ms` cadence — this is how UTC responses and commands arrive without blocking.
+3. The MQTT receive pump (`check_msg`) at the configured `mqtt_command_poll_ms` cadence — this is how UTC responses and commands arrive without blocking. The cadence is operationally bounded at the config boundary (`config.MAX_MQTT_COMMAND_POLL_MS`, 10 s): this pump is the only inbound-command path, so a representable multi-day value would leave an apparently healthy device (telemetry, health, keepalive, and the watchdog all normal) unable to receive the `write-config` command that would repair the value.
 4. Pending Core 0 command responses (when MQTT is connected and no entry is in flight).
 5. One outbound queue entry, published with QoS 1; a failed publish leaves the entry in flight for retry, and a successful one calls `complete_in_flight`.
 6. A PINGREQ when keepalive traffic is due — only when no outbound entry is being published (a PUBLISH itself resets the broker timer).

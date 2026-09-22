@@ -2,7 +2,7 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.148.
+**Release:** Bronze Owl — firmware 0.4.149.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-v1.28.0-00897B?logo=micropython&logoColor=white)](https://micropython.org)
@@ -198,7 +198,7 @@ The firmware expects `config_schema_version: 8`. Unknown top-level keys are reje
 | `device_read_failure_threshold` | Consecutive failures before reinit |
 | `outbound_queue_max_messages` | Outbound queue entry-count ceiling (1–256); the heap policy is evaluated first |
 | `mqtt_keepalive_sec` | MQTT keepalive interval (seconds) |
-| `mqtt_command_poll_ms` | MQTT receive pump interval (ms) |
+| `mqtt_command_poll_ms` | MQTT receive pump interval (1–10000 ms) |
 | `mqtt_outbound_publish_delay_ms` | Minimum delay (ms) after a successful outbound MQTT PUBLISH before another may begin; 0 disables pacing |
 | `mqtt_broker_response_timeout_sec` | Bounded PUBACK/UTC-response wait (seconds) |
 | `network_probe_timeout_sec` | Startup probe PUBACK wait (seconds) |

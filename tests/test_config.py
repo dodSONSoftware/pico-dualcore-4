@@ -18,6 +18,7 @@ from config import (
     MAX_DEVICE_READ_FAILURE_THRESHOLD,
     MAX_DEVICES,
     MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC,
+    MAX_MQTT_COMMAND_POLL_MS,
     MAX_MQTT_KEEPALIVE_SEC,
     MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS,
     MAX_MQTT_TOPIC_BYTES,
@@ -891,6 +892,7 @@ def test_validate_config_device_initialization_attempts_is_bounded():
         ("mqtt_broker_response_timeout_sec", MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC),
         ("network_probe_timeout_sec", MAX_NETWORK_PROBE_TIMEOUT_SEC),
         ("mqtt_outbound_publish_delay_ms", MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS),
+        ("mqtt_command_poll_ms", MAX_MQTT_COMMAND_POLL_MS),
         ("device_initialization_retry_delay_ms", MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS),
         ("device_read_failure_threshold", MAX_DEVICE_READ_FAILURE_THRESHOLD),
     ],
@@ -913,6 +915,25 @@ def test_validate_config_operational_liveness_bounds(key, max_value):
         validate_config(config)
     assert excinfo.value.code == "invalid_value"
     assert str(excinfo.value) == "{} must be at most {}".format(key, max_value)
+
+
+def test_validate_config_command_poll_far_above_the_bound_is_rejected():
+    """A value far above the 10 s bound — a unit/scale slip, here 86400 ms —
+    is rejected at the configuration boundary with the stable code and exact
+    message, while the shipped 100 ms pump interval keeps validating so normal
+    deployments are unaffected."""
+    config = _base_config()
+    config["mqtt_command_poll_ms"] = 86400
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    assert str(excinfo.value) == "mqtt_command_poll_ms must be at most {}".format(
+        MAX_MQTT_COMMAND_POLL_MS
+    )
+
+    config = _base_config()
+    assert config["mqtt_command_poll_ms"] == 100
+    assert validate_config(config) is config
 
 
 @pytest.mark.parametrize("value", [1, 32, 64, 256])
@@ -956,13 +977,13 @@ def test_validate_config_outbound_queue_max_messages_required_under_schema_8():
         ("read_loop_sec", 1000),
         ("health_interval_sec", 1000),
         ("network_snapshot_interval_sec", 1000),
-        # mqtt_broker_response_timeout_sec and mqtt_outbound_publish_delay_ms
-        # are NOT here: their operational liveness bounds (MAX_MQTT_BROKER_
-        # RESPONSE_TIMEOUT_SEC, MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS) are far
-        # tighter than the ticks ceiling and are pinned in
+        # mqtt_broker_response_timeout_sec, mqtt_outbound_publish_delay_ms,
+        # and mqtt_command_poll_ms are NOT here: their operational liveness
+        # bounds (MAX_MQTT_BROKER_RESPONSE_TIMEOUT_SEC,
+        # MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS, MAX_MQTT_COMMAND_POLL_MS) are
+        # far tighter than the ticks ceiling and are pinned in
         # test_validate_config_operational_liveness_bounds.
         ("datetime_sync_interval_min", 60 * 1000),
-        ("mqtt_command_poll_ms", 1),
     ],
 )
 def test_validate_config_ticks_backed_intervals_are_bounded_by_the_ticks_limit(

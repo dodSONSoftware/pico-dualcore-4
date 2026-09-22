@@ -82,6 +82,14 @@ MAX_NETWORK_PROBE_TIMEOUT_SEC = 30
 # keep a multi-day value from holding startup in a paced stall.
 MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS = 60 * 1000
 
+# Core 0's run loop pumps inbound commands (check_msg) only when this
+# interval has elapsed: a huge but schema-valid value leaves an apparently
+# healthy device (telemetry, health, keepalive, and the watchdog all
+# normal) that silently stops servicing commands — including the
+# write-config command that would repair the value. An operational liveness
+# bound on command-repair channel latency, not a ticks-width limit.
+MAX_MQTT_COMMAND_POLL_MS = 10 * 1000
+
 # Core 1's initialization retry pacing (a sliced sleep that refreshes the
 # liveness stamp, so no ticks or watchdog pressure): purely operational.
 MAX_DEVICE_INITIALIZATION_RETRY_DELAY_MS = 60 * 1000
@@ -631,6 +639,13 @@ def validate_config(config):
         raise ConfigError(
             "mqtt_outbound_publish_delay_ms must be at most {}".format(
                 MAX_MQTT_OUTBOUND_PUBLISH_DELAY_MS
+            ),
+            code="invalid_value",
+        )
+    if config["mqtt_command_poll_ms"] > MAX_MQTT_COMMAND_POLL_MS:
+        raise ConfigError(
+            "mqtt_command_poll_ms must be at most {}".format(
+                MAX_MQTT_COMMAND_POLL_MS
             ),
             code="invalid_value",
         )
