@@ -118,6 +118,21 @@ def host_boot(monkeypatch):
         },
     )
 
+    # Startup settles the config through the configuration manager's recovery
+    # path (ConfigManager.recover() -> load_config(path)) against the repo-root
+    # deployment config.json. These tests target main()'s recovery boundary, not
+    # that file -- an in-progress deployment retarget can leave it invalid -- so
+    # the boot must proceed past config loading deterministically: point the
+    # loader that path calls at the canonical host fixture instead.
+    import config_manager
+
+    _fixture_path = str(ROOT / "tests" / "fixtures" / "config.json")
+    monkeypatch.setattr(
+        config_manager,
+        "load_config",
+        lambda path: config_mod.load_config(_fixture_path),
+    )
+
     def _pico_w():
         return {
             "hardware_type": "pico_w",

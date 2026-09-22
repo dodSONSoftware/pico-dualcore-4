@@ -462,10 +462,14 @@ def test_write_config_device_changes_are_compact_entries(make_core0, tmp_path):
     candidate = _full_config()
     modified = json.loads(json.dumps(original))
     modified["config"]["sea_level_pressure_pa"] = 101000
+    # Two BME280 on one bus must be distinct physical chips, so each is pinned
+    # to one address (0x76 / 0x77) rather than the two-address default.
+    modified["config"]["i2c_address_candidates"] = [118]
     # Same explicit bus 0 pins as the fixture device: one bus is one physical
     # controller, so a same-bus device must configure it identically.
     added = {"id": "aaAddedDevice", "device_type": "bme280",
              "config": {"i2c_bus": 0, "i2c_sda_pin": 0, "i2c_scl_pin": 1,
+                        "i2c_address_candidates": [119],
                         "sea_level_pressure_pa": 101325}}
     candidate["devices"] = [added, modified]  # original id stays, one added
 

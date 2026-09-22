@@ -12,6 +12,7 @@ from device_factory import (
     validate_device_definition,
 )
 from devices.device import DeviceValidationError
+from devices.rp2_i2c import effective_rp2_i2c_pins
 from version import CONFIG_SCHEMA_VERSION
 
 # Keep Alive is a 16-bit word in CONNECT: above 65535 s the packet is
@@ -407,9 +408,12 @@ def _validate_devices(devices):
     # Cross-bus GPIO overlap spans the whole list, like the same-bus rule
     # above: one GPIO cannot carry two bus protocols (a 1-Wire data pin on an
     # I2C SDA/SCL pin would drive the same line in two protocols at once --
-    # flaky reads on both sensors). Only explicit I2C pins are compared: a
-    # device on the port's default pins resolves no config knowledge. Two
-    # ds18b20 devices on the same pin remain legal -- a 1-Wire multidrop bus.
+    # flaky reads on both sensors). An omitted I2C pin still drives a physical
+    # line at runtime (the port default for that bus), so each side is resolved
+    # to the GPIO it actually uses before the overlap check -- a 1-Wire device
+    # on a bus's default SDA/SCL is the same collision as one on an explicit
+    # pin. Two ds18b20 devices on the same pin remain legal -- a 1-Wire
+    # multidrop bus.
     onewire_owners = {}
     for index, device in enumerate(devices):
         if device.get("device_type") != "ds18b20":
@@ -425,17 +429,96 @@ def _validate_devices(devices):
             continue
         device_id = device.get("id")
         qualifier = device_id if isinstance(device_id, str) and device_id else str(index)
-        for pin_key in ("i2c_sda_pin", "i2c_scl_pin"):
-            owner = onewire_owners.get(device_config.get(pin_key))
+        # The bus is already a validated 0/1 (the per-device pure validation
+        # ran first), so the default-pin mapping is in range. An explicit pin
+        # resolves to itself; an omitted pin resolves to the default the
+        # runtime drives, so an explicit non-default routing does not reserve
+        # an unused default.
+        effective_sda, effective_scl = effective_rp2_i2c_pins(
+            device_config["i2c_bus"],
+            device_config.get("i2c_sda_pin"),
+            device_config.get("i2c_scl_pin"),
+        )
+        for pin_key, effective_pin in (
+            ("i2c_sda_pin", effective_sda),
+            ("i2c_scl_pin", effective_scl),
+        ):
+            owner = onewire_owners.get(effective_pin)
             if owner is None:
                 continue
             raise ConfigError(
                 "Conflicting GPIO pin {}: device '{}' (I2C {}) and device "
                 "'{}' (1-Wire DQ) share one pin; a GPIO cannot carry two bus "
                 "protocols"
-                .format(device_config.get(pin_key), qualifier, pin_key, owner),
+                .format(effective_pin, qualifier, pin_key, owner),
                 code="invalid_value",
             )
+
+    # Physical-sensor uniqueness spans the whole list: a logical device id is
+    # unique, but two definitions can still name the same physical I2C chip.
+    # The LTR390 has a fixed address (0x53), so a second LTR390 on one bus
+    # necessarily targets the same directly-attached sensor. The BME280 probes
+    # its candidate list in order and binds the first responder, so with more
+    # than one BME280 on a bus a list naming more than one address (including
+    # the two-address default) is ambiguous -- it may bind 0x76 or 0x77 -- and
+    # two devices naming the same single address target the same chip. Either
+    # way one physical sensor would publish under two device ids (plausible
+    # telemetry with the wrong identity), so both are configuration errors here,
+    # not runtime conditions. A single BME280 on a bus keeps its full
+    # candidate-list behavior (including the two-address default).
+    ltr390_owners = {}
+    bme280_by_bus = {}
+    for index, device in enumerate(devices):
+        device_config = device.get("config")
+        if not isinstance(device_config, dict) or "i2c_bus" not in device_config:
+            continue
+        device_type = device.get("device_type")
+        device_id = device.get("id")
+        qualifier = device_id if isinstance(device_id, str) and device_id else str(index)
+        if device_type == "ltr390":
+            owner = ltr390_owners.get(device_config["i2c_bus"])
+            if owner is not None:
+                raise ConfigError(
+                    "Multiple LTR390 devices cannot share i2c_bus {} because "
+                    "the sensor address is fixed: '{}' and '{}' would both "
+                    "target the same chip"
+                    .format(device_config["i2c_bus"], owner, qualifier),
+                    code="invalid_value",
+                )
+            ltr390_owners[device_config["i2c_bus"]] = qualifier
+        elif device_type == "bme280":
+            bme280_by_bus.setdefault(device_config["i2c_bus"], []).append(
+                (qualifier, device_config.get("i2c_address_candidates"))
+            )
+
+    if bme280_by_bus:
+        # Imported only when a BME280 is present (the residency rule: a type a
+        # board does not configure must not be resident from startup).
+        from devices.bme280.validation import DEFAULT_I2C_ADDRESS_CANDIDATES
+        for bus, entries in bme280_by_bus.items():
+            if len(entries) < 2:
+                continue
+            addresses = {}
+            conflict = False
+            for qualifier, candidates in entries:
+                # Effective list: the explicit one, or the two-address default
+                # the driver applies when the key is omitted.
+                effective = (
+                    candidates
+                    if candidates is not None
+                    else DEFAULT_I2C_ADDRESS_CANDIDATES
+                )
+                if len(effective) != 1 or effective[0] in addresses:
+                    conflict = True
+                    break
+                addresses[effective[0]] = qualifier
+            if conflict:
+                raise ConfigError(
+                    "Multiple BME280 devices on i2c_bus {} ({}) must each "
+                    "specify one distinct i2c_address_candidates address"
+                    .format(bus, ", ".join(qualifier for qualifier, _ in entries)),
+                    code="invalid_value",
+                )
 
 
 def validate_config(config):

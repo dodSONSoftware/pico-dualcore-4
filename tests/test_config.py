@@ -156,10 +156,13 @@ def _second_device(config, **config_changes):
 
 
 def test_validate_config_accepts_two_devices_sharing_one_i2c_bus_identically():
-    # The shipped configuration shape: two sensors on bus 0, same pins and
-    # (default) frequency, sharing one machine.I2C.
+    # Two sensors on bus 0 with identical controller settings (same pins and
+    # default frequency) share one machine.I2C. They must also be distinct
+    # physical chips, so each is pinned to one BME280 address (0x76 / 0x77)
+    # rather than the two-address default, which would leave both ambiguous.
     config = _base_config()
-    config["devices"].append(_second_device(config))
+    config["devices"][0]["config"]["i2c_address_candidates"] = [118]
+    config["devices"].append(_second_device(config, i2c_address_candidates=[119]))
     assert validate_config(config) is config
 
 
@@ -185,9 +188,16 @@ def test_validate_config_rejects_conflicting_i2c_bus_freq():
 def test_validate_config_accepts_absent_and_explicit_default_i2c_freq_on_one_bus():
     # The effective setting resolves the absent i2c_freq_hz to the type's
     # default, so absent vs explicit-default is one setting, not a conflict.
+    # The two BME280 are pinned to distinct addresses so the same-bus rule
+    # under test is the frequency, not physical identity.
     config = _base_config()
+    config["devices"][0]["config"]["i2c_address_candidates"] = [118]
     config["devices"].append(
-        _second_device(config, i2c_freq_hz=DEFAULT_I2C_FREQ_HZ)
+        _second_device(
+            config,
+            i2c_freq_hz=DEFAULT_I2C_FREQ_HZ,
+            i2c_address_candidates=[119],
+        )
     )
     assert validate_config(config) is config
 
@@ -229,6 +239,12 @@ def _ds18b20_device(device_id, pin=16, rom="28ff1ca26117048d"):
         "device_type": "ds18b20",
         "config": {"pin": pin, "rom": rom},
     }
+
+
+def _ltr390_device(device_id, bus=0, **config_changes):
+    config = {"i2c_bus": bus}
+    config.update(config_changes)
+    return {"id": device_id, "device_type": "ltr390", "config": config}
 
 
 def test_validate_config_accepts_a_ds18b20_device():
@@ -275,14 +291,182 @@ def test_validate_config_accepts_two_ds18b20_devices_sharing_one_pin():
     assert validate_config(config) is config
 
 
-def test_validate_config_does_not_compare_port_default_i2c_pins():
-    # Only explicit I2C pins are config knowledge: a device that relies on the
-    # port default is not compared (the same reason the same-bus rule leaves
-    # absent pins distinct from explicit ones).
+def _bme280_implicit_pins(config, bus=0):
+    """Point the fixture bme280 at ``bus`` with the pin args omitted, so it
+    relies on the port-default pins; the overlap check must resolve those to
+    the physical GPIOs the runtime actually drives (I2C0: SDA 4 / SCL 5,
+    I2C1: SDA 6 / SCL 7)."""
+    device_config = config["devices"][0]["config"]
+    device_config["i2c_bus"] = bus
+    device_config.pop("i2c_sda_pin", None)
+    device_config.pop("i2c_scl_pin", None)
+    return config
+
+
+def test_validate_config_rejects_a_ds18b20_on_the_implicit_i2c0_sda_pin():
+    # I2C0 with the pin args omitted drives the port default SDA (GPIO4) at
+    # runtime, so a 1-Wire device on GPIO4 is a real collision, not an unseen
+    # one (the prior code compared only explicit pins and let this through).
+    config = _bme280_implicit_pins(_base_config(), bus=0)
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=4))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 4" in message
+    assert "i2c_sda_pin" in message
+    assert "ds18b20-device" in message
+
+
+def test_validate_config_rejects_a_ds18b20_on_the_implicit_i2c0_scl_pin():
+    config = _bme280_implicit_pins(_base_config(), bus=0)
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=5))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 5" in message
+    assert "i2c_scl_pin" in message
+
+
+def test_validate_config_rejects_a_ds18b20_on_the_implicit_i2c1_sda_pin():
+    config = _bme280_implicit_pins(_base_config(), bus=1)
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=6))
+    with pytest.raises(ConfigError, match="Conflicting GPIO pin 6"):
+        validate_config(config)
+
+
+def test_validate_config_rejects_a_ds18b20_on_the_implicit_i2c1_scl_pin():
+    config = _bme280_implicit_pins(_base_config(), bus=1)
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=7))
+    with pytest.raises(ConfigError, match="Conflicting GPIO pin 7"):
+        validate_config(config)
+
+
+def test_validate_config_rejects_a_ds18b20_on_the_omitted_side_of_partial_pins():
+    # One pin explicit, one omitted: the omitted side still resolves to the
+    # physical default, so only the explicitly-routed line stays clear. Here
+    # SDA is explicit (GPIO0) and SCL is omitted, resolving to GPIO5.
     config = _base_config()
-    del config["devices"][0]["config"]["i2c_sda_pin"]
     del config["devices"][0]["config"]["i2c_scl_pin"]
-    config["devices"].append(_ds18b20_device("ds18b20-device", pin=0))
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=5))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 5" in message
+    assert "i2c_scl_pin" in message
+
+
+def test_validate_config_accepts_a_ds18b20_on_a_default_pin_not_routed():
+    # Explicit non-default routing frees the unused default: a bus wired to
+    # GPIO0/GPIO1 (the fixture) does not reserve GPIO4 (the default SDA), so a
+    # 1-Wire device on GPIO4 is legal -- the default pins are reserved only
+    # when the config actually omits them.
+    config = _base_config()
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=4))
+    assert validate_config(config) is config
+
+
+# ---------------------------------------------------------------------------
+# Physical-sensor uniqueness: a logical device id is unique, but two
+# definitions can still resolve to the same directly-attached I2C chip (one
+# physical sensor publishing under two device ids -- plausible telemetry with
+# the wrong identity), so the config boundary enforces the minimum identity
+# rules for the supported I2C sensors.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_config_accepts_a_single_ltr390_on_a_bus():
+    config = _base_config()
+    config["devices"] = [_ltr390_device("ltr-device", bus=0)]
+    assert validate_config(config) is config
+
+
+def test_validate_config_accepts_ltr390s_on_different_buses():
+    # The fixed address only collides on the same physical controller.
+    config = _base_config()
+    config["devices"] = [
+        _ltr390_device("ltr-bus0", bus=0),
+        _ltr390_device("ltr-bus1", bus=1),
+    ]
+    assert validate_config(config) is config
+
+
+def test_validate_config_rejects_two_ltr390_on_one_bus():
+    config = _base_config()
+    config["devices"] = [
+        _ltr390_device("ltr-a", bus=0),
+        _ltr390_device("ltr-b", bus=0),
+    ]
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    message = str(excinfo.value)
+    assert "Multiple LTR390 devices cannot share i2c_bus 0" in message
+    assert "ltr-a" in message
+    assert "ltr-b" in message
+
+
+def test_validate_config_accepts_a_single_bme280_with_the_default_candidates():
+    # A single BME280 keeps the full candidate-list behavior (the two-address
+    # default probe list is legal when it is the only BME280 on the bus).
+    config = _base_config()
+    del config["devices"][0]["config"]["i2c_address_candidates"]
+    assert validate_config(config) is config
+
+
+def test_validate_config_accepts_a_single_bme280_with_both_addresses():
+    config = _base_config()
+    config["devices"][0]["config"]["i2c_address_candidates"] = [118, 119]
+    assert validate_config(config) is config
+
+
+def test_validate_config_accepts_two_bme280_with_distinct_single_addresses():
+    config = _base_config()
+    config["devices"][0]["config"]["i2c_address_candidates"] = [118]
+    config["devices"].append(_second_device(config, i2c_address_candidates=[119]))
+    assert validate_config(config) is config
+
+
+def test_validate_config_rejects_two_bme280_with_the_same_single_address():
+    config = _base_config()
+    config["devices"][0]["config"]["i2c_address_candidates"] = [118]
+    config["devices"].append(_second_device(config, i2c_address_candidates=[118]))
+    with pytest.raises(ConfigError, match="Multiple BME280 devices on i2c_bus 0"):
+        validate_config(config)
+
+
+def test_validate_config_rejects_two_bme280_with_overlapping_candidate_lists():
+    config = _base_config()  # the fixture already carries [118, 119]
+    config["devices"].append(_second_device(config))  # copies [118, 119]
+    with pytest.raises(ConfigError, match="Multiple BME280 devices on i2c_bus 0"):
+        validate_config(config)
+
+
+def test_validate_config_rejects_default_plus_single_bme280_on_one_bus():
+    # The omitted (default) list is two addresses, so the first device is still
+    # ambiguous and may bind 0x76 or 0x77 -- a single-address neighbor does not
+    # make it distinct.
+    config = _base_config()
+    del config["devices"][0]["config"]["i2c_address_candidates"]
+    config["devices"].append(_second_device(config, i2c_address_candidates=[119]))
+    with pytest.raises(ConfigError, match="Multiple BME280 devices on i2c_bus 0"):
+        validate_config(config)
+
+
+def test_validate_config_accepts_bme280s_sharing_an_address_across_buses():
+    # The address only identifies a chip within one controller; the same
+    # address on the other bus is a different physical sensor.
+    config = _base_config()
+    config["devices"][0]["config"]["i2c_address_candidates"] = [118]
+    config["devices"].append(
+        _second_device(
+            config,
+            i2c_bus=1,
+            i2c_sda_pin=2,
+            i2c_scl_pin=3,
+            i2c_address_candidates=[118],
+        )
+    )
     assert validate_config(config) is config
 
 
@@ -522,21 +706,27 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
     for key in ("wifi_reconnect_delays_sec", "mqtt_reconnect_delays_sec"):
         config[key] = [MAX_RECONNECT_DELAY_SEC] * MAX_RECONNECT_ATTEMPTS
     # ids must be pairwise distinct: 15 full code points + a unique one-char
-    # ASCII suffix keeps each id at exactly 64 UTF-8 bytes.
+    # ASCII suffix keeps each id near its 64-byte bound and distinct.
     id_suffixes = [str(i) for i in range(10)] + ["a", "b", "c", "d", "e", "f"]
-    config["devices"] = [
-        {
-            "id": field_max[:15] + id_suffixes[index],
+    # The largest physically valid device composition: at most two BME280 per
+    # bus (each pinned to one distinct address) and one LTR390 per bus (fixed
+    # address), so 4 BME280 + 2 LTR390 fill the I2C side and 10 DS18B20
+    # (multidrop on one 1-Wire pin, distinct ROMs) bring the total to
+    # MAX_DEVICES. BME280 and LTR390 share each bus's controller, so their
+    # pin/frequency settings match (400 kHz, below the LTR390's fast-mode cap).
+    # Pins follow the bus: bus 0 -> GPIO 0/1, bus 1 -> GPIO 2/3.
+    devices = []
+    for bus, candidates in ((0, [118]), (0, [119]), (1, [118]), (1, [119])):
+        sda, scl = bus * 2, bus * 2 + 1
+        devices.append({
+            "id": field_max[:15] + id_suffixes[len(devices)],
             "device_type": "bme280",
             "config": {
-                # Pins follow the bus: bus 0 -> GPIO 0/1, bus 1 -> GPIO 2/3.
-                # (A fixed 0/1 pair is only routable to I2C0, so the alternating
-                # buses need each controller's own SDA/SCL group.)
-                "i2c_bus": index % 2,
-                "i2c_sda_pin": (index % 2) * 2,
-                "i2c_scl_pin": (index % 2) * 2 + 1,
-                "i2c_freq_hz": 1000000,
-                "i2c_address_candidates": [118, 119],
+                "i2c_bus": bus,
+                "i2c_sda_pin": sda,
+                "i2c_scl_pin": scl,
+                "i2c_freq_hz": 400000,
+                "i2c_address_candidates": candidates,
                 "temperature_oversampling": 5,
                 "pressure_oversampling": 5,
                 "humidity_oversampling": 5,
@@ -549,9 +739,38 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
                 },
             },
             "name": field_max,
-        }
-        for index in range(MAX_DEVICES)
-    ]
+        })
+    for bus in (0, 1):
+        sda, scl = bus * 2, bus * 2 + 1
+        devices.append({
+            "id": field_max[:15] + id_suffixes[len(devices)],
+            "device_type": "ltr390",
+            "config": {
+                "i2c_bus": bus,
+                "i2c_sda_pin": sda,
+                "i2c_scl_pin": scl,
+                "i2c_freq_hz": 400000,
+                "gain": 18,
+                "resolution_bits": 20,
+                "measurement_rate_ms": 2000,
+                "window_factor": 100,
+                "offsets": {"lux": 50000, "uv_index": 12},
+            },
+            "name": field_max,
+        })
+    for index in range(MAX_DEVICES - len(devices)):
+        devices.append({
+            "id": field_max[:15] + id_suffixes[len(devices)],
+            "device_type": "ds18b20",
+            "config": {
+                "pin": 16,
+                "rom": "28" + format(index, "014x"),
+                "conversion_ms": 1000,
+                "offsets": {"temperature_c": 100},
+            },
+            "name": field_max,
+        })
+    config["devices"] = devices
     validate_config(config)
 
     # The read-config response shape (core0._handle_read_config_command):
@@ -776,18 +995,17 @@ def test_validate_config_device_count_is_bounded():
     with the stable code and exact message. The bound keeps a valid
     configuration's per-device structures (startup-log fallback included) and
     its read-config response under the message-size ceiling."""
-    template = copy.deepcopy(_base_config()["devices"][0])
+    # DS18B20 is the only type unlimited per bus (multidrop, distinct ROMs),
+    # so it isolates the count bound from the I2C physical-identity rule.
+    def _device(index):
+        return _ds18b20_device("device-{}".format(index), rom="28" + format(index, "014x"))
 
     config = _base_config()
-    config["devices"] = [
-        dict(template, id="device-{}".format(i)) for i in range(MAX_DEVICES)
-    ]
+    config["devices"] = [_device(i) for i in range(MAX_DEVICES)]
     assert validate_config(config) is config
 
     config = _base_config()
-    config["devices"] = [
-        dict(template, id="device-{}".format(i)) for i in range(MAX_DEVICES + 1)
-    ]
+    config["devices"] = [_device(i) for i in range(MAX_DEVICES + 1)]
     with pytest.raises(ConfigError) as excinfo:
         validate_config(config)
     assert excinfo.value.code == "invalid_value"

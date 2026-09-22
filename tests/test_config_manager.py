@@ -454,6 +454,9 @@ def test_change_summary_reports_devices_compact_and_sorted(config_dir):
 
     modified = copy.deepcopy(original_device)
     modified["config"]["sea_level_pressure_pa"] = 101000
+    # Two BME280 on one bus must be distinct physical chips, so each is pinned
+    # to one address (0x76 / 0x77) rather than the two-address default.
+    modified["config"]["i2c_address_candidates"] = [118]
     added = {
         "id": "aaAddedDevice",
         "device_type": "bme280",
@@ -464,6 +467,7 @@ def test_change_summary_reports_devices_compact_and_sorted(config_dir):
             "i2c_bus": 0,
             "i2c_sda_pin": 0,
             "i2c_scl_pin": 1,
+            "i2c_address_candidates": [119],
             "sea_level_pressure_pa": 101325,
         },
     }
@@ -513,19 +517,23 @@ def test_change_summary_order_only_device_change_is_one_bounded_entry(config_dir
         "id": "secondDevice",
         "device_type": "bme280",
         # Same explicit bus 0 pins as the fixture device (see
-        # test_change_summary_reports_devices_compact_and_sorted).
+        # test_change_summary_reports_devices_compact_and_sorted). Pinned to
+        # 0x77 so the two same-bus BME280 are distinct physical chips.
         "config": {
             "i2c_bus": 0,
             "i2c_sda_pin": 0,
             "i2c_scl_pin": 1,
+            "i2c_address_candidates": [119],
             "sea_level_pressure_pa": 101325,
         },
     }
     two_devices["devices"] = list(_base_config()["devices"]) + [second]
+    two_devices["devices"][0]["config"]["i2c_address_candidates"] = [118]
     manager.begin_write(two_devices)  # committed: two devices
 
     reordered = _base_config()
     reordered["devices"] = [second] + list(_base_config()["devices"])
+    reordered["devices"][1]["config"]["i2c_address_candidates"] = [118]
     result = manager.begin_write(reordered)
 
     devices_changes = [c for c in result["changes"] if c["setting"] == "devices"]

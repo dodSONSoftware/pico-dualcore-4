@@ -45,10 +45,38 @@ _I2C_SCL_PINS = {
     for bus, mux in _I2C_SCL_MUX.items()
 }
 
+# The port's default (sda, scl) when a config omits the pin args. On the
+# supported Pico W / Pico 2 W boards machine.I2C(bus) with no pins routes to
+# the Pico SDK's PICO_DEFAULT_I2C pair (controller 0: SDA GP4 / SCL GP5) for
+# I2C0 and to the port's hardcoded I2C1 pair (SDA GP6 / SCL GP7) for I2C1
+# (ports/rp2/machine_i2c.h, v1.28). Used only to resolve an omitted pin to the
+# physical GPIO it drives so the cross-protocol GPIO-overlap check sees the
+# line the runtime actually drives; it does not touch the same-bus identity
+# rule, where an omitted pin stays distinct from an explicit one.
+_I2C_DEFAULT_PINS = {
+    0: (4, 5),
+    1: (6, 7),
+}
+
 
 def _pin_list(pins):
     """The pin group rendered as ``"a, b, c"`` for a message."""
     return ", ".join(str(pin) for pin in pins)
+
+
+def effective_rp2_i2c_pins(bus, sda, scl):
+    """The physical (sda, scl) an I2C device drives, resolving any omitted pin
+    to the port default for its bus (``_I2C_DEFAULT_PINS``). Pure and
+    allocation-light; ``bus`` must already be a validated 0/1. An omitted pin
+    is not routing knowledge for the same-bus identity rule (which keeps it
+    ``None``); it resolves here only for the cross-protocol GPIO-overlap check,
+    where the runtime still drives the default line even when the config names
+    no pin."""
+    default_sda, default_scl = _I2C_DEFAULT_PINS[bus]
+    return (
+        sda if sda is not None else default_sda,
+        scl if scl is not None else default_scl,
+    )
 
 
 def validate_rp2_i2c_pins(bus, sda, scl):
@@ -64,10 +92,10 @@ def validate_rp2_i2c_pins(bus, sda, scl):
     (``code`` ``invalid_value``) on the first violation; returns ``None``
     when the routing is valid.
 
-    A ``None`` pin skips the routing check: the port's default pins (hardcoded
-    routable pairs, I2C0 8/9, I2C1 6/7) always route to their own controller,
-    so ``machine.I2C(bus)`` with no pin args can never fail the port's own
-    check.
+    A ``None`` pin skips the routing check: the port's default pins
+    (``_I2C_DEFAULT_PINS``, each a member of its own controller's SDA/SCL mux
+    group) always route to their own controller, so ``machine.I2C(bus)`` with
+    no pin args can never fail the port's own check.
     """
     for key, value in (("i2c_sda_pin", sda), ("i2c_scl_pin", scl)):
         if value is None:

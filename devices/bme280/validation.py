@@ -36,9 +36,13 @@ _OFFSET_BOUNDS = {
     "pressure_pascal": 200000.0,
 }
 
-# The BME280 only ever sits at 0x76 (118) or 0x77 (119); a candidate outside this
-# set is a configuration error, not a runtime miss.
-_VALID_I2C_ADDRESSES = (118, 119)
+# The BME280 only ever sits at 0x76 (118) or 0x77 (119). The default probe
+# list is the same two addresses -- the driver tries them in order and binds
+# the first responder -- and any configured candidate must be one of them too,
+# so both share this single source of truth (config.py's cross-device check
+# and the driver read the default from here).
+DEFAULT_I2C_ADDRESS_CANDIDATES = (118, 119)
+_VALID_I2C_ADDRESSES = DEFAULT_I2C_ADDRESS_CANDIDATES
 
 # Register/parameter bounds (see bme280_device for the wire meaning).
 _MAX_I2C_BUS = 1

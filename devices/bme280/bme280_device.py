@@ -16,7 +16,7 @@ with the datasheet, the datasheet wins.
 import time
 
 from devices.device import Device
-from devices.bme280.validation import validate_config
+from devices.bme280.validation import DEFAULT_I2C_ADDRESS_CANDIDATES, validate_config
 
 try:
     from micropython import const
@@ -393,7 +393,7 @@ class BME280Device(Device):
         and re-read calibration over the held bus."""
         validate_config(config)
 
-        candidates = tuple(config.get("i2c_address_candidates", (118, 119)))
+        candidates = tuple(config.get("i2c_address_candidates", DEFAULT_I2C_ADDRESS_CANDIDATES))
         offsets = config.get("offsets", {})
         self._offset_t = offsets.get("temperature_c", 0)
         self._offset_p = offsets.get("pressure_pascal", 0)
