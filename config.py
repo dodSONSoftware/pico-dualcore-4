@@ -7,6 +7,7 @@ import json
 from command_protocol import MAX_SOURCE_LENGTH
 from device_factory import (
     DEVICE_DEFINITION_KEYS,
+    _validation_module,
     allowed_config_keys,
     i2c_bus_identity,
     validate_device_definition,
@@ -465,17 +466,21 @@ def _validate_devices(devices):
     # Physical-sensor uniqueness spans the whole list: a logical device id is
     # unique, but two definitions can still name the same physical I2C chip.
     # The LTR390 has a fixed address (0x53), so a second LTR390 on one bus
-    # necessarily targets the same directly-attached sensor. The BME280 probes
-    # its candidate list in order and binds the first responder, so with more
-    # than one BME280 on a bus a list naming more than one address (including
-    # the two-address default) is ambiguous -- it may bind 0x76 or 0x77 -- and
-    # two devices naming the same single address target the same chip. Either
-    # way one physical sensor would publish under two device ids (plausible
-    # telemetry with the wrong identity), so both are configuration errors here,
-    # not runtime conditions. A single BME280 on a bus keeps its full
-    # candidate-list behavior (including the two-address default).
+    # necessarily targets the same directly-attached sensor. The BME280 and
+    # the SHT35 each probe their candidate list in order and bind the first
+    # responder, so with more than one such sensor of one type on a bus a
+    # list naming more than one address (including the two-address default)
+    # is ambiguous -- it may bind either address -- and two devices naming
+    # the same single address target the same chip. Either way one physical
+    # sensor would publish under two device ids (plausible telemetry with the
+    # wrong identity), so both are configuration errors here, not runtime
+    # conditions. A single sensor of such a type on a bus keeps its full
+    # candidate-list behavior (including the two-address default). The rule
+    # is per type per bus: the candidate-list types never address each
+    # other's chips (BME280 0x76/0x77 vs SHT35 0x44/0x45).
+    candidate_address_labels = {"bme280": "BME280", "sht35": "SHT35"}
     ltr390_owners = {}
-    bme280_by_bus = {}
+    candidate_sensors = {}
     for index, device in enumerate(devices):
         device_config = device.get("config")
         if not isinstance(device_config, dict) or "i2c_bus" not in device_config:
@@ -494,16 +499,21 @@ def _validate_devices(devices):
                     code="invalid_value",
                 )
             ltr390_owners[device_config["i2c_bus"]] = qualifier
-        elif device_type == "bme280":
-            bme280_by_bus.setdefault(device_config["i2c_bus"], []).append(
+        elif device_type in candidate_address_labels:
+            candidate_sensors.setdefault(device_type, {}).setdefault(
+                device_config["i2c_bus"], []
+            ).append(
                 (qualifier, device_config.get("i2c_address_candidates"))
             )
 
-    if bme280_by_bus:
-        # Imported only when a BME280 is present (the residency rule: a type a
+    for device_type, by_bus in candidate_sensors.items():
+        # Imported only when the type is present (the residency rule: a type a
         # board does not configure must not be resident from startup).
-        from devices.bme280.validation import DEFAULT_I2C_ADDRESS_CANDIDATES
-        for bus, entries in bme280_by_bus.items():
+        default_candidates = (
+            _validation_module(device_type).DEFAULT_I2C_ADDRESS_CANDIDATES
+        )
+        label = candidate_address_labels[device_type]
+        for bus, entries in by_bus.items():
             if len(entries) < 2:
                 continue
             addresses = {}
@@ -514,7 +524,7 @@ def _validate_devices(devices):
                 effective = (
                     candidates
                     if candidates is not None
-                    else DEFAULT_I2C_ADDRESS_CANDIDATES
+                    else default_candidates
                 )
                 if len(effective) != 1 or effective[0] in addresses:
                     conflict = True
@@ -522,9 +532,11 @@ def _validate_devices(devices):
                 addresses[effective[0]] = qualifier
             if conflict:
                 raise ConfigError(
-                    "Multiple BME280 devices on i2c_bus {} ({}) must each "
+                    "Multiple {} devices on i2c_bus {} ({}) must each "
                     "specify one distinct i2c_address_candidates address"
-                    .format(bus, ", ".join(qualifier for qualifier, _ in entries)),
+                    .format(
+                        label, bus, ", ".join(qualifier for qualifier, _ in entries)
+                    ),
                     code="invalid_value",
                 )
 

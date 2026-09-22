@@ -2,7 +2,7 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.151.
+**Release:** Bronze Owl — firmware 0.4.152.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-v1.28.0-00897B?logo=micropython&logoColor=white)](https://micropython.org)
@@ -299,7 +299,7 @@ remaining sections are still returned.
 
 ## Built-in Devices
 
-Three device types are registered. Two are I2C sensors sharing Core 1's per-device bus configuration (bus, SDA/SCL pins; `bme280` also names its address candidates): `bme280` — temperature, pressure, humidity, and derived altitude (Bosch BME280) — and `ltr390` — ambient light and UV index (Lite-On LTR-390UV-01). The third is the first 1-Wire device, `ds18b20` — a digital thermometer read by its factory-programmed ROM (temperature only).
+Four device types are registered. Three are I2C sensors sharing Core 1's per-device bus configuration (bus, SDA/SCL pins; `bme280` and `sht35` also name their address candidates): `bme280` — temperature, pressure, humidity, and derived altitude (Bosch BME280) — `ltr390` — ambient light and UV index (Lite-On LTR-390UV-01) — and `sht35` — temperature and relative humidity (Sensirion SHT35-DIS). The fourth is the first 1-Wire device, `ds18b20` — a digital thermometer read by its factory-programmed ROM (temperature only).
 
 Example:
 ```
@@ -343,6 +343,22 @@ Example:
     "rom": "28115246d4927c03",
     "offsets": {
       "temperature_c": 0
+    }
+  }
+},
+{
+  "id": "pY6rT3vWnBk8Jm2QfX5sLd9ZgHa1C",
+  "device_type": "sht35",
+  "name": "SHT35 Temperature/Humidity Sensor",
+  "config": {
+    "i2c_bus": 0,
+    "i2c_sda_pin": 0,
+    "i2c_scl_pin": 1,
+    "i2c_address_candidates": [ 68, 69 ],
+    "repeatability": "high",
+    "offsets": {
+      "temperature_c": 0,
+      "humidity_percent": 0
     }
   }
 }
@@ -389,7 +405,9 @@ The system-information data the `get-details` command returns is organized into 
 │   ├── __init__.py
 │   ├── device.py      # Device interface (initialize, read)
 │   ├── bme280/        # BME280 temperature/pressure/humidity (I2C)
-│   └── ltr390/        # LTR-390 ambient light/UV (I2C)
+│   ├── ltr390/        # LTR-390 ambient light/UV (I2C)
+│   ├── ds18b20/       # DS18B20 digital thermometer (1-Wire)
+│   └── sht35/         # SHT35 temperature/humidity (I2C)
 ├── led_manager.py     # Core 0 LED state machine
 ├── wifi.py            # Core 0 Wi-Fi connection management
 ├── mqtt.py            # Core 0 MQTT lifecycle (QoS 1, keepalive PINGREQ)

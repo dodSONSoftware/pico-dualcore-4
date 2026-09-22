@@ -14,6 +14,7 @@ _DEVICE_REGISTRY = {
     "bme280": ("devices.bme280.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
     "ltr390": ("devices.ltr390.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
     "ds18b20": ("devices.ds18b20.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
+    "sht35": ("devices.sht35.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
 }
 
 # The complete set of keys a device definition may carry; anything beyond is
@@ -192,6 +193,24 @@ def create_device(device_definition, i2c_bus_factory=None, onewire_bus_factory=N
         # Same lazy-import rationale as the bme280 branch.
         from devices.ltr390.ltr390_device import LTR390Device
         return LTR390Device(i2c)
+
+    if device_type == "sht35":
+        # Same bus ownership as bme280: Core 1's factory builds (and dedupes)
+        # one machine.I2C per physical controller (bus); the sensor protocol
+        # runs in initialize().
+        if i2c_bus_factory is None:
+            raise ValueError("sht35 requires an i2c_bus_factory")
+        cfg = device_definition["config"]
+        i2c = i2c_bus_factory(
+            cfg["i2c_bus"],
+            cfg.get("i2c_sda_pin"),
+            cfg.get("i2c_scl_pin"),
+            cfg.get("i2c_freq_hz",
+                    _validation_module(device_type).DEFAULT_I2C_FREQ_HZ),
+        )
+        # Same lazy-import rationale as the bme280 branch.
+        from devices.sht35.sht35_device import SHT35Device
+        return SHT35Device(i2c)
 
     if device_type == "ds18b20":
         # 1-Wire bus ownership mirrors the I2C case: Core 1's factory builds

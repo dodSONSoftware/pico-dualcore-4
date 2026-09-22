@@ -51,6 +51,9 @@ REQUIRED_PACKAGES = {
     "devices/ds18b20/__init__.py",
     "devices/ds18b20/validation.py",
     "devices/ds18b20/ds18b20_device.py",
+    "devices/sht35/__init__.py",
+    "devices/sht35/validation.py",
+    "devices/sht35/sht35_device.py",
 }
 
 FILES = REQUIRED_FILES | REQUIRED_PACKAGES

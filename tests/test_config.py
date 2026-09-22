@@ -248,6 +248,12 @@ def _ltr390_device(device_id, bus=0, **config_changes):
     return {"id": device_id, "device_type": "ltr390", "config": config}
 
 
+def _sht35_device(device_id, bus=0, **config_changes):
+    config = {"i2c_bus": bus}
+    config.update(config_changes)
+    return {"id": device_id, "device_type": "sht35", "config": config}
+
+
 def test_validate_config_accepts_a_ds18b20_device():
     config = _base_config()
     config["devices"].append(_ds18b20_device("ds18b20-device"))
@@ -467,6 +473,97 @@ def test_validate_config_accepts_bme280s_sharing_an_address_across_buses():
             i2c_scl_pin=3,
             i2c_address_candidates=[118],
         )
+    )
+    assert validate_config(config) is config
+
+
+# SHT35: the same candidate-list rule as the BME280 (the SHT3x-DIS offers
+# exactly two addresses, 0x44 / 0x45; the driver binds the first CRC-valid
+# responder, so a multi-address list next to a neighbor is ambiguous).
+
+
+def test_validate_config_accepts_a_single_sht35_with_the_default_candidates():
+    # A single SHT35 keeps the full candidate-list behavior (the two-address
+    # default probe list is legal when it is the only SHT35 on the bus).
+    config = _base_config()
+    config["devices"] = [_sht35_device("sht-device", bus=0)]
+    assert validate_config(config) is config
+
+
+def test_validate_config_accepts_sht35s_on_different_buses():
+    # The address only collides on the same physical controller.
+    config = _base_config()
+    config["devices"] = [
+        _sht35_device("sht-bus0", bus=0),
+        _sht35_device("sht-bus1", bus=1),
+    ]
+    assert validate_config(config) is config
+
+
+def test_validate_config_accepts_two_sht35_with_distinct_single_addresses():
+    config = _base_config()
+    config["devices"] = [
+        _sht35_device("sht-a", bus=0, i2c_address_candidates=[68]),
+        _sht35_device("sht-b", bus=0, i2c_address_candidates=[69]),
+    ]
+    assert validate_config(config) is config
+
+
+def test_validate_config_rejects_two_sht35_with_the_same_single_address():
+    config = _base_config()
+    config["devices"] = [
+        _sht35_device("sht-a", bus=0, i2c_address_candidates=[68]),
+        _sht35_device("sht-b", bus=0, i2c_address_candidates=[68]),
+    ]
+    with pytest.raises(ConfigError, match="Multiple SHT35 devices on i2c_bus 0"):
+        validate_config(config)
+
+
+def test_validate_config_rejects_two_sht35_with_overlapping_candidate_lists():
+    # The omitted (default) list is two addresses, so both devices are
+    # ambiguous and may bind 0x44 or 0x45.
+    config = _base_config()
+    config["devices"] = [
+        _sht35_device("sht-a", bus=0),
+        _sht35_device("sht-b", bus=0),
+    ]
+    with pytest.raises(ConfigError, match="Multiple SHT35 devices on i2c_bus 0"):
+        validate_config(config)
+
+
+def test_validate_config_rejects_default_plus_single_sht35_on_one_bus():
+    # The omitted (default) list is two addresses, so the first device is still
+    # ambiguous and may bind 0x44 or 0x45 -- a single-address neighbor does not
+    # make it distinct.
+    config = _base_config()
+    config["devices"] = [
+        _sht35_device("sht-a", bus=0),
+        _sht35_device("sht-b", bus=0, i2c_address_candidates=[69]),
+    ]
+    with pytest.raises(ConfigError, match="Multiple SHT35 devices on i2c_bus 0"):
+        validate_config(config)
+
+
+def test_validate_config_accepts_sht35s_sharing_an_address_across_buses():
+    # The address only identifies a chip within one controller; the same
+    # address on the other bus is a different physical sensor.
+    config = _base_config()
+    config["devices"] = [
+        _sht35_device("sht-a", bus=0, i2c_address_candidates=[68]),
+        _sht35_device("sht-b", bus=1, i2c_address_candidates=[68]),
+    ]
+    assert validate_config(config) is config
+
+
+def test_validate_config_accepts_bme280_and_sht35_sharing_a_bus():
+    # The candidate-list types never address each other's chips (BME280
+    # 0x76/0x77 vs SHT35 0x44/0x45), so the uniqueness rule is per type: the
+    # fixture's bme280 and an sht35 on the same bus with identical controller
+    # settings are distinct physical sensors (the fixture's explicit GPIO
+    # 0/1 routing, so the same-bus identity rule sees one setting).
+    config = _base_config()
+    config["devices"].append(
+        _sht35_device("sht-device", bus=0, i2c_sda_pin=0, i2c_scl_pin=1)
     )
     assert validate_config(config) is config
 
@@ -709,13 +806,14 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
     # ids must be pairwise distinct: 15 full code points + a unique one-char
     # ASCII suffix keeps each id near its 64-byte bound and distinct.
     id_suffixes = [str(i) for i in range(10)] + ["a", "b", "c", "d", "e", "f"]
-    # The largest physically valid device composition: at most two BME280 per
-    # bus (each pinned to one distinct address) and one LTR390 per bus (fixed
-    # address), so 4 BME280 + 2 LTR390 fill the I2C side and 10 DS18B20
+    # The largest physically valid device composition: at most two BME280 and
+    # two SHT35 per bus (each candidate-list type pinned to one distinct
+    # address within its own two) and one LTR390 per bus (fixed address), so
+    # 4 BME280 + 4 SHT35 + 2 LTR390 fill the I2C side and 6 DS18B20
     # (multidrop on one 1-Wire pin, distinct ROMs) bring the total to
-    # MAX_DEVICES. BME280 and LTR390 share each bus's controller, so their
-    # pin/frequency settings match (400 kHz, below the LTR390's fast-mode cap).
-    # Pins follow the bus: bus 0 -> GPIO 0/1, bus 1 -> GPIO 2/3.
+    # MAX_DEVICES. All I2C devices on a bus share its controller, so their
+    # pin/frequency settings match (400 kHz, below the LTR390's fast-mode
+    # cap). Pins follow the bus: bus 0 -> GPIO 0/1, bus 1 -> GPIO 2/3.
     devices = []
     for bus, candidates in ((0, [118]), (0, [119]), (1, [118]), (1, [119])):
         sda, scl = bus * 2, bus * 2 + 1
@@ -737,6 +835,25 @@ def test_max_valid_configuration_serializes_under_the_outbound_ceiling():
                     "temperature_c": 100,
                     "humidity_percent": 100,
                     "pressure_pascal": 200000,
+                },
+            },
+            "name": field_max,
+        })
+    for bus, candidates in ((0, [68]), (0, [69]), (1, [68]), (1, [69])):
+        sda, scl = bus * 2, bus * 2 + 1
+        devices.append({
+            "id": field_max[:15] + id_suffixes[len(devices)],
+            "device_type": "sht35",
+            "config": {
+                "i2c_bus": bus,
+                "i2c_sda_pin": sda,
+                "i2c_scl_pin": scl,
+                "i2c_freq_hz": 400000,
+                "i2c_address_candidates": candidates,
+                "repeatability": "high",
+                "offsets": {
+                    "temperature_c": 100,
+                    "humidity_percent": 100,
                 },
             },
             "name": field_max,
