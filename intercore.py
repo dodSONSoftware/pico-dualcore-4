@@ -326,17 +326,13 @@ class OutboundQueue:
                         return False
                 gc.collect()
 
-    def put(self, kind, message, retention_priority):
-        """Admit one MQTT-bound message after validation, serialization, and
-        size check. A serializer MemoryError is recovered per
-        _serialize_with_recovery() before any queued data is discarded.
-        True if admitted, False on transient heap pressure; ValueError
-        (OutboundMessageTooLargeError for the size case) on a permanent
-        failure of the message itself."""
+    def _validate_admission_metadata(self, kind, retention_priority):
+        """Shared admission metadata gate for put() and put_with_kind():
+        kind must be a known channel and retention_priority an integer in the
+        retention range. The payload check stays local to each entry point
+        (a structured message vs. pre-serialized bytes)."""
         if kind not in _KNOWN_KINDS:
             raise ValueError("Unsupported outbound message kind: {}".format(kind))
-        if not isinstance(message, dict):
-            raise ValueError("outbound message must be a dictionary")
         if isinstance(retention_priority, bool) or not isinstance(retention_priority, int):
             raise ValueError("retention_priority must be an integer")
         if not RETENTION_PRIORITY_MIN <= retention_priority <= RETENTION_PRIORITY_MAX:
@@ -345,6 +341,17 @@ class OutboundQueue:
                     RETENTION_PRIORITY_MIN, RETENTION_PRIORITY_MAX
                 )
             )
+
+    def put(self, kind, message, retention_priority):
+        """Admit one MQTT-bound message after validation, serialization, and
+        size check. A serializer MemoryError is recovered per
+        _serialize_with_recovery() before any queued data is discarded.
+        True if admitted, False on transient heap pressure; ValueError
+        (OutboundMessageTooLargeError for the size case) on a permanent
+        failure of the message itself."""
+        self._validate_admission_metadata(kind, retention_priority)
+        if not isinstance(message, dict):
+            raise ValueError("outbound message must be a dictionary")
 
         # Serialize the actual message (recovery per _serialize_with_recovery);
         # admission below keeps its own post-serialization reserve check.
@@ -356,18 +363,9 @@ class OutboundQueue:
         """Admit one MQTT-bound message from pre-serialized, UTF-8 encoded JSON bytes.
 
         The per-message ceiling is enforced here, not by the caller: a payload beyond MAX_OUTBOUND_MESSAGE_BYTES raises OutboundMessageTooLargeError (a ValueError subclass). Returns True if admitted, False on transient heap pressure."""
-        if kind not in _KNOWN_KINDS:
-            raise ValueError("Unsupported outbound message kind: {}".format(kind))
+        self._validate_admission_metadata(kind, retention_priority)
         if not isinstance(payload_bytes, (bytes, bytearray)):
             raise ValueError("payload_bytes must be bytes")
-        if isinstance(retention_priority, bool) or not isinstance(retention_priority, int):
-            raise ValueError("retention_priority must be an integer")
-        if not RETENTION_PRIORITY_MIN <= retention_priority <= RETENTION_PRIORITY_MAX:
-            raise ValueError(
-                "retention_priority must be between {} and {}".format(
-                    RETENTION_PRIORITY_MIN, RETENTION_PRIORITY_MAX
-                )
-            )
 
         # Enforce the same per-message ceiling the put() serialization path
         # enforces; the bytes are already final, only their length matters.
