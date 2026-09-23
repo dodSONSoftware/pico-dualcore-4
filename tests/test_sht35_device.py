@@ -79,11 +79,17 @@ class FakeSHT35I2C:
     """A canned SHT35 at one address: a CRC-valid serial-number response to
     0x3682 and a CRC-valid measurement frame to any single-shot command.
     Records every 16-bit command word so the init/read protocol (probe order,
-    break, heater off, the per-repeatability command) can be asserted."""
+    break, heater off, the per-repeatability command) can be asserted.
+    `periodic` models a sensor handed over from a previous controller still
+    in periodic/ART acquisition: break is accepted (and ends the mode) while
+    the serial-number probe is rejected until break has run.
+    `memory_error_command` makes that one command's write raise MemoryError
+    (the heap-boundary escape)."""
 
     def __init__(self, address=68, serial=SERIAL, raw_t=RAW_T, raw_rh=RAW_RH,
                  bad_serial_crc=False, bad_temperature_crc=False,
-                 bad_humidity_crc=False, nack_commands=False, nack_reads=False):
+                 bad_humidity_crc=False, nack_commands=False, nack_reads=False,
+                 periodic=False, memory_error_command=None):
         self.address = address
         self._serial = serial
         self._raw_t = raw_t
@@ -93,6 +99,8 @@ class FakeSHT35I2C:
         self._bad_humidity_crc = bad_humidity_crc
         self.nack_commands = nack_commands
         self.nack_reads = nack_reads
+        self.periodic = periodic
+        self._memory_error_command = memory_error_command
         self.commands = []
 
     def _frame_for(self, command):
@@ -112,7 +120,16 @@ class FakeSHT35I2C:
     def writeto(self, address, data):
         if address != self.address or self.nack_commands:
             raise OSError(28, "I2C ACK timeout")
-        self.commands.append((data[0] << 8) | data[1])
+        command = (data[0] << 8) | data[1]
+        if command == self._memory_error_command:
+            raise MemoryError
+        if command == _CMD_BREAK:
+            self.periodic = False
+        elif command == _CMD_SERIAL and self.periodic:
+            # The handover hazard: while an acquisition is still running,
+            # the probe is rejected -- break must precede it.
+            raise OSError(28, "I2C ACK timeout")
+        self.commands.append(command)
 
     def readfrom_into(self, address, buffer):
         if address != self.address or self.nack_reads:
@@ -253,15 +270,20 @@ def test_initialize_walks_past_a_crc_invalid_candidate(fake_time):
     device = SHT35Device(i2c)
     with pytest.raises(OSError):
         device.initialize({"i2c_bus": 0, "i2c_address_candidates": [68, 69]})
-    # One serial probe at 68 (transmitted, CRC-rejected); the probe at 69
-    # NACKs at the address phase, so the fake records nothing for it.
-    assert i2c.commands == [_CMD_SERIAL]
+    # Per candidate: break first (at 68 recorded; at 69 it NACKs like the
+    # probe), then the serial probe (transmitted at 68, CRC-rejected; NACKed
+    # at 69, so the fake records nothing for it).
+    assert i2c.commands == [_CMD_BREAK, _CMD_SERIAL]
 
 
 def test_initialize_binds_the_second_candidate_when_the_first_nacks(fake_time):
+    # Nothing at 68: both break and the probe NACK there (unrecorded). A
+    # failed break at the first candidate must not abort detection -- the
+    # second candidate is normalized and bound as usual.
     i2c = FakeSHT35I2C(address=69)
     device = SHT35Device(i2c)
     device.initialize({"i2c_bus": 0, "i2c_address_candidates": [68, 69]})
+    assert i2c.commands == [_CMD_BREAK, _CMD_SERIAL, _CMD_HEATER_OFF]
     result = device.read()
     assert result["temperature_c"] == 25.0
 
@@ -274,17 +296,42 @@ def test_initialize_fails_when_no_candidate_answers(fake_time):
     assert "SHT35 not found at candidates" in str(excinfo.value)
 
 
-def test_initialize_writes_break_then_heater_off(fake_time):
-    """init establishes the known state the reads depend on: out of any
-    periodic/ART acquisition (break 0x3093) and heater off (0x3066) -- in
-    that order, after the detection probe."""
+def test_initialize_writes_break_before_the_probe_and_heater_off_after(fake_time):
+    """init normalizes each candidate to idle (break 0x3093) before
+    identifying it -- a powered sensor may still be in periodic/ART
+    acquisition from a previous controller -- and writes heater off (0x3066)
+    after successful detection."""
     i2c = FakeSHT35I2C()
     _initialized_device(i2c=i2c)
-    assert i2c.commands == [_CMD_SERIAL, _CMD_BREAK, _CMD_HEATER_OFF]
+    assert i2c.commands == [_CMD_BREAK, _CMD_SERIAL, _CMD_HEATER_OFF]
+
+
+def test_initialize_recovers_a_sensor_left_in_periodic_mode(fake_time):
+    """The handover case the recovery contract names: the sensor stays
+    powered across a controller reset and a previous user left it in
+    periodic/ART acquisition. The fake rejects the serial-number probe
+    until break has stopped the acquisition, so a probe-before-break
+    ordering walks the whole candidate list and fails to find a sensor
+    that is physically present and recoverable."""
+    i2c = FakeSHT35I2C(periodic=True)
+    device = SHT35Device(i2c)
+    device.initialize({"i2c_bus": 0})
+    assert i2c.periodic is False
+    assert i2c.commands == [_CMD_BREAK, _CMD_SERIAL, _CMD_HEATER_OFF]
+
+
+def test_detection_memory_error_escapes(fake_time):
+    """A MemoryError in the per-candidate work (here: the break write)
+    escapes to the recovery boundary -- it is never classified as a
+    candidate failure, and detection does not walk to the next address."""
+    i2c = FakeSHT35I2C(memory_error_command=_CMD_BREAK)
+    device = SHT35Device(i2c)
+    with pytest.raises(MemoryError):
+        device.initialize({"i2c_bus": 0})
 
 
 def test_initialize_waits_are_bounded(fake_time):
-    # Serial probe 1 ms + break 1 ms; the heater command is a command-only
+    # Break 1 ms + serial probe 1 ms; the heater command is a command-only
     # transaction with no wait.
     _initialized_device()
     assert fake_time.now_ms == 2
@@ -380,8 +427,9 @@ def test_offsets_are_applied_after_conversion(fake_time):
 
 def test_reinitialize_reruns_the_init_sequence(fake_time):
     """The read-failure reinit path calls initialize() again over the held
-    bus; the full sequence (re-detect, break, heater off) must repeat, because
-    a previously failed read can leave the sensor in any state."""
+    bus; the full sequence (per-candidate break, re-detect, heater off) must
+    repeat, because a previously failed read can leave the sensor in any
+    state."""
     i2c = FakeSHT35I2C()
     device = SHT35Device(i2c)
     config = {"i2c_bus": 0}

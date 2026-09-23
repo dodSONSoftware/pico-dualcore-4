@@ -136,18 +136,15 @@ class SHT35:
     # --- Initialization sequence -------------------------------------------
 
     def init(self):
-        """Run the bring-up: detect (bind the first candidate address whose
-        serial-number probe is CRC-valid), then establish the known state
-        this driver's reads depend on -- out of any periodic/ART acquisition
-        a previous user may have left (break) and heater off (an ambient
-        measurement precondition, written explicitly rather than assumed
-        from the power-on state). No soft reset: like the LTR390 profile,
-        every state the driver depends on is written explicitly, which also
-        makes the sequence re-runnable over the held bus. Re-runnable: the
-        read-failure reinit path repeats this."""
+        """Run the bring-up: detect (per candidate address: break any
+        periodic/ART acquisition a previous user may have left, then bind
+        the address whose serial-number probe is CRC-valid), then heater
+        off (an ambient measurement precondition, written explicitly rather
+        than assumed from the power-on state). No soft reset: like the
+        LTR390 profile, every state the driver depends on is written
+        explicitly, which also makes the sequence re-runnable over the held
+        bus. Re-runnable: the read-failure reinit path repeats this."""
         self._detect()
-        self._write_command(_CMD_BREAK)
-        time.sleep_ms(_BREAK_WAIT_MS)
         self._write_command(_CMD_HEATER_OFF)
 
     def _detect(self):
@@ -156,11 +153,18 @@ class SHT35:
         register; the 32-bit electronic identification code is the
         protocol's strongest identification -- a CRC-protected response to
         an SHT3x-specific command, not a mere ACK (a different device at
-        0x44/0x45 that answers with garbage fails the CRC and is skipped)."""
+        0x44/0x45 that answers with garbage fails the CRC and is skipped).
+        Each candidate is first returned to idle with break: a powered
+        sensor may still be in periodic/ART acquisition from a previous
+        controller, and the known command state must be established before
+        the probe depends on it (a NACKed break is a candidate failure,
+        like a NACKed probe)."""
         last_error = None
         for address in self._address_candidates:
             self._address = address
             try:
+                self._write_command(_CMD_BREAK)
+                time.sleep_ms(_BREAK_WAIT_MS)
                 self._serial_number()
             except MemoryError:
                 raise
