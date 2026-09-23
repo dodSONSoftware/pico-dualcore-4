@@ -137,7 +137,7 @@ def host_boot(monkeypatch):
         return {
             "hardware_type": "pico_w",
             "machine": "Raspberry Pi Pico W with RP2040",
-            "preferred_free_heap_bytes": 64 * 1024,
+            "preferred_free_heap_bytes": 60 * 1024,
             "minimum_free_heap_bytes": 48 * 1024,
         }
 

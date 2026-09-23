@@ -94,7 +94,7 @@ _GET_DETAILS_FALLBACK_DROP_ORDER = ("device_status", "devices")
 # mailbox was never populated — the Pico W preferred reserve, not any board's
 # survival floor (hardware.py is the source of truth for those): above the
 # Pico W floor (early alarm) but below the Pico 2 W floor (late alarm).
-_FALLBACK_MIN_FREE_HEAP_BYTES = 64 * 1024
+_FALLBACK_MIN_FREE_HEAP_BYTES = 60 * 1024
 
 
 def _startup_summary(device_status, startup_duration_ms, reset_cause):

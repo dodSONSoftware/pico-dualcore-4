@@ -40,7 +40,8 @@ from message_serializer import (  # noqa: E402
 )
 
 
-# Pico W reserve, and a heap with plenty of headroom over it.
+# A test-local reserve (the queues under test are single-threshold: the hard
+# floor is also the preferred reserve), and a heap with plenty of headroom.
 RESERVE = 65536
 HEAPY = 256 * 1024
 KB = 1024
@@ -834,11 +835,12 @@ def test_in_flight_entry_is_never_evicted(monkeypatch):
 
 
 def test_pico_w_steady_state_small_telemetry_admitted(monkeypatch):
-    """The real Pico W condition: ~85 KiB free heap against the 64 KiB
-    reserve, an empty queue, a small telemetry message. put() must admit it --
-    the old fixed gate demanded reserve + 48 KiB (≈ 112 KiB) of free heap
-    before the serializer was even allowed to run, so this steady state was
-    rejected indefinitely on supported hardware."""
+    """The real Pico W condition: ~85 KiB free heap against the board's 60 KiB
+    preferred reserve, an empty queue, a small telemetry message. put() must
+    admit it -- the old fixed gate demanded reserve + 48 KiB (≈ 112 KiB at
+    the then-current 64 KiB reserve) of free heap before the serializer was
+    even allowed to run, so this steady state was rejected indefinitely on
+    supported hardware."""
     ic, heap = _queue(monkeypatch, free_bytes=85 * KB)
     queue = ic.outbound_queue
     assert (

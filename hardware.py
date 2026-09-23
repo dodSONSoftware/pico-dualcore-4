@@ -11,10 +11,15 @@ HARDWARE_TYPE_UNKNOWN = "unknown"
 # Board-specific free-heap thresholds (bytes). Two distinct concepts: the
 # PREFERRED reserve marks the start of memory-pressure handling (GC,
 # increased willingness to reclaim — not a rejection wall), and the MINIMUM
-# is the hard survival floor admission must protect. Real Pico W operation
-# transiently approaches or dips below 64 KiB while constructing and
-# serializing legitimate messages, so the two must not be one value.
-PICO_W_PREFERRED_FREE_HEAP_BYTES = 64 * 1024   # 65,536 bytes
+# is the hard survival floor admission must protect. The Pico W preferred
+# line must sit below the worst supported steady state — a two-sensor Pico
+# W (bme280 + ltr390) idles at ~63-65 KiB free heap — or that board lives
+# permanently in the pressure band, where a put() on a non-empty queue evicts
+# one eligible entry (field capture 2026-09-22: 12 evictions, one telemetry
+# sample lost each, on exactly that configuration). 60 KiB keeps ~2.5 KiB of
+# margin under that steady state and a 12 KiB band above the 48 KiB floor,
+# so the two thresholds stay distinct values.
+PICO_W_PREFERRED_FREE_HEAP_BYTES = 60 * 1024   # 61,440 bytes
 PICO_W_MIN_FREE_HEAP_BYTES = 48 * 1024         # 49,152 bytes
 # Pico 2 W keeps its own policy: the same 16 KiB pressure band above its
 # (unchanged) 128 KiB hard floor.
