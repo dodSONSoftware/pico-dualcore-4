@@ -1,5 +1,5 @@
 {
-  "source": "Air-4",
+  "source": "Water-1",
   "config_schema_version": 10,
   "outbound_queue_max_messages": 32,
   "read_loop_sec": 20,
@@ -27,18 +27,14 @@
   "mqtt_reconnect_delays_sec": [ 2, 2, 2, 2, 2, 3, 3, 3, 5, 5, 5, 10, 10, 10, 20, 20, 20 ],
   "devices": [
     {
-      "id": "b2fba0cb9d95921febd0ffecf9c81406",
-      "device_type": "sht35",
-      "name": "SHT35 Temperature/Humidity Sensor",
+      "id": "xR7wJ9pXsRk2Hn6VcD8qZb3YgLu5W",
+      "device_type": "ds18b20",
+      "name": "DS18B20 Temperature Sensor",
       "config": {
-        "i2c_bus": 0,
-        "i2c_sda_pin": 0,
-        "i2c_scl_pin": 1,
-        "i2c_address_candidates": [ 68, 69 ],
-        "repeatability": "high",
+        "pin": 2,
+        "rom": "280a7a46d4e105e1",
         "offsets": {
-          "temperature_c": 0,
-          "humidity_percent": 0
+          "temperature_c": 0
         }
       }
     }

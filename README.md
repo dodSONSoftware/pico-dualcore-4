@@ -2,7 +2,7 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.155.
+**Release:** Bronze Owl — firmware 0.4.156.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-v1.28.0-00897B?logo=micropython&logoColor=white)](https://micropython.org)
@@ -20,7 +20,18 @@ This firmware implements a clean architecture where:
 - **Core 1** exclusively owns device drivers, sensor reads, device lifecycle management, and telemetry construction
 - Communication between cores uses three lanes with strict ownership rules (the two FIFO lanes are heap-governed: admitted against the board's two heap thresholds — the preferred reserve where memory-pressure handling begins and the hard minimum floor that must stay intact; the latest-value lane carries the state snapshots)
 
-### Architecture
+## Supported Sensors
+
+| Device Type | Sensor | Channels | Interface |
+|---------------|--------|----------|-----------|
+| `bme280` | Bosch BME280 | temperature, pressure, humidity (+ derived `altitude_m`) | I2C |
+| `ltr390` | ams LTR-390 | ambient light (lux), UV index | I2C |
+| `ds18b20` | Maxim DS18B20 | temperature | 1-Wire |
+| `sht35` | Sensirion SHT35-DIS | temperature, relative humidity | I2C |
+
+Each is registered in [`device_factory.py`](device_factory.py), with a pure config validator in its `devices/<type>/` package.
+
+## Architecture
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for detailed architecture documentation.
 

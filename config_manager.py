@@ -97,6 +97,9 @@ class ConfigManager:
     def _old_path(self):
         return self._config_path + ".old"
 
+    def _cleanup_path(self):
+        return self._config_path + ".cleanup"
+
     @staticmethod
     def _path_exists(path):
         try:
@@ -132,18 +135,46 @@ class ConfigManager:
 
     def recover(self):
         """Boot recovery: settle the committed config before anything else
-        runs. A valid .old is authoritative (a promotion interrupted before
-        its commit point), then a valid config.json, then a valid .tmp; an
-        invalid .old is released. On success the steady state is exactly one
-        valid config.json; else startup fails clearly, naming the reason: a
-        present artifact that fails to load or validate is reported as
-        invalid with its own error (the steady-state config.json first, then
-        the transaction artifacts), and only when nothing is present at all
-        are the artifacts reported as all missing."""
+        runs. A present .cleanup means the last write reached its commit
+        point: a valid config.json is the committed steady state (the
+        leftover .cleanup released with any stale artifacts); a missing or
+        invalid config.json falls back to the valid previous config inside
+        .cleanup (recovery from loss of the committed config, not a
+        rollback). Else a valid .old is authoritative (a promotion
+        interrupted before its commit point), then a valid config.json, then
+        a valid .tmp; an invalid .old is released. On success the steady
+        state is exactly one valid config.json; else startup fails clearly,
+        naming the reason: a present artifact that fails to load or validate
+        is reported as invalid with its own error (the steady-state
+        config.json first, then the transaction artifacts), and only when
+        nothing is present at all are the artifacts reported as all
+        missing."""
         config_path = self._config_path
         old_path = self._old_path()
+        cleanup_path = self._cleanup_path()
         tmp_path = self._tmp_path()
         invalid = {}
+
+        if self._path_exists(cleanup_path):
+            config = self._try_load(config_path, invalid)
+            if config is not None:
+                self._remove_if_exists(cleanup_path)
+                self._remove_if_exists(old_path)
+                self._remove_if_exists(tmp_path)
+                os.sync()
+                return config
+            # The committed config.json is missing or invalid: the previous
+            # config inside .cleanup is the emergency recovery copy. This is
+            # not the .old rollback -- the write had committed.
+            config = self._try_load(cleanup_path, invalid)
+            if config is not None:
+                if self._path_exists(config_path):
+                    os.remove(config_path)
+                os.rename(cleanup_path, config_path)
+                self._remove_if_exists(old_path)
+                self._remove_if_exists(tmp_path)
+                os.sync()
+                return config
 
         if self._path_exists(old_path):
             config = self._try_load(old_path, invalid)
@@ -167,9 +198,10 @@ class ConfigManager:
             config = self._try_load(tmp_path, invalid)
             if config is not None:
                 os.rename(tmp_path, config_path)
-                # The .old that reached this branch is invalid by
+                # The .old/.cleanup that reached this branch is invalid by
                 # definition: release it so the steady state is one file.
                 self._remove_if_exists(old_path)
+                self._remove_if_exists(cleanup_path)
                 os.sync()
                 return config
 
@@ -177,7 +209,7 @@ class ConfigManager:
         # closest to the steady state with its own reason -- a provisioned
         # config.json that fails validation must not masquerade as a
         # missing file.
-        for path in (config_path, old_path, tmp_path):
+        for path in (config_path, old_path, cleanup_path, tmp_path):
             if path in invalid:
                 raise ConfigError(
                     "No valid configuration found: {} is invalid: {}".format(
@@ -185,8 +217,8 @@ class ConfigManager:
                     code="unreadable_file",
                 )
         raise ConfigError(
-            "No valid configuration found: {} and its .old/.tmp recovery "
-            "artifacts are all missing".format(config_path),
+            "No valid configuration found: {} and its .old/.tmp/.cleanup "
+            "recovery artifacts are all missing".format(config_path),
             code="unreadable_file",
         )
 
@@ -200,9 +232,11 @@ class ConfigManager:
         summary (PERSISTED-before vs candidate). UNCHANGED writes perform no
         filesystem modification and preserve the current reboot state; a
         changed candidate commits and is pending a reboot -- no live apply on
-        either core. MemoryError propagates to the fail-fast boundary; other
-        failures restore pre-write state and leave the artifacts for boot
-        recovery."""
+        either core. MemoryError propagates to the fail-fast boundary; a
+        pre-commit failure restores pre-write state and leaves the artifacts
+        for boot recovery; a post-commit cleanup failure (removing the
+        leftover .cleanup) is a warning only -- the write is already
+        committed and its success result is returned."""
         validate_config(candidate)
         persisted = load_config(self._config_path)
         changes = _changes_summary(persisted, candidate)
@@ -224,6 +258,12 @@ class ConfigManager:
             os.rename(self._config_path, self._old_path())
             os.rename(self._tmp_path(), self._config_path)
             os.sync()
+            # Transition the durable rollback journal into the committed,
+            # cleanup-only artifact: once this rename is synced the write has
+            # COMMITTED (config.json is authoritative) and .cleanup is no
+            # longer a rollback journal.
+            os.rename(self._old_path(), self._cleanup_path())
+            os.sync()
         except MemoryError:
             # The heap is exhausted: every recovery artifact is already in
             # place; let the fail-fast boundary handle the reset.
@@ -239,11 +279,25 @@ class ConfigManager:
                 pass
             raise
 
-        # The running firmware keeps its boot values until the next reboot:
-        # the previous committed config is no longer needed.
-        self._remove_if_exists(self._old_path())
-        os.sync()
+        # Committed: the change is pending a reboot before any cleanup runs,
+        # so a failed cleanup can never leave it unmarked.
         self._reboot_required = True
+
+        # The running firmware keeps its boot values until the next reboot:
+        # the previous committed config is no longer needed. The write is
+        # already committed, so a cleanup failure is a warning, not a failed
+        # command -- the leftover .cleanup stays a valid recovery copy for
+        # the next boot.
+        try:
+            self._remove_if_exists(self._cleanup_path())
+            os.sync()
+        except MemoryError:
+            raise
+        except OSError as err:
+            print(
+                "[WARNING] write-config committed but cleanup failed for "
+                "{}: {}".format(self._cleanup_path(), err),
+            )
         return {
             "classification": CLASSIFICATION_REBOOT_REQUIRED,
             "changes": changes,
@@ -251,13 +305,22 @@ class ConfigManager:
         }
 
     def _restore_committed(self):
-        """Restore the pre-write committed config after a failed promotion:
-        if the first rename moved config.json into .old, put it back before
-        releasing the failed candidate, so config.json is never missing when
-        the caller regains control."""
+        """Restore the pre-write committed config after a pre-commit
+        failure: if the first rename moved config.json into .old, put it
+        back before releasing the failed candidate, so config.json is never
+        missing when the caller regains control. A .cleanup present without
+        .old means the commit rename completed before the failure (a failed
+        final sync): the previous config inside it is restored the same way
+        -- the commit point (the synced .old -> .cleanup rename) was not
+        reached, so the write is a rollback, not a commit."""
+        backup_path = None
         if self._path_exists(self._old_path()):
+            backup_path = self._old_path()
+        elif self._path_exists(self._cleanup_path()):
+            backup_path = self._cleanup_path()
+        if backup_path is not None:
             self._remove_if_exists(self._config_path)
-            os.rename(self._old_path(), self._config_path)
+            os.rename(backup_path, self._config_path)
         self._remove_if_exists(self._tmp_path())
         os.sync()
 

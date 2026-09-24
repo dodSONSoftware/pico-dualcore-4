@@ -20,6 +20,7 @@ its boot values until then.
 
 import importlib
 import json
+import os
 import pathlib
 import sys
 import time as _real_time
@@ -451,6 +452,48 @@ def test_write_config_reboot_required_commits_without_applying(make_core0, tmp_p
     settings = [c["setting"] for c in response["data"]["changes"]]
     assert settings == sorted(settings)
     assert settings == ["read_loop_sec", "source"]
+
+
+def test_write_config_cleanup_failure_still_answers_success(make_core0, tmp_path, monkeypatch):
+    """A post-commit .cleanup removal failure is contained inside the
+    ConfigManager: the write-config command still answers success
+    (REBOOT_REQUIRED) instead of being lost into the transport-error path,
+    the reboot stays marked, and read-config returns the committed
+    candidate."""
+    core0 = make_core0()
+    candidate = _full_config()
+    candidate["source"] = "Other-Pico"
+    real_remove = os.remove
+
+    def fail_cleanup_removal(path):
+        if str(path).endswith("config.json.cleanup"):
+            raise OSError("simulated cleanup removal failure")
+        return real_remove(path)
+
+    monkeypatch.setattr(os, "remove", fail_cleanup_removal)
+
+    _send(core0, _command("write-config", "cfg-wr-cleanup-fail",
+                          payload={"config": candidate}))
+
+    response = _last_response(core0)
+    assert response["success"] is True
+    assert response["targeted"] is True
+    assert response["data"]["configuration_changed"] is True
+    assert response["data"]["classification"] == "REBOOT_REQUIRED"
+    assert response["data"]["reboot_required"] is True
+    assert core0._config_manager.reboot_required is True
+    # Committed: the candidate is on disk, the leftover .cleanup (no .old)
+    # is the recovery copy for the next boot.
+    assert _committed(tmp_path) == candidate
+    assert (tmp_path / "config.json.cleanup").exists()
+    assert not (tmp_path / "config.json.old").exists()
+
+    _send(core0, _command("read-config", "cfg-read-after-cleanup-fail"))
+
+    response = _last_response(core0)
+    assert response["success"] is True
+    assert response["data"]["config"] == candidate
+    assert response["data"]["reboot_required"] is True
 
 
 def test_write_config_device_changes_are_compact_entries(make_core0, tmp_path):

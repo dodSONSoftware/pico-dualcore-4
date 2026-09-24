@@ -125,6 +125,38 @@ def test_recovery_restores_valid_old_over_invalid_current(config_dir):
     assert _names(config_dir) == ["config.json"]
 
 
+def test_recovery_after_cleanup_failure_preserves_committed_candidate(config_dir):
+    """A reboot after a failed post-commit cleanup: config.json = candidate,
+    .cleanup = previous. The write reached its commit point (the .old ->
+    .cleanup rename), so config.json wins and the leftover .cleanup is
+    released as the non-authoritative cleanup artifact -- the previous
+    configuration must NOT replace the committed candidate."""
+    (config_dir / "config.json").write_text(json.dumps(_changed_candidate()))
+    (config_dir / "config.json.cleanup").write_text(json.dumps(_base_config()))
+
+    manager = ConfigManager(str(config_dir / "config.json"))
+    config = manager.recover()
+
+    assert config == _changed_candidate()
+    assert manager.read_persisted() == _changed_candidate()
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_recovery_restores_cleanup_when_committed_config_is_corrupt(config_dir):
+    """A corrupt config.json alongside a valid .cleanup: the write had
+    committed, so the previous configuration inside .cleanup is the
+    emergency recovery copy (recovery from loss of the committed
+    configuration, not the .old rollback decision)."""
+    (config_dir / "config.json").write_text("corrupted beyond repair")
+    (config_dir / "config.json.cleanup").write_text(json.dumps(_base_config()))
+
+    manager = ConfigManager(str(config_dir / "config.json"))
+    config = manager.recover()
+
+    assert config == _base_config()
+    assert _names(config_dir) == ["config.json"]
+
+
 def test_recovery_interrupted_between_renames_restores_old(config_dir):
     """A crash between the two promotion renames leaves config.json missing
     with both old and tmp present: the committed old config (the last
@@ -413,6 +445,145 @@ def test_failed_restoration_preserves_artifacts_and_propagates(config_dir, monke
     # A fresh manager recovers this state on the next boot.
     recovered = ConfigManager(str(config_dir / "config.json")).recover()
     assert recovered == _base_config()
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_failed_commit_rename_restores_committed_config(config_dir, monkeypatch):
+    """A failure of the .old -> .cleanup commit rename is a PRE-commit
+    failure: begin_write raises, the previous configuration is restored in
+    place before the caller regains control, no reboot is marked, and the
+    steady state returns to config.json only."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    real_rename = os.rename
+
+    def fail_commit_rename(src, dst):
+        if dst.endswith("config.json.cleanup"):
+            raise OSError("simulated commit rename failure")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", fail_commit_rename)
+
+    with pytest.raises(OSError, match="simulated commit rename"):
+        manager.begin_write(_source_candidate())
+
+    assert manager.read_persisted() == _base_config()
+    assert _names(config_dir) == ["config.json"]
+    assert manager.reboot_required is False
+
+
+def test_failed_commit_sync_restores_committed_config(config_dir, monkeypatch):
+    """A failure of the os.sync() immediately after the .old -> .cleanup
+    rename: the commit point (the SYNCED rename) was not reached, so the
+    existing restoration path runs, no success result is returned, and a
+    subsequent recover() settles exactly one valid config.json."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    real_sync = os.sync
+    sync_calls = []
+
+    def fail_commit_sync():
+        sync_calls.append(1)
+        # 1st sync: after the promotion renames (durable, still rollback-
+        # capable). 2nd sync: after the commit rename (the failure).
+        if len(sync_calls) == 2:
+            raise OSError("simulated commit sync failure")
+        return real_sync()
+
+    monkeypatch.setattr(os, "sync", fail_commit_sync)
+
+    with pytest.raises(OSError, match="simulated commit sync"):
+        manager.begin_write(_source_candidate())
+
+    assert manager.reboot_required is False
+
+    # The restoration path preferred the .cleanup (the commit rename had
+    # completed, its sync had not): one valid config.json, in place.
+    assert _names(config_dir) == ["config.json"]
+
+    monkeypatch.undo()
+    # A fresh manager (the next boot) settles the same state.
+    recovered = ConfigManager(str(config_dir / "config.json")).recover()
+    assert recovered == _base_config()
+    assert _names(config_dir) == ["config.json"]
+
+
+def test_cleanup_removal_failure_does_not_fail_committed_write(config_dir, monkeypatch):
+    """An OSError while deleting the post-commit .cleanup must not turn the
+    already-committed write into a failed command: begin_write returns
+    REBOOT_REQUIRED with the candidate committed, and the leftover .cleanup
+    (no .old) stays as the valid recovery copy for the next boot."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    real_remove = os.remove
+
+    def fail_cleanup_removal(path):
+        if str(path).endswith("config.json.cleanup"):
+            raise OSError("simulated cleanup removal failure")
+        return real_remove(path)
+
+    monkeypatch.setattr(os, "remove", fail_cleanup_removal)
+
+    result = manager.begin_write(_source_candidate())
+
+    assert result["classification"] == CLASSIFICATION_REBOOT_REQUIRED
+    assert result["reboot_required"] is True
+    assert manager.reboot_required is True
+    assert manager.read_persisted() == _source_candidate()
+    assert _names(config_dir) == ["config.json", "config.json.cleanup"]
+
+
+def test_cleanup_removal_failure_logs_warning(config_dir, monkeypatch):
+    """The contained cleanup failure is visible in the log, not just in the
+    leftover artifact."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    lines = []
+    monkeypatch.setattr("builtins.print", lines.append)
+    real_remove = os.remove
+
+    def fail_cleanup_removal(path):
+        if str(path).endswith("config.json.cleanup"):
+            raise OSError("simulated cleanup removal failure")
+        return real_remove(path)
+
+    monkeypatch.setattr(os, "remove", fail_cleanup_removal)
+
+    result = manager.begin_write(_source_candidate())
+
+    assert result["classification"] == CLASSIFICATION_REBOOT_REQUIRED
+    assert any("[WARNING] write-config committed but cleanup failed" in line
+               for line in lines)
+
+
+def test_cleanup_sync_failure_does_not_fail_committed_write(config_dir, monkeypatch):
+    """Allow the .cleanup removal, then fail its following os.sync(): the
+    commit transition had already been durably established, so begin_write
+    still returns success and, after the simulated reboot, the candidate
+    wins either way (the artifact is gone, or it would be released as
+    non-authoritative)."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    real_sync = os.sync
+    sync_calls = []
+
+    def fail_cleanup_sync():
+        sync_calls.append(1)
+        # 1st/2nd syncs: promotion and commit. 3rd: after the .cleanup
+        # removal.
+        if len(sync_calls) == 3:
+            raise OSError("simulated cleanup sync failure")
+        return real_sync()
+
+    monkeypatch.setattr(os, "sync", fail_cleanup_sync)
+
+    result = manager.begin_write(_source_candidate())
+
+    assert result["classification"] == CLASSIFICATION_REBOOT_REQUIRED
+    assert result["reboot_required"] is True
+    assert manager.reboot_required is True
+    # The removal succeeded before the sync failed: the artifact is gone.
+    assert _names(config_dir) == ["config.json"]
+
+    fresh = ConfigManager(str(config_dir / "config.json"))
+    config = fresh.recover()
+
+    assert config == _source_candidate()
     assert _names(config_dir) == ["config.json"]
 
 
