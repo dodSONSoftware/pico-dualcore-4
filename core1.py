@@ -773,6 +773,32 @@ def _build_onewire_bus_factory():
     return create
 
 
+def _build_adc_bus_factory():
+    """Core 1 owns its ADC inputs. One machine.ADC per pin, cached: the
+    pin is the whole configuration (the channel follows from it, and the
+    RP2's three ADC channels on GP26/27/28 coexist on the one ADC
+    peripheral), so unlike the I2C factory there is no conflict raise --
+    and unlike 1-Wire there is no sharing either: validate_config rejects
+    two devices on one ADC pin, so the cache is a dedupe, not a multidrop
+    bus. The machine import is inside the closure, so building the factory
+    is side-effect-free until a configured yl69_fc28 device first requests
+    an input.
+    """
+    cache = {}
+
+    def create(pin):
+        from machine import ADC, Pin
+
+        cached = cache.get(pin)
+        if cached is not None:
+            return cached
+        adc = ADC(Pin(pin))
+        cache[pin] = adc
+        return adc
+
+    return create
+
+
 def core1_main(intercore, config, boot_ticks_ms, runtime_id):
     """Core 1 entry point; this core never imports or touches network/MQTT."""
     try:
@@ -803,6 +829,7 @@ def core1_main(intercore, config, boot_ticks_ms, runtime_id):
             # factories only for devices of that bus type.
             i2c_bus_factory=_build_i2c_bus_factory(),
             onewire_bus_factory=_build_onewire_bus_factory(),
+            adc_bus_factory=_build_adc_bus_factory(),
         )
         system_information.set_device_manager(device_manager)
 

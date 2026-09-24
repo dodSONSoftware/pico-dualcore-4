@@ -2,7 +2,7 @@
 
 Series 4 — Dual-Core Embedded System
 
-**Release:** Bronze Owl — firmware 0.4.157.
+**Release:** Bronze Owl — firmware 0.4.158.
 
 [![Dodson Labs](https://img.shields.io/badge/dodson%20labs-2026-purple?labelColor=gray)](https://github.com/dodSONSoftware)
 [![MicroPython](https://img.shields.io/badge/MicroPython-v1.28.0-00897B?logo=micropython&logoColor=white)](https://micropython.org)
@@ -28,6 +28,7 @@ This firmware implements a clean architecture where:
 | `ltr390` | ams LTR-390 | ambient light (lux), UV index | I2C |
 | `ds18b20` | Maxim DS18B20 | temperature | 1-Wire |
 | `sht35` | Sensirion SHT35-DIS | temperature, relative humidity | I2C |
+| `yl69_fc28` | YL-69 / FC-28 soil probe | relative soil moisture (installation-calibrated), raw count, comparator state | ADC |
 
 Each is registered in [`device_factory.py`](device_factory.py), with a pure config validator in its `devices/<type>/` package.
 
@@ -47,14 +48,14 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for detailed architecture documentation
 │    │  - UTC Synchronization  │         │  - Telemetry Build      │    │
 │    │  - Reboot Control       │         │  - Device Lifecycle     │    │
 │    └─────────────────────────┘         └─────────────────────────┘    │
-│           │                                      │                    │
-│           ▼                                      ▼                    │
-│    ┌──────────────────┐                  ┌──────────────────┐         │
-│    │  Inter-Core Bus  │  Outbound Queue  │  Inter-Core Bus  │         │
-│    │  - Outbound      │  (Core1→Core0)   │  - Event Queue   │         │
-│    │  - Event         │  - MQTT Topics   │  (Core0→Core1)   │         │
-│    │  - State         │  - Prioritized   │  - Commands      │         │
-│    └──────────────────┘                  └──────────────────┘         │
+│               │                                     │                 │
+│               ▼                                     ▼                 │
+│      ┌──────────────────┐                  ┌──────────────────┐       │
+│      │  Inter-Core Bus  │  Outbound Queue  │  Inter-Core Bus  │       │
+│      │  - Outbound      │  (Core1→Core0)   │  - Event Queue   │       │
+│      │  - Event         │  - MQTT Topics   │  (Core0→Core1)   │       │
+│      │  - State         │  - Prioritized   │  - Commands      │       │
+│      └──────────────────┘                  └──────────────────┘       │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -310,7 +311,7 @@ remaining sections are still returned.
 
 ## Built-in Devices
 
-Four device types are registered. Three are I2C sensors sharing Core 1's per-device bus configuration (bus, SDA/SCL pins; `bme280` and `sht35` also name their address candidates): `bme280` — temperature, pressure, humidity, and derived altitude (Bosch BME280) — `ltr390` — ambient light and UV index (Lite-On LTR-390UV-01) — and `sht35` — temperature and relative humidity (Sensirion SHT35-DIS). The fourth is the first 1-Wire device, `ds18b20` — a digital thermometer read by its factory-programmed ROM (temperature only).
+Five device types are registered. Three are I2C sensors sharing Core 1's per-device bus configuration (bus, SDA/SCL pins; `bme280` and `sht35` also name their address candidates): `bme280` — temperature, pressure, humidity, and derived altitude (Bosch BME280) — `ltr390` — ambient light and UV index (Lite-On LTR-390UV-01) — and `sht35` — temperature and relative humidity (Sensirion SHT35-DIS). The fourth is the first 1-Wire device, `ds18b20` — a digital thermometer read by its factory-programmed ROM (temperature only). The fifth is the first ADC device, `yl69_fc28` — a YL-69 / FC-28 soil-conductivity probe reporting relative installation-calibrated moisture (never volumetric water content) from the required `dry_raw`/`wet_raw` calibration points, with optional switched power (`power_pin`) to cut the probe's corrosion duty cycle.
 
 Example:
 ```
@@ -372,8 +373,20 @@ Example:
       "humidity_percent": 0
     }
   }
+},
+{
+  "id": "nV8sU4wXoCl9Kn3RgY6tMe0ZhJb2D",
+  "device_type": "yl69_fc28",
+  "name": "YL-69/FC-28 Soil Moisture Sensor",
+  "config": {
+    "adc_pin": 26,
+    "dry_raw": 52000,
+    "wet_raw": 22000
+  }
 }
 ```
+
+**Capturing the `yl69_fc28` calibration** — `dry_raw` and `wet_raw` are the 16-bit ADC counts (0–65535) of the probe in dry soil and saturated soil **at that installation**, and they are required: the telemetry channel is relative to that span, so a new probe position is a new calibration. Read them from the `raw` telemetry channel (or the REPL's `ADC(Pin(26)).read_u16()`) with the probe in each state, and copy the two counts into the config. Clone boards differ in comparator polarity, but the conversion is polarity-agnostic — the measured points, not an assumed polarity, define the 0%/100% endpoints.
 
 **Finding the `ds18b20` `rom` value** — the ROM is a 64-bit factory-programmed ID, unique per sensor. It cannot be predicted from the wiring, so read it from the 1-Wire bus in the MicroPython REPL before starting the firmware (`main.main()`), on the pin the sensor's data line is connected to:
 
@@ -418,7 +431,8 @@ The system-information data the `get-details` command returns is organized into 
 │   ├── bme280/        # BME280 temperature/pressure/humidity (I2C)
 │   ├── ltr390/        # LTR-390 ambient light/UV (I2C)
 │   ├── ds18b20/       # DS18B20 digital thermometer (1-Wire)
-│   └── sht35/         # SHT35 temperature/humidity (I2C)
+│   ├── sht35/         # SHT35 temperature/humidity (I2C)
+│   └── yl69_fc28/     # YL-69/FC-28 soil moisture (ADC)
 ├── led_manager.py     # Core 0 LED state machine
 ├── wifi.py            # Core 0 Wi-Fi connection management
 ├── mqtt.py            # Core 0 MQTT lifecycle (QoS 1, keepalive PINGREQ)

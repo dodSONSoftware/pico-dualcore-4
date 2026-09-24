@@ -1,5 +1,5 @@
 {
-  "source": "Water-1",
+  "source": "Soil-1",
   "config_schema_version": 10,
   "outbound_queue_max_messages": 32,
   "read_loop_sec": 20,
@@ -27,15 +27,13 @@
   "mqtt_reconnect_delays_sec": [ 2, 2, 2, 2, 2, 3, 3, 3, 5, 5, 5, 10, 10, 10, 20, 20, 20 ],
   "devices": [
     {
-      "id": "xR7wJ9pXsRk2Hn6VcD8qZb3YgLu5W",
-      "device_type": "ds18b20",
-      "name": "DS18B20 Temperature Sensor",
+      "id": "7c7b334a85bc5a8b4d7137365306f2a0",
+      "device_type": "yl69_fc28",
+      "name": "YL-69/FC-28 Soil Moisture Sensor",
       "config": {
-        "pin": 2,
-        "rom": "280a7a46d4e105e1",
-        "offsets": {
-          "temperature_c": 0
-        }
+        "adc_pin": 26,
+        "dry_raw": 52000,
+        "wet_raw": 22000
       }
     }
   ]

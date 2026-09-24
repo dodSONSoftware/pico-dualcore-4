@@ -152,7 +152,7 @@ def test_one_failing_device_does_not_stop_the_others():
     configured device still initializes, the failure is recorded for the
     failing device only, and the snapshot shows configured 2 / active 1."""
     saved = dm.create_device
-    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: (
+    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None: (
         FailingInitDriver() if device_def["id"] == "dev1" else OkDriver()
     )
     try:
@@ -183,7 +183,7 @@ def test_driver_construction_failure_records_zero_attempts():
     the failed-device record must report 0 attempts used, not the phantom 1
     the record previously hardcoded (it flows verbatim into the snapshot's
     device_status section and the startup log's failed_devices)."""
-    def _explode(device_def, i2c_bus_factory=None, onewire_bus_factory=None):
+    def _explode(device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None):
         raise OSError("simulated driver construction failure")
 
     saved = dm.create_device

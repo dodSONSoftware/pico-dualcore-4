@@ -374,6 +374,148 @@ def test_validate_config_accepts_a_ds18b20_on_a_default_pin_not_routed():
 
 
 # ---------------------------------------------------------------------------
+# GPIO ownership for the yl69_fc28 soil sensor: none of its three pins
+# (the AO analog input, the DO comparator input, the power-switch control)
+# can be shared with another device's signal or a bus line -- one GPIO
+# carries one signal, so a shared pin would read as flaky readings on both
+# devices. Unlike 1-Wire multidrop, two soil devices never share a pin:
+# distinct ADC-capable pins are distinct channels of the one ADC peripheral,
+# but the same pin is never legal.
+# ---------------------------------------------------------------------------
+
+
+def _yl69_fc28_device(device_id, adc_pin=26, **config_changes):
+    config = {"adc_pin": adc_pin, "dry_raw": 52000, "wet_raw": 22000}
+    config.update(config_changes)
+    return {"id": device_id, "device_type": "yl69_fc28", "config": config}
+
+
+def test_validate_config_accepts_a_yl69_fc28_device():
+    # ADC pin 26 is clear of the fixture bme280's I2C0 lines (GPIO0/1).
+    config = _base_config()
+    config["devices"].append(_yl69_fc28_device("soil-device"))
+    assert validate_config(config) is config
+
+
+def test_validate_config_accepts_two_yl69_fc28_devices_on_distinct_adc_pins():
+    # GP26/27/28 are three channels of the one ADC peripheral: two devices
+    # on distinct ADC pins coexist.
+    config = _base_config()
+    config["devices"].append(_yl69_fc28_device("soil-a"))
+    config["devices"].append(_yl69_fc28_device("soil-b", adc_pin=27))
+    assert validate_config(config) is config
+
+
+def test_validate_config_rejects_two_yl69_fc28_devices_on_one_adc_pin():
+    config = _base_config()
+    config["devices"].append(_yl69_fc28_device("soil-a"))
+    config["devices"].append(_yl69_fc28_device("soil-b"))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 26" in message
+    assert "soil-a" in message
+    assert "soil-b" in message
+    assert "adc_pin" in message
+
+
+def test_validate_config_rejects_a_soil_digital_pin_on_another_soil_adc_pin():
+    config = _base_config()
+    config["devices"].append(_yl69_fc28_device("soil-a"))
+    config["devices"].append(
+        _yl69_fc28_device("soil-b", adc_pin=27, digital_pin=26)
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 26" in message
+    assert "soil-a" in message
+    assert "soil-b" in message
+    assert "adc_pin" in message
+    assert "digital_pin" in message
+
+
+def test_validate_config_rejects_a_soil_power_pin_on_another_soil_digital_pin():
+    config = _base_config()
+    config["devices"].append(_yl69_fc28_device("soil-a", digital_pin=15))
+    config["devices"].append(_yl69_fc28_device("soil-b", adc_pin=27, power_pin=15))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 15" in message
+    assert "soil-a" in message
+    assert "soil-b" in message
+    assert "digital_pin" in message
+    assert "power_pin" in message
+
+
+def test_validate_config_rejects_a_soil_pin_on_a_ds18b20_pin():
+    config = _base_config()
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=16))
+    config["devices"].append(_yl69_fc28_device("soil-a", digital_pin=16))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 16" in message
+    assert "soil-a" in message
+    assert "ds18b20-device" in message
+    assert "digital_pin" in message
+
+
+def test_validate_config_rejects_a_soil_power_pin_on_a_ds18b20_pin():
+    config = _base_config()
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=14))
+    config["devices"].append(_yl69_fc28_device("soil-a", power_pin=14))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 14" in message
+    assert "power_pin" in message
+
+
+def test_validate_config_rejects_a_soil_pin_on_an_i2c_sda_pin():
+    # 26/27 is a valid I2C1 SDA/SCL routing: the fixture bme280 moved there
+    # collides with a soil device's AO input on the same line.
+    config = _base_config()
+    device_config = config["devices"][0]["config"]
+    device_config["i2c_bus"] = 1
+    device_config["i2c_sda_pin"] = 26
+    device_config["i2c_scl_pin"] = 27
+    config["devices"].append(_yl69_fc28_device("soil-a"))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 26" in message
+    assert "i2c_sda_pin" in message
+    assert "soil-a" in message
+
+
+def test_validate_config_rejects_a_soil_pin_on_the_implicit_i2c0_sda_pin():
+    # The omitted I2C pins still drive the port default (SDA GPIO4) at
+    # runtime, so a soil DO line on GPIO4 is a real collision, like the
+    # 1-Wire rule above.
+    config = _bme280_implicit_pins(_base_config(), bus=0)
+    config["devices"].append(_yl69_fc28_device("soil-a", digital_pin=4))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 4" in message
+    assert "i2c_sda_pin" in message
+    assert "soil-a" in message
+
+
+def test_validate_config_accepts_soil_pins_clear_of_the_i2c_lines():
+    # All three soil pins configured, none on the fixture's I2C0 lines
+    # (GPIO0/1).
+    config = _base_config()
+    config["devices"].append(
+        _yl69_fc28_device("soil-a", digital_pin=15, power_pin=14)
+    )
+    assert validate_config(config) is config
+
+
+# ---------------------------------------------------------------------------
 # Physical-sensor uniqueness: a logical device id is unique, but two
 # definitions can still resolve to the same directly-attached I2C chip (one
 # physical sensor publishing under two device ids -- plausible telemetry with

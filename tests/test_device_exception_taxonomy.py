@@ -184,7 +184,7 @@ def test_oserror_init_is_retried_and_recorded():
     manager = _manager(_DEV, attempts=3)
     driver = FakeDriver(init_error=OSError("simulated missing chip"))
     saved = dm.create_device
-    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: driver
+    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None: driver
     try:
         initialized = manager.initialize_devices()
     finally:
@@ -210,7 +210,7 @@ def test_contract_error_init_escapes_without_retry(error):
     manager = _manager(_DEV, attempts=3)
     driver = FakeDriver(init_error=error)
     saved = dm.create_device
-    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: driver
+    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None: driver
     try:
         with pytest.raises(type(error)):
             manager.initialize_devices()
@@ -228,7 +228,7 @@ def test_oserror_construction_is_recorded():
     operational failure: recorded with the honest 0 attempts."""
     manager = _manager(_DEV, attempts=3)
 
-    def _explode(device_def, i2c_bus_factory=None, onewire_bus_factory=None):
+    def _explode(device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None):
         raise OSError("simulated bus construction failure")
 
     saved = dm.create_device
@@ -255,7 +255,7 @@ def test_contract_error_construction_escapes(error):
     hide it behind the retry machinery, so it escapes."""
     manager = _manager(_DEV, attempts=3)
 
-    def _explode(device_def, i2c_bus_factory=None, onewire_bus_factory=None):
+    def _explode(device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None):
         raise error
 
     saved = dm.create_device
@@ -313,7 +313,7 @@ def test_late_retry_oserror_is_recorded():
     driver = FakeDriver(init_error=OSError("simulated missing chip"))
     manager = _manager(_DEV, attempts=1)
     saved = dm.create_device
-    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: driver
+    dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None: driver
     try:
         manager.initialize_devices()
         result = manager.retry_failed_devices()[0]
@@ -336,12 +336,12 @@ def test_late_retry_contract_error_construction_escapes(error):
     error on every steady-state interval would only hide it."""
     manager = _manager(_DEV, attempts=1)
 
-    def _explode(device_def, i2c_bus_factory=None, onewire_bus_factory=None):
+    def _explode(device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None):
         raise error
 
     saved = dm.create_device
     try:
-        dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: FakeDriver(
+        dm.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None: FakeDriver(
             init_error=OSError("simulated missing chip")
         )
         manager.initialize_devices()
@@ -499,7 +499,7 @@ def test_contract_violation_terminates_the_core1_worker(capsys):
         core1 = _reload_core1_under_fakes()
         dm_mod = sys.modules["device_manager"]
         saved_create_device = dm_mod.create_device
-        dm_mod.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None: (
+        dm_mod.create_device = lambda device_def, i2c_bus_factory=None, onewire_bus_factory=None, adc_bus_factory=None: (
             ContractViolatingDriver()
         )
 

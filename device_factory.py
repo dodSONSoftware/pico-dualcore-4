@@ -15,6 +15,7 @@ _DEVICE_REGISTRY = {
     "ltr390": ("devices.ltr390.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
     "ds18b20": ("devices.ds18b20.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
     "sht35": ("devices.sht35.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
+    "yl69_fc28": ("devices.yl69_fc28.validation", "validate_config", "ALLOWED_CONFIG_KEYS"),
 }
 
 # The complete set of keys a device definition may carry; anything beyond is
@@ -151,7 +152,12 @@ def i2c_bus_identity(device_definition):
     )
 
 
-def create_device(device_definition, i2c_bus_factory=None, onewire_bus_factory=None):
+def create_device(
+    device_definition,
+    i2c_bus_factory=None,
+    onewire_bus_factory=None,
+    adc_bus_factory=None,
+):
     device_type = device_definition["device_type"]
 
     if device_type == "bme280":
@@ -224,5 +230,18 @@ def create_device(device_definition, i2c_bus_factory=None, onewire_bus_factory=N
         # Same lazy-import rationale as the bme280 branch.
         from devices.ds18b20.ds18b20_device import DS18B20Device
         return DS18B20Device(ds)
+
+    if device_type == "yl69_fc28":
+        # No shared bus object: the probe has no protocol, just an ADC
+        # input on a fixed pin. Core 1's factory still builds (and dedupes)
+        # the one machine.ADC per pin, so the driver receives the object
+        # like every other device and imports no machine API itself.
+        if adc_bus_factory is None:
+            raise ValueError("yl69_fc28 requires an adc_bus_factory")
+        cfg = device_definition["config"]
+        adc = adc_bus_factory(cfg["adc_pin"])
+        # Same lazy-import rationale as the bme280 branch.
+        from devices.yl69_fc28.yl69_fc28_device import Yl69Fc28Device
+        return Yl69Fc28Device(adc)
 
     raise ValueError("Unsupported device type: {}".format(device_type))

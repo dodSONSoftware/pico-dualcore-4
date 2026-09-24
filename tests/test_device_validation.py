@@ -35,6 +35,9 @@ from devices.ds18b20.validation import (
 from devices.sht35.validation import (
     ALLOWED_CONFIG_KEYS as SHT35_ALLOWED_CONFIG_KEYS,
 )
+from devices.yl69_fc28.validation import (
+    ALLOWED_CONFIG_KEYS as YL69FC28_ALLOWED_CONFIG_KEYS,
+)
 from devices.device import DeviceValidationError
 
 
@@ -68,6 +71,7 @@ def test_registry_exposes_the_supported_types():
     assert allowed_config_keys("ltr390") is not None
     assert allowed_config_keys("ds18b20") == DS18B20_ALLOWED_CONFIG_KEYS
     assert allowed_config_keys("sht35") == SHT35_ALLOWED_CONFIG_KEYS
+    assert allowed_config_keys("yl69_fc28") == YL69FC28_ALLOWED_CONFIG_KEYS
     assert allowed_config_keys("acme-9000") is None
 
 
@@ -80,15 +84,18 @@ def test_registry_resolves_the_validation_modules_lazily():
     from devices.ltr390 import validation as ltr390_validation
     from devices.ds18b20 import validation as ds18b20_validation
     from devices.sht35 import validation as sht35_validation
+    from devices.yl69_fc28 import validation as yl69_fc28_validation
 
     assert device_factory._validation_module("bme280") is bme280_validation
     assert device_factory._validation_module("ltr390") is ltr390_validation
     assert device_factory._validation_module("ds18b20") is ds18b20_validation
     assert device_factory._validation_module("sht35") is sht35_validation
+    assert device_factory._validation_module("yl69_fc28") is yl69_fc28_validation
     assert device_factory._validation_module("acme-9000") is None
     assert allowed_config_keys("bme280") is bme280_validation.ALLOWED_CONFIG_KEYS
     assert allowed_config_keys("ds18b20") is ds18b20_validation.ALLOWED_CONFIG_KEYS
     assert allowed_config_keys("sht35") is sht35_validation.ALLOWED_CONFIG_KEYS
+    assert allowed_config_keys("yl69_fc28") is yl69_fc28_validation.ALLOWED_CONFIG_KEYS
 
 
 def test_dynamic_import_passes_fromlist_positionally():
@@ -120,6 +127,7 @@ def test_registry_imports_no_validation_package_at_module_top():
         or name.startswith("devices.ltr390")
         or name.startswith("devices.ds18b20")
         or name.startswith("devices.sht35")
+        or name.startswith("devices.yl69_fc28")
         for name in top_level_modules
     )
     # The firmware may only module-top import modules the board's MicroPython

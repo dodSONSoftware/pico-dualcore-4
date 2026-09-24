@@ -111,7 +111,7 @@ class DeviceManager:
     """
 
     def __init__(self, config, activity_refresh=None, uptime_state=None, i2c_bus_factory=None,
-                 onewire_bus_factory=None):
+                 onewire_bus_factory=None, adc_bus_factory=None):
         self._active_devices = []
         self._failed_devices = {}
 
@@ -121,11 +121,13 @@ class DeviceManager:
         self._devices_config = config["devices"]
 
         # Core 1's bus factories (one machine.I2C per bus, one
-        # ds18x20.DS18X20 per 1-Wire data pin). Injected so this module
-        # stays host-importable; None for a config with no device of that
-        # bus type, in which case create_device never asks for a bus.
+        # ds18x20.DS18X20 per 1-Wire data pin, one machine.ADC per ADC
+        # pin). Injected so this module stays host-importable; None for a
+        # config with no device of that bus type, in which case
+        # create_device never asks for a bus.
         self._i2c_bus_factory = i2c_bus_factory
         self._onewire_bus_factory = onewire_bus_factory
+        self._adc_bus_factory = adc_bus_factory
 
         # Core 1's accumulated-uptime state, the source of truth for the
         # read-age fields; raw ticks when not wired (host tests).
@@ -188,11 +190,13 @@ class DeviceManager:
 
     def _create_driver(self, device_def):
         try:
-            # Both factories are always passed (each may be None for a config
-            # with no device of that bus type); the type-specific branch in
-            # create_device raises ValueError if the factory it needs is None.
+            # All three factories are always passed (each may be None for a
+            # config with no device of that bus type); the type-specific
+            # branch in create_device raises ValueError if the factory it
+            # needs is None.
             driver = create_device(
-                device_def, self._i2c_bus_factory, self._onewire_bus_factory
+                device_def, self._i2c_bus_factory, self._onewire_bus_factory,
+                self._adc_bus_factory,
             )
             return driver, None
         except MemoryError:
