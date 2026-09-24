@@ -233,10 +233,14 @@ class ConfigManager:
         filesystem modification and preserve the current reboot state; a
         changed candidate commits and is pending a reboot -- no live apply on
         either core. MemoryError propagates to the fail-fast boundary; a
-        pre-commit failure restores pre-write state and leaves the artifacts
-        for boot recovery; a post-commit cleanup failure (removing the
-        leftover .cleanup) is a warning only -- the write is already
-        committed and its success result is returned."""
+        pre-commit failure restores pre-write state (leaving the artifacts
+        for boot recovery when the restoration itself fails), and a
+        pre-commit storage failure (OSError) is reported as a ConfigError
+        with code "storage_error" -- a raw OSError escaping here would reach
+        the run loop and be misclassified as an MQTT/network transport
+        failure; a post-commit cleanup failure (removing the leftover
+        .cleanup) is a warning only -- the write is already committed and
+        its success result is returned."""
         validate_config(candidate)
         persisted = load_config(self._config_path)
         changes = _changes_summary(persisted, candidate)
@@ -268,15 +272,23 @@ class ConfigManager:
             # The heap is exhausted: every recovery artifact is already in
             # place; let the fail-fast boundary handle the reset.
             raise
-        except Exception:
-            # A non-MemoryError failure (I/O, corrupted read-back): restore
-            # pre-write state, release the transient .tmp, and propagate.
-            try:
-                self._restore_committed()
-            except OSError:
-                # A failed restoration still leaves every recovery artifact
-                # in place for boot recovery.
-                pass
+        except OSError as err:
+            # A pre-commit storage failure (a flash fault in the candidate
+            # write, or the promotion/commit rename or its sync): restore the
+            # pre-write state and report it in the configuration domain. A
+            # raw OSError escaping here would reach the run loop, be
+            # misclassified as an MQTT/network transport failure, and cost
+            # the command its response.
+            self._try_restore()
+            raise ConfigError(
+                "Failed to persist configuration: {}".format(err),
+                code="storage_error",
+            ) from err
+        except ConfigError:
+            # A corrupted candidate read-back (already a configuration-domain
+            # error with its own code): restore pre-write state, release the
+            # transient .tmp, and propagate unchanged.
+            self._try_restore()
             raise
 
         # Committed: the change is pending a reboot before any cleanup runs,
@@ -303,6 +315,18 @@ class ConfigManager:
             "changes": changes,
             "reboot_required": True,
         }
+
+    def _try_restore(self):
+        """Best-effort pre-write restoration after a pre-commit failure:
+        MemoryError propagates to the fail-fast boundary; a failed
+        restoration (OSError) leaves every recovery artifact in place for
+        boot recovery instead of masking the original failure."""
+        try:
+            self._restore_committed()
+        except MemoryError:
+            raise
+        except OSError:
+            pass
 
     def _restore_committed(self):
         """Restore the pre-write committed config after a pre-commit

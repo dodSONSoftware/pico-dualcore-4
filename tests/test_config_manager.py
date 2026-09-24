@@ -408,8 +408,12 @@ def test_failed_second_promotion_rename_restores_committed_config(config_dir, mo
 
     monkeypatch.setattr(os, "rename", fail_promotion_rename)
 
-    with pytest.raises(OSError, match="simulated second-promotion"):
+    with pytest.raises(ConfigError) as excinfo:
         manager.begin_write(_source_candidate())
+    # A storage failure is reported in the configuration domain, not as a
+    # raw OSError (which the run loop would misread as a transport failure).
+    assert excinfo.value.code == "storage_error"
+    assert "simulated second-promotion" in str(excinfo.value)
 
     # Pre-write state restored in place: the committed config is the
     # original, no .old/.tmp left behind, no reboot left pending.
@@ -418,9 +422,11 @@ def test_failed_second_promotion_rename_restores_committed_config(config_dir, mo
     assert manager.reboot_required is False
 
 
-def test_failed_restoration_preserves_artifacts_and_propagates(config_dir, monkeypatch):
+def test_failed_restoration_preserves_artifacts_and_reports_storage_error(
+        config_dir, monkeypatch):
     """If the restoration itself fails, every recovery artifact is
-    preserved for boot recovery and the ORIGINAL failure propagates."""
+    preserved for boot recovery and the storage failure is still reported
+    as a configuration-domain error carrying the original failure."""
     manager = ConfigManager(str(config_dir / "config.json"))
     real_rename = os.rename
 
@@ -433,8 +439,10 @@ def test_failed_restoration_preserves_artifacts_and_propagates(config_dir, monke
 
     monkeypatch.setattr(os, "rename", fail_promotion_and_restore)
 
-    with pytest.raises(OSError, match="simulated second-promotion"):
+    with pytest.raises(ConfigError) as excinfo:
         manager.begin_write(_source_candidate())
+    assert excinfo.value.code == "storage_error"
+    assert "simulated second-promotion" in str(excinfo.value)
 
     # config.json is missing, but the previous committed config survives in
     # .old: exactly the state boot recovery settles.
@@ -463,8 +471,10 @@ def test_failed_commit_rename_restores_committed_config(config_dir, monkeypatch)
 
     monkeypatch.setattr(os, "rename", fail_commit_rename)
 
-    with pytest.raises(OSError, match="simulated commit rename"):
+    with pytest.raises(ConfigError) as excinfo:
         manager.begin_write(_source_candidate())
+    assert excinfo.value.code == "storage_error"
+    assert "simulated commit rename" in str(excinfo.value)
 
     assert manager.read_persisted() == _base_config()
     assert _names(config_dir) == ["config.json"]
@@ -490,8 +500,10 @@ def test_failed_commit_sync_restores_committed_config(config_dir, monkeypatch):
 
     monkeypatch.setattr(os, "sync", fail_commit_sync)
 
-    with pytest.raises(OSError, match="simulated commit sync"):
+    with pytest.raises(ConfigError) as excinfo:
         manager.begin_write(_source_candidate())
+    assert excinfo.value.code == "storage_error"
+    assert "simulated commit sync" in str(excinfo.value)
 
     assert manager.reboot_required is False
 
@@ -504,6 +516,61 @@ def test_failed_commit_sync_restores_committed_config(config_dir, monkeypatch):
     recovered = ConfigManager(str(config_dir / "config.json")).recover()
     assert recovered == _base_config()
     assert _names(config_dir) == ["config.json"]
+
+
+def test_memory_error_in_candidate_write_propagates(config_dir, monkeypatch):
+    """A MemoryError while writing the candidate is never converted: it
+    propagates to the fail-fast boundary, and no success result exists."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+
+    def exhaust(candidate):
+        raise MemoryError()
+
+    monkeypatch.setattr(manager, "_write_candidate_tmp", exhaust)
+
+    with pytest.raises(MemoryError):
+        manager.begin_write(_source_candidate())
+
+    assert manager.reboot_required is False
+
+
+def test_memory_error_in_commit_rename_propagates(config_dir, monkeypatch):
+    """A MemoryError at the commit rename (still pre-commit-point)
+    propagates unchanged; no reboot is marked."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    real_rename = os.rename
+
+    def exhaust_commit_rename(src, dst):
+        if dst.endswith("config.json.cleanup"):
+            raise MemoryError()
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", exhaust_commit_rename)
+
+    with pytest.raises(MemoryError):
+        manager.begin_write(_source_candidate())
+
+    assert manager.reboot_required is False
+
+
+def test_memory_error_in_cleanup_removal_propagates(config_dir, monkeypatch):
+    """Past the commit point the best-effort cleanup runs: a MemoryError
+    there still propagates (not swallowed as the OSError warning), with the
+    commit already marked pending a reboot."""
+    manager = ConfigManager(str(config_dir / "config.json"))
+    real_remove = os.remove
+
+    def exhaust_cleanup_removal(path):
+        if str(path).endswith("config.json.cleanup"):
+            raise MemoryError()
+        return real_remove(path)
+
+    monkeypatch.setattr(os, "remove", exhaust_cleanup_removal)
+
+    with pytest.raises(MemoryError):
+        manager.begin_write(_source_candidate())
+
+    assert manager.reboot_required is True
 
 
 def test_cleanup_removal_failure_does_not_fail_committed_write(config_dir, monkeypatch):

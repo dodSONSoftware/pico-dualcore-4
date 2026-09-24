@@ -496,6 +496,42 @@ def test_write_config_cleanup_failure_still_answers_success(make_core0, tmp_path
     assert response["data"]["reboot_required"] is True
 
 
+def test_write_config_pre_commit_storage_failure_answers_config_domain_error(
+        make_core0, tmp_path, monkeypatch):
+    """A flash/filesystem failure before the commit point answers as a
+    normal write-config failure (code storage_error) -- the raw OSError
+    never escapes the command handler into the MQTT transport error path
+    (which would swallow it as a network failure and lose the response).
+    The previous configuration stays committed and no reboot is marked."""
+    core0 = make_core0()
+    candidate = _full_config()
+    candidate["source"] = "Other-Pico"
+    real_rename = os.rename
+
+    def fail_promotion_rename(src, dst):
+        if dst == str(tmp_path / "config.json") and src.endswith("config.json.tmp"):
+            raise OSError("simulated storage failure")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", fail_promotion_rename)
+
+    _send(core0, _command("write-config", "cfg-wr-storage-fail",
+                          payload={"config": candidate}))
+
+    response = _last_response(core0)
+    assert response["success"] is False
+    assert response["command"] == "write-config"
+    assert response["error"]["code"] == "storage_error"
+    assert "simulated storage failure" in response["error"]["message"]
+    # Pre-commit: the previous configuration is still committed and no
+    # reboot is pending; the pre-write state was restored in place.
+    assert _committed(tmp_path) == _full_config()
+    assert core0._config_manager.reboot_required is False
+    assert not (tmp_path / "config.json.old").exists()
+    assert not (tmp_path / "config.json.tmp").exists()
+    assert not (tmp_path / "config.json.cleanup").exists()
+
+
 def test_write_config_device_changes_are_compact_entries(make_core0, tmp_path):
     """Device additions/removals/modifications are REBOOT_REQUIRED and reported
     as bounded whole-device entries, never the full definitions."""
