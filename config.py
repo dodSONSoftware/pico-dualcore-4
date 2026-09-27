@@ -432,46 +432,56 @@ def _validate_devices(devices):
         qualifier = device_id if isinstance(device_id, str) and device_id else str(index)
         onewire_owners.setdefault(pin, qualifier)
 
-    # GPIO ownership for the yl69_fc28 soil sensor spans the whole list,
-    # like the rules above: none of its three pins (the AO analog input,
-    # the DO comparator input, the power-switch control) can be shared --
-    # each carries a distinct signal, and one of them driven onto another
-    # device's line (or a bus line) would read as flaky readings on both
-    # sensors, not as a configuration error. Two devices may each use a
-    # DISTINCT ADC-capable pin (GP26/27/28 are three channels of the one
-    # ADC peripheral); the same pin is never legal, unlike 1-Wire
-    # multidrop. Per-device validation (type, the within-device
-    # distinctness) already ran, so the pins here are validated ints.
+    # GPIO ownership for the soil sensors (yl69_fc28 and plantmate_soil)
+    # spans the whole list, like the rules above: none of a soil device's
+    # pins (the AO analog input; the yl69_fc28's DO comparator input and
+    # power-switch control) can be shared -- each carries a distinct
+    # signal, and one of them driven onto another device's line (or a bus
+    # line) would read as flaky readings on both sensors, not as a
+    # configuration error. Two devices may each use a DISTINCT ADC-capable
+    # pin (GP26/27/28 are three channels of the one ADC peripheral); the
+    # same pin is never legal, unlike 1-Wire multidrop. Per-device
+    # validation (type, the within-device distinctness) already ran, so the
+    # pins here are validated ints.
     soil_pin_owners = {}
     for index, device in enumerate(devices):
-        if device.get("device_type") != "yl69_fc28":
+        device_type = device.get("device_type")
+        if device_type not in ("yl69_fc28", "plantmate_soil"):
             continue
         device_config = device["config"]
         device_id = device.get("id")
         qualifier = device_id if isinstance(device_id, str) and device_id else str(index)
-        for pin_key in ("adc_pin", "digital_pin", "power_pin"):
+        # The plantmate_soil probe carries only the analog input (no DO,
+        # no power switch -- it is wired continuously to the 3.3 V rail);
+        # the yl69_fc28 board may carry all three.
+        if device_type == "yl69_fc28":
+            pin_keys = ("adc_pin", "digital_pin", "power_pin")
+        else:
+            pin_keys = ("adc_pin",)
+        for pin_key in pin_keys:
             if pin_key not in device_config:
                 continue
             pin = device_config[pin_key]
             owner = soil_pin_owners.get(pin)
             if owner is not None:
                 raise ConfigError(
-                    "Conflicting GPIO pin {}: device '{}' (yl69_fc28 {}) and "
-                    "device '{}' (yl69_fc28 {}) share one pin; one GPIO "
+                    "Conflicting GPIO pin {}: device '{}' ({} {}) and "
+                    "device '{}' ({} {}) share one pin; one GPIO "
                     "cannot carry two signals"
-                    .format(pin, owner[0], owner[1], qualifier, pin_key),
+                    .format(pin, owner[0], owner[2], owner[1],
+                            qualifier, device_type, pin_key),
                     code="invalid_value",
                 )
             onewire_owner = onewire_owners.get(pin)
             if onewire_owner is not None:
                 raise ConfigError(
-                    "Conflicting GPIO pin {}: device '{}' (yl69_fc28 {}) and "
+                    "Conflicting GPIO pin {}: device '{}' ({} {}) and "
                     "device '{}' (1-Wire DQ) share one pin; one GPIO cannot "
                     "carry two signals"
-                    .format(pin, qualifier, pin_key, onewire_owner),
+                    .format(pin, qualifier, device_type, pin_key, onewire_owner),
                     code="invalid_value",
                 )
-            soil_pin_owners[pin] = (qualifier, pin_key)
+            soil_pin_owners[pin] = (qualifier, pin_key, device_type)
 
     for index, device in enumerate(devices):
         device_config = device.get("config")
@@ -506,9 +516,10 @@ def _validate_devices(devices):
             if soil_owner is not None:
                 raise ConfigError(
                     "Conflicting GPIO pin {}: device '{}' (I2C {}) and device "
-                    "'{}' (yl69_fc28 {}) share one pin; one GPIO cannot carry "
+                    "'{}' ({} {}) share one pin; one GPIO cannot carry "
                     "two signals"
-                    .format(effective_pin, qualifier, pin_key, soil_owner[0], soil_owner[1]),
+                    .format(effective_pin, qualifier, pin_key, soil_owner[0],
+                            soil_owner[2], soil_owner[1]),
                     code="invalid_value",
                 )
 

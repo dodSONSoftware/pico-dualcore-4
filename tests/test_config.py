@@ -516,6 +516,112 @@ def test_validate_config_accepts_soil_pins_clear_of_the_i2c_lines():
 
 
 # ---------------------------------------------------------------------------
+# The rule spans both soil sensor types (yl69_fc28 and plantmate_soil): a
+# plantmate_soil probe carries only the analog input (no DO, no power
+# switch), but that pin is owned the same way.
+# ---------------------------------------------------------------------------
+
+
+def _plantmate_soil_device(device_id, adc_pin=26, **config_changes):
+    config = {"adc_pin": adc_pin, "dry_raw": 50000, "wet_raw": 28000}
+    config.update(config_changes)
+    return {"id": device_id, "device_type": "plantmate_soil", "config": config}
+
+
+def test_validate_config_accepts_a_plantmate_soil_device():
+    # ADC pin 26 is clear of the fixture bme280's I2C0 lines (GPIO0/1).
+    config = _base_config()
+    config["devices"].append(_plantmate_soil_device("plantmate-device"))
+    assert validate_config(config) is config
+
+
+def test_validate_config_accepts_soil_devices_of_both_types_on_distinct_adc_pins():
+    config = _base_config()
+    config["devices"].append(_yl69_fc28_device("soil-a"))
+    config["devices"].append(_plantmate_soil_device("plantmate-a", adc_pin=27))
+    assert validate_config(config) is config
+
+
+def test_validate_config_rejects_a_plantmate_adc_pin_on_a_yl69_adc_pin():
+    config = _base_config()
+    config["devices"].append(_yl69_fc28_device("soil-a"))
+    config["devices"].append(_plantmate_soil_device("plantmate-a"))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 26" in message
+    assert "soil-a" in message
+    assert "plantmate-a" in message
+    assert "yl69_fc28" in message
+    assert "plantmate_soil" in message
+    assert "adc_pin" in message
+
+
+def test_validate_config_rejects_a_yl69_digital_pin_on_a_plantmate_adc_pin():
+    # The reverse direction: the owner is a plantmate_soil probe.
+    config = _base_config()
+    config["devices"].append(_plantmate_soil_device("plantmate-a"))
+    config["devices"].append(
+        _yl69_fc28_device("soil-a", adc_pin=27, digital_pin=26)
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 26" in message
+    assert "plantmate-a" in message
+    assert "soil-a" in message
+    assert "plantmate_soil" in message
+    assert "yl69_fc28" in message
+    assert "digital_pin" in message
+
+
+def test_validate_config_rejects_two_plantmate_soil_devices_on_one_adc_pin():
+    config = _base_config()
+    config["devices"].append(_plantmate_soil_device("plantmate-a"))
+    config["devices"].append(_plantmate_soil_device("plantmate-b"))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    assert excinfo.value.code == "invalid_value"
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 26" in message
+    assert "plantmate-a" in message
+    assert "plantmate-b" in message
+    assert "adc_pin" in message
+
+
+def test_validate_config_rejects_a_plantmate_adc_pin_on_a_ds18b20_pin():
+    # The probe's only pin is ADC-bound (26/27/28), so the 1-Wire device
+    # must be the one on an ADC-capable pin (its data pin may be any
+    # externally exposed GPIO).
+    config = _base_config()
+    config["devices"].append(_ds18b20_device("ds18b20-device", pin=26))
+    config["devices"].append(_plantmate_soil_device("plantmate-a"))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 26" in message
+    assert "plantmate-a" in message
+    assert "ds18b20-device" in message
+    assert "adc_pin" in message
+
+
+def test_validate_config_rejects_a_plantmate_adc_pin_on_an_i2c_sda_pin():
+    config = _base_config()
+    device_config = config["devices"][0]["config"]
+    device_config["i2c_bus"] = 1
+    device_config["i2c_sda_pin"] = 26
+    device_config["i2c_scl_pin"] = 27
+    config["devices"].append(_plantmate_soil_device("plantmate-a"))
+    with pytest.raises(ConfigError) as excinfo:
+        validate_config(config)
+    message = str(excinfo.value)
+    assert "Conflicting GPIO pin 26" in message
+    assert "i2c_sda_pin" in message
+    assert "plantmate-a" in message
+
+
+# ---------------------------------------------------------------------------
 # Physical-sensor uniqueness: a logical device id is unique, but two
 # definitions can still resolve to the same directly-attached I2C chip (one
 # physical sensor publishing under two device ids -- plausible telemetry with

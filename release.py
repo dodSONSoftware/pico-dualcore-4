@@ -57,6 +57,9 @@ REQUIRED_PACKAGES = {
     "devices/yl69_fc28/__init__.py",
     "devices/yl69_fc28/validation.py",
     "devices/yl69_fc28/yl69_fc28_device.py",
+    "devices/plantmate_soil/__init__.py",
+    "devices/plantmate_soil/validation.py",
+    "devices/plantmate_soil/plantmate_soil_device.py",
 }
 
 FILES = REQUIRED_FILES | REQUIRED_PACKAGES
