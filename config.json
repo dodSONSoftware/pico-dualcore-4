@@ -1,5 +1,5 @@
 {
-  "source": "Soil-2",
+  "source": "Air-Light-2",
   "config_schema_version": 10,
   "outbound_queue_max_messages": 32,
   "read_loop_sec": 20,
@@ -27,13 +27,34 @@
   "mqtt_reconnect_delays_sec": [ 2, 2, 2, 2, 2, 3, 3, 3, 5, 5, 5, 10, 10, 10, 20, 20, 20 ],
   "devices": [
     {
-      "id": "3bfe6dc1ec0e49a4baca91b463da0eba",
-      "device_type": "plantmate_soil",
-      "name": "PlantMate Soil Moisture Sensor",
+      "id": "a8e1c0fb13d4101fafdd3578f4de58ec",
+      "device_type": "bme280",
+      "name": "BME280 Environmental Sensor",
       "config": {
-        "adc_pin": 26,
-        "dry_raw": 54461,
-        "wet_raw": 27158
+        "i2c_bus": 0,
+        "i2c_sda_pin": 0,
+        "i2c_scl_pin": 1,
+        "i2c_address_candidates": [ 118, 119 ],
+        "sea_level_pressure_pa": 101325,
+        "offsets": {
+          "temperature_c": 0,
+          "humidity_percent": 0,
+          "pressure_pascal": 0
+        }
+      }
+    },
+    {
+      "id": "410e8cc714848a69792befb7e3240a2b",
+      "device_type": "ltr390",
+      "name": "LTR390 Light/UV Sensor",
+      "config": {
+        "i2c_bus": 0,
+        "i2c_sda_pin": 0,
+        "i2c_scl_pin": 1,
+        "offsets": {
+          "lux": 0,
+          "uv_index": 0
+        }
       }
     }
   ]
